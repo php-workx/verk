@@ -112,6 +112,9 @@ func RunTicket(ctx context.Context, req RunTicketRequest) (RunTicketResult, erro
 	if st.currentPhase != state.TicketPhaseIntake && st.currentPhase != state.TicketPhaseImplement {
 		return RunTicketResult{}, fmt.Errorf("ticket run cannot start from phase %q", st.currentPhase)
 	}
+	if err := state.SaveJSONAtomic(filepath.Join(st.paths.runDir, "plan.json"), req.Plan); err != nil {
+		return RunTicketResult{}, err
+	}
 
 	if st.currentPhase == state.TicketPhaseIntake {
 		if err := st.transitionTo(state.TicketPhaseImplement); err != nil {
