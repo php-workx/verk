@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 
 	"verk/internal/adapters/repo/git"
 	"verk/internal/adapters/runtime/claude"
@@ -131,9 +132,10 @@ func RunDoctor(repoRoot string) (DoctorReport, int, error) {
 }
 
 func checkRuntimes(ctx context.Context, cfg policy.Config) []RuntimeCheck {
-	checks := []RuntimeCheck{
-		{Runtime: "codex"},
-		{Runtime: "claude"},
+	names := configuredRuntimes(cfg)
+	checks := make([]RuntimeCheck, 0, len(names))
+	for _, name := range names {
+		checks = append(checks, RuntimeCheck{Runtime: name})
 	}
 	for i := range checks {
 		var err error
@@ -155,6 +157,27 @@ func checkRuntimes(ctx context.Context, cfg policy.Config) []RuntimeCheck {
 		}
 	}
 	return checks
+}
+
+func configuredRuntimes(cfg policy.Config) []string {
+	seen := map[string]struct{}{}
+	out := make([]string, 0, 2)
+	for _, candidate := range []string{cfg.Runtime.DefaultRuntime} {
+		name := strings.TrimSpace(strings.ToLower(candidate))
+		if name == "" {
+			continue
+		}
+		if _, exists := seen[name]; exists {
+			continue
+		}
+		seen[name] = struct{}{}
+		out = append(out, name)
+	}
+	if len(out) == 0 {
+		return []string{"codex"}
+	}
+	sort.Strings(out)
+	return out
 }
 
 func loadJSONMap(path string, target *map[string]any) error {

@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"verk/internal/adapters/repo/git"
@@ -19,8 +20,10 @@ type RunEpicRequest struct {
 	RepoRoot             string
 	RunID                string
 	RootTicketID         string
+	BaseBranch           string
 	BaseCommit           string
 	Adapter              runtime.Adapter
+	AdapterFactory       func(ticketPreference string) (runtime.Adapter, error)
 	Config               policy.Config
 	VerificationByTicket map[string][]string
 }
@@ -68,6 +71,9 @@ func RunEpic(ctx context.Context, req RunEpicRequest) (RunEpicResult, error) {
 		RootTicketID: req.RootTicketID,
 		Status:       state.EpicRunStatusRunning,
 		CurrentPhase: state.TicketPhaseImplement,
+		Policy:       configMap(cfg.Policy),
+		Config:       configMap(cfg),
+		BaseBranch:   strings.TrimSpace(req.BaseBranch),
 		BaseCommit:   baseCommit,
 		TicketIDs:    ticketIDs(children),
 		ResumeCursor: map[string]any{
@@ -79,7 +85,6 @@ func RunEpic(ctx context.Context, req RunEpicRequest) (RunEpicResult, error) {
 	}
 
 	result := RunEpicResult{Run: run, Path: runPath}
-	acceptedScope := make([]string, 0)
 	waveOrdinal := 0
 
 	for {
@@ -134,89 +139,39 @@ func RunEpic(ctx context.Context, req RunEpicRequest) (RunEpicResult, error) {
 			return result, err
 		}
 
-		ticketPhases := make([]state.TicketPhase, 0, len(wave.TicketIDs))
+		waveBaselineChangedFiles, err := repo.ChangedFilesAgainst(baseCommit)
+		if err != nil {
+			return result, err
+		}
+		waveBaselineChangedFiles = filterEngineOwnedFiles(waveBaselineChangedFiles)
+		if result.Run.ResumeCursor == nil {
+			result.Run.ResumeCursor = map[string]any{}
+		}
+		result.Run.ResumeCursor["wave_baseline_changed_files"] = append([]string(nil), waveBaselineChangedFiles...)
+
+		outcomes := make([]waveTicketOutcome, len(wave.TicketIDs))
+		var wg sync.WaitGroup
+		for i, ticketID := range wave.TicketIDs {
+			wg.Add(1)
+			i := i
+			ticketID := ticketID
+			go func() {
+				defer wg.Done()
+				outcomes[i] = executeEpicTicket(ctx, req, cfg, wave, ticketID)
+			}()
+		}
+		wg.Wait()
+
+		ticketPhases := make([]state.TicketPhase, len(outcomes))
 		waveFailed := false
 		var waveErr error
-
-		for _, ticketID := range wave.TicketIDs {
-			if err := ctx.Err(); err != nil {
-				return result, err
-			}
-
-			ticket, err := loadEpicTicket(req.RepoRoot, ticketID)
-			if err != nil {
+		for i, outcome := range outcomes {
+			ticketPhases[i] = outcome.phase
+			if outcome.err != nil {
 				waveFailed = true
-				waveErr = err
-				break
-			}
-
-			if err := updateTicketStoreStatus(req.RepoRoot, ticket.ID, tkmd.StatusInProgress); err != nil {
-				waveFailed = true
-				waveErr = err
-				break
-			}
-
-			plan, err := BuildPlanArtifact(ticket, cfg)
-			if err != nil {
-				waveFailed = true
-				waveErr = err
-				if statusErr := updateTicketStoreStatus(req.RepoRoot, ticket.ID, tkmd.StatusBlocked); statusErr != nil {
-					waveErr = fmt.Errorf("%w: update ticket %s status to blocked: %v", err, ticket.ID, statusErr)
+				if waveErr == nil {
+					waveErr = outcome.err
 				}
-				break
-			}
-
-			leaseID := fmt.Sprintf("lease-%s-%s", req.RunID, ticket.ID)
-			claim, err := tkmd.AcquireClaim(req.RepoRoot, req.RunID, ticket.ID, leaseID, wave.WaveID, 30*time.Minute, time.Now().UTC())
-			if err != nil {
-				waveFailed = true
-				waveErr = err
-				if statusErr := updateTicketStoreStatus(req.RepoRoot, ticket.ID, tkmd.StatusBlocked); statusErr != nil {
-					waveErr = fmt.Errorf("%w: update ticket %s status to blocked: %v", err, ticket.ID, statusErr)
-				}
-				break
-			}
-
-			runTicketReq := RunTicketRequest{
-				RepoRoot:             req.RepoRoot,
-				RunID:                req.RunID,
-				Ticket:               ticket,
-				Plan:                 plan,
-				Claim:                claim,
-				Adapter:              req.Adapter,
-				Config:               cfg,
-				VerificationCommands: verificationCommandsFor(req, ticket),
-			}
-			ticketResult, err := RunTicket(ctx, runTicketReq)
-			if err != nil {
-				waveFailed = true
-				waveErr = err
-				if statusErr := updateTicketStoreStatus(req.RepoRoot, ticket.ID, tkmd.StatusBlocked); statusErr != nil {
-					waveErr = fmt.Errorf("%w: update ticket %s status to blocked: %v", err, ticket.ID, statusErr)
-				}
-				break
-			}
-
-			ticketPhases = append(ticketPhases, ticketResult.Snapshot.CurrentPhase)
-			switch ticketResult.Snapshot.CurrentPhase {
-			case state.TicketPhaseClosed:
-				if err := updateTicketStoreStatus(req.RepoRoot, ticket.ID, tkmd.StatusClosed); err != nil {
-					waveFailed = true
-					waveErr = err
-				}
-			case state.TicketPhaseBlocked:
-				if err := updateTicketStoreStatus(req.RepoRoot, ticket.ID, tkmd.StatusBlocked); err != nil {
-					waveFailed = true
-					waveErr = err
-				}
-			default:
-				if err := updateTicketStoreStatus(req.RepoRoot, ticket.ID, tkmd.StatusBlocked); err != nil {
-					waveFailed = true
-					waveErr = err
-				}
-			}
-			if waveFailed {
-				break
 			}
 		}
 
@@ -225,7 +180,7 @@ func RunEpic(ctx context.Context, req RunEpicRequest) (RunEpicResult, error) {
 			return result, err
 		}
 		changedFiles = filterEngineOwnedFiles(changedFiles)
-		changedFiles = filterCoveredFiles(changedFiles, acceptedScope)
+		changedFiles = subtractFiles(changedFiles, waveBaselineChangedFiles)
 
 		claimsReleased, err := waveClaimsReleased(req.RepoRoot, req.RunID, wave.TicketIDs)
 		if err != nil {
@@ -249,7 +204,10 @@ func RunEpic(ctx context.Context, req RunEpicRequest) (RunEpicResult, error) {
 				acceptErr = waveErr
 			}
 		}
-
+		if acceptedWave.Acceptance == nil {
+			acceptedWave.Acceptance = map[string]any{}
+		}
+		acceptedWave.Acceptance["baseline_changed_files"] = append([]string(nil), waveBaselineChangedFiles...)
 		acceptedWave.UpdatedAt = time.Now().UTC()
 		if acceptedWave.FinishedAt.IsZero() {
 			acceptedWave.FinishedAt = acceptedWave.UpdatedAt
@@ -260,6 +218,20 @@ func RunEpic(ctx context.Context, req RunEpicRequest) (RunEpicResult, error) {
 		result.Waves = append(result.Waves, acceptedWave)
 		result.Run.WaveIDs = append(result.Run.WaveIDs, acceptedWave.WaveID)
 		result.Run.UpdatedAt = time.Now().UTC()
+
+		for i, outcome := range outcomes {
+			status := tkmd.StatusBlocked
+			if acceptedWave.Status == state.WaveStatusAccepted && outcome.err == nil && outcome.phase == state.TicketPhaseClosed {
+				status = tkmd.StatusClosed
+			}
+			if err := updateTicketStoreStatus(req.RepoRoot, wave.TicketIDs[i], status); err != nil {
+				result.Run.Status = state.EpicRunStatusBlocked
+				result.Run.CurrentPhase = state.TicketPhaseBlocked
+				result.Run.UpdatedAt = time.Now().UTC()
+				_ = state.SaveJSONAtomic(runPath, result.Run)
+				return result, err
+			}
+		}
 
 		if acceptErr != nil {
 			result.Run.Status = state.EpicRunStatusBlocked
@@ -273,7 +245,10 @@ func RunEpic(ctx context.Context, req RunEpicRequest) (RunEpicResult, error) {
 			return result, nil
 		}
 
-		acceptedScope = append(acceptedScope, acceptedWave.PlannedScope...)
+		if result.Run.ResumeCursor != nil {
+			result.Run.ResumeCursor["wave_ordinal"] = waveOrdinal
+			result.Run.ResumeCursor["last_wave_base_commit"] = wave.WaveBaseCommit
+		}
 		if err := state.SaveJSONAtomic(runPath, result.Run); err != nil {
 			return result, err
 		}
@@ -290,7 +265,7 @@ func validateRunEpicRequest(req RunEpicRequest) error {
 	if req.RootTicketID == "" {
 		return fmt.Errorf("run epic requires root ticket id")
 	}
-	if req.Adapter == nil {
+	if req.Adapter == nil && req.AdapterFactory == nil {
 		return fmt.Errorf("run epic requires runtime adapter")
 	}
 	return nil
@@ -437,6 +412,86 @@ func coveredByAny(file string, scopes []string) bool {
 		}
 	}
 	return false
+}
+
+type waveTicketOutcome struct {
+	ticketID string
+	phase    state.TicketPhase
+	err      error
+}
+
+func executeEpicTicket(ctx context.Context, req RunEpicRequest, cfg policy.Config, wave state.WaveArtifact, ticketID string) waveTicketOutcome {
+	outcome := waveTicketOutcome{ticketID: ticketID, phase: state.TicketPhaseBlocked}
+
+	ticket, err := loadEpicTicket(req.RepoRoot, ticketID)
+	if err != nil {
+		outcome.err = err
+		return outcome
+	}
+	plan, err := BuildPlanArtifact(ticket, cfg)
+	if err != nil {
+		outcome.err = err
+		return outcome
+	}
+	claim, err := tkmd.AcquireClaim(req.RepoRoot, req.RunID, ticket.ID, fmt.Sprintf("lease-%s-%s", req.RunID, ticket.ID), wave.WaveID, 10*time.Minute, time.Now().UTC())
+	if err != nil {
+		outcome.err = err
+		return outcome
+	}
+	adapter, err := adapterForEpicTicket(req, plan)
+	if err != nil {
+		_ = tkmd.ReleaseClaim(req.RepoRoot, req.RunID, ticket.ID, claim.LeaseID, "runtime adapter selection failed")
+		outcome.err = err
+		return outcome
+	}
+
+	ticketResult, err := RunTicket(ctx, RunTicketRequest{
+		RepoRoot:             req.RepoRoot,
+		RunID:                req.RunID,
+		Ticket:               ticket,
+		Plan:                 plan,
+		Claim:                claim,
+		Adapter:              adapter,
+		Config:               cfg,
+		VerificationCommands: verificationCommandsFor(req, ticket),
+	})
+	if err != nil {
+		outcome.err = err
+		return outcome
+	}
+	outcome.phase = ticketResult.Snapshot.CurrentPhase
+	return outcome
+}
+
+func adapterForEpicTicket(req RunEpicRequest, plan state.PlanArtifact) (runtime.Adapter, error) {
+	if req.AdapterFactory != nil {
+		return req.AdapterFactory(chosenRuntime(plan, req.Config))
+	}
+	if req.Adapter != nil {
+		return req.Adapter, nil
+	}
+	return nil, fmt.Errorf("run epic requires runtime adapter")
+}
+
+func subtractFiles(changed, baseline []string) []string {
+	if len(changed) == 0 {
+		return nil
+	}
+	if len(baseline) == 0 {
+		return append([]string(nil), changed...)
+	}
+	blocked := make(map[string]struct{}, len(baseline))
+	for _, file := range baseline {
+		blocked[file] = struct{}{}
+	}
+	out := make([]string, 0, len(changed))
+	for _, file := range changed {
+		if _, ok := blocked[file]; ok {
+			continue
+		}
+		out = append(out, file)
+	}
+	return out
 }
 
 func ticketParent(ticket *tkmd.Ticket) string {

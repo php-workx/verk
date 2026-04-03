@@ -2,12 +2,13 @@ package e2e
 
 import (
 	"context"
+	"fmt"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
 	"verk/internal/adapters/runtime"
-	runtimefake "verk/internal/adapters/runtime/fake"
 	"verk/internal/engine"
 	"verk/internal/policy"
 	"verk/internal/state"
@@ -24,16 +25,16 @@ func TestEpicMultipleWavesNoConflicts(t *testing.T) {
 	saveTicket(t, repoRoot, epicChild("ticket-b", root.ID, "ready", []string{"internal/app/api"}))
 	saveTicket(t, repoRoot, epicChild("ticket-c", root.ID, "ready", []string{"docs"}))
 
-	adapter := runtimefake.New(
-		[]runtime.WorkerResult{
-			workerDone("lease-run-epic-ticket-a", repoRoot, "worker-a.json", 0),
-			workerDone("lease-run-epic-ticket-c", repoRoot, "worker-c.json", 4*time.Second),
-			workerDone("lease-run-epic-ticket-b", repoRoot, "worker-b.json", 8*time.Second),
+	adapter := newRoutingAdapter(
+		map[string]runtime.WorkerResult{
+			"ticket-a": workerDone(repoRoot, "worker-a.json", 0),
+			"ticket-b": workerDone(repoRoot, "worker-b.json", 8*time.Second),
+			"ticket-c": workerDone(repoRoot, "worker-c.json", 4*time.Second),
 		},
-		[]runtime.ReviewResult{
-			reviewPassed("lease-run-epic-ticket-a", repoRoot, "review-a.json", 2*time.Second),
-			reviewPassed("lease-run-epic-ticket-c", repoRoot, "review-c.json", 6*time.Second),
-			reviewPassed("lease-run-epic-ticket-b", repoRoot, "review-b.json", 10*time.Second),
+		map[string]runtime.ReviewResult{
+			"ticket-a": reviewPassed(repoRoot, "review-a.json", 2*time.Second),
+			"ticket-b": reviewPassed(repoRoot, "review-b.json", 10*time.Second),
+			"ticket-c": reviewPassed(repoRoot, "review-c.json", 6*time.Second),
 		},
 	)
 
@@ -66,14 +67,14 @@ func TestEpicConflictSerialization(t *testing.T) {
 	saveTicket(t, repoRoot, epicChild("ticket-a", root.ID, "ready", []string{"internal/app"}))
 	saveTicket(t, repoRoot, epicChild("ticket-b", root.ID, "ready", []string{"internal/app/api"}))
 
-	adapter := runtimefake.New(
-		[]runtime.WorkerResult{
-			workerDone("lease-run-conflict-ticket-a", repoRoot, "worker-a.json", 0),
-			workerDone("lease-run-conflict-ticket-b", repoRoot, "worker-b.json", 4*time.Second),
+	adapter := newRoutingAdapter(
+		map[string]runtime.WorkerResult{
+			"ticket-a": workerDone(repoRoot, "worker-a.json", 0),
+			"ticket-b": workerDone(repoRoot, "worker-b.json", 4*time.Second),
 		},
-		[]runtime.ReviewResult{
-			reviewPassed("lease-run-conflict-ticket-a", repoRoot, "review-a.json", 2*time.Second),
-			reviewPassed("lease-run-conflict-ticket-b", repoRoot, "review-b.json", 6*time.Second),
+		map[string]runtime.ReviewResult{
+			"ticket-a": reviewPassed(repoRoot, "review-a.json", 2*time.Second),
+			"ticket-b": reviewPassed(repoRoot, "review-b.json", 6*time.Second),
 		},
 	)
 
@@ -96,26 +97,78 @@ func TestEpicConflictSerialization(t *testing.T) {
 	}
 }
 
-func workerDone(leaseID, repoRoot, artifact string, offset time.Duration) runtime.WorkerResult {
+func workerDone(repoRoot, artifact string, offset time.Duration) runtime.WorkerResult {
 	return runtime.WorkerResult{
 		Status:             runtime.WorkerStatusDone,
 		RetryClass:         runtime.RetryClassTerminal,
-		LeaseID:            leaseID,
 		StartedAt:          testTime().Add(offset),
 		FinishedAt:         testTime().Add(offset + time.Second),
 		ResultArtifactPath: filepath.Join(repoRoot, artifact),
 	}
 }
 
-func reviewPassed(leaseID, repoRoot, artifact string, offset time.Duration) runtime.ReviewResult {
+func reviewPassed(repoRoot, artifact string, offset time.Duration) runtime.ReviewResult {
 	return runtime.ReviewResult{
 		Status:             runtime.WorkerStatusDone,
 		RetryClass:         runtime.RetryClassTerminal,
-		LeaseID:            leaseID,
 		StartedAt:          testTime().Add(offset),
 		FinishedAt:         testTime().Add(offset + time.Second),
 		ReviewStatus:       runtime.ReviewStatusPassed,
 		Summary:            "clean",
 		ResultArtifactPath: filepath.Join(repoRoot, artifact),
 	}
+}
+
+type routingAdapter struct {
+	mu sync.Mutex
+
+	workerResults map[string]runtime.WorkerResult
+	reviewResults map[string]runtime.ReviewResult
+}
+
+func newRoutingAdapter(workerResults map[string]runtime.WorkerResult, reviewResults map[string]runtime.ReviewResult) *routingAdapter {
+	return &routingAdapter{
+		workerResults: workerResults,
+		reviewResults: reviewResults,
+	}
+}
+
+func (a *routingAdapter) RunWorker(ctx context.Context, req runtime.WorkerRequest) (runtime.WorkerResult, error) {
+	if err := ctx.Err(); err != nil {
+		return runtime.WorkerResult{}, err
+	}
+	a.mu.Lock()
+	result, ok := a.workerResults[req.TicketID]
+	a.mu.Unlock()
+	if !ok {
+		return runtime.WorkerResult{}, fmt.Errorf("missing worker result for ticket %q", req.TicketID)
+	}
+	result.LeaseID = req.LeaseID
+	if result.StartedAt.IsZero() {
+		result.StartedAt = testTime()
+	}
+	if result.FinishedAt.IsZero() {
+		result.FinishedAt = result.StartedAt.Add(time.Second)
+	}
+	return result, nil
+}
+
+func (a *routingAdapter) RunReviewer(ctx context.Context, req runtime.ReviewRequest) (runtime.ReviewResult, error) {
+	if err := ctx.Err(); err != nil {
+		return runtime.ReviewResult{}, err
+	}
+	a.mu.Lock()
+	result, ok := a.reviewResults[req.TicketID]
+	a.mu.Unlock()
+	if !ok {
+		return runtime.ReviewResult{}, fmt.Errorf("missing review result for ticket %q", req.TicketID)
+	}
+	result.LeaseID = req.LeaseID
+	if result.StartedAt.IsZero() {
+		result.StartedAt = testTime().Add(2 * time.Second)
+	}
+	if result.FinishedAt.IsZero() {
+		result.FinishedAt = result.StartedAt.Add(time.Second)
+	}
+	return result, nil
 }

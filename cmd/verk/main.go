@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 
@@ -93,6 +94,10 @@ func runStatus(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "usage: verk status <run-id> [--json]")
 		return 2
 	}
+	if err := validateCLIIdentifier(args[0], "run-id"); err != nil {
+		fmt.Fprintln(stderr, err)
+		return 2
+	}
 
 	report, err := engine.DeriveStatus(engine.StatusRequest{RunID: args[0]})
 	if err != nil {
@@ -114,6 +119,13 @@ func runStatus(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stdout, "- %s: %s", ticket.TicketID, ticket.Phase)
 		if ticket.BlockReason != "" {
 			fmt.Fprintf(stdout, " (%s)", ticket.BlockReason)
+		}
+		if ticket.ClaimState != "" {
+			fmt.Fprintf(stdout, " [claim=%s", ticket.ClaimState)
+			if ticket.LeaseID != "" {
+				fmt.Fprintf(stdout, " lease=%s", ticket.LeaseID)
+			}
+			fmt.Fprint(stdout, "]")
 		}
 		fmt.Fprintln(stdout)
 	}
@@ -174,6 +186,14 @@ func runReopen(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "usage: verk reopen <run-id> <ticket-id> --to <phase>")
 		return 2
 	}
+	if err := validateCLIIdentifier(args[0], "run-id"); err != nil {
+		fmt.Fprintln(stderr, err)
+		return 2
+	}
+	if err := validateCLIIdentifier(args[1], "ticket-id"); err != nil {
+		fmt.Fprintln(stderr, err)
+		return 2
+	}
 
 	if err := engine.ReopenTicket(context.Background(), engine.ReopenRequest{
 		RunID:    args[0],
@@ -197,6 +217,10 @@ func runResume(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "usage: verk resume <run-id> [--json]")
 		return 2
 	}
+	if err := validateCLIIdentifier(args[0], "run-id"); err != nil {
+		fmt.Fprintln(stderr, err)
+		return 2
+	}
 
 	report, err := engine.ResumeRun(context.Background(), engine.ResumeRequest{RunID: args[0]})
 	if err != nil {
@@ -214,6 +238,9 @@ func runResume(args []string, stdout, stderr io.Writer) int {
 }
 
 func runTicket(ticketID string) (string, error) {
+	if err := validateCLIIdentifier(ticketID, "ticket-id"); err != nil {
+		return "", err
+	}
 	repoRoot, cfg, repo, err := loadExecutionContext()
 	if err != nil {
 		return "", err
@@ -238,7 +265,7 @@ func runTicket(ticketID string) (string, error) {
 	plan.UpdatedAt = plan.CreatedAt
 
 	leaseID := fmt.Sprintf("lease-%s-%s", runID, ticketID)
-	claim, err := tkmd.AcquireClaim(repoRoot, runID, ticketID, leaseID, 30*time.Minute, time.Now().UTC())
+	claim, err := tkmd.AcquireClaim(repoRoot, runID, ticketID, leaseID, 10*time.Minute, time.Now().UTC())
 	if err != nil {
 		return "", err
 	}
@@ -247,6 +274,10 @@ func runTicket(ticketID string) (string, error) {
 		return "", err
 	}
 	baseCommit, err := repo.HeadCommit()
+	if err != nil {
+		return "", err
+	}
+	baseBranch, err := repo.CurrentBranch()
 	if err != nil {
 		return "", err
 	}
@@ -262,8 +293,12 @@ func runTicket(ticketID string) (string, error) {
 		RootTicketID: ticketID,
 		Status:       state.EpicRunStatusRunning,
 		CurrentPhase: state.TicketPhaseImplement,
+		Policy:       mustJSONMap(cfg.Policy),
+		Config:       mustJSONMap(cfg),
 		TicketIDs:    []string{ticketID},
+		BaseBranch:   baseBranch,
 		BaseCommit:   baseCommit,
+		ResumeCursor: map[string]any{"ticket_id": ticketID},
 	}
 	if err := state.SaveJSONAtomic(filepath.Join(repoRoot, ".verk", "runs", runID, "run.json"), run); err != nil {
 		return "", err
@@ -311,6 +346,9 @@ func runTicket(ticketID string) (string, error) {
 }
 
 func runEpic(ticketID string) (string, error) {
+	if err := validateCLIIdentifier(ticketID, "ticket-id"); err != nil {
+		return "", err
+	}
 	repoRoot, cfg, repo, err := loadExecutionContext()
 	if err != nil {
 		return "", err
@@ -328,14 +366,22 @@ func runEpic(ticketID string) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	baseBranch, err := repo.CurrentBranch()
+	if err != nil {
+		return "", err
+	}
 	runID := newRunID(ticketID)
 	if _, err := engine.RunEpic(context.Background(), engine.RunEpicRequest{
 		RepoRoot:     repoRoot,
 		RunID:        runID,
 		RootTicketID: ticketID,
+		BaseBranch:   baseBranch,
 		BaseCommit:   baseCommit,
-		Adapter:      adapter,
-		Config:       cfg,
+		AdapterFactory: func(ticketPreference string) (runtime.Adapter, error) {
+			return runtimeAdapterFor(ticketPreference, cfg.Runtime.DefaultRuntime)
+		},
+		Adapter: adapter,
+		Config:  cfg,
 	}); err != nil {
 		return "", err
 	}
@@ -381,6 +427,27 @@ func normalizeRuntime(ticketPreference, defaultRuntime string) string {
 
 func newRunID(ticketID string) string {
 	return fmt.Sprintf("run-%s-%d", ticketID, time.Now().UTC().UnixNano())
+}
+
+var cliIdentifierPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*$`)
+
+func validateCLIIdentifier(value, label string) error {
+	if !cliIdentifierPattern.MatchString(strings.TrimSpace(value)) {
+		return fmt.Errorf("invalid %s %q", label, value)
+	}
+	return nil
+}
+
+func mustJSONMap(v any) map[string]any {
+	data, err := json.Marshal(v)
+	if err != nil {
+		return map[string]any{}
+	}
+	var out map[string]any
+	if err := json.Unmarshal(data, &out); err != nil {
+		return map[string]any{}
+	}
+	return out
 }
 
 func printJSON(w io.Writer, v any) int {

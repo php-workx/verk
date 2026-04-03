@@ -59,6 +59,14 @@ func HeadCommit() (string, error) {
 	return repo.HeadCommit()
 }
 
+func CurrentBranch() (string, error) {
+	repo, err := New(".")
+	if err != nil {
+		return "", err
+	}
+	return repo.CurrentBranch()
+}
+
 func ChangedFilesAgainst(baseCommit string) ([]string, error) {
 	repo, err := New(".")
 	if err != nil {
@@ -96,6 +104,17 @@ func (r *Repo) HeadCommit() (string, error) {
 	}
 
 	out, err := gitOutput(r.root, "rev-parse", "HEAD")
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(out), nil
+}
+
+func (r *Repo) CurrentBranch() (string, error) {
+	if r == nil {
+		return "", fmt.Errorf("nil repo")
+	}
+	out, err := gitOutput(r.root, "rev-parse", "--abbrev-ref", "HEAD")
 	if err != nil {
 		return "", err
 	}

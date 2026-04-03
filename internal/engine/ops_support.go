@@ -62,7 +62,7 @@ func loadRunArtifacts(repoRoot, runID string) (runArtifacts, error) {
 	plans := make(map[string]state.PlanArtifact, len(ticketIDs))
 	for _, ticketID := range ticketIDs {
 		var snapshot TicketRunSnapshot
-		if err := state.LoadJSON(ticketSnapshotPath(repoRoot, runID, ticketID), &snapshot); err != nil {
+		if err := loadTicketSnapshot(repoRoot, runID, ticketID, &snapshot); err != nil {
 			return runArtifacts{}, err
 		}
 		tickets[ticketID] = snapshot
@@ -109,7 +109,7 @@ func loadRunArtifacts(repoRoot, runID string) (runArtifacts, error) {
 }
 
 func discoverRunTicketIDs(repoRoot, runID string) ([]string, error) {
-	paths, err := filepath.Glob(filepath.Join(runDir(repoRoot, runID), "tickets", "*", "ticket-run.json"))
+	paths, err := filepath.Glob(filepath.Join(runDir(repoRoot, runID), "tickets", "*", "plan.json"))
 	if err != nil {
 		return nil, err
 	}
@@ -148,6 +148,22 @@ func ticketDir(repoRoot, runID, ticketID string) string {
 
 func ticketSnapshotPath(repoRoot, runID, ticketID string) string {
 	return filepath.Join(ticketDir(repoRoot, runID, ticketID), "ticket-run.json")
+}
+
+func implementationArtifactPath(repoRoot, runID, ticketID string) string {
+	return filepath.Join(ticketDir(repoRoot, runID, ticketID), "implementation.json")
+}
+
+func verificationArtifactPath(repoRoot, runID, ticketID string) string {
+	return filepath.Join(ticketDir(repoRoot, runID, ticketID), "verification.json")
+}
+
+func reviewArtifactPath(repoRoot, runID, ticketID string) string {
+	return filepath.Join(ticketDir(repoRoot, runID, ticketID), "review-findings.json")
+}
+
+func repairCycleArtifactGlob(repoRoot, runID, ticketID string) string {
+	return filepath.Join(ticketDir(repoRoot, runID, ticketID), "cycles", "repair-*.json")
 }
 
 func planArtifactPath(repoRoot, runID, ticketID string) string {
@@ -189,6 +205,101 @@ func loadOptionalClaim(path string) (*state.ClaimArtifact, error) {
 	return &claim, nil
 }
 
+func loadTicketSnapshot(repoRoot, runID, ticketID string, target *TicketRunSnapshot) error {
+	if err := state.LoadJSON(ticketSnapshotPath(repoRoot, runID, ticketID), target); err == nil {
+		return nil
+	} else if !os.IsNotExist(extractReadErr(err)) {
+		return err
+	}
+
+	derived, err := deriveTicketSnapshot(repoRoot, runID, ticketID)
+	if err != nil {
+		return err
+	}
+	*target = derived
+	return nil
+}
+
+func deriveTicketSnapshot(repoRoot, runID, ticketID string) (TicketRunSnapshot, error) {
+	snapshot := TicketRunSnapshot{
+		ArtifactMeta: state.ArtifactMeta{
+			SchemaVersion: artifactSchemaVersion,
+			RunID:         runID,
+			CreatedAt:     stateTime(),
+			UpdatedAt:     stateTime(),
+		},
+		TicketID: ticketID,
+	}
+	var implementation state.ImplementationArtifact
+	if err := state.LoadJSON(implementationArtifactPath(repoRoot, runID, ticketID), &implementation); err == nil {
+		snapshot.Implementation = &implementation
+	} else if !os.IsNotExist(extractReadErr(err)) {
+		return TicketRunSnapshot{}, err
+	}
+	var verification state.VerificationArtifact
+	if err := state.LoadJSON(verificationArtifactPath(repoRoot, runID, ticketID), &verification); err == nil {
+		snapshot.Verification = &verification
+	} else if !os.IsNotExist(extractReadErr(err)) {
+		return TicketRunSnapshot{}, err
+	}
+	var review state.ReviewFindingsArtifact
+	if err := state.LoadJSON(reviewArtifactPath(repoRoot, runID, ticketID), &review); err == nil {
+		snapshot.Review = &review
+	} else if !os.IsNotExist(extractReadErr(err)) {
+		return TicketRunSnapshot{}, err
+	}
+	var closeout state.CloseoutArtifact
+	if err := state.LoadJSON(closeoutArtifactPath(repoRoot, runID, ticketID), &closeout); err == nil {
+		snapshot.Closeout = &closeout
+	} else if !os.IsNotExist(extractReadErr(err)) {
+		return TicketRunSnapshot{}, err
+	}
+	cyclePaths, err := filepath.Glob(repairCycleArtifactGlob(repoRoot, runID, ticketID))
+	if err != nil {
+		return TicketRunSnapshot{}, err
+	}
+	sort.Strings(cyclePaths)
+	for _, path := range cyclePaths {
+		var cycle state.RepairCycleArtifact
+		if err := state.LoadJSON(path, &cycle); err != nil {
+			return TicketRunSnapshot{}, err
+		}
+		snapshot.RepairCycles = append(snapshot.RepairCycles, cycle)
+	}
+	if snapshot.Implementation != nil {
+		snapshot.ImplementationAttempts = snapshot.Implementation.Attempt
+	}
+	if snapshot.Verification != nil {
+		snapshot.VerificationAttempts = snapshot.Verification.Attempt
+	}
+	if snapshot.Review != nil {
+		snapshot.ReviewAttempts = snapshot.Review.Attempt
+	}
+	switch {
+	case snapshot.Closeout != nil && snapshot.Closeout.Closable:
+		snapshot.CurrentPhase = state.TicketPhaseClosed
+	case snapshot.Closeout != nil && snapshot.Closeout.FailedGate != "":
+		snapshot.CurrentPhase = state.TicketPhaseBlocked
+		snapshot.BlockReason = snapshot.Closeout.FailedGate
+	case len(snapshot.RepairCycles) > 0:
+		last := snapshot.RepairCycles[len(snapshot.RepairCycles)-1]
+		if last.Status == "repair_pending" {
+			snapshot.CurrentPhase = state.TicketPhaseRepair
+		} else {
+			snapshot.CurrentPhase = state.TicketPhaseReview
+		}
+	case snapshot.Review != nil:
+		snapshot.CurrentPhase = state.TicketPhaseReview
+	case snapshot.Verification != nil:
+		snapshot.CurrentPhase = state.TicketPhaseVerify
+	case snapshot.Implementation != nil:
+		snapshot.CurrentPhase = state.TicketPhaseImplement
+	default:
+		snapshot.CurrentPhase = state.TicketPhaseIntake
+	}
+	return snapshot, nil
+}
+
 func extractReadErr(err error) error {
 	if err == nil {
 		return nil
@@ -224,6 +335,18 @@ func appendRunAuditEvent(run *state.RunArtifact, eventType, ticketID string, pha
 
 func stateTime() time.Time {
 	return time.Now().UTC()
+}
+
+func configMap(v any) map[string]any {
+	data, err := json.Marshal(v)
+	if err != nil {
+		return map[string]any{}
+	}
+	var out map[string]any
+	if err := json.Unmarshal(data, &out); err != nil {
+		return map[string]any{}
+	}
+	return out
 }
 
 func updateRunStatusFromTickets(run *state.RunArtifact, tickets map[string]TicketRunSnapshot) {
