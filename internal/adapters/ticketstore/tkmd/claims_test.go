@@ -3,6 +3,7 @@ package tkmd
 import (
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -36,6 +37,40 @@ func TestAcquireClaim_Exclusive(t *testing.T) {
 	}
 	if _, err := os.Stat(durablePath); err != nil {
 		t.Fatalf("expected durable claim file: %v", err)
+	}
+}
+
+func TestAcquireClaim_ConcurrentOnlyOneWins(t *testing.T) {
+	dir := t.TempDir()
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	errs := make(chan error, 2)
+
+	acquire := func(runID string) {
+		defer wg.Done()
+		<-start
+		_, err := AcquireClaim(dir, runID, "ticket-1", "lease-"+runID, 15*time.Minute)
+		errs <- err
+	}
+
+	wg.Add(2)
+	go acquire("run-a")
+	go acquire("run-b")
+	close(start)
+	wg.Wait()
+	close(errs)
+
+	successes := 0
+	failures := 0
+	for err := range errs {
+		if err != nil {
+			failures++
+			continue
+		}
+		successes++
+	}
+	if successes != 1 || failures != 1 {
+		t.Fatalf("expected exactly one claim winner and one loser, got successes=%d failures=%d", successes, failures)
 	}
 }
 

@@ -95,15 +95,22 @@ type WaveArtifact struct {
 
 type PlanArtifact struct {
 	ArtifactMeta
-	TicketID                 string      `json:"ticket_id"`
-	Phase                    TicketPhase `json:"phase"`
-	AcceptanceCriteria       []string    `json:"acceptance_criteria"`
-	TestCases                []string    `json:"test_cases"`
-	ValidationCommands       []string    `json:"validation_commands"`
-	OwnedPaths               []string    `json:"owned_paths"`
-	ReviewThreshold          Severity    `json:"review_threshold"`
-	EffectiveReviewThreshold Severity    `json:"effective_review_threshold"`
-	RuntimePreference        string      `json:"runtime_preference"`
+	TicketID                 string          `json:"ticket_id"`
+	Phase                    TicketPhase     `json:"phase"`
+	AcceptanceCriteria       []string        `json:"acceptance_criteria"`
+	Criteria                 []PlanCriterion `json:"criteria,omitempty"`
+	TestCases                []string        `json:"test_cases"`
+	ValidationCommands       []string        `json:"validation_commands"`
+	DeclaredChecks           []string        `json:"declared_checks,omitempty"`
+	OwnedPaths               []string        `json:"owned_paths"`
+	ReviewThreshold          Severity        `json:"review_threshold"`
+	EffectiveReviewThreshold Severity        `json:"effective_review_threshold"`
+	RuntimePreference        string          `json:"runtime_preference"`
+}
+
+type PlanCriterion struct {
+	ID   string `json:"id"`
+	Text string `json:"text"`
 }
 
 type ImplementationArtifact struct {
@@ -126,7 +133,9 @@ type ImplementationArtifact struct {
 
 type VerificationResult struct {
 	Command    string    `json:"command"`
+	Cwd        string    `json:"cwd"`
 	ExitCode   int       `json:"exit_code"`
+	TimedOut   bool      `json:"timed_out"`
 	Passed     bool      `json:"passed"`
 	DurationMS int64     `json:"duration_ms"`
 	StdoutPath string    `json:"stdout_path,omitempty"`

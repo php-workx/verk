@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"crypto/sha1"
 	"fmt"
 	"strings"
 	"time"
@@ -28,14 +29,16 @@ func BuildPlanArtifact(t tkmd.Ticket, cfg policy.Config) (state.PlanArtifact, er
 		ArtifactMeta: state.ArtifactMeta{
 			SchemaVersion: artifactSchemaVersion,
 			RunID:         ticketRunID(t),
-			CreatedAt:     time.Time{},
-			UpdatedAt:     time.Time{},
+			CreatedAt:     time.Now().UTC(),
+			UpdatedAt:     time.Now().UTC(),
 		},
 		TicketID:                 t.ID,
 		Phase:                    state.TicketPhaseIntake,
 		AcceptanceCriteria:       append([]string(nil), t.AcceptanceCriteria...),
+		Criteria:                 buildPlanCriteria(t.AcceptanceCriteria),
 		TestCases:                append([]string(nil), t.TestCases...),
 		ValidationCommands:       append([]string(nil), t.ValidationCommands...),
+		DeclaredChecks:           ticketDeclaredChecks(t),
 		OwnedPaths:               append([]string(nil), t.OwnedPaths...),
 		ReviewThreshold:          plannedThreshold,
 		EffectiveReviewThreshold: effective,
@@ -62,6 +65,68 @@ func ticketRunID(t tkmd.Ticket) string {
 		return strings.TrimSpace(runID)
 	}
 	return ""
+}
+
+func buildPlanCriteria(criteria []string) []state.PlanCriterion {
+	out := make([]state.PlanCriterion, 0, len(criteria))
+	for i, text := range criteria {
+		trimmed := strings.TrimSpace(text)
+		if trimmed == "" {
+			continue
+		}
+		sum := sha1.Sum([]byte(trimmed))
+		out = append(out, state.PlanCriterion{
+			ID:   fmt.Sprintf("criterion-%02d-%x", i+1, sum[:4]),
+			Text: trimmed,
+		})
+	}
+	return out
+}
+
+func ticketDeclaredChecks(t tkmd.Ticket) []string {
+	if t.UnknownFrontmatter == nil {
+		return nil
+	}
+	raw, ok := t.UnknownFrontmatter["declared_checks"]
+	if !ok {
+		return nil
+	}
+	seen := map[string]struct{}{}
+	out := make([]string, 0)
+	for _, value := range asStringSlice(raw) {
+		trimmed := strings.TrimSpace(value)
+		if trimmed == "" {
+			continue
+		}
+		if _, exists := seen[trimmed]; exists {
+			continue
+		}
+		seen[trimmed] = struct{}{}
+		out = append(out, trimmed)
+	}
+	return out
+}
+
+func asStringSlice(value any) []string {
+	switch v := value.(type) {
+	case nil:
+		return nil
+	case []string:
+		return append([]string(nil), v...)
+	case []any:
+		out := make([]string, 0, len(v))
+		for _, item := range v {
+			out = append(out, fmt.Sprint(item))
+		}
+		return out
+	case string:
+		if strings.TrimSpace(v) == "" {
+			return nil
+		}
+		return []string{v}
+	default:
+		return []string{fmt.Sprint(v)}
+	}
 }
 
 func isEpicTicket(t tkmd.Ticket) bool {

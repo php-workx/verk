@@ -34,7 +34,7 @@ func TestTicketRepairCycle(t *testing.T) {
 		[]runtime.WorkerResult{
 			{
 				Status:             runtime.WorkerStatusDone,
-				RetryClass:         runtime.RetryClassRetryable,
+				RetryClass:         runtime.RetryClassTerminal,
 				LeaseID:            claim.LeaseID,
 				StartedAt:          testTime(),
 				FinishedAt:         testTime().Add(time.Second),
@@ -42,7 +42,7 @@ func TestTicketRepairCycle(t *testing.T) {
 			},
 			{
 				Status:             runtime.WorkerStatusDone,
-				RetryClass:         runtime.RetryClassRetryable,
+				RetryClass:         runtime.RetryClassTerminal,
 				LeaseID:            claim.LeaseID,
 				StartedAt:          testTime().Add(4 * time.Second),
 				FinishedAt:         testTime().Add(5 * time.Second),

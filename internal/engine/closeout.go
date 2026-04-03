@@ -142,6 +142,8 @@ func BuildCloseoutArtifact(args ...any) (state.CloseoutArtifact, error) {
 		ArtifactMeta: state.ArtifactMeta{
 			SchemaVersion: artifactSchemaVersion,
 			RunID:         runID,
+			CreatedAt:     stateTime(),
+			UpdatedAt:     stateTime(),
 		},
 		TicketID:          req.ticket.ID,
 		CriteriaEvidence:  criteriaEvidence,
@@ -341,10 +343,9 @@ func validateCriteriaEvidence(req closeoutRequest, currentRunID string) error {
 		seen[evidence.CriterionID] = true
 		seen[strings.TrimSpace(evidence.CriterionText)] = true
 	}
-	for _, criterion := range req.plan.AcceptanceCriteria {
-		criterionID := criterionEvidenceID(criterion)
-		if !seen[criterionID] && !seen[strings.TrimSpace(criterion)] {
-			return fmt.Errorf("missing evidence for criterion %q", criterionID)
+	for _, criterion := range planCriteria(req.plan) {
+		if !seen[criterion.ID] && !seen[strings.TrimSpace(criterion.Text)] {
+			return fmt.Errorf("missing evidence for criterion %q", criterion.ID)
 		}
 	}
 	return nil
@@ -466,6 +467,15 @@ func validateReview(req closeoutRequest) (state.GateResult, error) {
 }
 
 func validateDeclaredChecks(req closeoutRequest) error {
+	if len(req.plan.DeclaredChecks) == 0 {
+		return nil
+	}
+	if req.verification == nil {
+		return fmt.Errorf("declared checks require verification artifacts")
+	}
+	if !derivedVerificationPassed(req.verification.Results) {
+		return fmt.Errorf("declared checks failed because verification did not pass")
+	}
 	return nil
 }
 
@@ -622,7 +632,8 @@ func resolveCloseoutRunID(req closeoutRequest, evidence []state.CriteriaEvidence
 }
 
 func deriveCriteriaEvidence(req closeoutRequest) []state.CriteriaEvidence {
-	count := len(req.plan.AcceptanceCriteria)
+	criteria := planCriteria(req.plan)
+	count := len(criteria)
 	if count == 0 {
 		return nil
 	}
@@ -644,11 +655,10 @@ func deriveCriteriaEvidence(req closeoutRequest) []state.CriteriaEvidence {
 	}
 
 	out := make([]state.CriteriaEvidence, 0, count)
-	for i, criterion := range req.plan.AcceptanceCriteria {
-		criterionID := criterionEvidenceID(criterion)
+	for i, criterion := range criteria {
 		out = append(out, state.CriteriaEvidence{
-			CriterionID:   criterionID,
-			CriterionText: criterion,
+			CriterionID:   criterion.ID,
+			CriterionText: criterion.Text,
 			EvidenceType:  sourceType,
 			Source:        sourceRef,
 			Summary:       summary,
@@ -656,6 +666,24 @@ func deriveCriteriaEvidence(req closeoutRequest) []state.CriteriaEvidence {
 			TicketID:      req.ticket.ID,
 			Attempt:       evidenceAttempt(req),
 			ArtifactRef:   fmt.Sprintf("%s#%d", sourceRef, i+1),
+		})
+	}
+	return out
+}
+
+func planCriteria(plan state.PlanArtifact) []state.PlanCriterion {
+	if len(plan.Criteria) > 0 {
+		return append([]state.PlanCriterion(nil), plan.Criteria...)
+	}
+	out := make([]state.PlanCriterion, 0, len(plan.AcceptanceCriteria))
+	for _, criterion := range plan.AcceptanceCriteria {
+		trimmed := strings.TrimSpace(criterion)
+		if trimmed == "" {
+			continue
+		}
+		out = append(out, state.PlanCriterion{
+			ID:   criterionEvidenceID(trimmed),
+			Text: trimmed,
 		})
 	}
 	return out

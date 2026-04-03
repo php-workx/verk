@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"reflect"
@@ -15,6 +16,11 @@ import (
 	"verk/internal/policy"
 	"verk/internal/state"
 )
+
+const maxRuntimeRetryAttempts = 2
+
+var errRuntimeExecutionBlocked = errors.New("runtime execution blocked")
+var errClaimRenewalLost = errors.New("claim renewal failed")
 
 type RunTicketRequest struct {
 	RepoRoot             string
@@ -133,16 +139,26 @@ func RunTicket(ctx context.Context, req RunTicketRequest) (RunTicketResult, erro
 		switch st.currentPhase {
 		case state.TicketPhaseImplement:
 			workerReq := runtime.WorkerRequest{
-				RunID:        req.RunID,
-				TicketID:     req.Ticket.ID,
-				LeaseID:      req.Claim.LeaseID,
-				Attempt:      st.implementationAttempts + 1,
-				Runtime:      chosenRuntime(req.Plan, cfg),
-				WorktreePath: absRepoRoot,
-				Instructions: renderImplementInstructions(req.Plan, st.currentPhase, st.implementationAttempts+1),
+				RunID:           req.RunID,
+				TicketID:        req.Ticket.ID,
+				LeaseID:         req.Claim.LeaseID,
+				Attempt:         st.implementationAttempts + 1,
+				Runtime:         chosenRuntime(req.Plan, cfg),
+				WorktreePath:    absRepoRoot,
+				Instructions:    renderImplementInstructions(req.Plan, st.currentPhase, st.implementationAttempts+1),
+				ExecutionConfig: executionConfigFromPolicy(cfg),
 			}
-			result, err := req.Adapter.RunWorker(ctx, workerReq)
+			result, err := st.runWorkerWithRuntimeControls(ctx, workerReq)
 			if err != nil {
+				if errors.Is(err, errRuntimeExecutionBlocked) {
+					if err := st.persist(); err != nil {
+						return RunTicketResult{}, err
+					}
+					if err := st.releaseClaim(); err != nil {
+						return RunTicketResult{}, err
+					}
+					return RunTicketResult{Snapshot: st.snapshot(), Path: st.paths.snapshotPath}, nil
+				}
 				return RunTicketResult{}, err
 			}
 			if err := handleImplementResult(st, result, workerReq.Attempt); err != nil {
@@ -200,9 +216,19 @@ func RunTicket(ctx context.Context, req RunTicketRequest) (RunTicketResult, erro
 				Runtime:                  chosenRuntime(req.Plan, cfg),
 				InputArtifactPath:        st.paths.verificationPath,
 				EffectiveReviewThreshold: req.Plan.EffectiveReviewThreshold,
+				ExecutionConfig:          executionConfigFromPolicy(cfg),
 			}
-			result, err := req.Adapter.RunReviewer(ctx, reviewReq)
+			result, err := st.runReviewerWithRuntimeControls(ctx, reviewReq)
 			if err != nil {
+				if errors.Is(err, errRuntimeExecutionBlocked) {
+					if err := st.persist(); err != nil {
+						return RunTicketResult{}, err
+					}
+					if err := st.releaseClaim(); err != nil {
+						return RunTicketResult{}, err
+					}
+					return RunTicketResult{Snapshot: st.snapshot(), Path: st.paths.snapshotPath}, nil
+				}
 				return RunTicketResult{}, err
 			}
 			if err := handleReviewOutcome(st, result, reviewReq.Attempt); err != nil {
@@ -217,19 +243,60 @@ func RunTicket(ctx context.Context, req RunTicketRequest) (RunTicketResult, erro
 				}
 				return RunTicketResult{Snapshot: st.snapshot(), Path: st.paths.snapshotPath}, nil
 			}
+			if st.currentPhase == state.TicketPhaseCloseout {
+				continue
+			}
+
+		case state.TicketPhaseCloseout:
+			if st.closeout == nil {
+				closeout, err := BuildCloseoutArtifact(st.req.Ticket, st.req.Plan, st.verification, st.review)
+				if err != nil {
+					return RunTicketResult{}, err
+				}
+				st.closeout = &closeout
+			}
+			if st.closeout.Closable {
+				st.blockReason = ""
+				if err := st.transitionTo(state.TicketPhaseClosed); err != nil {
+					return RunTicketResult{}, err
+				}
+			} else {
+				st.blockReason = st.closeout.FailedGate
+				next := state.TicketPhaseBlocked
+				if st.closeout.FailedGate == gateReview {
+					next = state.TicketPhaseRepair
+				}
+				if err := st.transitionTo(next); err != nil {
+					return RunTicketResult{}, err
+				}
+			}
+			if err := st.persist(); err != nil {
+				return RunTicketResult{}, err
+			}
+			continue
 
 		case state.TicketPhaseRepair:
 			workerReq := runtime.WorkerRequest{
-				RunID:        req.RunID,
-				TicketID:     req.Ticket.ID,
-				LeaseID:      req.Claim.LeaseID,
-				Attempt:      st.implementationAttempts + 1,
-				Runtime:      chosenRuntime(req.Plan, cfg),
-				WorktreePath: absRepoRoot,
-				Instructions: renderRepairInstructions(st),
+				RunID:           req.RunID,
+				TicketID:        req.Ticket.ID,
+				LeaseID:         req.Claim.LeaseID,
+				Attempt:         st.implementationAttempts + 1,
+				Runtime:         chosenRuntime(req.Plan, cfg),
+				WorktreePath:    absRepoRoot,
+				Instructions:    renderRepairInstructions(st),
+				ExecutionConfig: executionConfigFromPolicy(cfg),
 			}
-			result, err := req.Adapter.RunWorker(ctx, workerReq)
+			result, err := st.runWorkerWithRuntimeControls(ctx, workerReq)
 			if err != nil {
+				if errors.Is(err, errRuntimeExecutionBlocked) {
+					if err := st.persist(); err != nil {
+						return RunTicketResult{}, err
+					}
+					if err := st.releaseClaim(); err != nil {
+						return RunTicketResult{}, err
+					}
+					return RunTicketResult{Snapshot: st.snapshot(), Path: st.paths.snapshotPath}, nil
+				}
 				return RunTicketResult{}, err
 			}
 			if err := handleImplementResult(st, result, workerReq.Attempt); err != nil {
@@ -308,6 +375,8 @@ func handleImplementResult(st *ticketRunState, result runtime.WorkerResult, atte
 		ArtifactMeta: state.ArtifactMeta{
 			SchemaVersion: artifactSchemaVersion,
 			RunID:         st.req.RunID,
+			CreatedAt:     stateTime(),
+			UpdatedAt:     stateTime(),
 		},
 		TicketID:       st.req.Ticket.ID,
 		Attempt:        st.implementationAttempts,
@@ -387,6 +456,8 @@ func handleReviewOutcome(st *ticketRunState, result runtime.ReviewResult, attemp
 		ArtifactMeta: state.ArtifactMeta{
 			SchemaVersion: artifactSchemaVersion,
 			RunID:         st.req.RunID,
+			CreatedAt:     stateTime(),
+			UpdatedAt:     stateTime(),
 		},
 		TicketID:                 st.req.Ticket.ID,
 		Attempt:                  st.reviewAttempts,
@@ -415,9 +486,6 @@ func handleReviewOutcome(st *ticketRunState, result runtime.ReviewResult, attemp
 		if err := st.transitionTo(state.TicketPhaseCloseout); err != nil {
 			return err
 		}
-		if err := st.transitionTo(state.TicketPhaseClosed); err != nil {
-			return err
-		}
 		if err := st.persist(); err != nil {
 			return err
 		}
@@ -428,6 +496,8 @@ func handleReviewOutcome(st *ticketRunState, result runtime.ReviewResult, attemp
 		ArtifactMeta: state.ArtifactMeta{
 			SchemaVersion: artifactSchemaVersion,
 			RunID:         st.req.RunID,
+			CreatedAt:     stateTime(),
+			UpdatedAt:     stateTime(),
 		},
 		TicketID:            st.req.Ticket.ID,
 		Cycle:               len(st.repairCycles) + 1,
@@ -473,6 +543,8 @@ func (st *ticketRunState) runVerification(ctx context.Context, repoRoot string) 
 		ArtifactMeta: state.ArtifactMeta{
 			SchemaVersion: artifactSchemaVersion,
 			RunID:         st.req.RunID,
+			CreatedAt:     stateTime(),
+			UpdatedAt:     stateTime(),
 		},
 		TicketID:   st.req.Ticket.ID,
 		Attempt:    st.verificationAttempts + 1,
@@ -484,6 +556,240 @@ func (st *ticketRunState) runVerification(ctx context.Context, repoRoot string) 
 		FinishedAt: verificationFinishedAt(converted),
 	}
 	return artifact, artifact.Passed, nil
+}
+
+func (st *ticketRunState) runWorkerWithRuntimeControls(ctx context.Context, req runtime.WorkerRequest) (runtime.WorkerResult, error) {
+	var lastErr error
+	for attempt := 0; attempt <= maxRuntimeRetryAttempts; attempt++ {
+		result, err := st.runWorkerWithClaimRenewal(ctx, req)
+		if err != nil {
+			if errors.Is(err, errClaimRenewalLost) {
+				if err := st.blockRuntimeExecution(fmt.Sprintf("claim renewal lost during worker execution: %v", err)); err != nil {
+					return runtime.WorkerResult{}, err
+				}
+				return runtime.WorkerResult{}, errRuntimeExecutionBlocked
+			}
+			if errors.Is(err, context.Canceled) {
+				return runtime.WorkerResult{}, err
+			}
+			if shouldRetryRuntimeError(err) && attempt < maxRuntimeRetryAttempts {
+				lastErr = err
+				continue
+			}
+			lastErr = err
+			break
+		}
+
+		switch result.RetryClass {
+		case runtime.RetryClassRetryable:
+			lastErr = fmt.Errorf("retryable worker failure: %s", workerBlockReason(runtime.WorkerResult{
+				Status:         result.Status,
+				CompletionCode: result.CompletionCode,
+				RetryClass:     result.RetryClass,
+			}))
+			if attempt < maxRuntimeRetryAttempts {
+				continue
+			}
+		case runtime.RetryClassBlockedByOperatorInput:
+			reason := fmt.Sprintf("worker blocked by operator input: %s", workerBlockReason(runtime.WorkerResult{
+				Status:         result.Status,
+				CompletionCode: result.CompletionCode,
+				RetryClass:     result.RetryClass,
+			}))
+			if err := st.blockRuntimeExecution(reason); err != nil {
+				return runtime.WorkerResult{}, err
+			}
+			return runtime.WorkerResult{}, errRuntimeExecutionBlocked
+		default:
+			return result, nil
+		}
+
+		if attempt >= maxRuntimeRetryAttempts {
+			break
+		}
+	}
+
+	if lastErr == nil {
+		lastErr = fmt.Errorf("worker runtime failed")
+	}
+	if !shouldRetryRuntimeError(lastErr) {
+		return runtime.WorkerResult{}, lastErr
+	}
+	if err := st.blockRuntimeExecution(fmt.Sprintf("retryable worker failure after %d retries: %v", maxRuntimeRetryAttempts, lastErr)); err != nil {
+		return runtime.WorkerResult{}, err
+	}
+	return runtime.WorkerResult{}, errRuntimeExecutionBlocked
+}
+
+func (st *ticketRunState) runReviewerWithRuntimeControls(ctx context.Context, req runtime.ReviewRequest) (runtime.ReviewResult, error) {
+	var lastErr error
+	for attempt := 0; attempt <= maxRuntimeRetryAttempts; attempt++ {
+		result, err := st.runReviewerWithClaimRenewal(ctx, req)
+		if err != nil {
+			if errors.Is(err, errClaimRenewalLost) {
+				if err := st.blockRuntimeExecution(fmt.Sprintf("claim renewal lost during reviewer execution: %v", err)); err != nil {
+					return runtime.ReviewResult{}, err
+				}
+				return runtime.ReviewResult{}, errRuntimeExecutionBlocked
+			}
+			if errors.Is(err, context.Canceled) {
+				return runtime.ReviewResult{}, err
+			}
+			if shouldRetryRuntimeError(err) && attempt < maxRuntimeRetryAttempts {
+				lastErr = err
+				continue
+			}
+			lastErr = err
+			break
+		}
+
+		switch result.RetryClass {
+		case runtime.RetryClassRetryable:
+			lastErr = fmt.Errorf("retryable reviewer failure: %s", workerBlockReason(runtime.WorkerResult{
+				Status:         result.Status,
+				CompletionCode: result.CompletionCode,
+				RetryClass:     result.RetryClass,
+			}))
+			if attempt < maxRuntimeRetryAttempts {
+				continue
+			}
+		case runtime.RetryClassBlockedByOperatorInput:
+			reason := fmt.Sprintf("reviewer blocked by operator input: %s", workerBlockReason(runtime.WorkerResult{
+				Status:         result.Status,
+				CompletionCode: result.CompletionCode,
+				RetryClass:     result.RetryClass,
+			}))
+			if err := st.blockRuntimeExecution(reason); err != nil {
+				return runtime.ReviewResult{}, err
+			}
+			return runtime.ReviewResult{}, errRuntimeExecutionBlocked
+		default:
+			return result, nil
+		}
+
+		if attempt >= maxRuntimeRetryAttempts {
+			break
+		}
+	}
+
+	if lastErr == nil {
+		lastErr = fmt.Errorf("reviewer runtime failed")
+	}
+	if !shouldRetryRuntimeError(lastErr) {
+		return runtime.ReviewResult{}, lastErr
+	}
+	if err := st.blockRuntimeExecution(fmt.Sprintf("retryable reviewer failure after %d retries: %v", maxRuntimeRetryAttempts, lastErr)); err != nil {
+		return runtime.ReviewResult{}, err
+	}
+	return runtime.ReviewResult{}, errRuntimeExecutionBlocked
+}
+
+func (st *ticketRunState) runWorkerWithClaimRenewal(ctx context.Context, req runtime.WorkerRequest) (runtime.WorkerResult, error) {
+	renewCtx, stopRenewal := st.startClaimRenewal(ctx)
+	result, err := st.req.Adapter.RunWorker(renewCtx, req)
+	renewErr := stopRenewal()
+	if renewErr != nil {
+		return runtime.WorkerResult{}, fmt.Errorf("%w: %v", errClaimRenewalLost, renewErr)
+	}
+	return result, err
+}
+
+func (st *ticketRunState) runReviewerWithClaimRenewal(ctx context.Context, req runtime.ReviewRequest) (runtime.ReviewResult, error) {
+	renewCtx, stopRenewal := st.startClaimRenewal(ctx)
+	result, err := st.req.Adapter.RunReviewer(renewCtx, req)
+	renewErr := stopRenewal()
+	if renewErr != nil {
+		return runtime.ReviewResult{}, fmt.Errorf("%w: %v", errClaimRenewalLost, renewErr)
+	}
+	return result, err
+}
+
+func (st *ticketRunState) startClaimRenewal(ctx context.Context) (context.Context, func() error) {
+	ttl := st.claimTTL()
+	if ttl <= 0 {
+		ttl = 10 * time.Minute
+	}
+	interval := ttl / 3
+	if interval < 25*time.Millisecond {
+		interval = 25 * time.Millisecond
+	}
+
+	renewCtx, cancel := context.WithCancel(ctx)
+	errCh := make(chan error, 1)
+	done := make(chan struct{})
+
+	go func() {
+		defer close(done)
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-renewCtx.Done():
+				return
+			case <-ticker.C:
+				if _, err := tkmd.RenewClaim(st.repoRoot, st.req.RunID, st.req.Ticket.ID, st.req.Claim.LeaseID, ttl, time.Now().UTC()); err != nil {
+					select {
+					case errCh <- err:
+					default:
+					}
+					cancel()
+					return
+				}
+			}
+		}
+	}()
+
+	stop := func() error {
+		cancel()
+		<-done
+		select {
+		case err := <-errCh:
+			return err
+		default:
+			return nil
+		}
+	}
+	return renewCtx, stop
+}
+
+func (st *ticketRunState) claimTTL() time.Duration {
+	if st.req.Claim.LeasedAt.IsZero() || st.req.Claim.ExpiresAt.IsZero() {
+		return 10 * time.Minute
+	}
+	ttl := st.req.Claim.ExpiresAt.Sub(st.req.Claim.LeasedAt)
+	if ttl <= 0 {
+		return 10 * time.Minute
+	}
+	return ttl
+}
+
+func shouldRetryRuntimeError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.Canceled) {
+		return false
+	}
+	if errors.Is(err, errRuntimeExecutionBlocked) || errors.Is(err, errClaimRenewalLost) {
+		return false
+	}
+	if strings.Contains(strings.ToLower(err.Error()), "invalid") {
+		return false
+	}
+	return true
+}
+
+func (st *ticketRunState) blockRuntimeExecution(reason string) error {
+	reason = strings.TrimSpace(reason)
+	if reason == "" {
+		reason = "runtime execution blocked"
+	}
+	st.blockReason = reason
+	if err := st.transitionTo(state.TicketPhaseBlocked); err != nil {
+		return err
+	}
+	return st.persist()
 }
 
 func (st *ticketRunState) transitionTo(next state.TicketPhase) error {
@@ -543,6 +849,8 @@ func (st *ticketRunState) snapshot() TicketRunSnapshot {
 		ArtifactMeta: state.ArtifactMeta{
 			SchemaVersion: artifactSchemaVersion,
 			RunID:         st.req.RunID,
+			CreatedAt:     stateTime(),
+			UpdatedAt:     stateTime(),
 		},
 		TicketID:               st.req.Ticket.ID,
 		CurrentPhase:           st.currentPhase,
@@ -581,15 +889,15 @@ func buildTicketRunPaths(repoRoot, runID, ticketID string) ticketRunPaths {
 	return ticketRunPaths{
 		runDir:             runDir,
 		snapshotPath:       filepath.Join(runDir, "ticket-run.json"),
-		implementationPath: filepath.Join(runDir, "implement.json"),
+		implementationPath: filepath.Join(runDir, "implementation.json"),
 		verificationPath:   filepath.Join(runDir, "verification.json"),
-		reviewPath:         filepath.Join(runDir, "review.json"),
+		reviewPath:         filepath.Join(runDir, "review-findings.json"),
 		closeoutPath:       filepath.Join(runDir, "closeout.json"),
 	}
 }
 
 func (p ticketRunPaths) repairCyclePath(cycle int) string {
-	return filepath.Join(p.runDir, fmt.Sprintf("repair-cycle-%02d.json", cycle))
+	return filepath.Join(p.runDir, "cycles", fmt.Sprintf("repair-%d.json", cycle))
 }
 
 func validateRunTicketRequest(req RunTicketRequest) error {
@@ -641,6 +949,14 @@ func normalizeRunTicketConfig(cfg policy.Config) policy.Config {
 		cfg.Verification.EnvPassthrough = append([]string(nil), defaults.Verification.EnvPassthrough...)
 	}
 	return cfg
+}
+
+func executionConfigFromPolicy(cfg policy.Config) runtime.ExecutionConfig {
+	return runtime.ExecutionConfig{
+		WorkerTimeoutMinutes:   cfg.Runtime.WorkerTimeoutMinutes,
+		ReviewerTimeoutMinutes: cfg.Runtime.ReviewerTimeoutMinutes,
+		AuthEnvVars:            append([]string(nil), cfg.Runtime.AuthEnvVars...),
+	}
 }
 
 func chosenRuntime(plan state.PlanArtifact, cfg policy.Config) string {
@@ -700,7 +1016,9 @@ func convertVerificationResults(commands []string, results []verifycommand.Comma
 		}
 		converted = append(converted, state.VerificationResult{
 			Command:    command,
+			Cwd:        result.Cwd,
 			ExitCode:   result.ExitCode,
+			TimedOut:   result.TimedOut,
 			Passed:     result.ExitCode == 0 && !result.TimedOut,
 			DurationMS: result.DurationMS,
 			StdoutPath: result.StdoutPath,

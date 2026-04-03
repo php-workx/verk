@@ -28,8 +28,10 @@ func TestRunWorker_NormalizesAndCapturesArtifacts(t *testing.T) {
 		times = times[1:]
 		return value
 	}
+	t.Setenv("VERK_API_KEY", "test-key")
+	t.Setenv("VERK_SECRET_TOKEN", "should-not-leak")
 
-	runCommand = func(ctx context.Context, binary string, args []string, stdin []byte) (commandResult, error) {
+	runCommand = func(ctx context.Context, binary string, args []string, stdin []byte, env []string, timeout time.Duration) (commandResult, error) {
 		t.Helper()
 		if binary != "claude-test" {
 			t.Fatalf("expected binary claude-test, got %q", binary)
@@ -50,6 +52,11 @@ func TestRunWorker_NormalizesAndCapturesArtifacts(t *testing.T) {
 		if req.Runtime != runtimeName {
 			t.Fatalf("expected runtime %q, got %q", runtimeName, req.Runtime)
 		}
+		if timeout != 7*time.Minute {
+			t.Fatalf("expected worker timeout 7m, got %s", timeout)
+		}
+		assertEnvValue(t, env, "VERK_API_KEY", "test-key")
+		assertEnvMissing(t, env, "VERK_SECRET_TOKEN")
 
 		return commandResult{
 			stdout:   []byte(`{"status":"done_with_concerns","completion_code":"ok","lease_id":"lease-1","result_artifact_path":"runtime-worker.json"}`),
@@ -65,6 +72,10 @@ func TestRunWorker_NormalizesAndCapturesArtifacts(t *testing.T) {
 		TicketID:     "ticket-1",
 		Attempt:      2,
 		WorktreePath: "/tmp/worktree",
+		ExecutionConfig: runtime.ExecutionConfig{
+			WorkerTimeoutMinutes: 7,
+			AuthEnvVars:          []string{"VERK_API_KEY"},
+		},
 	})
 	if err != nil {
 		t.Fatalf("RunWorker returned error: %v", err)
@@ -133,8 +144,10 @@ func TestRunReviewer_NormalizesFindingsAndDerivesStatus(t *testing.T) {
 		times = times[1:]
 		return value
 	}
+	t.Setenv("VERK_API_KEY", "review-key")
+	t.Setenv("VERK_SECRET_TOKEN", "should-not-leak")
 
-	runCommand = func(ctx context.Context, binary string, args []string, stdin []byte) (commandResult, error) {
+	runCommand = func(ctx context.Context, binary string, args []string, stdin []byte, env []string, timeout time.Duration) (commandResult, error) {
 		t.Helper()
 		if binary != "claude-test" {
 			t.Fatalf("expected binary claude-test, got %q", binary)
@@ -159,6 +172,11 @@ func TestRunReviewer_NormalizesFindingsAndDerivesStatus(t *testing.T) {
 		if req.Runtime != runtimeName {
 			t.Fatalf("expected runtime %q, got %q", runtimeName, req.Runtime)
 		}
+		if timeout != 9*time.Minute {
+			t.Fatalf("expected reviewer timeout 9m, got %s", timeout)
+		}
+		assertEnvValue(t, env, "VERK_API_KEY", "review-key")
+		assertEnvMissing(t, env, "VERK_SECRET_TOKEN")
 
 		return commandResult{
 			stdout: []byte(`{"status":"done","completion_code":"reviewed","lease_id":"lease-2","review_status":"findings","summary":"needs fixes","findings":[{"severity":"p2","title":"blocking issue","body":"blocking issue","file":"internal/example.go","line":12,"disposition":"open"}]}`),
@@ -172,6 +190,10 @@ func TestRunReviewer_NormalizesFindingsAndDerivesStatus(t *testing.T) {
 		RunID:                    "run-2",
 		TicketID:                 "ticket-2",
 		EffectiveReviewThreshold: runtime.SeverityP2,
+		ExecutionConfig: runtime.ExecutionConfig{
+			ReviewerTimeoutMinutes: 9,
+			AuthEnvVars:            []string{"VERK_API_KEY"},
+		},
 	})
 	if err != nil {
 		t.Fatalf("RunReviewer returned error: %v", err)
@@ -212,7 +234,7 @@ func TestRunReviewer_RejectsContradictoryReviewStatus(t *testing.T) {
 		return time.Date(2026, 4, 2, 14, 0, 0, 0, time.UTC)
 	}
 
-	runCommand = func(ctx context.Context, binary string, args []string, stdin []byte) (commandResult, error) {
+	runCommand = func(ctx context.Context, binary string, args []string, stdin []byte, env []string, timeout time.Duration) (commandResult, error) {
 		return commandResult{
 			stdout: []byte(`{"status":"done","lease_id":"lease-3","review_status":"passed","summary":"looks good","findings":[{"severity":"P2","title":"blocking issue","body":"blocking issue","file":"internal/example.go","line":12,"disposition":"open"}]}`),
 		}, nil
@@ -236,7 +258,7 @@ func TestCheckAvailability_UsesVersionProbe(t *testing.T) {
 	defer func() { runCommand = oldRunCommand }()
 
 	probed := false
-	runCommand = func(ctx context.Context, binary string, args []string, stdin []byte) (commandResult, error) {
+	runCommand = func(ctx context.Context, binary string, args []string, stdin []byte, env []string, timeout time.Duration) (commandResult, error) {
 		probed = true
 		if binary != "claude-test" {
 			t.Fatalf("expected binary claude-test, got %q", binary)
@@ -252,6 +274,28 @@ func TestCheckAvailability_UsesVersionProbe(t *testing.T) {
 	}
 	if !probed {
 		t.Fatalf("expected availability probe to run")
+	}
+}
+
+func assertEnvValue(t *testing.T, env []string, key, want string) {
+	t.Helper()
+	for _, pair := range env {
+		if strings.HasPrefix(pair, key+"=") {
+			if got := strings.TrimPrefix(pair, key+"="); got != want {
+				t.Fatalf("expected %s=%q, got %q", key, want, got)
+			}
+			return
+		}
+	}
+	t.Fatalf("expected %s in env, got %v", key, env)
+}
+
+func assertEnvMissing(t *testing.T, env []string, key string) {
+	t.Helper()
+	for _, pair := range env {
+		if strings.HasPrefix(pair, key+"=") {
+			t.Fatalf("expected %s to be omitted, got env %v", key, env)
+		}
 	}
 }
 

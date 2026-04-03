@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -26,6 +27,15 @@ var (
 	runCommand = defaultRunCommand
 	now        = time.Now
 )
+
+var runtimeEnvAllowlist = []string{
+	"HOME",
+	"LANG",
+	"LC_ALL",
+	"PATH",
+	"TERM",
+	"TMPDIR",
+}
 
 type Adapter struct {
 	Command string
@@ -111,7 +121,7 @@ func (a *Adapter) CheckAvailability(ctx context.Context) error {
 		ctx = context.Background()
 	}
 
-	result, err := runCommand(ctx, a.binary(), []string{"--version"}, nil)
+	result, err := runCommand(ctx, a.binary(), []string{"--version"}, nil, runtimeCommandEnv(runtime.ExecutionConfig{}), 0)
 	if err != nil {
 		return fmt.Errorf("%s availability check failed: %w", runtimeName, err)
 	}
@@ -135,7 +145,7 @@ func (a *Adapter) RunWorker(ctx context.Context, req runtime.WorkerRequest) (run
 	}
 
 	args := buildWorkerArgs(req)
-	execResult, err := runCommand(ctx, a.binary(), args, payload)
+	execResult, err := runCommand(ctx, a.binary(), args, payload, runtimeCommandEnv(req.ExecutionConfig), runtimeCommandTimeout(req.ExecutionConfig.WorkerTimeoutMinutes))
 	finishedAt := now().UTC()
 	if err != nil {
 		return runtime.WorkerResult{}, fmt.Errorf("run %s worker: %w", runtimeName, err)
@@ -211,7 +221,7 @@ func (a *Adapter) RunReviewer(ctx context.Context, req runtime.ReviewRequest) (r
 	}
 
 	args := buildReviewArgs(req)
-	execResult, err := runCommand(ctx, a.binary(), args, payload)
+	execResult, err := runCommand(ctx, a.binary(), args, payload, runtimeCommandEnv(req.ExecutionConfig), runtimeCommandTimeout(req.ExecutionConfig.ReviewerTimeoutMinutes))
 	finishedAt := now().UTC()
 	if err != nil {
 		return runtime.ReviewResult{}, fmt.Errorf("run %s reviewer: %w", runtimeName, err)
@@ -618,9 +628,15 @@ func ensureRuntime(value, fallback string) string {
 	return strings.TrimSpace(value)
 }
 
-func defaultRunCommand(ctx context.Context, binary string, args []string, stdin []byte) (commandResult, error) {
+func defaultRunCommand(ctx context.Context, binary string, args []string, stdin []byte, env []string, timeout time.Duration) (commandResult, error) {
+	if timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, timeout)
+		defer cancel()
+	}
 	cmd := exec.CommandContext(ctx, binary, args...)
 	cmd.Stdin = bytes.NewReader(stdin)
+	cmd.Env = env
 
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
@@ -634,6 +650,9 @@ func defaultRunCommand(ctx context.Context, binary string, args []string, stdin 
 	}
 	if err == nil {
 		return result, nil
+	}
+	if ctx.Err() != nil {
+		return result, ctx.Err()
 	}
 
 	var exitErr *exec.ExitError
@@ -694,4 +713,35 @@ func encodeJSON(file *os.File, payload any) error {
 	encoder := json.NewEncoder(file)
 	encoder.SetIndent("", "  ")
 	return encoder.Encode(payload)
+}
+
+func runtimeCommandEnv(cfg runtime.ExecutionConfig) []string {
+	names := make([]string, 0, len(runtimeEnvAllowlist)+len(cfg.AuthEnvVars))
+	names = append(names, runtimeEnvAllowlist...)
+	names = append(names, cfg.AuthEnvVars...)
+
+	seen := make(map[string]struct{}, len(names))
+	env := make([]string, 0, len(names))
+	for _, name := range names {
+		key := strings.TrimSpace(name)
+		if key == "" {
+			continue
+		}
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		if value, ok := os.LookupEnv(key); ok {
+			env = append(env, key+"="+value)
+		}
+	}
+	sort.Strings(env)
+	return env
+}
+
+func runtimeCommandTimeout(minutes int) time.Duration {
+	if minutes <= 0 {
+		return 0
+	}
+	return time.Duration(minutes) * time.Minute
 }

@@ -94,7 +94,7 @@ func TestLateWorkerResultRejectedAfterReacquisition(t *testing.T) {
 	adapter := runtimefake.New(
 		[]runtime.WorkerResult{{
 			Status:             runtime.WorkerStatusDone,
-			RetryClass:         runtime.RetryClassRetryable,
+			RetryClass:         runtime.RetryClassTerminal,
 			LeaseID:            "lease-stale",
 			StartedAt:          testTime(),
 			FinishedAt:         testTime().Add(time.Second),

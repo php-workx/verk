@@ -18,6 +18,9 @@ import (
 func TestRunTicket_HappyPath(t *testing.T) {
 	repoRoot := t.TempDir()
 	cfg := policy.DefaultConfig()
+	cfg.Runtime.WorkerTimeoutMinutes = 7
+	cfg.Runtime.ReviewerTimeoutMinutes = 9
+	cfg.Runtime.AuthEnvVars = []string{"VERK_API_KEY"}
 	ticket := testTicket("ver-happy")
 	plan, claim := testPlanAndClaim(t, repoRoot, ticket, cfg, "run-happy", "lease-happy", []string{`true`})
 
@@ -91,6 +94,12 @@ func TestRunTicket_HappyPath(t *testing.T) {
 	if len(adapter.ReviewRequests()) != 1 {
 		t.Fatalf("expected 1 review request, got %d", len(adapter.ReviewRequests()))
 	}
+	if got := adapter.WorkerRequests()[0].ExecutionConfig; got.WorkerTimeoutMinutes != 7 || got.ReviewerTimeoutMinutes != 9 || len(got.AuthEnvVars) != 1 || got.AuthEnvVars[0] != "VERK_API_KEY" {
+		t.Fatalf("unexpected worker execution config: %#v", got)
+	}
+	if got := adapter.ReviewRequests()[0].ExecutionConfig; got.WorkerTimeoutMinutes != 7 || got.ReviewerTimeoutMinutes != 9 || len(got.AuthEnvVars) != 1 || got.AuthEnvVars[0] != "VERK_API_KEY" {
+		t.Fatalf("unexpected review execution config: %#v", got)
+	}
 }
 
 func TestRunTicket_VerifyFailureLoopsToImplement(t *testing.T) {
@@ -104,7 +113,7 @@ func TestRunTicket_VerifyFailureLoopsToImplement(t *testing.T) {
 		[]runtime.WorkerResult{
 			{
 				Status:             runtime.WorkerStatusDone,
-				RetryClass:         runtime.RetryClassRetryable,
+				RetryClass:         runtime.RetryClassTerminal,
 				LeaseID:            claim.LeaseID,
 				StartedAt:          started,
 				FinishedAt:         finished,
@@ -112,7 +121,7 @@ func TestRunTicket_VerifyFailureLoopsToImplement(t *testing.T) {
 			},
 			{
 				Status:             runtime.WorkerStatusDoneWithConcerns,
-				RetryClass:         runtime.RetryClassRetryable,
+				RetryClass:         runtime.RetryClassTerminal,
 				LeaseID:            claim.LeaseID,
 				StartedAt:          finished.Add(3 * time.Second),
 				FinishedAt:         finished.Add(4 * time.Second),
@@ -186,7 +195,7 @@ func TestRunTicket_RepairLimitBlocks(t *testing.T) {
 		[]runtime.WorkerResult{
 			{
 				Status:             runtime.WorkerStatusDone,
-				RetryClass:         runtime.RetryClassRetryable,
+				RetryClass:         runtime.RetryClassTerminal,
 				LeaseID:            claim.LeaseID,
 				StartedAt:          started,
 				FinishedAt:         finished,
@@ -194,7 +203,7 @@ func TestRunTicket_RepairLimitBlocks(t *testing.T) {
 			},
 			{
 				Status:             runtime.WorkerStatusDone,
-				RetryClass:         runtime.RetryClassRetryable,
+				RetryClass:         runtime.RetryClassTerminal,
 				LeaseID:            claim.LeaseID,
 				StartedAt:          finished.Add(3 * time.Second),
 				FinishedAt:         finished.Add(4 * time.Second),
@@ -259,6 +268,129 @@ func TestRunTicket_RepairLimitBlocks(t *testing.T) {
 	}
 }
 
+func TestRunTicket_RetryableRuntimeFailuresRetryBeforeBlocking(t *testing.T) {
+	repoRoot := t.TempDir()
+	cfg := policy.DefaultConfig()
+	ticket := testTicket("ver-runtime-retry")
+	plan, claim := testPlanAndClaim(t, repoRoot, ticket, cfg, "run-runtime-retry", "lease-runtime-retry", []string{`true`})
+
+	started, finished := testRunTimes()
+	adapter := runtimefake.New(
+		[]runtime.WorkerResult{
+			{
+				Status:             runtime.WorkerStatusBlocked,
+				RetryClass:         runtime.RetryClassRetryable,
+				LeaseID:            claim.LeaseID,
+				StartedAt:          started,
+				FinishedAt:         finished,
+				ResultArtifactPath: filepath.Join(repoRoot, "worker-1.json"),
+			},
+			{
+				Status:             runtime.WorkerStatusBlocked,
+				RetryClass:         runtime.RetryClassRetryable,
+				LeaseID:            claim.LeaseID,
+				StartedAt:          finished.Add(3 * time.Second),
+				FinishedAt:         finished.Add(4 * time.Second),
+				ResultArtifactPath: filepath.Join(repoRoot, "worker-2.json"),
+			},
+			{
+				Status:             runtime.WorkerStatusDone,
+				RetryClass:         runtime.RetryClassTerminal,
+				LeaseID:            claim.LeaseID,
+				StartedAt:          finished.Add(5 * time.Second),
+				FinishedAt:         finished.Add(6 * time.Second),
+				ResultArtifactPath: filepath.Join(repoRoot, "worker-3.json"),
+			},
+		},
+		[]runtime.ReviewResult{
+			{
+				Status:             runtime.WorkerStatusDone,
+				RetryClass:         runtime.RetryClassTerminal,
+				LeaseID:            claim.LeaseID,
+				StartedAt:          finished.Add(7 * time.Second),
+				FinishedAt:         finished.Add(8 * time.Second),
+				ReviewStatus:       runtime.ReviewStatusPassed,
+				Summary:            "clean",
+				ResultArtifactPath: filepath.Join(repoRoot, "review.json"),
+			},
+		},
+	)
+
+	result, err := RunTicket(context.Background(), RunTicketRequest{
+		RepoRoot: repoRoot,
+		RunID:    "run-runtime-retry",
+		Ticket:   ticket,
+		Plan:     plan,
+		Claim:    claim,
+		Adapter:  adapter,
+		Config:   cfg,
+	})
+	if err != nil {
+		t.Fatalf("RunTicket returned error: %v", err)
+	}
+	if result.Snapshot.CurrentPhase != state.TicketPhaseClosed {
+		t.Fatalf("expected closed phase, got %q", result.Snapshot.CurrentPhase)
+	}
+	if len(adapter.WorkerRequests()) != 3 {
+		t.Fatalf("expected 3 worker requests after retry budget, got %d", len(adapter.WorkerRequests()))
+	}
+}
+
+func TestRunTicket_RenewsClaimDuringLongRunningWorker(t *testing.T) {
+	repoRoot := t.TempDir()
+	cfg := policy.DefaultConfig()
+	ticket := testTicket("ver-claim-renewal")
+	plan, claim := testPlanAndClaim(t, repoRoot, ticket, cfg, "run-claim-renewal", "lease-claim-renewal", []string{`true`})
+	claim.ExpiresAt = claim.LeasedAt.Add(500 * time.Millisecond)
+
+	adapter := &sleepyRuntimeAdapter{
+		workerDelay: 250 * time.Millisecond,
+		workerResult: runtime.WorkerResult{
+			Status:             runtime.WorkerStatusDone,
+			RetryClass:         runtime.RetryClassTerminal,
+			LeaseID:            claim.LeaseID,
+			StartedAt:          testRunTime(),
+			FinishedAt:         testRunTime().Add(time.Second),
+			ResultArtifactPath: filepath.Join(repoRoot, "worker.json"),
+		},
+		reviewResult: runtime.ReviewResult{
+			Status:             runtime.WorkerStatusDone,
+			RetryClass:         runtime.RetryClassTerminal,
+			LeaseID:            claim.LeaseID,
+			StartedAt:          testRunTime().Add(2 * time.Second),
+			FinishedAt:         testRunTime().Add(3 * time.Second),
+			ReviewStatus:       runtime.ReviewStatusPassed,
+			Summary:            "clean",
+			ResultArtifactPath: filepath.Join(repoRoot, "review.json"),
+		},
+	}
+
+	result, err := RunTicket(context.Background(), RunTicketRequest{
+		RepoRoot: repoRoot,
+		RunID:    "run-claim-renewal",
+		Ticket:   ticket,
+		Plan:     plan,
+		Claim:    claim,
+		Adapter:  adapter,
+		Config:   cfg,
+	})
+	if err != nil {
+		t.Fatalf("RunTicket returned error: %v", err)
+	}
+	if result.Path == "" {
+		t.Fatal("expected run result path to be populated")
+	}
+
+	durableClaimPath := filepath.Join(repoRoot, ".verk", "runs", "run-claim-renewal", "claims", "claim-"+ticket.ID+".json")
+	var durableClaim state.ClaimArtifact
+	if err := state.LoadJSON(durableClaimPath, &durableClaim); err != nil {
+		t.Fatalf("load durable claim: %v", err)
+	}
+	if !durableClaim.ExpiresAt.After(claim.ExpiresAt) {
+		t.Fatalf("expected durable claim expiry to be renewed past %s, got %s", claim.ExpiresAt, durableClaim.ExpiresAt)
+	}
+}
+
 func TestRunTicket_RejectsStaleLeaseID(t *testing.T) {
 	repoRoot := t.TempDir()
 	cfg := policy.DefaultConfig()
@@ -270,7 +402,7 @@ func TestRunTicket_RejectsStaleLeaseID(t *testing.T) {
 		[]runtime.WorkerResult{
 			{
 				Status:             runtime.WorkerStatusDone,
-				RetryClass:         runtime.RetryClassRetryable,
+				RetryClass:         runtime.RetryClassTerminal,
 				LeaseID:            "lease-stale",
 				StartedAt:          started,
 				FinishedAt:         finished,
@@ -320,11 +452,36 @@ func testPlanAndClaim(t *testing.T, repoRoot string, ticket tkmd.Ticket, cfg pol
 	}
 	plan.ValidationCommands = append([]string(nil), verificationCommands...)
 
-	claim, err := tkmd.AcquireClaim(repoRoot, runID, ticket.ID, leaseID, 30*time.Minute, testRunTime())
+	claim, err := tkmd.AcquireClaim(repoRoot, runID, ticket.ID, leaseID, 10*time.Minute, testRunTime())
 	if err != nil {
 		t.Fatalf("AcquireClaim: %v", err)
 	}
 	return plan, claim
+}
+
+type sleepyRuntimeAdapter struct {
+	workerDelay  time.Duration
+	reviewDelay  time.Duration
+	workerResult runtime.WorkerResult
+	reviewResult runtime.ReviewResult
+}
+
+func (a *sleepyRuntimeAdapter) RunWorker(ctx context.Context, req runtime.WorkerRequest) (runtime.WorkerResult, error) {
+	select {
+	case <-time.After(a.workerDelay):
+	case <-ctx.Done():
+		return runtime.WorkerResult{}, ctx.Err()
+	}
+	return a.workerResult, nil
+}
+
+func (a *sleepyRuntimeAdapter) RunReviewer(ctx context.Context, req runtime.ReviewRequest) (runtime.ReviewResult, error) {
+	select {
+	case <-time.After(a.reviewDelay):
+	case <-ctx.Done():
+		return runtime.ReviewResult{}, ctx.Err()
+	}
+	return a.reviewResult, nil
 }
 
 func verifyToggleCommand() string {

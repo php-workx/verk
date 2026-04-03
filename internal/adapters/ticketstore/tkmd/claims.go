@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	"verk/internal/state"
@@ -27,56 +28,66 @@ func AcquireClaim(rootDir string, args ...any) (state.ClaimArtifact, error) {
 	if err != nil {
 		return state.ClaimArtifact{}, err
 	}
-
-	live, err := loadClaimArtifact(livePath)
-	if err != nil {
-		return state.ClaimArtifact{}, err
+	if err := os.MkdirAll(filepath.Dir(livePath), 0o755); err != nil {
+		return state.ClaimArtifact{}, fmt.Errorf("create claim dir: %w", err)
 	}
-	if live != nil && !claimReleased(live) {
-		if claimActiveAt(*live, req.now) {
-			return state.ClaimArtifact{}, fmt.Errorf("claim %s already held by run %s", req.ticketID, live.OwnerRunID)
+
+	var claim state.ClaimArtifact
+	if err := withClaimAcquisitionLock(livePath, func() error {
+		live, err := loadClaimArtifact(livePath)
+		if err != nil {
+			return err
 		}
-		return state.ClaimArtifact{}, fmt.Errorf("claim %s has stale live state", req.ticketID)
-	}
-
-	durable, err := loadClaimArtifact(durablePath)
-	if err != nil {
-		return state.ClaimArtifact{}, err
-	}
-	if durable != nil && !claimReleased(durable) {
-		if claimActiveAt(*durable, req.now) {
-			return state.ClaimArtifact{}, fmt.Errorf("claim %s already recorded for run %s", req.ticketID, durable.OwnerRunID)
+		if live != nil && !claimReleased(live) {
+			if claimActiveAt(*live, req.now) {
+				return fmt.Errorf("claim %s already held by run %s", req.ticketID, live.OwnerRunID)
+			}
+			return fmt.Errorf("claim %s has stale live state", req.ticketID)
 		}
-		return state.ClaimArtifact{}, fmt.Errorf("claim %s has stale durable state", req.ticketID)
-	}
 
-	leaseID := req.leaseID
-	if leaseID == "" {
-		leaseID = generateLeaseID(req.runID, req.ticketID, req.now)
-	}
+		durable, err := loadClaimArtifact(durablePath)
+		if err != nil {
+			return err
+		}
+		if durable != nil && !claimReleased(durable) {
+			if claimActiveAt(*durable, req.now) {
+				return fmt.Errorf("claim %s already recorded for run %s", req.ticketID, durable.OwnerRunID)
+			}
+			return fmt.Errorf("claim %s has stale durable state", req.ticketID)
+		}
 
-	claim := state.ClaimArtifact{
-		ArtifactMeta: state.ArtifactMeta{
-			SchemaVersion: claimSchemaVersion,
-			RunID:         req.runID,
-			CreatedAt:     req.now,
-			UpdatedAt:     req.now,
-		},
-		TicketID:              req.ticketID,
-		OwnerRunID:            req.runID,
-		OwnerWaveID:           req.ownerWaveID,
-		LeaseID:               leaseID,
-		LeasedAt:              req.now,
-		ExpiresAt:             req.now.Add(req.ttl),
-		State:                 "active",
-		LastSeenLiveClaimPath: liveClaimRelativePath(req.ticketID),
-	}
+		leaseID := req.leaseID
+		if leaseID == "" {
+			leaseID = generateLeaseID(req.runID, req.ticketID, req.now)
+		}
 
-	if err := state.SaveJSONAtomic(livePath, claim); err != nil {
-		return state.ClaimArtifact{}, fmt.Errorf("write live claim: %w", err)
-	}
-	if err := state.SaveJSONAtomic(durablePath, claim); err != nil {
-		return state.ClaimArtifact{}, fmt.Errorf("write durable claim: %w", err)
+		claim = state.ClaimArtifact{
+			ArtifactMeta: state.ArtifactMeta{
+				SchemaVersion: claimSchemaVersion,
+				RunID:         req.runID,
+				CreatedAt:     req.now,
+				UpdatedAt:     req.now,
+			},
+			TicketID:              req.ticketID,
+			OwnerRunID:            req.runID,
+			OwnerWaveID:           req.ownerWaveID,
+			LeaseID:               leaseID,
+			LeasedAt:              req.now,
+			ExpiresAt:             req.now.Add(req.ttl),
+			State:                 "active",
+			LastSeenLiveClaimPath: liveClaimRelativePath(req.ticketID),
+		}
+
+		if err := state.SaveJSONAtomic(livePath, claim); err != nil {
+			return fmt.Errorf("write live claim: %w", err)
+		}
+		if err := state.SaveJSONAtomic(durablePath, claim); err != nil {
+			_ = os.Remove(livePath)
+			return fmt.Errorf("write durable claim: %w", err)
+		}
+		return nil
+	}); err != nil {
+		return state.ClaimArtifact{}, err
 	}
 	return claim, nil
 }
@@ -275,6 +286,23 @@ func ValidateLeaseFence(expected, actual string) error {
 		return fmt.Errorf("lease fence mismatch: expected %q, got %q", expected, actual)
 	}
 	return nil
+}
+
+func withClaimAcquisitionLock(path string, fn func() error) error {
+	lockFile, err := os.OpenFile(path+".lock", os.O_CREATE|os.O_RDWR, 0o644)
+	if err != nil {
+		return fmt.Errorf("open claim lock: %w", err)
+	}
+	defer func() {
+		_ = syscall.Flock(int(lockFile.Fd()), syscall.LOCK_UN)
+		_ = lockFile.Close()
+		_ = os.Remove(path + ".lock")
+	}()
+
+	if err := syscall.Flock(int(lockFile.Fd()), syscall.LOCK_EX); err != nil {
+		return fmt.Errorf("lock claim: %w", err)
+	}
+	return fn()
 }
 
 type acquireClaimRequest struct {

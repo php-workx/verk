@@ -48,26 +48,34 @@ const (
 )
 
 type WorkerRequest struct {
-	RunID             string `json:"run_id,omitempty"`
-	TicketID          string `json:"ticket_id,omitempty"`
-	WaveID            string `json:"wave_id,omitempty"`
-	LeaseID           string `json:"lease_id"`
-	Attempt           int    `json:"attempt,omitempty"`
-	Runtime           string `json:"runtime,omitempty"`
-	WorktreePath      string `json:"worktree_path,omitempty"`
-	InputArtifactPath string `json:"input_artifact_path,omitempty"`
-	Instructions      string `json:"instructions,omitempty"`
+	RunID             string          `json:"run_id,omitempty"`
+	TicketID          string          `json:"ticket_id,omitempty"`
+	WaveID            string          `json:"wave_id,omitempty"`
+	LeaseID           string          `json:"lease_id"`
+	Attempt           int             `json:"attempt,omitempty"`
+	Runtime           string          `json:"runtime,omitempty"`
+	WorktreePath      string          `json:"worktree_path,omitempty"`
+	InputArtifactPath string          `json:"input_artifact_path,omitempty"`
+	Instructions      string          `json:"instructions,omitempty"`
+	ExecutionConfig   ExecutionConfig `json:"execution_config,omitempty"`
 }
 
 type ReviewRequest struct {
-	RunID                    string   `json:"run_id,omitempty"`
-	TicketID                 string   `json:"ticket_id,omitempty"`
-	WaveID                   string   `json:"wave_id,omitempty"`
-	LeaseID                  string   `json:"lease_id"`
-	Attempt                  int      `json:"attempt,omitempty"`
-	Runtime                  string   `json:"runtime,omitempty"`
-	InputArtifactPath        string   `json:"input_artifact_path,omitempty"`
-	EffectiveReviewThreshold Severity `json:"effective_review_threshold"`
+	RunID                    string          `json:"run_id,omitempty"`
+	TicketID                 string          `json:"ticket_id,omitempty"`
+	WaveID                   string          `json:"wave_id,omitempty"`
+	LeaseID                  string          `json:"lease_id"`
+	Attempt                  int             `json:"attempt,omitempty"`
+	Runtime                  string          `json:"runtime,omitempty"`
+	InputArtifactPath        string          `json:"input_artifact_path,omitempty"`
+	EffectiveReviewThreshold Severity        `json:"effective_review_threshold"`
+	ExecutionConfig          ExecutionConfig `json:"execution_config,omitempty"`
+}
+
+type ExecutionConfig struct {
+	WorkerTimeoutMinutes   int      `json:"worker_timeout_minutes,omitempty"`
+	ReviewerTimeoutMinutes int      `json:"reviewer_timeout_minutes,omitempty"`
+	AuthEnvVars            []string `json:"auth_env_vars,omitempty"`
 }
 
 type WorkerResult struct {

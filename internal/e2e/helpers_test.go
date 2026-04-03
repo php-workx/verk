@@ -98,7 +98,7 @@ func testPlanAndClaim(t *testing.T, repoRoot string, cfg policy.Config, runID st
 	}
 	plan.RunID = runID
 	plan.ValidationCommands = append([]string(nil), commands...)
-	claim, err := tkmd.AcquireClaim(repoRoot, runID, ticket.ID, leaseID, 30*time.Minute, testTime())
+	claim, err := tkmd.AcquireClaim(repoRoot, runID, ticket.ID, leaseID, 10*time.Minute, testTime())
 	if err != nil {
 		t.Fatalf("AcquireClaim: %v", err)
 	}
