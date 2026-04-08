@@ -433,6 +433,283 @@ func TestRunTicket_RejectsStaleLeaseID(t *testing.T) {
 	}
 }
 
+func TestRunTicket_ScopeViolationBlocksTicket(t *testing.T) {
+	repoRoot := t.TempDir()
+
+	// Initialize a real git repo so collectChangedFiles can detect changes.
+	mustRunGit(t, repoRoot, "init")
+	mustRunGit(t, repoRoot, "config", "user.email", "test@example.com")
+	mustRunGit(t, repoRoot, "config", "user.name", "Test User")
+	if err := os.WriteFile(filepath.Join(repoRoot, "tracked.txt"), []byte("base\n"), 0o644); err != nil {
+		t.Fatalf("seed repo: %v", err)
+	}
+	mustRunGit(t, repoRoot, "add", "tracked.txt")
+	mustRunGit(t, repoRoot, "commit", "-m", "base")
+
+	headOut, err := gitOutput(repoRoot, "rev-parse", "HEAD")
+	if err != nil {
+		t.Fatalf("rev-parse HEAD: %v", err)
+	}
+	baseCommit := strings.TrimSpace(headOut)
+
+	// Create a file outside the owned scope to simulate a scope violation.
+	outsideDir := filepath.Join(repoRoot, "outside")
+	if err := os.MkdirAll(outsideDir, 0o755); err != nil {
+		t.Fatalf("mkdir outside: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(outsideDir, "violation.go"), []byte("package outside\n"), 0o644); err != nil {
+		t.Fatalf("write violation file: %v", err)
+	}
+	mustRunGit(t, repoRoot, "add", "outside/violation.go")
+	mustRunGit(t, repoRoot, "commit", "-m", "out-of-scope change")
+
+	cfg := policy.DefaultConfig()
+	ticket := tkmd.Ticket{
+		ID:         "ver-scope-viol",
+		Title:      "Ticket ver-scope-viol",
+		OwnedPaths: []string{"internal/engine"},
+		UnknownFrontmatter: map[string]any{
+			"type": "task",
+		},
+	}
+	plan, claim := testPlanAndClaim(t, repoRoot, ticket, cfg, "run-scope-viol", "lease-scope-viol", []string{`true`})
+
+	started, finished := testRunTimes()
+	adapter := runtimefake.New(
+		[]runtime.WorkerResult{
+			{
+				Status:             runtime.WorkerStatusDone,
+				RetryClass:         runtime.RetryClassTerminal,
+				LeaseID:            claim.LeaseID,
+				StartedAt:          started,
+				FinishedAt:         finished,
+				ResultArtifactPath: filepath.Join(repoRoot, "worker.json"),
+			},
+		},
+		nil,
+	)
+
+	result, err := RunTicket(context.Background(), RunTicketRequest{
+		RepoRoot:           repoRoot,
+		RunID:              "run-scope-viol",
+		BaseCommit:         baseCommit,
+		Ticket:             ticket,
+		Plan:               plan,
+		Claim:              claim,
+		Adapter:            adapter,
+		Config:             cfg,
+		EnforceSingleScope: true,
+	})
+	if err != nil {
+		t.Fatalf("RunTicket returned error: %v", err)
+	}
+	if result.Snapshot.CurrentPhase != state.TicketPhaseBlocked {
+		t.Fatalf("expected blocked phase, got %q", result.Snapshot.CurrentPhase)
+	}
+	if !strings.Contains(result.Snapshot.BlockReason, "scope violation") {
+		t.Fatalf("expected scope violation block reason, got %q", result.Snapshot.BlockReason)
+	}
+}
+
+func TestRunTicket_ScopeCheckSkippedWhenOwnedPathsEmpty(t *testing.T) {
+	repoRoot := t.TempDir()
+
+	// Initialize a real git repo with a file change outside any scope.
+	mustRunGit(t, repoRoot, "init")
+	mustRunGit(t, repoRoot, "config", "user.email", "test@example.com")
+	mustRunGit(t, repoRoot, "config", "user.name", "Test User")
+	if err := os.WriteFile(filepath.Join(repoRoot, "tracked.txt"), []byte("base\n"), 0o644); err != nil {
+		t.Fatalf("seed repo: %v", err)
+	}
+	mustRunGit(t, repoRoot, "add", "tracked.txt")
+	mustRunGit(t, repoRoot, "commit", "-m", "base")
+
+	headOut, err := gitOutput(repoRoot, "rev-parse", "HEAD")
+	if err != nil {
+		t.Fatalf("rev-parse HEAD: %v", err)
+	}
+	baseCommit := strings.TrimSpace(headOut)
+
+	// Create a file that would be out of scope if owned_paths were set.
+	if err := os.MkdirAll(filepath.Join(repoRoot, "anywhere"), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(repoRoot, "anywhere", "file.go"), []byte("package anywhere\n"), 0o644); err != nil {
+		t.Fatalf("write file: %v", err)
+	}
+	mustRunGit(t, repoRoot, "add", "anywhere/file.go")
+	mustRunGit(t, repoRoot, "commit", "-m", "change")
+
+	cfg := policy.DefaultConfig()
+	// No OwnedPaths set — scope check should be skipped.
+	ticket := testTicket("ver-no-scope")
+	plan, claim := testPlanAndClaim(t, repoRoot, ticket, cfg, "run-no-scope", "lease-no-scope", []string{`true`})
+
+	started, finished := testRunTimes()
+	adapter := runtimefake.New(
+		[]runtime.WorkerResult{
+			{
+				Status:             runtime.WorkerStatusDone,
+				RetryClass:         runtime.RetryClassTerminal,
+				LeaseID:            claim.LeaseID,
+				StartedAt:          started,
+				FinishedAt:         finished,
+				ResultArtifactPath: filepath.Join(repoRoot, "worker.json"),
+			},
+		},
+		[]runtime.ReviewResult{
+			{
+				Status:             runtime.WorkerStatusDone,
+				RetryClass:         runtime.RetryClassTerminal,
+				LeaseID:            claim.LeaseID,
+				StartedAt:          finished.Add(time.Second),
+				FinishedAt:         finished.Add(2 * time.Second),
+				ReviewStatus:       runtime.ReviewStatusPassed,
+				Summary:            "clean",
+				ResultArtifactPath: filepath.Join(repoRoot, "review.json"),
+			},
+		},
+	)
+
+	result, err := RunTicket(context.Background(), RunTicketRequest{
+		RepoRoot:           repoRoot,
+		RunID:              "run-no-scope",
+		BaseCommit:         baseCommit,
+		Ticket:             ticket,
+		Plan:               plan,
+		Claim:              claim,
+		Adapter:            adapter,
+		Config:             cfg,
+		EnforceSingleScope: true,
+	})
+	if err != nil {
+		t.Fatalf("RunTicket returned error: %v", err)
+	}
+	// With no owned_paths, scope check is skipped — ticket should close normally.
+	if result.Snapshot.CurrentPhase != state.TicketPhaseClosed {
+		t.Fatalf("expected closed phase, got %q", result.Snapshot.CurrentPhase)
+	}
+	if result.Snapshot.BlockReason != "" {
+		t.Fatalf("expected no block reason, got %q", result.Snapshot.BlockReason)
+	}
+}
+
+func TestRunTicket_WorkerBlockReasonRoundTrips(t *testing.T) {
+	repoRoot := t.TempDir()
+	cfg := policy.DefaultConfig()
+	ticket := testTicket("ver-block-reason")
+	plan, claim := testPlanAndClaim(t, repoRoot, ticket, cfg, "run-block-reason", "lease-block-reason", []string{`true`})
+
+	started, finished := testRunTimes()
+	adapter := runtimefake.New(
+		[]runtime.WorkerResult{
+			{
+				Status:             runtime.WorkerStatusNeedsContext,
+				CompletionCode:     "missing credentials",
+				BlockReason:        "cannot proceed without AWS_SECRET_ACCESS_KEY",
+				RetryClass:         runtime.RetryClassTerminal,
+				LeaseID:            claim.LeaseID,
+				StartedAt:          started,
+				FinishedAt:         finished,
+				ResultArtifactPath: filepath.Join(repoRoot, "worker.json"),
+			},
+		},
+		nil,
+	)
+
+	result, err := RunTicket(context.Background(), RunTicketRequest{
+		RepoRoot: repoRoot,
+		RunID:    "run-block-reason",
+		Ticket:   ticket,
+		Plan:     plan,
+		Claim:    claim,
+		Adapter:  adapter,
+		Config:   cfg,
+	})
+	if err != nil {
+		t.Fatalf("RunTicket returned error: %v", err)
+	}
+	if result.Snapshot.CurrentPhase != state.TicketPhaseBlocked {
+		t.Fatalf("expected blocked phase, got %q", result.Snapshot.CurrentPhase)
+	}
+
+	// The worker's specific block_reason should flow through to the snapshot and implementation artifact.
+	expectedReason := "cannot proceed without AWS_SECRET_ACCESS_KEY"
+	if result.Snapshot.BlockReason != expectedReason {
+		t.Fatalf("expected snapshot block reason %q, got %q", expectedReason, result.Snapshot.BlockReason)
+	}
+	if result.Snapshot.Implementation == nil {
+		t.Fatalf("expected implementation artifact to be present")
+	}
+	if result.Snapshot.Implementation.BlockReason != expectedReason {
+		t.Fatalf("expected implementation block reason %q, got %q", expectedReason, result.Snapshot.Implementation.BlockReason)
+	}
+}
+
+func TestRunTicket_ConcernsRoundTripToArtifact(t *testing.T) {
+	repoRoot := t.TempDir()
+	cfg := policy.DefaultConfig()
+	ticket := testTicket("ver-concerns")
+	plan, claim := testPlanAndClaim(t, repoRoot, ticket, cfg, "run-concerns", "lease-concerns", []string{`true`})
+
+	started, finished := testRunTimes()
+	adapter := runtimefake.New(
+		[]runtime.WorkerResult{
+			{
+				Status:             runtime.WorkerStatusDoneWithConcerns,
+				CompletionCode:     "ok",
+				Concerns:           []string{"minor style issue", "consider adding more tests"},
+				RetryClass:         runtime.RetryClassTerminal,
+				LeaseID:            claim.LeaseID,
+				StartedAt:          started,
+				FinishedAt:         finished,
+				ResultArtifactPath: filepath.Join(repoRoot, "worker.json"),
+			},
+		},
+		[]runtime.ReviewResult{
+			{
+				Status:             runtime.WorkerStatusDone,
+				RetryClass:         runtime.RetryClassTerminal,
+				LeaseID:            claim.LeaseID,
+				StartedAt:          finished.Add(time.Second),
+				FinishedAt:         finished.Add(2 * time.Second),
+				ReviewStatus:       runtime.ReviewStatusPassed,
+				Summary:            "clean",
+				ResultArtifactPath: filepath.Join(repoRoot, "review.json"),
+			},
+		},
+	)
+
+	result, err := RunTicket(context.Background(), RunTicketRequest{
+		RepoRoot: repoRoot,
+		RunID:    "run-concerns",
+		Ticket:   ticket,
+		Plan:     plan,
+		Claim:    claim,
+		Adapter:  adapter,
+		Config:   cfg,
+	})
+	if err != nil {
+		t.Fatalf("RunTicket returned error: %v", err)
+	}
+	if result.Snapshot.CurrentPhase != state.TicketPhaseClosed {
+		t.Fatalf("expected closed phase, got %q", result.Snapshot.CurrentPhase)
+	}
+	if result.Snapshot.Implementation == nil {
+		t.Fatalf("expected implementation artifact to be present")
+	}
+	concerns := result.Snapshot.Implementation.Concerns
+	if len(concerns) != 2 {
+		t.Fatalf("expected 2 concerns, got %d: %v", len(concerns), concerns)
+	}
+	if concerns[0] != "minor style issue" {
+		t.Fatalf("expected first concern 'minor style issue', got %q", concerns[0])
+	}
+	if concerns[1] != "consider adding more tests" {
+		t.Fatalf("expected second concern 'consider adding more tests', got %q", concerns[1])
+	}
+}
+
 func testTicket(id string) tkmd.Ticket {
 	return tkmd.Ticket{
 		ID:    id,

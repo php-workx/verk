@@ -68,6 +68,7 @@ type ReviewRequest struct {
 	Attempt                  int             `json:"attempt,omitempty"`
 	Runtime                  string          `json:"runtime,omitempty"`
 	InputArtifactPath        string          `json:"input_artifact_path,omitempty"`
+	Instructions             string          `json:"instructions,omitempty"`
 	EffectiveReviewThreshold Severity        `json:"effective_review_threshold"`
 	ExecutionConfig          ExecutionConfig `json:"execution_config,omitempty"`
 }
@@ -81,6 +82,8 @@ type ExecutionConfig struct {
 type WorkerResult struct {
 	Status             WorkerStatus `json:"status"`
 	CompletionCode     string       `json:"completion_code,omitempty"`
+	Concerns           []string     `json:"concerns,omitempty"`
+	BlockReason        string       `json:"block_reason,omitempty"`
 	RetryClass         RetryClass   `json:"retry_class"`
 	StdoutPath         string       `json:"stdout_path,omitempty"`
 	StderrPath         string       `json:"stderr_path,omitempty"`

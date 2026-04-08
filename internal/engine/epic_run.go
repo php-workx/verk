@@ -448,6 +448,7 @@ func executeEpicTicket(ctx context.Context, req RunEpicRequest, cfg policy.Confi
 	ticketResult, err := RunTicket(ctx, RunTicketRequest{
 		RepoRoot:             req.RepoRoot,
 		RunID:                req.RunID,
+		BaseCommit:           wave.WaveBaseCommit,
 		Ticket:               ticket,
 		Plan:                 plan,
 		Claim:                claim,

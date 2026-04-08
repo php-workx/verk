@@ -11,6 +11,24 @@ import (
 	"verk/internal/adapters/runtime"
 )
 
+// mockCLIOutput builds a JSON response matching `claude -p --output-format json`.
+func mockCLIOutput(resultText string, isError bool) []byte {
+	output := runtime.CLIOutputJSON{
+		Type:       "result",
+		Subtype:    "success",
+		IsError:    isError,
+		NumTurns:   3,
+		Result:     resultText,
+		SessionID:  "test-session",
+		DurationMS: 5000,
+	}
+	if isError {
+		output.Subtype = "error"
+	}
+	data, _ := json.Marshal(output)
+	return data
+}
+
 func TestRunWorker_NormalizesAndCapturesArtifacts(t *testing.T) {
 	oldRunCommand := runCommand
 	oldNow := now
@@ -28,38 +46,34 @@ func TestRunWorker_NormalizesAndCapturesArtifacts(t *testing.T) {
 		times = times[1:]
 		return value
 	}
-	t.Setenv("VERK_API_KEY", "test-key")
-	t.Setenv("VERK_SECRET_TOKEN", "should-not-leak")
-
 	runCommand = func(ctx context.Context, binary string, args []string, stdin []byte, env []string, timeout time.Duration) (commandResult, error) {
 		t.Helper()
 		if binary != "claude-test" {
 			t.Fatalf("expected binary claude-test, got %q", binary)
 		}
-		if !hasArg(args, "worker") {
-			t.Fatalf("expected worker subcommand in args: %v", args)
+		if !hasArg(args, "-p") {
+			t.Fatalf("expected -p flag in args: %v", args)
 		}
-		assertArgValue(t, args, "--lease-id", "lease-1")
-		assertArgValue(t, args, "--runtime", runtimeName)
+		assertArgValue(t, args, "--output-format", "json")
 
-		var req runtime.WorkerRequest
-		if err := json.Unmarshal(stdin, &req); err != nil {
-			t.Fatalf("unexpected worker request payload: %v", err)
+		promptText := string(stdin)
+		if !strings.Contains(promptText, "ticket-1") {
+			t.Fatalf("expected prompt to contain ticket id, got: %s", promptText)
 		}
-		if req.LeaseID != "lease-1" {
-			t.Fatalf("expected lease id lease-1, got %q", req.LeaseID)
+		if !strings.Contains(promptText, "Attempt: 2") {
+			t.Fatalf("expected prompt to contain attempt number, got: %s", promptText)
 		}
-		if req.Runtime != runtimeName {
-			t.Fatalf("expected runtime %q, got %q", runtimeName, req.Runtime)
-		}
+
 		if timeout != 7*time.Minute {
 			t.Fatalf("expected worker timeout 7m, got %s", timeout)
 		}
-		assertEnvValue(t, env, "VERK_API_KEY", "test-key")
-		assertEnvMissing(t, env, "VERK_SECRET_TOKEN")
+		// env is nil — subprocess inherits full parent environment
+
+		// AI returns JSON-only as instructed
+		resultJSON := `{"status":"done_with_concerns","completion_code":"ok","concerns":["minor style issue in helper"]}`
 
 		return commandResult{
-			stdout:   []byte(`{"status":"done_with_concerns","completion_code":"ok","lease_id":"lease-1","result_artifact_path":"runtime-worker.json"}`),
+			stdout:   mockCLIOutput(resultJSON, false),
 			stderr:   []byte("worker log"),
 			exitCode: 0,
 		}, nil
@@ -87,19 +101,14 @@ func TestRunWorker_NormalizesAndCapturesArtifacts(t *testing.T) {
 	if result.RetryClass != runtime.RetryClassTerminal {
 		t.Fatalf("expected terminal retry class, got %q", result.RetryClass)
 	}
+	if len(result.Concerns) != 1 || result.Concerns[0] != "minor style issue in helper" {
+		t.Fatalf("expected concerns [minor style issue in helper], got %v", result.Concerns)
+	}
 	if result.LeaseID != "lease-1" {
 		t.Fatalf("expected lease id lease-1, got %q", result.LeaseID)
 	}
 	if result.StdoutPath == "" || result.StderrPath == "" || result.ResultArtifactPath == "" {
 		t.Fatalf("expected captured artifact paths, got %#v", result)
-	}
-
-	stdoutBytes, err := os.ReadFile(result.StdoutPath)
-	if err != nil {
-		t.Fatalf("read stdout artifact: %v", err)
-	}
-	if string(stdoutBytes) != `{"status":"done_with_concerns","completion_code":"ok","lease_id":"lease-1","result_artifact_path":"runtime-worker.json"}` {
-		t.Fatalf("unexpected stdout capture: %s", string(stdoutBytes))
 	}
 
 	stderrBytes, err := os.ReadFile(result.StderrPath)
@@ -127,6 +136,77 @@ func TestRunWorker_NormalizesAndCapturesArtifacts(t *testing.T) {
 	}
 }
 
+func TestRunWorker_BlockedStatus(t *testing.T) {
+	oldRunCommand := runCommand
+	oldNow := now
+	defer func() {
+		runCommand = oldRunCommand
+		now = oldNow
+	}()
+
+	now = func() time.Time {
+		return time.Date(2026, 4, 2, 12, 0, 0, 0, time.UTC)
+	}
+
+	runCommand = func(ctx context.Context, binary string, args []string, stdin []byte, env []string, timeout time.Duration) (commandResult, error) {
+		resultJSON := `{"status":"blocked","completion_code":"missing_dependency","block_reason":"required service unavailable"}`
+		return commandResult{
+			stdout:   mockCLIOutput(resultJSON, false),
+			exitCode: 0,
+		}, nil
+	}
+
+	adapter := NewWithCommand("claude-test")
+	result, err := adapter.RunWorker(context.Background(), runtime.WorkerRequest{
+		LeaseID:  "lease-1",
+		TicketID: "ticket-1",
+	})
+	if err != nil {
+		t.Fatalf("RunWorker returned error: %v", err)
+	}
+	if result.Status != runtime.WorkerStatusBlocked {
+		t.Fatalf("expected blocked, got %q", result.Status)
+	}
+	if result.CompletionCode != "missing_dependency" {
+		t.Fatalf("expected completion code missing_dependency, got %q", result.CompletionCode)
+	}
+}
+
+func TestRunWorker_FallbackWhenNoResultBlock(t *testing.T) {
+	oldRunCommand := runCommand
+	oldNow := now
+	defer func() {
+		runCommand = oldRunCommand
+		now = oldNow
+	}()
+
+	now = func() time.Time {
+		return time.Date(2026, 4, 2, 12, 0, 0, 0, time.UTC)
+	}
+
+	runCommand = func(ctx context.Context, binary string, args []string, stdin []byte, env []string, timeout time.Duration) (commandResult, error) {
+		// AI didn't follow JSON-only instruction — returned prose
+		resultText := "I made all the changes. Everything looks good."
+		return commandResult{
+			stdout:   mockCLIOutput(resultText, false),
+			exitCode: 0,
+		}, nil
+	}
+
+	adapter := NewWithCommand("claude-test")
+	result, err := adapter.RunWorker(context.Background(), runtime.WorkerRequest{
+		LeaseID:  "lease-1",
+		TicketID: "ticket-1",
+	})
+	if err != nil {
+		t.Fatalf("RunWorker returned error: %v", err)
+	}
+	// Without parseable JSON, successful CLI exit → done
+	if result.Status != runtime.WorkerStatusDone {
+		t.Fatalf("expected done fallback, got %q", result.Status)
+	}
+}
+
 func TestRunReviewer_NormalizesFindingsAndDerivesStatus(t *testing.T) {
 	oldRunCommand := runCommand
 	oldNow := now
@@ -144,42 +224,24 @@ func TestRunReviewer_NormalizesFindingsAndDerivesStatus(t *testing.T) {
 		times = times[1:]
 		return value
 	}
-	t.Setenv("VERK_API_KEY", "review-key")
-	t.Setenv("VERK_SECRET_TOKEN", "should-not-leak")
-
 	runCommand = func(ctx context.Context, binary string, args []string, stdin []byte, env []string, timeout time.Duration) (commandResult, error) {
 		t.Helper()
 		if binary != "claude-test" {
 			t.Fatalf("expected binary claude-test, got %q", binary)
 		}
-		if !hasArg(args, "review") {
-			t.Fatalf("expected review subcommand in args: %v", args)
+		if !hasArg(args, "-p") {
+			t.Fatalf("expected -p flag in args: %v", args)
 		}
-		assertArgValue(t, args, "--lease-id", "lease-2")
-		assertArgValue(t, args, "--runtime", runtimeName)
-		assertArgValue(t, args, "--effective-review-threshold", string(runtime.SeverityP2))
-		if !hasArg(args, "--fresh-context") {
-			t.Fatalf("expected fresh reviewer flag in args: %v", args)
-		}
+		assertArgValue(t, args, "--output-format", "json")
 
-		var req runtime.ReviewRequest
-		if err := json.Unmarshal(stdin, &req); err != nil {
-			t.Fatalf("unexpected review request payload: %v", err)
-		}
-		if req.LeaseID != "lease-2" {
-			t.Fatalf("expected lease id lease-2, got %q", req.LeaseID)
-		}
-		if req.Runtime != runtimeName {
-			t.Fatalf("expected runtime %q, got %q", runtimeName, req.Runtime)
-		}
 		if timeout != 9*time.Minute {
 			t.Fatalf("expected reviewer timeout 9m, got %s", timeout)
 		}
-		assertEnvValue(t, env, "VERK_API_KEY", "review-key")
-		assertEnvMissing(t, env, "VERK_SECRET_TOKEN")
+
+		resultJSON := `{"review_status":"findings","summary":"needs fixes","findings":[{"severity":"P2","title":"blocking issue","body":"blocking issue","file":"internal/example.go","line":12,"disposition":"open"}]}`
 
 		return commandResult{
-			stdout: []byte(`{"status":"done","completion_code":"reviewed","lease_id":"lease-2","review_status":"findings","summary":"needs fixes","findings":[{"severity":"p2","title":"blocking issue","body":"blocking issue","file":"internal/example.go","line":12,"disposition":"open"}]}`),
+			stdout: mockCLIOutput(resultJSON, false),
 			stderr: []byte("review log"),
 		}, nil
 	}
@@ -199,8 +261,8 @@ func TestRunReviewer_NormalizesFindingsAndDerivesStatus(t *testing.T) {
 		t.Fatalf("RunReviewer returned error: %v", err)
 	}
 
-	if result.Status != runtime.WorkerStatusDone {
-		t.Fatalf("expected done review process status, got %q", result.Status)
+	if result.Status != runtime.WorkerStatusDoneWithConcerns {
+		t.Fatalf("expected done_with_concerns review process status, got %q", result.Status)
 	}
 	if result.ReviewStatus != runtime.ReviewStatusFindings {
 		t.Fatalf("expected findings review status, got %q", result.ReviewStatus)
@@ -220,9 +282,12 @@ func TestRunReviewer_NormalizesFindingsAndDerivesStatus(t *testing.T) {
 	if result.Findings[0].Disposition != runtime.ReviewDispositionOpen {
 		t.Fatalf("expected canonical open disposition, got %q", result.Findings[0].Disposition)
 	}
+	if result.Summary != "needs fixes" {
+		t.Fatalf("expected summary 'needs fixes', got %q", result.Summary)
+	}
 }
 
-func TestRunReviewer_RejectsContradictoryReviewStatus(t *testing.T) {
+func TestRunReviewer_PassedReview(t *testing.T) {
 	oldRunCommand := runCommand
 	oldNow := now
 	defer func() {
@@ -235,21 +300,25 @@ func TestRunReviewer_RejectsContradictoryReviewStatus(t *testing.T) {
 	}
 
 	runCommand = func(ctx context.Context, binary string, args []string, stdin []byte, env []string, timeout time.Duration) (commandResult, error) {
+		resultJSON := `{"review_status":"passed","summary":"clean implementation, all criteria met","findings":[]}`
 		return commandResult{
-			stdout: []byte(`{"status":"done","lease_id":"lease-3","review_status":"passed","summary":"looks good","findings":[{"severity":"P2","title":"blocking issue","body":"blocking issue","file":"internal/example.go","line":12,"disposition":"open"}]}`),
+			stdout: mockCLIOutput(resultJSON, false),
 		}, nil
 	}
 
 	adapter := NewWithCommand("claude-test")
-	_, err := adapter.RunReviewer(context.Background(), runtime.ReviewRequest{
+	result, err := adapter.RunReviewer(context.Background(), runtime.ReviewRequest{
 		LeaseID:                  "lease-3",
 		EffectiveReviewThreshold: runtime.SeverityP2,
 	})
-	if err == nil {
-		t.Fatalf("expected contradictory review status to fail")
+	if err != nil {
+		t.Fatalf("RunReviewer returned error: %v", err)
 	}
-	if !strings.Contains(err.Error(), "contradicts derived status") {
-		t.Fatalf("unexpected error: %v", err)
+	if result.ReviewStatus != runtime.ReviewStatusPassed {
+		t.Fatalf("expected passed, got %q", result.ReviewStatus)
+	}
+	if result.Status != runtime.WorkerStatusDone {
+		t.Fatalf("expected done, got %q", result.Status)
 	}
 }
 
@@ -274,6 +343,42 @@ func TestCheckAvailability_UsesVersionProbe(t *testing.T) {
 	}
 	if !probed {
 		t.Fatalf("expected availability probe to run")
+	}
+}
+
+func TestRunWorker_NeedsContextStatus(t *testing.T) {
+	oldRunCommand := runCommand
+	oldNow := now
+	defer func() {
+		runCommand = oldRunCommand
+		now = oldNow
+	}()
+
+	now = func() time.Time {
+		return time.Date(2026, 4, 2, 12, 0, 0, 0, time.UTC)
+	}
+
+	runCommand = func(ctx context.Context, binary string, args []string, stdin []byte, env []string, timeout time.Duration) (commandResult, error) {
+		resultJSON := `{"status":"needs_context","completion_code":"missing_spec","block_reason":"acceptance criteria unclear"}`
+		return commandResult{
+			stdout:   mockCLIOutput(resultJSON, false),
+			exitCode: 0,
+		}, nil
+	}
+
+	adapter := NewWithCommand("claude-test")
+	result, err := adapter.RunWorker(context.Background(), runtime.WorkerRequest{
+		LeaseID:  "lease-1",
+		TicketID: "ticket-1",
+	})
+	if err != nil {
+		t.Fatalf("RunWorker returned error: %v", err)
+	}
+	if result.Status != runtime.WorkerStatusNeedsContext {
+		t.Fatalf("expected needs_context, got %q", result.Status)
+	}
+	if result.RetryClass != runtime.RetryClassBlockedByOperatorInput {
+		t.Fatalf("expected blocked_by_operator_input, got %q", result.RetryClass)
 	}
 }
 

@@ -222,7 +222,20 @@ func runResume(args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 
-	report, err := engine.ResumeRun(context.Background(), engine.ResumeRequest{RunID: args[0]})
+	repoRoot, cfg, _, err := loadExecutionContext()
+	if err != nil {
+		fmt.Fprintln(stderr, err)
+		return 1
+	}
+
+	report, err := engine.ResumeRun(context.Background(), engine.ResumeRequest{
+		RepoRoot: repoRoot,
+		RunID:    args[0],
+		AdapterFactory: func(ticketPreference string) (runtime.Adapter, error) {
+			return runtimeAdapterFor(ticketPreference, cfg.Runtime.DefaultRuntime)
+		},
+		Config: cfg,
+	})
 	if err != nil {
 		fmt.Fprintln(stderr, err)
 		return 1
@@ -233,6 +246,9 @@ func runResume(args []string, stdout, stderr io.Writer) int {
 	fmt.Fprintf(stdout, "run %s: %s\n", report.Run.RunID, report.Run.Status)
 	if len(report.RecoveredTickets) > 0 {
 		fmt.Fprintf(stdout, "recovered: %s\n", strings.Join(report.RecoveredTickets, ", "))
+	}
+	if len(report.ResumedTickets) > 0 {
+		fmt.Fprintf(stdout, "resumed: %s\n", strings.Join(report.ResumedTickets, ", "))
 	}
 	return 0
 }
@@ -265,7 +281,7 @@ func runTicket(ticketID string) (string, error) {
 	plan.UpdatedAt = plan.CreatedAt
 
 	leaseID := fmt.Sprintf("lease-%s-%s", runID, ticketID)
-	claim, err := tkmd.AcquireClaim(repoRoot, runID, ticketID, leaseID, 10*time.Minute, time.Now().UTC())
+	claim, err := tkmd.AcquireClaim(repoRoot, runID, ticketID, leaseID, 30*time.Minute, time.Now().UTC())
 	if err != nil {
 		return "", err
 	}

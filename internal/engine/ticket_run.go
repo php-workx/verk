@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"verk/internal/adapters/repo/git"
 	"verk/internal/adapters/runtime"
 	"verk/internal/adapters/ticketstore/tkmd"
 	verifycommand "verk/internal/adapters/verify/command"
@@ -25,12 +26,14 @@ var errClaimRenewalLost = errors.New("claim renewal failed")
 type RunTicketRequest struct {
 	RepoRoot             string
 	RunID                string
+	BaseCommit           string
 	Ticket               tkmd.Ticket
 	Plan                 state.PlanArtifact
 	Claim                state.ClaimArtifact
 	Adapter              runtime.Adapter
 	Config               policy.Config
-	VerificationCommands []string
+	VerificationCommands  []string
+	EnforceSingleScope    bool
 }
 
 type RunTicketResult struct {
@@ -161,11 +164,23 @@ func RunTicket(ctx context.Context, req RunTicketRequest) (RunTicketResult, erro
 				}
 				return RunTicketResult{}, err
 			}
-			if err := handleImplementResult(st, result, workerReq.Attempt); err != nil {
+			if err := handleImplementResult(st, result, workerReq.Attempt, workerReq.InputArtifactPath); err != nil {
 				return RunTicketResult{}, err
 			}
 
 			if st.currentPhase == state.TicketPhaseVerify {
+				if err := checkSingleTicketScope(st); err != nil {
+					return RunTicketResult{}, err
+				}
+				if st.currentPhase == state.TicketPhaseBlocked {
+					if err := st.persist(); err != nil {
+						return RunTicketResult{}, err
+					}
+					if err := st.releaseClaim(); err != nil {
+						return RunTicketResult{}, err
+					}
+					return RunTicketResult{Snapshot: st.snapshot(), Path: st.paths.snapshotPath}, nil
+				}
 				if err := st.persist(); err != nil {
 					return RunTicketResult{}, err
 				}
@@ -215,6 +230,7 @@ func RunTicket(ctx context.Context, req RunTicketRequest) (RunTicketResult, erro
 				Attempt:                  st.reviewAttempts + 1,
 				Runtime:                  chosenRuntime(req.Plan, cfg),
 				InputArtifactPath:        st.paths.verificationPath,
+				Instructions:             renderReviewInstructions(req.Plan, st.reviewAttempts+1),
 				EffectiveReviewThreshold: req.Plan.EffectiveReviewThreshold,
 				ExecutionConfig:          executionConfigFromPolicy(cfg),
 			}
@@ -299,10 +315,22 @@ func RunTicket(ctx context.Context, req RunTicketRequest) (RunTicketResult, erro
 				}
 				return RunTicketResult{}, err
 			}
-			if err := handleImplementResult(st, result, workerReq.Attempt); err != nil {
+			if err := handleImplementResult(st, result, workerReq.Attempt, workerReq.InputArtifactPath); err != nil {
 				return RunTicketResult{}, err
 			}
 			if st.currentPhase == state.TicketPhaseVerify {
+				if err := checkSingleTicketScope(st); err != nil {
+					return RunTicketResult{}, err
+				}
+				if st.currentPhase == state.TicketPhaseBlocked {
+					if err := st.persist(); err != nil {
+						return RunTicketResult{}, err
+					}
+					if err := st.releaseClaim(); err != nil {
+						return RunTicketResult{}, err
+					}
+					return RunTicketResult{Snapshot: st.snapshot(), Path: st.paths.snapshotPath}, nil
+				}
 				if err := st.persist(); err != nil {
 					return RunTicketResult{}, err
 				}
@@ -362,7 +390,7 @@ func RunTicket(ctx context.Context, req RunTicketRequest) (RunTicketResult, erro
 	}
 }
 
-func handleImplementResult(st *ticketRunState, result runtime.WorkerResult, attempt int) error {
+func handleImplementResult(st *ticketRunState, result runtime.WorkerResult, attempt int, inputArtifactPath string) error {
 	if err := result.Validate(); err != nil {
 		return err
 	}
@@ -384,10 +412,13 @@ func handleImplementResult(st *ticketRunState, result runtime.WorkerResult, atte
 		Status:         string(result.Status),
 		CompletionCode: result.CompletionCode,
 		RetryClass:     state.RetryClass(result.RetryClass),
-		LeaseID:        result.LeaseID,
-		StartedAt:      result.StartedAt,
-		FinishedAt:     result.FinishedAt,
-		Artifacts:      compactStrings([]string{result.StdoutPath, result.StderrPath, result.ResultArtifactPath}),
+		Concerns:          result.Concerns,
+		LeaseID:           result.LeaseID,
+		InputArtifactPath: inputArtifactPath,
+		StartedAt:         result.StartedAt,
+		FinishedAt:        result.FinishedAt,
+		Artifacts:         compactStrings([]string{result.StdoutPath, result.StderrPath, result.ResultArtifactPath}),
+		ChangedFiles:      []string{},
 	}
 
 	switch result.Status {
@@ -397,6 +428,7 @@ func handleImplementResult(st *ticketRunState, result runtime.WorkerResult, atte
 		}
 		st.blockReason = ""
 		st.implementation.BlockReason = ""
+		st.implementation.ChangedFiles = collectChangedFiles(st.repoRoot, st.req.BaseCommit)
 	case runtime.WorkerStatusNeedsContext, runtime.WorkerStatusBlocked:
 		reason := workerBlockReason(result)
 		st.blockReason = reason
@@ -414,12 +446,54 @@ func handleImplementResult(st *ticketRunState, result runtime.WorkerResult, atte
 	return nil
 }
 
+func checkSingleTicketScope(st *ticketRunState) error {
+	if !st.req.EnforceSingleScope {
+		return nil
+	}
+	ownedPaths := st.req.Ticket.OwnedPaths
+	if len(ownedPaths) == 0 {
+		return nil
+	}
+	var changedFiles []string
+	if st.implementation != nil {
+		changedFiles = st.implementation.ChangedFiles
+	}
+	if len(changedFiles) == 0 {
+		return nil
+	}
+	if err := CheckScopeViolation(changedFiles, ownedPaths); err != nil {
+		st.blockReason = fmt.Sprintf("single-ticket scope violation: %v", err)
+		return st.transitionTo(state.TicketPhaseBlocked)
+	}
+	return nil
+}
+
+func collectChangedFiles(repoRoot, baseCommit string) []string {
+	baseCommit = strings.TrimSpace(baseCommit)
+	if baseCommit == "" {
+		return []string{}
+	}
+	repo, err := git.New(repoRoot)
+	if err != nil {
+		return []string{}
+	}
+	files, err := repo.ChangedFilesAgainst(baseCommit)
+	if err != nil {
+		return []string{}
+	}
+	filtered := filterEngineOwnedFiles(files)
+	if filtered == nil {
+		return []string{}
+	}
+	return filtered
+}
+
 func handleVerificationFailure(st *ticketRunState, verification state.VerificationArtifact) error {
 	if !verification.Passed {
 		st.verification = &verification
 	}
 	if st.implementationAttempts >= st.cfg.Policy.MaxImplementationAttempts {
-		st.blockReason = fmt.Sprintf("non-convergence: verification failed after %d implementation attempt(s)", st.implementationAttempts)
+		st.blockReason = fmt.Sprintf("%s: failed after %d attempt(s)", state.EscalationNonConvergentVerification, st.implementationAttempts)
 		if err := st.transitionTo(state.TicketPhaseBlocked); err != nil {
 			return err
 		}
@@ -511,7 +585,7 @@ func handleReviewOutcome(st *ticketRunState, result runtime.ReviewResult, attemp
 	st.repairCycles = append(st.repairCycles, cycle)
 
 	if len(st.repairCycles) > st.cfg.Policy.MaxRepairCycles {
-		st.blockReason = fmt.Sprintf("non-convergence: repair limit reached after %d repair cycle(s)", len(st.repairCycles)-1)
+		st.blockReason = fmt.Sprintf("%s: repair limit reached after %d cycle(s)", state.EscalationNonConvergentReview, len(st.repairCycles)-1)
 		last := &st.repairCycles[len(st.repairCycles)-1]
 		last.Status = "blocked"
 		last.FinishedAt = time.Now().UTC()
@@ -585,6 +659,7 @@ func (st *ticketRunState) runWorkerWithRuntimeControls(ctx context.Context, req 
 			lastErr = fmt.Errorf("retryable worker failure: %s", workerBlockReason(runtime.WorkerResult{
 				Status:         result.Status,
 				CompletionCode: result.CompletionCode,
+				BlockReason:    result.BlockReason,
 				RetryClass:     result.RetryClass,
 			}))
 			if attempt < maxRuntimeRetryAttempts {
@@ -594,6 +669,7 @@ func (st *ticketRunState) runWorkerWithRuntimeControls(ctx context.Context, req 
 			reason := fmt.Sprintf("worker blocked by operator input: %s", workerBlockReason(runtime.WorkerResult{
 				Status:         result.Status,
 				CompletionCode: result.CompletionCode,
+				BlockReason:    result.BlockReason,
 				RetryClass:     result.RetryClass,
 			}))
 			if err := st.blockRuntimeExecution(reason); err != nil {
@@ -707,7 +783,7 @@ func (st *ticketRunState) runReviewerWithClaimRenewal(ctx context.Context, req r
 func (st *ticketRunState) startClaimRenewal(ctx context.Context) (context.Context, func() error) {
 	ttl := st.claimTTL()
 	if ttl <= 0 {
-		ttl = 10 * time.Minute
+		ttl = 30 * time.Minute
 	}
 	interval := ttl / 3
 	if interval < 25*time.Millisecond {
@@ -755,11 +831,11 @@ func (st *ticketRunState) startClaimRenewal(ctx context.Context) (context.Contex
 
 func (st *ticketRunState) claimTTL() time.Duration {
 	if st.req.Claim.LeasedAt.IsZero() || st.req.Claim.ExpiresAt.IsZero() {
-		return 10 * time.Minute
+		return 30 * time.Minute
 	}
 	ttl := st.req.Claim.ExpiresAt.Sub(st.req.Claim.LeasedAt)
 	if ttl <= 0 {
-		return 10 * time.Minute
+		return 30 * time.Minute
 	}
 	return ttl
 }
@@ -967,25 +1043,174 @@ func chosenRuntime(plan state.PlanArtifact, cfg policy.Config) string {
 }
 
 func renderImplementInstructions(plan state.PlanArtifact, phase state.TicketPhase, attempt int) string {
-	parts := []string{
-		fmt.Sprintf("phase=%s", phase),
-		fmt.Sprintf("attempt=%d", attempt),
+	var b strings.Builder
+
+	fmt.Fprintf(&b, "**Ticket ID:** %s\n", plan.TicketID)
+	if plan.Title != "" {
+		fmt.Fprintf(&b, "**Title:** %s\n", plan.Title)
 	}
+	fmt.Fprintf(&b, "**Phase:** %s\n", phase)
+	fmt.Fprintf(&b, "**Attempt:** %d\n\n", attempt)
+
+	if plan.Description != "" {
+		b.WriteString("### Description\n\n")
+		b.WriteString(plan.Description)
+		b.WriteString("\n\n")
+	}
+
 	if len(plan.AcceptanceCriteria) > 0 {
-		parts = append(parts, fmt.Sprintf("criteria=%d", len(plan.AcceptanceCriteria)))
+		b.WriteString("### Acceptance Criteria\n\n")
+		for i, criterion := range plan.AcceptanceCriteria {
+			fmt.Fprintf(&b, "%d. %s\n", i+1, criterion)
+		}
+		b.WriteString("\n")
 	}
-	return strings.Join(parts, "; ")
+
+	if len(plan.OwnedPaths) > 0 {
+		b.WriteString("### Scope (owned paths)\n\n")
+		b.WriteString("You may ONLY modify files within these paths:\n\n")
+		for _, p := range plan.OwnedPaths {
+			fmt.Fprintf(&b, "- `%s`\n", p)
+		}
+		b.WriteString("\n")
+	}
+
+	if len(plan.TestCases) > 0 {
+		b.WriteString("### Test Cases\n\n")
+		for _, tc := range plan.TestCases {
+			fmt.Fprintf(&b, "- %s\n", tc)
+		}
+		b.WriteString("\n")
+	}
+
+	if len(plan.ValidationCommands) > 0 {
+		b.WriteString("### Verification Commands\n\n")
+		b.WriteString("These commands will be run to verify your implementation:\n\n")
+		for _, cmd := range plan.ValidationCommands {
+			fmt.Fprintf(&b, "```\n%s\n```\n", cmd)
+		}
+		b.WriteString("\n")
+	}
+
+	if attempt > 1 {
+		b.WriteString("### Note\n\n")
+		b.WriteString("This is a retry. The previous attempt failed verification. ")
+		b.WriteString("Review the prior artifact for failure details and fix the issues.\n")
+	}
+
+	return b.String()
 }
 
 func renderRepairInstructions(st *ticketRunState) string {
-	if len(st.repairCycles) == 0 {
-		return "repair cycle"
+	var b strings.Builder
+
+	fmt.Fprintf(&b, "**Ticket ID:** %s\n", st.req.Plan.TicketID)
+	if st.req.Plan.Title != "" {
+		fmt.Fprintf(&b, "**Title:** %s\n", st.req.Plan.Title)
 	}
-	last := st.repairCycles[len(st.repairCycles)-1]
-	return fmt.Sprintf("repair cycle %d: %s", last.Cycle, strings.Join(last.TriggerFindingIDs, ", "))
+	fmt.Fprintf(&b, "**Phase:** repair\n")
+
+	cycleNum := len(st.repairCycles)
+	if cycleNum > 0 {
+		last := st.repairCycles[cycleNum-1]
+		fmt.Fprintf(&b, "**Repair Cycle:** %d\n\n", last.Cycle)
+
+		if len(last.TriggerFindingIDs) > 0 {
+			b.WriteString("### Findings to Address\n\n")
+			b.WriteString("The following review findings triggered this repair cycle:\n\n")
+			for _, id := range last.TriggerFindingIDs {
+				fmt.Fprintf(&b, "- `%s`\n", id)
+			}
+			b.WriteString("\n")
+		}
+	} else {
+		b.WriteString("**Repair Cycle:** 1\n\n")
+	}
+
+	if st.review != nil && len(st.review.Findings) > 0 {
+		b.WriteString("### Review Findings Detail\n\n")
+		for _, finding := range st.review.Findings {
+			if finding.Disposition == "open" {
+				fmt.Fprintf(&b, "- **[%s] %s** (%s:%d): %s\n",
+					finding.Severity, finding.Title, finding.File, finding.Line, finding.Body)
+			}
+		}
+		b.WriteString("\n")
+	}
+
+	if len(st.req.Plan.AcceptanceCriteria) > 0 {
+		b.WriteString("### Acceptance Criteria\n\n")
+		for i, criterion := range st.req.Plan.AcceptanceCriteria {
+			fmt.Fprintf(&b, "%d. %s\n", i+1, criterion)
+		}
+		b.WriteString("\n")
+	}
+
+	if len(st.req.Plan.OwnedPaths) > 0 {
+		b.WriteString("### Scope (owned paths)\n\n")
+		for _, p := range st.req.Plan.OwnedPaths {
+			fmt.Fprintf(&b, "- `%s`\n", p)
+		}
+		b.WriteString("\n")
+	}
+
+	b.WriteString("Fix the review findings while maintaining all acceptance criteria.\n")
+
+	return b.String()
+}
+
+func renderReviewInstructions(plan state.PlanArtifact, attempt int) string {
+	var b strings.Builder
+
+	fmt.Fprintf(&b, "**Ticket ID:** %s\n", plan.TicketID)
+	if plan.Title != "" {
+		fmt.Fprintf(&b, "**Title:** %s\n", plan.Title)
+	}
+	fmt.Fprintf(&b, "**Review attempt:** %d\n", attempt)
+	fmt.Fprintf(&b, "**Review threshold:** %s\n\n", plan.EffectiveReviewThreshold)
+
+	if plan.Description != "" {
+		b.WriteString("### Original Ticket Description\n\n")
+		b.WriteString(plan.Description)
+		b.WriteString("\n\n")
+	}
+
+	if len(plan.AcceptanceCriteria) > 0 {
+		b.WriteString("### Acceptance Criteria to Verify\n\n")
+		for i, criterion := range plan.AcceptanceCriteria {
+			fmt.Fprintf(&b, "%d. %s\n", i+1, criterion)
+		}
+		b.WriteString("\n")
+	}
+
+	if len(plan.OwnedPaths) > 0 {
+		b.WriteString("### Expected Scope\n\n")
+		b.WriteString("Changes should be limited to these paths:\n\n")
+		for _, p := range plan.OwnedPaths {
+			fmt.Fprintf(&b, "- `%s`\n", p)
+		}
+		b.WriteString("\n")
+	}
+
+	if len(plan.TestCases) > 0 {
+		b.WriteString("### Test Cases\n\n")
+		for _, tc := range plan.TestCases {
+			fmt.Fprintf(&b, "- %s\n", tc)
+		}
+		b.WriteString("\n")
+	}
+
+	b.WriteString("Review the implementation changes against these criteria. ")
+	b.WriteString("Use `git diff` to see the changes. ")
+	b.WriteString("Flag any issues with appropriate severity.\n")
+
+	return b.String()
 }
 
 func workerBlockReason(result runtime.WorkerResult) string {
+	if strings.TrimSpace(result.BlockReason) != "" {
+		return strings.TrimSpace(result.BlockReason)
+	}
 	reason := string(result.Status)
 	if strings.TrimSpace(result.CompletionCode) != "" {
 		reason = fmt.Sprintf("%s: %s", reason, strings.TrimSpace(result.CompletionCode))

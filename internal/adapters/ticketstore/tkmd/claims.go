@@ -15,7 +15,7 @@ import (
 
 const (
 	claimSchemaVersion = 1
-	defaultClaimTTL    = 10 * time.Minute
+	defaultClaimTTL    = 30 * time.Minute
 )
 
 func AcquireClaim(rootDir string, args ...any) (state.ClaimArtifact, error) {

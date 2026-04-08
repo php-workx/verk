@@ -10,8 +10,6 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
-	"sort"
-	"strconv"
 	"strings"
 	"time"
 
@@ -28,14 +26,10 @@ var (
 	now        = time.Now
 )
 
-var runtimeEnvAllowlist = []string{
-	"HOME",
-	"LANG",
-	"LC_ALL",
-	"PATH",
-	"TERM",
-	"TMPDIR",
-}
+// runtimeEnvPassthrough lists additional env vars from config that should be
+// explicitly set. The subprocess inherits the full parent environment so that
+// Claude Code can access auth credentials (keychain, ~/.claude/, etc.).
+// Config-specified AuthEnvVars are verified to exist and passed through.
 
 type Adapter struct {
 	Command string
@@ -47,61 +41,24 @@ type commandResult struct {
 	exitCode int
 }
 
-type workerResponse struct {
-	Status             string `json:"status"`
-	CompletionCode     string `json:"completion_code,omitempty"`
-	RetryClass         string `json:"retry_class,omitempty"`
-	StdoutPath         string `json:"stdout_path,omitempty"`
-	StderrPath         string `json:"stderr_path,omitempty"`
-	ResultArtifactPath string `json:"result_artifact_path,omitempty"`
-	LeaseID            string `json:"lease_id,omitempty"`
-}
-
-type rawFinding struct {
-	ID              string     `json:"id,omitempty"`
-	Severity        string     `json:"severity,omitempty"`
-	Title           string     `json:"title,omitempty"`
-	Body            string     `json:"body,omitempty"`
-	File            string     `json:"file,omitempty"`
-	Line            int        `json:"line,omitempty"`
-	Disposition     string     `json:"disposition,omitempty"`
-	WaivedBy        string     `json:"waived_by,omitempty"`
-	WaivedAt        time.Time  `json:"waived_at,omitempty"`
-	WaiverReason    string     `json:"waiver_reason,omitempty"`
-	WaiverExpiresAt *time.Time `json:"waiver_expires_at,omitempty"`
-}
-
-type reviewResponse struct {
-	Status             string       `json:"status"`
-	CompletionCode     string       `json:"completion_code,omitempty"`
-	RetryClass         string       `json:"retry_class,omitempty"`
-	StdoutPath         string       `json:"stdout_path,omitempty"`
-	StderrPath         string       `json:"stderr_path,omitempty"`
-	ResultArtifactPath string       `json:"result_artifact_path,omitempty"`
-	LeaseID            string       `json:"lease_id,omitempty"`
-	ReviewStatus       string       `json:"review_status,omitempty"`
-	Summary            string       `json:"summary,omitempty"`
-	Findings           []rawFinding `json:"findings,omitempty"`
-}
-
 type workerArtifact struct {
 	Runtime              string                `json:"runtime"`
 	Request              runtime.WorkerRequest `json:"request"`
-	Response             workerResponse        `json:"response"`
+	CLIOutput            json.RawMessage       `json:"cli_output"`
+	ResultBlock          *runtime.VerkResultBlock `json:"result_block,omitempty"`
 	Normalized           runtime.WorkerResult  `json:"normalized"`
 	CapturedStdoutPath   string                `json:"captured_stdout_path"`
 	CapturedStderrPath   string                `json:"captured_stderr_path"`
-	CapturedArtifactPath string                `json:"captured_artifact_path"`
 }
 
 type reviewArtifact struct {
-	Runtime              string                `json:"runtime"`
-	Request              runtime.ReviewRequest `json:"request"`
-	Response             reviewResponse        `json:"response"`
-	Normalized           runtime.ReviewResult  `json:"normalized"`
-	CapturedStdoutPath   string                `json:"captured_stdout_path"`
-	CapturedStderrPath   string                `json:"captured_stderr_path"`
-	CapturedArtifactPath string                `json:"captured_artifact_path"`
+	Runtime              string                 `json:"runtime"`
+	Request              runtime.ReviewRequest  `json:"request"`
+	CLIOutput            json.RawMessage        `json:"cli_output"`
+	ReviewBlock          *runtime.VerkReviewBlock `json:"review_block,omitempty"`
+	Normalized           runtime.ReviewResult   `json:"normalized"`
+	CapturedStdoutPath   string                 `json:"captured_stdout_path"`
+	CapturedStderrPath   string                 `json:"captured_stderr_path"`
 }
 
 func New() *Adapter {
@@ -139,33 +96,23 @@ func (a *Adapter) RunWorker(ctx context.Context, req runtime.WorkerRequest) (run
 	req.Runtime = ensureRuntime(req.Runtime, runtimeName)
 	startedAt := now().UTC()
 
-	payload, err := json.Marshal(req)
-	if err != nil {
-		return runtime.WorkerResult{}, fmt.Errorf("marshal worker request: %w", err)
-	}
-
+	prompt := runtime.BuildWorkerPrompt(req)
 	args := buildWorkerArgs(req)
-	execResult, err := runCommand(ctx, a.binary(), args, payload, runtimeCommandEnv(req.ExecutionConfig), runtimeCommandTimeout(req.ExecutionConfig.WorkerTimeoutMinutes))
+	execResult, err := runCommand(ctx, a.binary(), args, []byte(prompt), runtimeCommandEnv(req.ExecutionConfig), runtimeCommandTimeout(req.ExecutionConfig.WorkerTimeoutMinutes))
 	finishedAt := now().UTC()
 	if err != nil {
 		return runtime.WorkerResult{}, fmt.Errorf("run %s worker: %w", runtimeName, err)
 	}
 
-	response, err := decodeWorkerResponse(execResult.stdout)
-	if err != nil {
-		return runtime.WorkerResult{}, err
-	}
-	if response.LeaseID == "" {
-		response.LeaseID = req.LeaseID
-	}
-	if response.LeaseID != req.LeaseID {
-		return runtime.WorkerResult{}, fmt.Errorf("%s worker result lease_id %q does not match request %q", runtimeName, response.LeaseID, req.LeaseID)
-	}
+	resultText, cliOK := runtime.ExtractCLIResultText(execResult.stdout)
+	resultBlock, blockFound := runtime.ParseResultBlock(resultText)
 
 	result := runtime.WorkerResult{
-		Status:         normalizeWorkerStatus(response.Status, execResult.exitCode, execResult.stderr),
-		CompletionCode: normalizeCompletionCode(response.CompletionCode, response.Status, execResult.exitCode),
-		RetryClass:     normalizeRetryClass(response.RetryClass, response.Status, execResult.exitCode, execResult.stderr),
+		Status:         deriveWorkerStatus(resultBlock, blockFound, cliOK, execResult.exitCode, execResult.stderr),
+		CompletionCode: deriveWorkerCompletionCode(resultBlock, blockFound, execResult.exitCode),
+		Concerns:       deriveWorkerConcerns(resultBlock, blockFound),
+		BlockReason:    deriveWorkerBlockReason(resultBlock, blockFound),
+		RetryClass:     deriveWorkerRetryClass(resultBlock, blockFound, cliOK, execResult.exitCode, execResult.stderr),
 		LeaseID:        req.LeaseID,
 		StartedAt:      startedAt,
 		FinishedAt:     finishedAt,
@@ -180,14 +127,18 @@ func (a *Adapter) RunWorker(ctx context.Context, req runtime.WorkerRequest) (run
 		return runtime.WorkerResult{}, err
 	}
 
+	var blockPtr *runtime.VerkResultBlock
+	if blockFound {
+		blockPtr = &resultBlock
+	}
 	artifact := workerArtifact{
-		Runtime:              runtimeName,
-		Request:              req,
-		Response:             response,
-		Normalized:           result,
-		CapturedStdoutPath:   result.StdoutPath,
-		CapturedStderrPath:   result.StderrPath,
-		CapturedArtifactPath: response.ResultArtifactPath,
+		Runtime:            runtimeName,
+		Request:            req,
+		CLIOutput:          safeRawJSON(execResult.stdout),
+		ResultBlock:        blockPtr,
+		Normalized:         result,
+		CapturedStdoutPath: result.StdoutPath,
+		CapturedStderrPath: result.StderrPath,
 	}
 	result.ResultArtifactPath, err = writeJSONArtifact(runtimeName+"-worker-result", artifact)
 	if err != nil {
@@ -212,54 +163,36 @@ func (a *Adapter) RunReviewer(ctx context.Context, req runtime.ReviewRequest) (r
 	req.Runtime = ensureRuntime(req.Runtime, runtimeName)
 	startedAt := now().UTC()
 
-	payload, err := json.Marshal(req)
-	if err != nil {
-		return runtime.ReviewResult{}, fmt.Errorf("marshal review request: %w", err)
-	}
-
+	prompt := runtime.BuildReviewPrompt(req)
 	args := buildReviewArgs(req)
-	execResult, err := runCommand(ctx, a.binary(), args, payload, runtimeCommandEnv(req.ExecutionConfig), runtimeCommandTimeout(req.ExecutionConfig.ReviewerTimeoutMinutes))
+	execResult, err := runCommand(ctx, a.binary(), args, []byte(prompt), runtimeCommandEnv(req.ExecutionConfig), runtimeCommandTimeout(req.ExecutionConfig.ReviewerTimeoutMinutes))
 	finishedAt := now().UTC()
 	if err != nil {
 		return runtime.ReviewResult{}, fmt.Errorf("run %s reviewer: %w", runtimeName, err)
 	}
 
-	response, err := decodeReviewResponse(execResult.stdout)
-	if err != nil {
-		return runtime.ReviewResult{}, err
-	}
-	if response.LeaseID == "" {
-		response.LeaseID = req.LeaseID
-	}
-	if response.LeaseID != req.LeaseID {
-		return runtime.ReviewResult{}, fmt.Errorf("%s review result lease_id %q does not match request %q", runtimeName, response.LeaseID, req.LeaseID)
-	}
+	resultText, cliOK := runtime.ExtractCLIResultText(execResult.stdout)
+	reviewBlock, blockFound := runtime.ParseReviewBlock(resultText)
 
-	findings, err := normalizeFindings(response.Findings)
+	findings, err := normalizeBlockFindings(reviewBlock, blockFound)
 	if err != nil {
 		return runtime.ReviewResult{}, err
 	}
 
 	normalized := runtime.ReviewResult{
-		Status:         normalizeReviewStatus(response.Status, response.ReviewStatus, findings, req.EffectiveReviewThreshold, execResult.exitCode, execResult.stderr),
-		CompletionCode: normalizeCompletionCode(response.CompletionCode, response.Status, execResult.exitCode),
-		RetryClass:     normalizeRetryClass(response.RetryClass, response.Status, execResult.exitCode, execResult.stderr),
-		LeaseID:        req.LeaseID,
-		StartedAt:      startedAt,
-		FinishedAt:     finishedAt,
-		ReviewStatus:   deriveReviewStatus(findings, req.EffectiveReviewThreshold),
-		Summary:        strings.TrimSpace(response.Summary),
-		Findings:       findings,
+		Status:       deriveReviewWorkerStatus(reviewBlock, blockFound, cliOK, findings, req.EffectiveReviewThreshold, execResult.exitCode, execResult.stderr),
+		CompletionCode: deriveReviewCompletionCode(reviewBlock, blockFound, execResult.exitCode),
+		RetryClass:   deriveReviewRetryClass(reviewBlock, blockFound, cliOK, execResult.exitCode, execResult.stderr),
+		LeaseID:      req.LeaseID,
+		StartedAt:    startedAt,
+		FinishedAt:   finishedAt,
+		ReviewStatus: deriveReviewStatus(findings, req.EffectiveReviewThreshold),
+		Summary:      extractReviewSummary(reviewBlock, blockFound),
+		Findings:     findings,
 	}
 
-	if response.ReviewStatus != "" {
-		reported, err := normalizeReviewStatusString(response.ReviewStatus)
-		if err != nil {
-			return runtime.ReviewResult{}, err
-		}
-		if reported != normalized.ReviewStatus {
-			return runtime.ReviewResult{}, fmt.Errorf("%s review status %q contradicts derived status %q", runtimeName, reported, normalized.ReviewStatus)
-		}
+	if err := checkReviewStatusContradiction(reviewBlock, blockFound, normalized.ReviewStatus); err != nil {
+		return runtime.ReviewResult{}, err
 	}
 
 	normalized.StdoutPath, err = writeBytesArtifact(runtimeName+"-review-stdout", execResult.stdout)
@@ -271,14 +204,18 @@ func (a *Adapter) RunReviewer(ctx context.Context, req runtime.ReviewRequest) (r
 		return runtime.ReviewResult{}, err
 	}
 
+	var blockPtr *runtime.VerkReviewBlock
+	if blockFound {
+		blockPtr = &reviewBlock
+	}
 	artifact := reviewArtifact{
-		Runtime:              runtimeName,
-		Request:              req,
-		Response:             response,
-		Normalized:           normalized,
-		CapturedStdoutPath:   normalized.StdoutPath,
-		CapturedStderrPath:   normalized.StderrPath,
-		CapturedArtifactPath: response.ResultArtifactPath,
+		Runtime:            runtimeName,
+		Request:            req,
+		CLIOutput:          safeRawJSON(execResult.stdout),
+		ReviewBlock:        blockPtr,
+		Normalized:         normalized,
+		CapturedStdoutPath: normalized.StdoutPath,
+		CapturedStderrPath: normalized.StderrPath,
 	}
 	normalized.ResultArtifactPath, err = writeJSONArtifact(runtimeName+"-review-result", artifact)
 	if err != nil {
@@ -319,70 +256,43 @@ func validateReviewRequest(req runtime.ReviewRequest) error {
 	return nil
 }
 
+// buildWorkerArgs constructs CLI args for `claude -p --output-format json`.
+// The user prompt is passed via stdin.
 func buildWorkerArgs(req runtime.WorkerRequest) []string {
-	args := []string{"worker", "--lease-id", req.LeaseID, "--runtime", runtimeName}
-	appendIf := func(flag, value string) {
-		if strings.TrimSpace(value) == "" {
-			return
-		}
-		args = append(args, flag, value)
+	args := []string{
+		"-p",
+		"--output-format", "json",
+		"--system-prompt", runtime.WorkerSystemPrompt(),
 	}
-	appendIf("--run-id", req.RunID)
-	appendIf("--ticket-id", req.TicketID)
-	appendIf("--wave-id", req.WaveID)
-	if req.Attempt > 0 {
-		args = append(args, "--attempt", strconv.Itoa(req.Attempt))
+	if req.ExecutionConfig.WorkerTimeoutMinutes > 0 {
+		args = append(args, "--max-turns", "50")
 	}
-	appendIf("--worktree-path", req.WorktreePath)
-	appendIf("--input-artifact-path", req.InputArtifactPath)
 	return args
 }
 
+// buildReviewArgs constructs CLI args for `claude -p --output-format json`.
+// The user prompt is passed via stdin.
 func buildReviewArgs(req runtime.ReviewRequest) []string {
-	args := []string{"review", "--fresh-context", "--lease-id", req.LeaseID, "--runtime", runtimeName, "--effective-review-threshold", string(req.EffectiveReviewThreshold)}
-	appendIf := func(flag, value string) {
-		if strings.TrimSpace(value) == "" {
-			return
-		}
-		args = append(args, flag, value)
+	args := []string{
+		"-p",
+		"--output-format", "json",
+		"--system-prompt", runtime.ReviewerSystemPrompt(),
 	}
-	appendIf("--run-id", req.RunID)
-	appendIf("--ticket-id", req.TicketID)
-	appendIf("--wave-id", req.WaveID)
-	if req.Attempt > 0 {
-		args = append(args, "--attempt", strconv.Itoa(req.Attempt))
+	if req.ExecutionConfig.ReviewerTimeoutMinutes > 0 {
+		args = append(args, "--max-turns", "30")
 	}
-	appendIf("--input-artifact-path", req.InputArtifactPath)
 	return args
 }
 
-func decodeWorkerResponse(stdout []byte) (workerResponse, error) {
-	var response workerResponse
-	if len(bytes.TrimSpace(stdout)) == 0 {
-		return response, fmt.Errorf("%s worker produced empty stdout", runtimeName)
-	}
-	if err := json.Unmarshal(stdout, &response); err != nil {
-		return response, fmt.Errorf("%s worker output is not valid JSON: %w", runtimeName, err)
-	}
-	return response, nil
-}
+// --- Status derivation from verk protocol blocks ---
 
-func decodeReviewResponse(stdout []byte) (reviewResponse, error) {
-	var response reviewResponse
-	if len(bytes.TrimSpace(stdout)) == 0 {
-		return response, fmt.Errorf("%s reviewer produced empty stdout", runtimeName)
+func deriveWorkerStatus(block runtime.VerkResultBlock, found, cliOK bool, exitCode int, stderr []byte) runtime.WorkerStatus {
+	if found {
+		if status, ok := normalizeWorkerStatusString(block.Status); ok {
+			return status
+		}
 	}
-	if err := json.Unmarshal(stdout, &response); err != nil {
-		return response, fmt.Errorf("%s reviewer output is not valid JSON: %w", runtimeName, err)
-	}
-	return response, nil
-}
-
-func normalizeWorkerStatus(raw string, exitCode int, stderr []byte) runtime.WorkerStatus {
-	if status, ok := normalizeWorkerStatusString(raw); ok {
-		return status
-	}
-	if exitCode == 0 {
+	if cliOK && exitCode == 0 {
 		return runtime.WorkerStatusDone
 	}
 	if looksLikeMissingContext(stderr) {
@@ -391,33 +301,38 @@ func normalizeWorkerStatus(raw string, exitCode int, stderr []byte) runtime.Work
 	return runtime.WorkerStatusBlocked
 }
 
-func normalizeReviewStatus(statusRaw, reviewStatusRaw string, findings []runtime.ReviewFinding, threshold runtime.Severity, exitCode int, stderr []byte) runtime.WorkerStatus {
-	if status, ok := normalizeWorkerStatusString(statusRaw); ok {
-		return status
+func deriveWorkerCompletionCode(block runtime.VerkResultBlock, found bool, exitCode int) string {
+	if found && strings.TrimSpace(block.CompletionCode) != "" {
+		return strings.TrimSpace(block.CompletionCode)
 	}
-	if exitCode == 0 {
-		if deriveReviewStatus(findings, threshold) == runtime.ReviewStatusFindings {
-			return runtime.WorkerStatusDoneWithConcerns
-		}
-		if reviewStatus, err := normalizeReviewStatusString(reviewStatusRaw); err == nil && reviewStatus == runtime.ReviewStatusFindings {
-			return runtime.WorkerStatusDoneWithConcerns
-		}
-		return runtime.WorkerStatusDone
+	if found && strings.TrimSpace(block.Status) != "" {
+		return strings.TrimSpace(block.Status)
 	}
-	if looksLikeMissingContext(stderr) {
-		return runtime.WorkerStatusNeedsContext
-	}
-	return runtime.WorkerStatusBlocked
+	return fmt.Sprintf("exit_%d", exitCode)
 }
 
-func normalizeRetryClass(raw string, statusRaw string, exitCode int, stderr []byte) runtime.RetryClass {
-	if retryClass, ok := normalizeRetryClassString(raw); ok {
-		return retryClass
+func deriveWorkerConcerns(block runtime.VerkResultBlock, found bool) []string {
+	if found && len(block.Concerns) > 0 {
+		return block.Concerns
 	}
-	if status, ok := normalizeWorkerStatusString(statusRaw); ok {
-		return retryClassForStatus(status, exitCode, stderr)
+	return nil
+}
+
+func deriveWorkerBlockReason(block runtime.VerkResultBlock, found bool) string {
+	if found {
+		return strings.TrimSpace(block.BlockReason)
 	}
-	if exitCode == 0 {
+	return ""
+}
+
+func deriveWorkerRetryClass(block runtime.VerkResultBlock, found, cliOK bool, exitCode int, stderr []byte) runtime.RetryClass {
+	if found {
+		status, ok := normalizeWorkerStatusString(block.Status)
+		if ok {
+			return retryClassForStatus(status, exitCode, stderr)
+		}
+	}
+	if cliOK && exitCode == 0 {
 		return runtime.RetryClassTerminal
 	}
 	if looksLikeTransientFailure(stderr) {
@@ -429,75 +344,54 @@ func normalizeRetryClass(raw string, statusRaw string, exitCode int, stderr []by
 	return runtime.RetryClassRetryable
 }
 
-func retryClassForStatus(status runtime.WorkerStatus, exitCode int, stderr []byte) runtime.RetryClass {
-	switch status {
-	case runtime.WorkerStatusDone, runtime.WorkerStatusDoneWithConcerns:
-		return runtime.RetryClassTerminal
-	case runtime.WorkerStatusNeedsContext, runtime.WorkerStatusBlocked:
-		if exitCode != 0 && looksLikeTransientFailure(stderr) {
-			return runtime.RetryClassRetryable
+func deriveReviewWorkerStatus(block runtime.VerkReviewBlock, found, cliOK bool, findings []runtime.ReviewFinding, threshold runtime.Severity, exitCode int, stderr []byte) runtime.WorkerStatus {
+	if cliOK && exitCode == 0 {
+		if deriveReviewStatus(findings, threshold) == runtime.ReviewStatusFindings {
+			return runtime.WorkerStatusDoneWithConcerns
 		}
-		return runtime.RetryClassBlockedByOperatorInput
-	default:
-		if exitCode == 0 {
-			return runtime.RetryClassTerminal
-		}
-		return runtime.RetryClassRetryable
+		return runtime.WorkerStatusDone
 	}
+	if looksLikeMissingContext(stderr) {
+		return runtime.WorkerStatusNeedsContext
+	}
+	return runtime.WorkerStatusBlocked
 }
 
-func normalizeCompletionCode(raw, statusRaw string, exitCode int) string {
-	if strings.TrimSpace(raw) != "" {
-		return strings.TrimSpace(raw)
-	}
-	if status, ok := normalizeWorkerStatusString(statusRaw); ok {
-		return string(status)
+func deriveReviewCompletionCode(block runtime.VerkReviewBlock, found bool, exitCode int) string {
+	if found && strings.TrimSpace(block.ReviewStatus) != "" {
+		return strings.TrimSpace(block.ReviewStatus)
 	}
 	return fmt.Sprintf("exit_%d", exitCode)
 }
 
-func normalizeWorkerStatusString(raw string) (runtime.WorkerStatus, bool) {
-	switch normalizeKey(raw) {
-	case "done", "completed", "complete", "success", "passed", "ok":
-		return runtime.WorkerStatusDone, true
-	case "done_with_concerns", "donewithconcerns", "concerns":
-		return runtime.WorkerStatusDoneWithConcerns, true
-	case "needs_context", "needscontext", "context_needed", "needs-more-context":
-		return runtime.WorkerStatusNeedsContext, true
-	case "blocked", "blocked_by_operator_input", "blockedbyoperatorinput":
-		return runtime.WorkerStatusBlocked, true
-	default:
-		return "", false
+func deriveReviewRetryClass(block runtime.VerkReviewBlock, found, cliOK bool, exitCode int, stderr []byte) runtime.RetryClass {
+	if cliOK && exitCode == 0 {
+		return runtime.RetryClassTerminal
 	}
+	if looksLikeTransientFailure(stderr) {
+		return runtime.RetryClassRetryable
+	}
+	if looksLikeMissingContext(stderr) {
+		return runtime.RetryClassBlockedByOperatorInput
+	}
+	return runtime.RetryClassRetryable
 }
 
-func normalizeRetryClassString(raw string) (runtime.RetryClass, bool) {
-	switch normalizeKey(raw) {
-	case "retryable", "retry", "transient":
-		return runtime.RetryClassRetryable, true
-	case "terminal", "final", "done":
-		return runtime.RetryClassTerminal, true
-	case "blocked_by_operator_input", "blockedbyoperatorinput", "operator_input", "needs_context", "needscontext":
-		return runtime.RetryClassBlockedByOperatorInput, true
-	default:
-		return "", false
+func extractReviewSummary(block runtime.VerkReviewBlock, found bool) string {
+	if found {
+		return strings.TrimSpace(block.Summary)
 	}
+	return ""
 }
 
-func normalizeReviewStatusString(raw string) (runtime.ReviewStatus, error) {
-	switch normalizeKey(raw) {
-	case "passed", "pass", "clean", "ok":
-		return runtime.ReviewStatusPassed, nil
-	case "findings", "failed", "fail", "issues":
-		return runtime.ReviewStatusFindings, nil
-	default:
-		return "", fmt.Errorf("invalid review status %q", raw)
-	}
-}
+// --- Finding normalization from verk-review blocks ---
 
-func normalizeFindings(rawFindings []rawFinding) ([]runtime.ReviewFinding, error) {
-	findings := make([]runtime.ReviewFinding, 0, len(rawFindings))
-	for i, raw := range rawFindings {
+func normalizeBlockFindings(block runtime.VerkReviewBlock, found bool) ([]runtime.ReviewFinding, error) {
+	if !found {
+		return nil, nil
+	}
+	findings := make([]runtime.ReviewFinding, 0, len(block.Findings))
+	for i, raw := range block.Findings {
 		finding, err := normalizeFinding(i, raw)
 		if err != nil {
 			return nil, err
@@ -507,7 +401,7 @@ func normalizeFindings(rawFindings []rawFinding) ([]runtime.ReviewFinding, error
 	return findings, nil
 }
 
-func normalizeFinding(index int, raw rawFinding) (runtime.ReviewFinding, error) {
+func normalizeFinding(index int, raw runtime.RawFinding) (runtime.ReviewFinding, error) {
 	severity, err := normalizeSeverity(raw.Severity)
 	if err != nil {
 		return runtime.ReviewFinding{}, err
@@ -544,12 +438,20 @@ func normalizeFinding(index int, raw rawFinding) (runtime.ReviewFinding, error) 
 		Line:         raw.Line,
 		Disposition:  disposition,
 		WaivedBy:     strings.TrimSpace(raw.WaivedBy),
-		WaivedAt:     raw.WaivedAt,
 		WaiverReason: strings.TrimSpace(raw.WaiverReason),
 	}
-	if raw.WaiverExpiresAt != nil {
-		expiresAt := raw.WaiverExpiresAt.UTC()
-		finding.WaiverExpiresAt = &expiresAt
+	if raw.WaivedAt != "" {
+		t, err := time.Parse(time.RFC3339, raw.WaivedAt)
+		if err == nil {
+			finding.WaivedAt = t.UTC()
+		}
+	}
+	if raw.WaiverExpiresAt != nil && *raw.WaiverExpiresAt != "" {
+		t, err := time.Parse(time.RFC3339, *raw.WaiverExpiresAt)
+		if err == nil {
+			expiresAt := t.UTC()
+			finding.WaiverExpiresAt = &expiresAt
+		}
 	}
 	if finding.Disposition == runtime.ReviewDispositionWaived {
 		if finding.WaivedBy == "" {
@@ -563,6 +465,33 @@ func normalizeFinding(index int, raw rawFinding) (runtime.ReviewFinding, error) 
 		}
 	}
 	return finding, nil
+}
+
+// checkReviewStatusContradiction detects when the reviewer's self-reported
+// review_status disagrees with the status derived from their findings.
+// This catches cases like a reviewer claiming "passed" while reporting blocking
+// findings, or claiming "findings" when no blocking findings exist.
+func checkReviewStatusContradiction(block runtime.VerkReviewBlock, blockFound bool, derived runtime.ReviewStatus) error {
+	if !blockFound {
+		return nil
+	}
+	raw := normalizeKey(block.ReviewStatus)
+	if raw == "" {
+		return nil
+	}
+	var selfReported runtime.ReviewStatus
+	switch raw {
+	case "passed":
+		selfReported = runtime.ReviewStatusPassed
+	case "findings":
+		selfReported = runtime.ReviewStatusFindings
+	default:
+		return nil
+	}
+	if selfReported != derived {
+		return fmt.Errorf("reviewer self-reported review_status %q contradicts derived status %q from findings", selfReported, derived)
+	}
+	return nil
 }
 
 func deriveReviewStatus(findings []runtime.ReviewFinding, threshold runtime.Severity) runtime.ReviewStatus {
@@ -596,6 +525,40 @@ func normalizeDisposition(raw string) (runtime.ReviewDisposition, error) {
 		return runtime.ReviewDispositionWaived, nil
 	default:
 		return "", fmt.Errorf("invalid review disposition %q", raw)
+	}
+}
+
+// --- Shared helpers ---
+
+func retryClassForStatus(status runtime.WorkerStatus, exitCode int, stderr []byte) runtime.RetryClass {
+	switch status {
+	case runtime.WorkerStatusDone, runtime.WorkerStatusDoneWithConcerns:
+		return runtime.RetryClassTerminal
+	case runtime.WorkerStatusNeedsContext, runtime.WorkerStatusBlocked:
+		if exitCode != 0 && looksLikeTransientFailure(stderr) {
+			return runtime.RetryClassRetryable
+		}
+		return runtime.RetryClassBlockedByOperatorInput
+	default:
+		if exitCode == 0 {
+			return runtime.RetryClassTerminal
+		}
+		return runtime.RetryClassRetryable
+	}
+}
+
+func normalizeWorkerStatusString(raw string) (runtime.WorkerStatus, bool) {
+	switch normalizeKey(raw) {
+	case "done", "completed", "complete", "success", "passed", "ok":
+		return runtime.WorkerStatusDone, true
+	case "done_with_concerns", "donewithconcerns", "concerns":
+		return runtime.WorkerStatusDoneWithConcerns, true
+	case "needs_context", "needscontext", "context_needed", "needs_more_context":
+		return runtime.WorkerStatusNeedsContext, true
+	case "blocked", "blocked_by_operator_input", "blockedbyoperatorinput":
+		return runtime.WorkerStatusBlocked, true
+	default:
+		return "", false
 	}
 }
 
@@ -709,28 +672,12 @@ func encodeJSON(file *os.File, payload any) error {
 	return encoder.Encode(payload)
 }
 
-func runtimeCommandEnv(cfg runtime.ExecutionConfig) []string {
-	names := make([]string, 0, len(runtimeEnvAllowlist)+len(cfg.AuthEnvVars))
-	names = append(names, runtimeEnvAllowlist...)
-	names = append(names, cfg.AuthEnvVars...)
-
-	seen := make(map[string]struct{}, len(names))
-	env := make([]string, 0, len(names))
-	for _, name := range names {
-		key := strings.TrimSpace(name)
-		if key == "" {
-			continue
-		}
-		if _, ok := seen[key]; ok {
-			continue
-		}
-		seen[key] = struct{}{}
-		if value, ok := os.LookupEnv(key); ok {
-			env = append(env, key+"="+value)
-		}
-	}
-	sort.Strings(env)
-	return env
+// runtimeCommandEnv returns nil to inherit the full parent environment.
+// Claude Code needs access to auth credentials (keychain, ~/.claude/) which
+// require the ambient environment. Config-specified AuthEnvVars are informational
+// only — they document which vars the runtime expects but don't restrict the env.
+func runtimeCommandEnv(_ runtime.ExecutionConfig) []string {
+	return nil
 }
 
 func runtimeCommandTimeout(minutes int) time.Duration {
@@ -738,4 +685,12 @@ func runtimeCommandTimeout(minutes int) time.Duration {
 		return 0
 	}
 	return time.Duration(minutes) * time.Minute
+}
+
+func safeRawJSON(data []byte) json.RawMessage {
+	if json.Valid(data) {
+		return json.RawMessage(data)
+	}
+	escaped, _ := json.Marshal(string(data))
+	return json.RawMessage(escaped)
 }

@@ -20,10 +20,12 @@ const (
 	gateArtifactIntegrity = "artifact_integrity"
 	gatePassed            = "passed"
 	gateFailed            = "failed"
-	defaultEvidenceSource = "verification.json"
-	defaultReviewSource   = "review-findings.json"
-	defaultArtifactSource = "artifact.json"
-	defaultCriteriaPrefix = "criterion-"
+	defaultEvidenceSource        = "verification.json"
+	defaultReviewSource          = "review-findings.json"
+	defaultArtifactSource        = "artifact.json"
+	defaultDiffSource            = "implementation.json"
+	defaultResultArtifactSource  = "result-artifacts.json"
+	defaultCriteriaPrefix        = "criterion-"
 )
 
 type closeoutRequest struct {
@@ -31,6 +33,7 @@ type closeoutRequest struct {
 	plan              state.PlanArtifact
 	verification      *state.VerificationArtifact
 	review            *state.ReviewFindingsArtifact
+	implementation    *state.ImplementationArtifact
 	criteriaEvidence  []state.CriteriaEvidence
 	requiredArtifacts []string
 }
@@ -181,6 +184,11 @@ func parseCloseoutRequest(args ...any) (closeoutRequest, error) {
 			req.review = &tmp
 		case *state.ReviewFindingsArtifact:
 			req.review = v
+		case state.ImplementationArtifact:
+			tmp := v
+			req.implementation = &tmp
+		case *state.ImplementationArtifact:
+			req.implementation = v
 		case []state.CriteriaEvidence:
 			req.criteriaEvidence = append([]state.CriteriaEvidence(nil), v...)
 		case []string:
@@ -654,6 +662,9 @@ func deriveCriteriaEvidence(req closeoutRequest) []state.CriteriaEvidence {
 		}
 	}
 
+	runID := currentRunIDForEvidence(req)
+	attempt := evidenceAttempt(req)
+
 	out := make([]state.CriteriaEvidence, 0, count)
 	for i, criterion := range criteria {
 		out = append(out, state.CriteriaEvidence{
@@ -662,13 +673,66 @@ func deriveCriteriaEvidence(req closeoutRequest) []state.CriteriaEvidence {
 			EvidenceType:  sourceType,
 			Source:        sourceRef,
 			Summary:       summary,
-			RunID:         currentRunIDForEvidence(req),
+			RunID:         runID,
 			TicketID:      req.ticket.ID,
-			Attempt:       evidenceAttempt(req),
+			Attempt:       attempt,
 			ArtifactRef:   fmt.Sprintf("%s#%d", sourceRef, i+1),
 		})
 	}
+
+	// Append diff evidence from implementation artifact changed files.
+	if impl := req.implementation; impl != nil && len(impl.ChangedFiles) > 0 {
+		diffSource := defaultDiffSource
+		diffSummary := diffEvidenceSummary(impl.ChangedFiles)
+		for i, criterion := range criteria {
+			out = append(out, state.CriteriaEvidence{
+				CriterionID:   criterion.ID,
+				CriterionText: criterion.Text,
+				EvidenceType:  "diff",
+				Source:        diffSource,
+				Summary:       diffSummary,
+				RunID:         runID,
+				TicketID:      req.ticket.ID,
+				Attempt:       attempt,
+				ArtifactRef:   fmt.Sprintf("%s#%d", diffSource, i+1),
+			})
+		}
+	}
+
+	// Append artifact evidence from implementation artifact result artifacts.
+	if impl := req.implementation; impl != nil && len(impl.Artifacts) > 0 {
+		artifactSource := defaultResultArtifactSource
+		artifactSummary := artifactEvidenceSummary(impl.Artifacts)
+		for i, criterion := range criteria {
+			out = append(out, state.CriteriaEvidence{
+				CriterionID:   criterion.ID,
+				CriterionText: criterion.Text,
+				EvidenceType:  "artifact",
+				Source:        artifactSource,
+				Summary:       artifactSummary,
+				RunID:         runID,
+				TicketID:      req.ticket.ID,
+				Attempt:       attempt,
+				ArtifactRef:   fmt.Sprintf("%s#%d", artifactSource, i+1),
+			})
+		}
+	}
+
 	return out
+}
+
+func diffEvidenceSummary(changedFiles []string) string {
+	if len(changedFiles) == 1 {
+		return fmt.Sprintf("diff: 1 file changed: %s", changedFiles[0])
+	}
+	return fmt.Sprintf("diff: %d files changed: %s", len(changedFiles), strings.Join(changedFiles, ", "))
+}
+
+func artifactEvidenceSummary(artifacts []string) string {
+	if len(artifacts) == 1 {
+		return fmt.Sprintf("artifact produced: %s", artifacts[0])
+	}
+	return fmt.Sprintf("%d artifacts produced: %s", len(artifacts), strings.Join(artifacts, ", "))
 }
 
 func planCriteria(plan state.PlanArtifact) []state.PlanCriterion {

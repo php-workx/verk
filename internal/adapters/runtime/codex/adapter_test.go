@@ -28,38 +28,35 @@ func TestRunWorker_NormalizesAndCapturesArtifacts(t *testing.T) {
 		times = times[1:]
 		return value
 	}
-	t.Setenv("VERK_API_KEY", "test-key")
-	t.Setenv("VERK_SECRET_TOKEN", "should-not-leak")
-
 	runCommand = func(ctx context.Context, binary string, args []string, stdin []byte, env []string, timeout time.Duration) (commandResult, error) {
 		t.Helper()
 		if binary != "codex-test" {
 			t.Fatalf("expected binary codex-test, got %q", binary)
 		}
-		if !hasArg(args, "worker") {
-			t.Fatalf("expected worker subcommand in args: %v", args)
+		if !hasArg(args, "exec") {
+			t.Fatalf("expected exec subcommand in args: %v", args)
 		}
-		assertArgValue(t, args, "--lease-id", "lease-1")
-		assertArgValue(t, args, "--runtime", runtimeName)
+		if !hasArg(args, "--json") {
+			t.Fatalf("expected --json flag in args: %v", args)
+		}
+		if !hasArg(args, "--full-auto") {
+			t.Fatalf("expected --full-auto flag in args: %v", args)
+		}
 
-		var req runtime.WorkerRequest
-		if err := json.Unmarshal(stdin, &req); err != nil {
-			t.Fatalf("unexpected worker request payload: %v", err)
+		lastArg := args[len(args)-1]
+		if !strings.Contains(lastArg, "ticket-1") {
+			t.Fatalf("expected prompt to contain ticket id, got last arg: %s", lastArg)
 		}
-		if req.LeaseID != "lease-1" {
-			t.Fatalf("expected lease id lease-1, got %q", req.LeaseID)
-		}
-		if req.Runtime != runtimeName {
-			t.Fatalf("expected runtime %q, got %q", runtimeName, req.Runtime)
-		}
+
 		if timeout != 7*time.Minute {
 			t.Fatalf("expected worker timeout 7m, got %s", timeout)
 		}
-		assertEnvValue(t, env, "VERK_API_KEY", "test-key")
-		assertEnvMissing(t, env, "VERK_SECRET_TOKEN")
+
+		// AI returns JSON-only as instructed
+		outputJSON := `{"status":"done_with_concerns","completion_code":"ok","concerns":["minor style issue"]}`
 
 		return commandResult{
-			stdout:   []byte(`{"status":"done_with_concerns","completion_code":"ok","lease_id":"lease-1","result_artifact_path":"runtime-worker.json"}`),
+			stdout:   []byte(outputJSON),
 			stderr:   []byte("worker log"),
 			exitCode: 0,
 		}, nil
@@ -87,19 +84,14 @@ func TestRunWorker_NormalizesAndCapturesArtifacts(t *testing.T) {
 	if result.RetryClass != runtime.RetryClassTerminal {
 		t.Fatalf("expected terminal retry class, got %q", result.RetryClass)
 	}
+	if len(result.Concerns) != 1 || result.Concerns[0] != "minor style issue" {
+		t.Fatalf("expected concerns [minor style issue], got %v", result.Concerns)
+	}
 	if result.LeaseID != "lease-1" {
 		t.Fatalf("expected lease id lease-1, got %q", result.LeaseID)
 	}
 	if result.StdoutPath == "" || result.StderrPath == "" || result.ResultArtifactPath == "" {
 		t.Fatalf("expected captured artifact paths, got %#v", result)
-	}
-
-	stdoutBytes, err := os.ReadFile(result.StdoutPath)
-	if err != nil {
-		t.Fatalf("read stdout artifact: %v", err)
-	}
-	if string(stdoutBytes) != `{"status":"done_with_concerns","completion_code":"ok","lease_id":"lease-1","result_artifact_path":"runtime-worker.json"}` {
-		t.Fatalf("unexpected stdout capture: %s", string(stdoutBytes))
 	}
 
 	stderrBytes, err := os.ReadFile(result.StderrPath)
@@ -144,42 +136,23 @@ func TestRunReviewer_NormalizesFindingsAndDerivesStatus(t *testing.T) {
 		times = times[1:]
 		return value
 	}
-	t.Setenv("VERK_API_KEY", "review-key")
-	t.Setenv("VERK_SECRET_TOKEN", "should-not-leak")
-
 	runCommand = func(ctx context.Context, binary string, args []string, stdin []byte, env []string, timeout time.Duration) (commandResult, error) {
 		t.Helper()
 		if binary != "codex-test" {
 			t.Fatalf("expected binary codex-test, got %q", binary)
 		}
-		if !hasArg(args, "review") {
-			t.Fatalf("expected review subcommand in args: %v", args)
-		}
-		assertArgValue(t, args, "--lease-id", "lease-2")
-		assertArgValue(t, args, "--runtime", runtimeName)
-		assertArgValue(t, args, "--effective-review-threshold", string(runtime.SeverityP2))
-		if !hasArg(args, "--fresh-context") {
-			t.Fatalf("expected fresh reviewer flag in args: %v", args)
+		if !hasArg(args, "exec") {
+			t.Fatalf("expected exec subcommand in args: %v", args)
 		}
 
-		var req runtime.ReviewRequest
-		if err := json.Unmarshal(stdin, &req); err != nil {
-			t.Fatalf("unexpected review request payload: %v", err)
-		}
-		if req.LeaseID != "lease-2" {
-			t.Fatalf("expected lease id lease-2, got %q", req.LeaseID)
-		}
-		if req.Runtime != runtimeName {
-			t.Fatalf("expected runtime %q, got %q", runtimeName, req.Runtime)
-		}
 		if timeout != 9*time.Minute {
 			t.Fatalf("expected reviewer timeout 9m, got %s", timeout)
 		}
-		assertEnvValue(t, env, "VERK_API_KEY", "review-key")
-		assertEnvMissing(t, env, "VERK_SECRET_TOKEN")
+
+		outputJSON := `{"review_status":"findings","summary":"needs fixes","findings":[{"severity":"P2","title":"blocking issue","body":"blocking issue","file":"internal/example.go","line":12,"disposition":"open"}]}`
 
 		return commandResult{
-			stdout: []byte(`{"status":"done","completion_code":"reviewed","lease_id":"lease-2","review_status":"findings","summary":"needs fixes","findings":[{"severity":"p2","title":"blocking issue","body":"blocking issue","file":"internal/example.go","line":12,"disposition":"open"}]}`),
+			stdout: []byte(outputJSON),
 			stderr: []byte("review log"),
 		}, nil
 	}
@@ -199,8 +172,8 @@ func TestRunReviewer_NormalizesFindingsAndDerivesStatus(t *testing.T) {
 		t.Fatalf("RunReviewer returned error: %v", err)
 	}
 
-	if result.Status != runtime.WorkerStatusDone {
-		t.Fatalf("expected done review process status, got %q", result.Status)
+	if result.Status != runtime.WorkerStatusDoneWithConcerns {
+		t.Fatalf("expected done_with_concerns review process status, got %q", result.Status)
 	}
 	if result.ReviewStatus != runtime.ReviewStatusFindings {
 		t.Fatalf("expected findings review status, got %q", result.ReviewStatus)
@@ -220,9 +193,12 @@ func TestRunReviewer_NormalizesFindingsAndDerivesStatus(t *testing.T) {
 	if result.Findings[0].Disposition != runtime.ReviewDispositionOpen {
 		t.Fatalf("expected canonical open disposition, got %q", result.Findings[0].Disposition)
 	}
+	if result.Summary != "needs fixes" {
+		t.Fatalf("expected summary 'needs fixes', got %q", result.Summary)
+	}
 }
 
-func TestRunReviewer_RejectsContradictoryReviewStatus(t *testing.T) {
+func TestRunReviewer_PassedReview(t *testing.T) {
 	oldRunCommand := runCommand
 	oldNow := now
 	defer func() {
@@ -235,21 +211,25 @@ func TestRunReviewer_RejectsContradictoryReviewStatus(t *testing.T) {
 	}
 
 	runCommand = func(ctx context.Context, binary string, args []string, stdin []byte, env []string, timeout time.Duration) (commandResult, error) {
+		outputJSON := `{"review_status":"passed","summary":"clean implementation","findings":[]}`
 		return commandResult{
-			stdout: []byte(`{"status":"done","lease_id":"lease-3","review_status":"passed","summary":"looks good","findings":[{"severity":"P2","title":"blocking issue","body":"blocking issue","file":"internal/example.go","line":12,"disposition":"open"}]}`),
+			stdout: []byte(outputJSON),
 		}, nil
 	}
 
 	adapter := NewWithCommand("codex-test")
-	_, err := adapter.RunReviewer(context.Background(), runtime.ReviewRequest{
+	result, err := adapter.RunReviewer(context.Background(), runtime.ReviewRequest{
 		LeaseID:                  "lease-3",
 		EffectiveReviewThreshold: runtime.SeverityP2,
 	})
-	if err == nil {
-		t.Fatalf("expected contradictory review status to fail")
+	if err != nil {
+		t.Fatalf("RunReviewer returned error: %v", err)
 	}
-	if !strings.Contains(err.Error(), "contradicts derived status") {
-		t.Fatalf("unexpected error: %v", err)
+	if result.ReviewStatus != runtime.ReviewStatusPassed {
+		t.Fatalf("expected passed, got %q", result.ReviewStatus)
+	}
+	if result.Status != runtime.WorkerStatusDone {
+		t.Fatalf("expected done, got %q", result.Status)
 	}
 }
 
@@ -274,6 +254,75 @@ func TestCheckAvailability_UsesVersionProbe(t *testing.T) {
 	}
 	if !probed {
 		t.Fatalf("expected availability probe to run")
+	}
+}
+
+func TestRunWorker_FallbackWhenNoJSON(t *testing.T) {
+	oldRunCommand := runCommand
+	oldNow := now
+	defer func() {
+		runCommand = oldRunCommand
+		now = oldNow
+	}()
+
+	now = func() time.Time {
+		return time.Date(2026, 4, 2, 12, 0, 0, 0, time.UTC)
+	}
+
+	runCommand = func(ctx context.Context, binary string, args []string, stdin []byte, env []string, timeout time.Duration) (commandResult, error) {
+		return commandResult{
+			stdout:   []byte("I made all the changes. Everything looks good."),
+			exitCode: 0,
+		}, nil
+	}
+
+	adapter := NewWithCommand("codex-test")
+	result, err := adapter.RunWorker(context.Background(), runtime.WorkerRequest{
+		LeaseID:  "lease-1",
+		TicketID: "ticket-1",
+	})
+	if err != nil {
+		t.Fatalf("RunWorker returned error: %v", err)
+	}
+	if result.Status != runtime.WorkerStatusDone {
+		t.Fatalf("expected done fallback, got %q", result.Status)
+	}
+}
+
+func TestRunWorker_SentinelFallback(t *testing.T) {
+	oldRunCommand := runCommand
+	oldNow := now
+	defer func() {
+		runCommand = oldRunCommand
+		now = oldNow
+	}()
+
+	now = func() time.Time {
+		return time.Date(2026, 4, 2, 12, 0, 0, 0, time.UTC)
+	}
+
+	runCommand = func(ctx context.Context, binary string, args []string, stdin []byte, env []string, timeout time.Duration) (commandResult, error) {
+		// AI mixed prose with a sentinel-prefixed JSON line
+		output := "Done with changes.\nVERK_RESULT:{\"status\":\"done\",\"completion_code\":\"ok\"}"
+		return commandResult{
+			stdout:   []byte(output),
+			exitCode: 0,
+		}, nil
+	}
+
+	adapter := NewWithCommand("codex-test")
+	result, err := adapter.RunWorker(context.Background(), runtime.WorkerRequest{
+		LeaseID:  "lease-1",
+		TicketID: "ticket-1",
+	})
+	if err != nil {
+		t.Fatalf("RunWorker returned error: %v", err)
+	}
+	if result.Status != runtime.WorkerStatusDone {
+		t.Fatalf("expected done via sentinel fallback, got %q", result.Status)
+	}
+	if result.CompletionCode != "ok" {
+		t.Fatalf("expected completion code ok, got %q", result.CompletionCode)
 	}
 }
 

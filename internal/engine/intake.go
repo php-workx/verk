@@ -33,6 +33,8 @@ func BuildPlanArtifact(t tkmd.Ticket, cfg policy.Config) (state.PlanArtifact, er
 			UpdatedAt:     time.Now().UTC(),
 		},
 		TicketID:                 t.ID,
+		Title:                    t.Title,
+		Description:              t.Body,
 		Phase:                    state.TicketPhaseIntake,
 		AcceptanceCriteria:       append([]string(nil), t.AcceptanceCriteria...),
 		Criteria:                 buildPlanCriteria(t.AcceptanceCriteria),

@@ -48,6 +48,12 @@ const (
 	SeverityP4 Severity = "P4"
 )
 
+// Canonical escalation reason prefixes for non-convergent ticket blocking.
+const (
+	EscalationNonConvergentVerification = "non_convergent_verification"
+	EscalationNonConvergentReview       = "non_convergent_review"
+)
+
 type ArtifactMeta struct {
 	SchemaVersion int       `json:"schema_version"`
 	RunID         string    `json:"run_id"`
@@ -96,6 +102,8 @@ type WaveArtifact struct {
 type PlanArtifact struct {
 	ArtifactMeta
 	TicketID                 string          `json:"ticket_id"`
+	Title                    string          `json:"title,omitempty"`
+	Description              string          `json:"description,omitempty"`
 	Phase                    TicketPhase     `json:"phase"`
 	AcceptanceCriteria       []string        `json:"acceptance_criteria"`
 	Criteria                 []PlanCriterion `json:"criteria,omitempty"`
@@ -115,20 +123,21 @@ type PlanCriterion struct {
 
 type ImplementationArtifact struct {
 	ArtifactMeta
-	TicketID       string     `json:"ticket_id"`
-	Attempt        int        `json:"attempt"`
-	Runtime        string     `json:"runtime"`
-	Status         string     `json:"status"`
-	CompletionCode string     `json:"completion_code"`
-	RetryClass     RetryClass `json:"retry_class"`
-	Concerns       []string   `json:"concerns"`
-	FailureReason  string     `json:"failure_reason"`
-	BlockReason    string     `json:"block_reason"`
-	ChangedFiles   []string   `json:"changed_files"`
-	Artifacts      []string   `json:"artifacts"`
-	LeaseID        string     `json:"lease_id"`
-	StartedAt      time.Time  `json:"started_at"`
-	FinishedAt     time.Time  `json:"finished_at"`
+	TicketID          string     `json:"ticket_id"`
+	Attempt           int        `json:"attempt"`
+	Runtime           string     `json:"runtime"`
+	Status            string     `json:"status"`
+	CompletionCode    string     `json:"completion_code"`
+	RetryClass        RetryClass `json:"retry_class"`
+	Concerns          []string   `json:"concerns"`
+	FailureReason     string     `json:"failure_reason"`
+	BlockReason       string     `json:"block_reason"`
+	ChangedFiles      []string   `json:"changed_files"`
+	Artifacts         []string   `json:"artifacts"`
+	LeaseID           string     `json:"lease_id"`
+	InputArtifactPath string     `json:"input_artifact_path,omitempty"`
+	StartedAt         time.Time  `json:"started_at"`
+	FinishedAt        time.Time  `json:"finished_at"`
 }
 
 type VerificationResult struct {

@@ -3,20 +3,31 @@ package engine
 import (
 	"context"
 	"fmt"
+	"path/filepath"
+	"sort"
+	"sync"
+	"time"
 
+	repoadapter "verk/internal/adapters/repo/git"
+	"verk/internal/adapters/runtime"
 	"verk/internal/adapters/ticketstore/tkmd"
+	"verk/internal/policy"
 	"verk/internal/state"
 )
 
 type ResumeRequest struct {
-	RepoRoot string
-	RunID    string
+	RepoRoot       string
+	RunID          string
+	Adapter        runtime.Adapter
+	AdapterFactory func(ticketPreference string) (runtime.Adapter, error)
+	Config         policy.Config
 }
 
 type ResumeReport struct {
 	Run              state.RunArtifact `json:"run"`
 	Status           StatusReport      `json:"status"`
 	RecoveredTickets []string          `json:"recovered_tickets,omitempty"`
+	ResumedTickets   []string          `json:"resumed_tickets,omitempty"`
 }
 
 func ResumeRun(ctx context.Context, req ResumeRequest) (ResumeReport, error) {
@@ -35,6 +46,7 @@ func ResumeRun(ctx context.Context, req ResumeRequest) (ResumeReport, error) {
 		return ResumeReport{}, err
 	}
 
+	// Phase 1: Reconciliation (existing logic)
 	recovered := make([]string, 0)
 	for _, ticketID := range artifacts.Run.TicketIDs {
 		snapshot := artifacts.Tickets[ticketID]
@@ -119,6 +131,38 @@ func ResumeRun(ctx context.Context, req ResumeRequest) (ResumeReport, error) {
 		return ResumeReport{}, err
 	}
 
+	// Phase 2: Re-execution
+	var resumed []string
+	if resumeExecutionAllowed(artifacts.Run, req) {
+		appendRunAuditEvent(&artifacts.Run, "resume_reexecution_start", "", artifacts.Run.CurrentPhase, nil)
+		if err := state.SaveJSONAtomic(runJSONPath(artifacts.RepoRoot, req.RunID), artifacts.Run); err != nil {
+			return ResumeReport{}, err
+		}
+
+		switch artifacts.Run.Mode {
+		case "ticket":
+			resumed, err = resumeTicketMode(ctx, req, &artifacts)
+		case "epic":
+			resumed, err = resumeEpicMode(ctx, req, &artifacts)
+		default:
+			err = fmt.Errorf("unsupported run mode %q for resume", artifacts.Run.Mode)
+		}
+		if err != nil {
+			return ResumeReport{}, err
+		}
+
+		// Re-derive run status after execution
+		updateRunStatusFromTickets(&artifacts.Run, artifacts.Tickets)
+		if len(resumed) > 0 {
+			appendRunAuditEvent(&artifacts.Run, "resume_reexecution_complete", "", artifacts.Run.CurrentPhase, map[string]any{
+				"tickets": resumed,
+			})
+		}
+		if err := state.SaveJSONAtomic(runJSONPath(artifacts.RepoRoot, req.RunID), artifacts.Run); err != nil {
+			return ResumeReport{}, err
+		}
+	}
+
 	status, err := DeriveStatus(StatusRequest{RepoRoot: artifacts.RepoRoot, RunID: req.RunID})
 	if err != nil {
 		return ResumeReport{}, err
@@ -127,7 +171,348 @@ func ResumeRun(ctx context.Context, req ResumeRequest) (ResumeReport, error) {
 		Run:              artifacts.Run,
 		Status:           status,
 		RecoveredTickets: recovered,
+		ResumedTickets:   resumed,
 	}, nil
+}
+
+// resumeExecutionAllowed returns true if the run has non-terminal tickets
+// and the caller provided a runtime adapter for re-execution.
+func resumeExecutionAllowed(run state.RunArtifact, req ResumeRequest) bool {
+	if req.Adapter == nil && req.AdapterFactory == nil {
+		return false
+	}
+	return run.Status == state.EpicRunStatusRunning
+}
+
+// resumeTicketMode re-executes non-terminal tickets in a ticket-mode run.
+func resumeTicketMode(ctx context.Context, req ResumeRequest, artifacts *runArtifacts) ([]string, error) {
+	var resumed []string
+	for _, ticketID := range artifacts.Run.TicketIDs {
+		if err := ctx.Err(); err != nil {
+			return resumed, err
+		}
+		snapshot := artifacts.Tickets[ticketID]
+		if isTerminalPhase(snapshot.CurrentPhase) {
+			continue
+		}
+
+		// Release existing claim so we can re-acquire
+		_ = tkmd.ReleaseClaim(artifacts.RepoRoot, req.RunID, ticketID, "resume_reacquisition")
+
+		// Re-acquire claim
+		leaseID := fmt.Sprintf("lease-resume-%s-%d", req.RunID, time.Now().UTC().UnixNano())
+		claim, err := tkmd.AcquireClaim(artifacts.RepoRoot, req.RunID, ticketID, leaseID, 30*time.Minute, time.Now().UTC())
+		if err != nil {
+			return resumed, fmt.Errorf("resume claim for ticket %s: %w", ticketID, err)
+		}
+
+		// Load ticket markdown
+		ticket, err := tkmd.LoadTicket(ticketMarkdownPath(artifacts.RepoRoot, ticketID))
+		if err != nil {
+			return resumed, fmt.Errorf("load ticket %s: %w", ticketID, err)
+		}
+		ticket.Status = tkmd.StatusInProgress
+
+		// Load or build plan
+		plan, ok := artifacts.Plans[ticketID]
+		if !ok {
+			plan, err = BuildPlanArtifact(ticket, req.Config)
+			if err != nil {
+				return resumed, fmt.Errorf("build plan for ticket %s: %w", ticketID, err)
+			}
+			plan.RunID = req.RunID
+		}
+		// Resume at implement phase (the furthest-back supported entry point)
+		plan.Phase = state.TicketPhaseImplement
+
+		// Resolve adapter
+		adapter, err := resumeAdapter(req, plan)
+		if err != nil {
+			return resumed, fmt.Errorf("adapter for ticket %s: %w", ticketID, err)
+		}
+
+		// Execute ticket
+		result, runErr := RunTicket(ctx, RunTicketRequest{
+			RepoRoot:             artifacts.RepoRoot,
+			RunID:                req.RunID,
+			BaseCommit:           artifacts.Run.BaseCommit,
+			Ticket:               ticket,
+			Plan:                 plan,
+			Claim:                claim,
+			Adapter:              adapter,
+			Config:               req.Config,
+			VerificationCommands: plan.ValidationCommands,
+		})
+		if runErr != nil {
+			return resumed, fmt.Errorf("run ticket %s: %w", ticketID, runErr)
+		}
+
+		// Update artifacts with result
+		artifacts.Tickets[ticketID] = result.Snapshot
+
+		// Update ticket store
+		switch result.Snapshot.CurrentPhase {
+		case state.TicketPhaseClosed:
+			ticket.Status = tkmd.StatusClosed
+		case state.TicketPhaseBlocked:
+			ticket.Status = tkmd.StatusBlocked
+		default:
+			ticket.Status = tkmd.StatusBlocked
+		}
+		if err := tkmd.SaveTicket(ticketMarkdownPath(artifacts.RepoRoot, ticketID), ticket); err != nil {
+			return resumed, err
+		}
+
+		resumed = append(resumed, ticketID)
+	}
+	return resumed, nil
+}
+
+// resumeEpicMode re-enters the wave loop for an epic-mode run,
+// skipping already-completed waves.
+func resumeEpicMode(ctx context.Context, req ResumeRequest, artifacts *runArtifacts) ([]string, error) {
+	cfg := normalizeEpicConfig(req.Config)
+	repo, err := repoadapter.New(artifacts.RepoRoot)
+	if err != nil {
+		return nil, err
+	}
+
+	// Determine the last completed wave ordinal from ResumeCursor
+	lastWaveOrdinal := resumeCursorWaveOrdinal(artifacts.Run.ResumeCursor)
+	waveOrdinal := lastWaveOrdinal
+
+	baseCommit := artifacts.Run.BaseCommit
+
+	// Reset non-terminal tickets to "ready" so ListReadyChildren can pick them up
+	for _, ticketID := range artifacts.Run.TicketIDs {
+		snapshot := artifacts.Tickets[ticketID]
+		if isTerminalPhase(snapshot.CurrentPhase) {
+			continue
+		}
+		// Release existing claim
+		_ = tkmd.ReleaseClaim(artifacts.RepoRoot, req.RunID, ticketID, "resume_reacquisition")
+		// Reset ticket store status to ready
+		if err := setTicketReady(artifacts.RepoRoot, ticketID); err != nil {
+			return nil, fmt.Errorf("reset ticket %s to ready: %w", ticketID, err)
+		}
+	}
+
+	// Build an epic request for use by executeEpicTicket
+	epicReq := RunEpicRequest{
+		RepoRoot:     artifacts.RepoRoot,
+		RunID:        req.RunID,
+		RootTicketID: artifacts.Run.RootTicketID,
+		BaseBranch:   artifacts.Run.BaseBranch,
+		BaseCommit:   baseCommit,
+		Adapter:      req.Adapter,
+		AdapterFactory: req.AdapterFactory,
+		Config:       cfg,
+	}
+
+	var allResumed []string
+	runPath := runJSONPath(artifacts.RepoRoot, req.RunID)
+
+	for {
+		if err := ctx.Err(); err != nil {
+			return allResumed, err
+		}
+
+		ready, err := tkmd.ListReadyChildren(artifacts.RepoRoot, artifacts.Run.RootTicketID, req.RunID)
+		if err != nil {
+			return allResumed, err
+		}
+		if len(ready) == 0 {
+			// Determine final epic status
+			currentChildren, err := listEpicChildren(artifacts.RepoRoot, artifacts.Run.RootTicketID)
+			if err != nil {
+				return allResumed, err
+			}
+			status := epicCompletionStatus(currentChildren)
+			artifacts.Run.Status = status
+			switch status {
+			case state.EpicRunStatusCompleted:
+				artifacts.Run.CurrentPhase = state.TicketPhaseClosed
+			case state.EpicRunStatusBlocked:
+				artifacts.Run.CurrentPhase = state.TicketPhaseBlocked
+			default:
+				artifacts.Run.CurrentPhase = state.TicketPhaseImplement
+			}
+			artifacts.Run.UpdatedAt = time.Now().UTC()
+			if err := state.SaveJSONAtomic(runPath, artifacts.Run); err != nil {
+				return allResumed, err
+			}
+			return allResumed, nil
+		}
+
+		wave, err := BuildWave(ready, cfg.Scheduler.MaxConcurrency)
+		if err != nil {
+			artifacts.Run.Status = state.EpicRunStatusBlocked
+			artifacts.Run.CurrentPhase = state.TicketPhaseBlocked
+			artifacts.Run.UpdatedAt = time.Now().UTC()
+			_ = state.SaveJSONAtomic(runPath, artifacts.Run)
+			return allResumed, err
+		}
+
+		waveOrdinal++
+		waveID := fmt.Sprintf("wave-%d", waveOrdinal)
+		wave.WaveID = waveID
+		wave.Ordinal = waveOrdinal
+		wave.Status = state.WaveStatusRunning
+		wave.WaveBaseCommit = baseCommit
+		wave.StartedAt = time.Now().UTC()
+		wavePath := filepath.Join(artifacts.RepoRoot, ".verk", "runs", req.RunID, "waves", waveID+".json")
+		if err := state.SaveJSONAtomic(wavePath, wave); err != nil {
+			return allResumed, err
+		}
+
+		waveBaselineChangedFiles, err := repo.ChangedFilesAgainst(baseCommit)
+		if err != nil {
+			return allResumed, err
+		}
+		waveBaselineChangedFiles = filterEngineOwnedFiles(waveBaselineChangedFiles)
+		if artifacts.Run.ResumeCursor == nil {
+			artifacts.Run.ResumeCursor = map[string]any{}
+		}
+		artifacts.Run.ResumeCursor["wave_baseline_changed_files"] = append([]string(nil), waveBaselineChangedFiles...)
+
+		// Execute wave tickets in parallel
+		outcomes := make([]waveTicketOutcome, len(wave.TicketIDs))
+		var wg sync.WaitGroup
+		for i, ticketID := range wave.TicketIDs {
+			wg.Add(1)
+			i := i
+			ticketID := ticketID
+			go func() {
+				defer wg.Done()
+				outcomes[i] = executeEpicTicket(ctx, epicReq, cfg, wave, ticketID)
+			}()
+		}
+		wg.Wait()
+
+		ticketPhases := make([]state.TicketPhase, len(outcomes))
+		waveFailed := false
+		var waveErr error
+		for i, outcome := range outcomes {
+			ticketPhases[i] = outcome.phase
+			if outcome.err != nil {
+				waveFailed = true
+				if waveErr == nil {
+					waveErr = outcome.err
+				}
+			}
+		}
+
+		changedFiles, err := repo.ChangedFilesAgainst(baseCommit)
+		if err != nil {
+			return allResumed, err
+		}
+		changedFiles = filterEngineOwnedFiles(changedFiles)
+		changedFiles = subtractFiles(changedFiles, waveBaselineChangedFiles)
+
+		claimsReleased, err := waveClaimsReleased(artifacts.RepoRoot, req.RunID, wave.TicketIDs)
+		if err != nil {
+			return allResumed, err
+		}
+
+		acceptedWave, acceptErr := AcceptWave(WaveAcceptanceRequest{
+			Wave:                 wave,
+			TicketPhases:         ticketPhases,
+			ChangedFiles:         changedFiles,
+			ClaimsReleased:       claimsReleased,
+			PersistenceSucceeded: true,
+		})
+		if waveFailed {
+			acceptedWave.Status = state.WaveStatusFailed
+			if acceptedWave.Acceptance == nil {
+				acceptedWave.Acceptance = map[string]any{}
+			}
+			if waveErr != nil {
+				acceptedWave.Acceptance["reason"] = waveErr.Error()
+				acceptErr = waveErr
+			}
+		}
+		if acceptedWave.Acceptance == nil {
+			acceptedWave.Acceptance = map[string]any{}
+		}
+		acceptedWave.Acceptance["baseline_changed_files"] = append([]string(nil), waveBaselineChangedFiles...)
+		acceptedWave.UpdatedAt = time.Now().UTC()
+		if acceptedWave.FinishedAt.IsZero() {
+			acceptedWave.FinishedAt = acceptedWave.UpdatedAt
+		}
+		if err := state.SaveJSONAtomic(wavePath, acceptedWave); err != nil {
+			return allResumed, err
+		}
+		artifacts.Run.WaveIDs = append(artifacts.Run.WaveIDs, acceptedWave.WaveID)
+		artifacts.Run.UpdatedAt = time.Now().UTC()
+
+		for i, outcome := range outcomes {
+			tid := wave.TicketIDs[i]
+			status := tkmd.StatusBlocked
+			if acceptedWave.Status == state.WaveStatusAccepted && outcome.err == nil && outcome.phase == state.TicketPhaseClosed {
+				status = tkmd.StatusClosed
+			}
+			if err := updateTicketStoreStatus(artifacts.RepoRoot, tid, status); err != nil {
+				artifacts.Run.Status = state.EpicRunStatusBlocked
+				artifacts.Run.CurrentPhase = state.TicketPhaseBlocked
+				artifacts.Run.UpdatedAt = time.Now().UTC()
+				_ = state.SaveJSONAtomic(runPath, artifacts.Run)
+				return allResumed, err
+			}
+			allResumed = appendIfMissing(allResumed, tid)
+		}
+
+		if acceptErr != nil {
+			artifacts.Run.Status = state.EpicRunStatusBlocked
+			artifacts.Run.CurrentPhase = state.TicketPhaseBlocked
+			if err := state.SaveJSONAtomic(runPath, artifacts.Run); err != nil {
+				return allResumed, err
+			}
+			if waveFailed {
+				return allResumed, acceptErr
+			}
+			return allResumed, nil
+		}
+
+		if artifacts.Run.ResumeCursor != nil {
+			artifacts.Run.ResumeCursor["wave_ordinal"] = waveOrdinal
+			artifacts.Run.ResumeCursor["last_wave_base_commit"] = wave.WaveBaseCommit
+		}
+		if err := state.SaveJSONAtomic(runPath, artifacts.Run); err != nil {
+			return allResumed, err
+		}
+	}
+}
+
+// resumeAdapter resolves a runtime adapter for the given plan from the resume request.
+func resumeAdapter(req ResumeRequest, plan state.PlanArtifact) (runtime.Adapter, error) {
+	if req.AdapterFactory != nil {
+		return req.AdapterFactory(plan.RuntimePreference)
+	}
+	if req.Adapter != nil {
+		return req.Adapter, nil
+	}
+	return nil, fmt.Errorf("resume requires a runtime adapter")
+}
+
+// resumeCursorWaveOrdinal extracts the wave_ordinal from a ResumeCursor map.
+func resumeCursorWaveOrdinal(cursor map[string]any) int {
+	if cursor == nil {
+		return 0
+	}
+	raw, ok := cursor["wave_ordinal"]
+	if !ok {
+		return 0
+	}
+	switch v := raw.(type) {
+	case float64:
+		return int(v)
+	case int:
+		return v
+	case int64:
+		return int(v)
+	default:
+		return 0
+	}
 }
 
 func reconcileTicketClaimForResume(repoRoot, runID, ticketID string, snapshot TicketRunSnapshot) (*state.ClaimArtifact, bool, error) {
@@ -167,3 +552,12 @@ func appendIfMissing(values []string, value string) []string {
 	}
 	return append(values, value)
 }
+
+// Ensure imports are used.
+var (
+	_ = filepath.Join
+	_ = sort.Strings
+	_ = (*sync.WaitGroup)(nil)
+	_ = time.Now
+	_ = (*repoadapter.Repo)(nil)
+)
