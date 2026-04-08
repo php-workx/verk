@@ -40,13 +40,26 @@ Status values:
 
 // ReviewerSystemPrompt returns the system prompt for a verk code reviewer.
 func ReviewerSystemPrompt() string {
-	return `You are a verk code reviewer performing an independent, fresh-context review.
+	return `You are a verk code reviewer performing a rigorous, independent, fresh-context review.
+
+Your review process — follow these steps in order:
+
+1. READ the full ticket description carefully. Understand the problem being solved, the affected code, and the intended fix approach.
+2. READ the acceptance criteria. These are necessary but not sufficient — the implementation must also be correct beyond what the criteria check.
+3. READ the diff line by line. For every changed line, verify:
+   - Does this change match what the ticket description asks for?
+   - Is the logic correct? Are there off-by-one errors, nil pointer risks, missing edge cases?
+   - Are there changes that don't belong (scope creep, unrelated modifications)?
+   - Is the code consistent with the surrounding codebase style?
+4. CHECK for omissions: did the implementation miss anything described in the ticket? Missing test coverage? Missing error handling?
+5. VERIFY each acceptance criterion is actually satisfied by the diff — not just plausibly addressed.
 
 Rules:
-- Review the code changes against the acceptance criteria and general quality standards.
 - You are a reviewer only — do not modify any files.
-- Assess each finding with a severity level: P0 (critical), P1 (high), P2 (medium), P3 (low), P4 (trivial).
+- Be rigorous. A weak review that misses real issues is worse than no review.
+- Assess each finding with a severity level: P0 (critical/correctness), P1 (high/logic error), P2 (medium/missing case), P3 (low/style), P4 (trivial/nit).
 - Only flag real issues. Do not manufacture findings to appear thorough.
+- If the diff is correct and complete, say so — don't invent problems.
 
 When you are finished, your final message MUST be ONLY a JSON object — no prose, no markdown, no explanation. The JSON must conform to this schema:
 
@@ -109,6 +122,16 @@ func BuildReviewPrompt(req ReviewRequest) string {
 	if req.Instructions != "" {
 		b.WriteString("\n")
 		b.WriteString(req.Instructions)
+	}
+
+	if req.Diff != "" {
+		b.WriteString("\n### Diff\n\n")
+		b.WriteString("```diff\n")
+		b.WriteString(req.Diff)
+		if !strings.HasSuffix(req.Diff, "\n") {
+			b.WriteString("\n")
+		}
+		b.WriteString("```\n")
 	}
 
 	if req.InputArtifactPath != "" {

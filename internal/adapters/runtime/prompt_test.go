@@ -257,4 +257,36 @@ func TestReviewerSystemPrompt_JSONOnly(t *testing.T) {
 	if strings.Contains(prompt, "<verk") {
 		t.Fatal("expected no XML tags in system prompt")
 	}
+	if !strings.Contains(prompt, "READ the diff line by line") {
+		t.Fatal("expected rigorous diff review instruction")
+	}
+	if !strings.Contains(prompt, "ticket description") {
+		t.Fatal("expected instruction to read ticket description")
+	}
+}
+
+func TestBuildReviewPrompt_IncludesDiff(t *testing.T) {
+	prompt := BuildReviewPrompt(ReviewRequest{
+		TicketID:                 "VER-001",
+		LeaseID:                  "lease-1",
+		EffectiveReviewThreshold: "P2",
+		Diff:                     "--- a/foo.go\n+++ b/foo.go\n@@ -1 +1 @@\n-old\n+new\n",
+	})
+	if !strings.Contains(prompt, "```diff") {
+		t.Fatal("expected diff code block in prompt")
+	}
+	if !strings.Contains(prompt, "+new") {
+		t.Fatal("expected diff content in prompt")
+	}
+}
+
+func TestBuildReviewPrompt_NoDiffWhenEmpty(t *testing.T) {
+	prompt := BuildReviewPrompt(ReviewRequest{
+		TicketID:                 "VER-001",
+		LeaseID:                  "lease-1",
+		EffectiveReviewThreshold: "P2",
+	})
+	if strings.Contains(prompt, "```diff") {
+		t.Fatal("expected no diff block when diff is empty")
+	}
 }

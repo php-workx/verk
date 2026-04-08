@@ -231,6 +231,7 @@ func RunTicket(ctx context.Context, req RunTicketRequest) (RunTicketResult, erro
 				Runtime:                  chosenRuntime(req.Plan, cfg),
 				InputArtifactPath:        st.paths.verificationPath,
 				Instructions:             renderReviewInstructions(req.Plan, st.reviewAttempts+1),
+				Diff:                     collectDiff(absRepoRoot, req.BaseCommit),
 				EffectiveReviewThreshold: req.Plan.EffectiveReviewThreshold,
 				ExecutionConfig:          executionConfigFromPolicy(cfg),
 			}
@@ -466,6 +467,22 @@ func checkSingleTicketScope(st *ticketRunState) error {
 		return st.transitionTo(state.TicketPhaseBlocked)
 	}
 	return nil
+}
+
+func collectDiff(repoRoot, baseCommit string) string {
+	baseCommit = strings.TrimSpace(baseCommit)
+	if baseCommit == "" {
+		return ""
+	}
+	repo, err := git.New(repoRoot)
+	if err != nil {
+		return ""
+	}
+	diff, err := repo.DiffAgainst(baseCommit)
+	if err != nil {
+		return ""
+	}
+	return diff
 }
 
 func collectChangedFiles(repoRoot, baseCommit string) []string {
@@ -1200,8 +1217,7 @@ func renderReviewInstructions(plan state.PlanArtifact, attempt int) string {
 		b.WriteString("\n")
 	}
 
-	b.WriteString("Review the implementation changes against these criteria. ")
-	b.WriteString("Use `git diff` to see the changes. ")
+	b.WriteString("Review the diff below against the ticket description and acceptance criteria. ")
 	b.WriteString("Flag any issues with appropriate severity.\n")
 
 	return b.String()

@@ -166,6 +166,24 @@ func (r *Repo) ChangedFilesAgainst(baseCommit string) ([]string, error) {
 	return out, nil
 }
 
+func (r *Repo) DiffAgainst(baseCommit string) (string, error) {
+	if r == nil {
+		return "", fmt.Errorf("nil repo")
+	}
+	if strings.TrimSpace(baseCommit) == "" {
+		return "", fmt.Errorf("base commit is required")
+	}
+	if err := r.verifyCommit(baseCommit); err != nil {
+		return "", err
+	}
+
+	out, err := gitOutput(r.root, "diff", baseCommit, "--")
+	if err != nil {
+		return "", err
+	}
+	return out, nil
+}
+
 func (r *Repo) NormalizeOwnedPath(candidate string) (string, error) {
 	if r == nil {
 		return "", fmt.Errorf("nil repo")
