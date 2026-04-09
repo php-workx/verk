@@ -2,8 +2,11 @@ package cli
 
 import (
 	"fmt"
+	"sort"
+	"strings"
 
 	"verk/internal/engine"
+	"verk/internal/state"
 
 	"github.com/spf13/cobra"
 )
@@ -11,8 +14,8 @@ import (
 var statusJSONFlag bool
 
 var statusCmd = &cobra.Command{
-	Use:     "status [run-id]",
-	Short:   "Show run status",
+	Use:          "status [run-id]",
+	Short:        "Show run status",
 	GroupID:      groupObserve,
 	SilenceUsage: true,
 	Args:         cobra.MaximumNArgs(1),
@@ -31,27 +34,70 @@ var statusCmd = &cobra.Command{
 		}
 
 		w := cmd.OutOrStdout()
-		fmt.Fprintf(w, "run %s: %s (%s)\n", report.RunID, report.RunStatus, report.CurrentPhase)
+		color := shouldColorizeFunc()
+		r := doctorRenderer{color: color}
+
+		fmt.Fprintln(w, r.bold("verk status"))
+		fmt.Fprintln(w, r.dim(strings.Repeat("─", 40)))
+		fmt.Fprintln(w)
+
+		fmt.Fprintf(w, "  Run:    %s\n", report.RunID)
+		fmt.Fprintf(w, "  Status: %s\n", formatRunStatus(r, report.RunStatus))
 		if report.CurrentWave != "" {
-			fmt.Fprintf(w, "current wave: %s\n", report.CurrentWave)
+			fmt.Fprintf(w, "  Wave:   %s\n", report.CurrentWave)
 		}
 		if report.LastFailedGate != "" {
-			fmt.Fprintf(w, "last failed gate: %s\n", report.LastFailedGate)
+			fmt.Fprintf(w, "  Gate:   %s\n", r.fail(report.LastFailedGate))
 		}
-		for _, ticket := range report.Tickets {
-			fmt.Fprintf(w, "- %s: %s", ticket.TicketID, ticket.Phase)
+
+		fmt.Fprintf(w, "\n  %s\n\n", r.bold("Tickets:"))
+
+		tickets := sortTicketsByPhase(report.Tickets)
+		closed, blocked, active, pending := 0, 0, 0, 0
+		for _, ticket := range tickets {
+			tag, tagFn := statusTag(ticket.Phase)
+			title := ticket.TicketID
+			if ticket.Title != "" {
+				title = fmt.Sprintf("%-10s %s", ticket.TicketID, ticket.Title)
+			}
+
+			fmt.Fprintf(w, "  %s %s\n", tagFn(r, tag), title)
+
 			if ticket.BlockReason != "" {
-				fmt.Fprintf(w, " (%s)", ticket.BlockReason)
+				reason := shortenBlockReason(ticket.BlockReason)
+				fmt.Fprintf(w, "  %s %s\n", strings.Repeat(" ", len(tag)), r.dim(reason))
 			}
-			if ticket.ClaimState != "" {
-				fmt.Fprintf(w, " [claim=%s", ticket.ClaimState)
-				if ticket.LeaseID != "" {
-					fmt.Fprintf(w, " lease=%s", ticket.LeaseID)
-				}
-				fmt.Fprint(w, "]")
+
+			switch ticket.Phase {
+			case state.TicketPhaseClosed:
+				closed++
+			case state.TicketPhaseBlocked:
+				blocked++
+			case state.TicketPhaseImplement, state.TicketPhaseVerify, state.TicketPhaseReview, state.TicketPhaseRepair, state.TicketPhaseCloseout:
+				active++
+			default:
+				pending++
 			}
-			fmt.Fprintln(w)
 		}
+
+		fmt.Fprintln(w)
+		parts := make([]string, 0, 4)
+		if closed > 0 {
+			parts = append(parts, fmt.Sprintf("%d closed", closed))
+		}
+		if active > 0 {
+			parts = append(parts, fmt.Sprintf("%d active", active))
+		}
+		if blocked > 0 {
+			parts = append(parts, fmt.Sprintf("%d blocked", blocked))
+		}
+		if pending > 0 {
+			parts = append(parts, fmt.Sprintf("%d pending", pending))
+		}
+		if len(parts) > 0 {
+			fmt.Fprintf(w, "  %s\n", strings.Join(parts, ", "))
+		}
+
 		return nil
 	},
 }
@@ -59,4 +105,93 @@ var statusCmd = &cobra.Command{
 func initStatusCmd() {
 	statusCmd.Flags().BoolVar(&statusJSONFlag, "json", false, "Output as JSON")
 	rootCmd.AddCommand(statusCmd)
+}
+
+type tagFormatter func(r doctorRenderer, tag string) string
+
+func statusTag(phase state.TicketPhase) (string, tagFormatter) {
+	switch phase {
+	case state.TicketPhaseClosed:
+		return "[CLOSED] ", func(r doctorRenderer, tag string) string { return r.ok(tag) }
+	case state.TicketPhaseBlocked:
+		return "[BLOCKED]", func(r doctorRenderer, tag string) string { return r.fail(tag) }
+	case state.TicketPhaseImplement:
+		return "[IMPL]   ", func(r doctorRenderer, tag string) string { return r.warn(tag) }
+	case state.TicketPhaseVerify:
+		return "[VERIFY] ", func(r doctorRenderer, tag string) string { return r.warn(tag) }
+	case state.TicketPhaseReview:
+		return "[REVIEW] ", func(r doctorRenderer, tag string) string { return r.warn(tag) }
+	case state.TicketPhaseRepair:
+		return "[REPAIR] ", func(r doctorRenderer, tag string) string { return r.warn(tag) }
+	case state.TicketPhaseCloseout:
+		return "[CLOSE]  ", func(r doctorRenderer, tag string) string { return r.warn(tag) }
+	default:
+		return "[--]     ", func(r doctorRenderer, tag string) string { return r.dim(tag) }
+	}
+}
+
+func formatRunStatus(r doctorRenderer, status state.EpicRunStatus) string {
+	switch status {
+	case state.EpicRunStatusCompleted:
+		return r.ok(string(status))
+	case state.EpicRunStatusBlocked:
+		return r.fail(string(status))
+	case state.EpicRunStatusRunning:
+		return r.warn(string(status))
+	default:
+		return string(status)
+	}
+}
+
+func phaseOrder(phase state.TicketPhase) int {
+	switch phase {
+	case state.TicketPhaseBlocked:
+		return 0
+	case state.TicketPhaseImplement, state.TicketPhaseVerify, state.TicketPhaseReview, state.TicketPhaseRepair, state.TicketPhaseCloseout:
+		return 1
+	case state.TicketPhaseClosed:
+		return 3
+	default:
+		return 2 // intake/pending
+	}
+}
+
+func sortTicketsByPhase(tickets []engine.StatusTicket) []engine.StatusTicket {
+	sorted := append([]engine.StatusTicket(nil), tickets...)
+	sort.SliceStable(sorted, func(i, j int) bool {
+		oi, oj := phaseOrder(sorted[i].Phase), phaseOrder(sorted[j].Phase)
+		if oi != oj {
+			return oi < oj
+		}
+		return sorted[i].TicketID < sorted[j].TicketID
+	})
+	return sorted
+}
+
+func shortenBlockReason(reason string) string {
+	// Strip nested prefixes that add no information
+	prefixes := []string{
+		"retryable worker failure after 2 retries: ",
+		"retryable reviewer failure after 2 retries: ",
+		"retryable worker failure: ",
+		"retryable reviewer failure: ",
+	}
+	changed := true
+	for changed {
+		changed = false
+		for _, prefix := range prefixes {
+			if strings.HasPrefix(reason, prefix) {
+				reason = strings.TrimPrefix(reason, prefix)
+				changed = true
+			}
+		}
+	}
+	// Strip "claim renewal lost during worker execution: " prefix
+	if i := strings.Index(reason, "claim renewal failed:"); i >= 0 {
+		reason = "lease expired"
+	}
+	if len(reason) > 72 {
+		reason = reason[:69] + "..."
+	}
+	return reason
 }
