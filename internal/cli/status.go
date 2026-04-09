@@ -22,12 +22,12 @@ var statusCmd = &cobra.Command{
 	RunE: func(cmd *cobra.Command, args []string) error {
 		runID, err := resolveRunID(args)
 		if err != nil {
-			return withExitCode(err, 1)
+			return cmdError(cmd, err, 1)
 		}
 
 		report, err := engine.DeriveStatus(engine.StatusRequest{RunID: runID})
 		if err != nil {
-			return withExitCode(err, 1)
+			return cmdError(cmd, err, 1)
 		}
 		if statusJSONFlag {
 			return printJSON(cmd.OutOrStdout(), report)
@@ -126,7 +126,7 @@ func statusTag(phase state.TicketPhase) (string, tagFormatter) {
 	case state.TicketPhaseCloseout:
 		return "[CLOSE]  ", func(r doctorRenderer, tag string) string { return r.warn(tag) }
 	default:
-		return "[--]     ", func(r doctorRenderer, tag string) string { return r.dim(tag) }
+		return "[PENDING]", func(r doctorRenderer, tag string) string { return r.dim(tag) }
 	}
 }
 

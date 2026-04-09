@@ -14,6 +14,8 @@ import (
 	"verk/internal/adapters/runtime/claude"
 	"verk/internal/adapters/runtime/codex"
 	"verk/internal/policy"
+
+	"github.com/spf13/cobra"
 )
 
 func loadExecutionContext() (string, policy.Config, *repoadapter.Repo, error) {
@@ -112,6 +114,13 @@ func resolveRunID(args []string) (string, error) {
 		return "", fmt.Errorf("no current run — start one with: verk run ticket <id>")
 	}
 	return runID, nil
+}
+
+// cmdError prints an error to the command's stdout (so it's always visible,
+// even when stderr is suppressed) and returns it as a cobra error.
+func cmdError(cmd *cobra.Command, err error, code int) error {
+	fmt.Fprintf(cmd.OutOrStdout(), "Error: %s\n", err)
+	return withExitCode(err, code)
 }
 
 func printJSON(w io.Writer, v any) error {

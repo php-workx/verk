@@ -22,7 +22,7 @@ var resumeCmd = &cobra.Command{
 	RunE: func(cmd *cobra.Command, args []string) error {
 		repoRoot, cfg, _, err := loadExecutionContext()
 		if err != nil {
-			return withExitCode(err, 1)
+			return cmdError(cmd, err, 1)
 		}
 
 		var runID string
@@ -31,10 +31,10 @@ var resumeCmd = &cobra.Command{
 		} else {
 			runID, err = readCurrentRunID(repoRoot)
 			if err != nil {
-				return withExitCode(fmt.Errorf("could not read current run: %w", err), 1)
+				return cmdError(cmd, fmt.Errorf("could not read current run: %w", err), 1)
 			}
 			if runID == "" {
-				return withExitCode(fmt.Errorf("no current run — start one with: verk run ticket <id>"), 1)
+				return cmdError(cmd, fmt.Errorf("no current run — start one with: verk run ticket <id>"), 1)
 			}
 		}
 
