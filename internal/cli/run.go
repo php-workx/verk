@@ -3,6 +3,7 @@ package cli
 import (
 	"context"
 	"fmt"
+	"io"
 	"path/filepath"
 	"time"
 
@@ -25,11 +26,10 @@ var runTicketCmd = &cobra.Command{
 	Short: "Run a single ticket through the full lifecycle",
 	Args:  cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
-		runID, err := doRunTicket(args[0])
+		_, err := doRunTicket(cmd.OutOrStdout(), cmd.ErrOrStderr(), args[0])
 		if err != nil {
 			return withExitCode(err, 1)
 		}
-		fmt.Fprintf(cmd.OutOrStdout(), "run_id=%s\n", runID)
 		return nil
 	},
 }
@@ -39,11 +39,10 @@ var runEpicCmd = &cobra.Command{
 	Short: "Run an epic (all child tickets in waves)",
 	Args:  cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
-		runID, err := doRunEpic(args[0])
+		_, err := doRunEpic(cmd.OutOrStdout(), cmd.ErrOrStderr(), args[0])
 		if err != nil {
 			return withExitCode(err, 1)
 		}
-		fmt.Fprintf(cmd.OutOrStdout(), "run_id=%s\n", runID)
 		return nil
 	},
 }
@@ -53,7 +52,7 @@ func initRunCmd() {
 	rootCmd.AddCommand(runCmd)
 }
 
-func doRunTicket(ticketID string) (string, error) {
+func doRunTicket(w, errw io.Writer, ticketID string) (string, error) {
 	repoRoot, cfg, repo, err := loadExecutionContext()
 	if err != nil {
 		return "", err
@@ -77,22 +76,28 @@ func doRunTicket(ticketID string) (string, error) {
 	plan.CreatedAt = time.Now().UTC()
 	plan.UpdatedAt = plan.CreatedAt
 
+	// Print run_id immediately so the user has it before the long-running engine call.
+	fmt.Fprintf(w, "run_id=%s\n", runID)
+	if wErr := writeCurrentRunID(repoRoot, runID); wErr != nil {
+		fmt.Fprintf(errw, "warning: could not write current run: %v\n", wErr)
+	}
+
 	leaseID := fmt.Sprintf("lease-%s-%s", runID, ticketID)
 	claim, err := tkmd.AcquireClaim(repoRoot, runID, ticketID, leaseID, 30*time.Minute, time.Now().UTC())
 	if err != nil {
-		return "", err
+		return runID, err
 	}
 	adapter, err := runtimeAdapterFor(ticket.Runtime, cfg.Runtime.DefaultRuntime)
 	if err != nil {
-		return "", err
+		return runID, err
 	}
 	baseCommit, err := repo.HeadCommit()
 	if err != nil {
-		return "", err
+		return runID, err
 	}
 	baseBranch, err := repo.CurrentBranch()
 	if err != nil {
-		return "", err
+		return runID, err
 	}
 
 	run := state.RunArtifact{
@@ -114,12 +119,12 @@ func doRunTicket(ticketID string) (string, error) {
 		ResumeCursor: map[string]any{"ticket_id": ticketID},
 	}
 	if err := state.SaveJSONAtomic(filepath.Join(repoRoot, ".verk", "runs", runID, "run.json"), run); err != nil {
-		return "", err
+		return runID, err
 	}
 
 	ticket.Status = tkmd.StatusInProgress
 	if err := tkmd.SaveTicket(filepath.Join(repoRoot, ".tickets", ticketID+".md"), ticket); err != nil {
-		return "", err
+		return runID, err
 	}
 
 	result, err := engine.RunTicket(context.Background(), engine.RunTicketRequest{
@@ -133,7 +138,7 @@ func doRunTicket(ticketID string) (string, error) {
 		BaseCommit: baseCommit,
 	})
 	if err != nil {
-		return "", err
+		return runID, err
 	}
 	switch result.Snapshot.CurrentPhase {
 	case state.TicketPhaseClosed:
@@ -148,10 +153,12 @@ func doRunTicket(ticketID string) (string, error) {
 	run.UpdatedAt = time.Now().UTC()
 	_ = tkmd.SaveTicket(filepath.Join(repoRoot, ".tickets", ticketID+".md"), ticket)
 	_ = state.SaveJSONAtomic(filepath.Join(repoRoot, ".verk", "runs", runID, "run.json"), run)
+
+	fmt.Fprintf(w, "status=%s phase=%s\n", run.Status, run.CurrentPhase)
 	return runID, nil
 }
 
-func doRunEpic(ticketID string) (string, error) {
+func doRunEpic(w, errw io.Writer, ticketID string) (string, error) {
 	repoRoot, cfg, repo, err := loadExecutionContext()
 	if err != nil {
 		return "", err
@@ -174,7 +181,14 @@ func doRunEpic(ticketID string) (string, error) {
 		return "", err
 	}
 	runID := newRunID(ticketID)
-	if _, err := engine.RunEpic(context.Background(), engine.RunEpicRequest{
+
+	// Print run_id immediately so the user has it before the long-running engine call.
+	fmt.Fprintf(w, "run_id=%s\n", runID)
+	if wErr := writeCurrentRunID(repoRoot, runID); wErr != nil {
+		fmt.Fprintf(errw, "warning: could not write current run: %v\n", wErr)
+	}
+
+	result, err := engine.RunEpic(context.Background(), engine.RunEpicRequest{
 		RepoRoot:     repoRoot,
 		RunID:        runID,
 		RootTicketID: ticketID,
@@ -185,8 +199,11 @@ func doRunEpic(ticketID string) (string, error) {
 		},
 		Adapter: adapter,
 		Config:  cfg,
-	}); err != nil {
-		return "", err
+	})
+	if err != nil {
+		return runID, err
 	}
+
+	fmt.Fprintf(w, "status=%s phase=%s\n", result.Run.Status, result.Run.CurrentPhase)
 	return runID, nil
 }

@@ -34,6 +34,7 @@ var versionCmd = &cobra.Command{
 }
 
 func init() {
+	rootCmd.SilenceErrors = true
 	rootCmd.AddGroup(
 		&cobra.Group{ID: groupExecution, Title: "Execution"},
 		&cobra.Group{ID: groupObserve, Title: "Observe"},
@@ -66,6 +67,7 @@ func ExecuteArgs(args []string, stdout, stderr *os.File) int {
 	rootCmd.SetErr(stderr)
 	rootCmd.SetArgs(args)
 	if err := rootCmd.Execute(); err != nil {
+		fmt.Fprintln(stderr, err)
 		var exitErr interface{ ExitCode() int }
 		if errors.As(err, &exitErr) {
 			return exitErr.ExitCode()

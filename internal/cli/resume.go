@@ -14,19 +14,37 @@ import (
 var resumeJSONFlag bool
 
 var resumeCmd = &cobra.Command{
-	Use:     "resume <run-id>",
+	Use:     "resume [run-id]",
 	Short:   "Resume an interrupted run",
-	GroupID: groupExecution,
-	Args:    cobra.ExactArgs(1),
+	GroupID:      groupExecution,
+	SilenceUsage: true,
+	Args:         cobra.MaximumNArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		repoRoot, cfg, _, err := loadExecutionContext()
 		if err != nil {
 			return withExitCode(err, 1)
 		}
 
+		var runID string
+		if len(args) > 0 {
+			runID = args[0]
+		} else {
+			runID, err = readCurrentRunID(repoRoot)
+			if err != nil {
+				return withExitCode(fmt.Errorf("could not read current run: %w", err), 1)
+			}
+			if runID == "" {
+				return withExitCode(fmt.Errorf("no current run — start one with: verk run ticket <id>"), 1)
+			}
+		}
+
+		if wErr := writeCurrentRunID(repoRoot, runID); wErr != nil {
+			fmt.Fprintf(cmd.ErrOrStderr(), "warning: could not write current run: %v\n", wErr)
+		}
+
 		report, err := engine.ResumeRun(context.Background(), engine.ResumeRequest{
 			RepoRoot: repoRoot,
-			RunID:    args[0],
+			RunID:    runID,
 			AdapterFactory: func(ticketPreference string) (runtime.Adapter, error) {
 				return runtimeAdapterFor(ticketPreference, cfg.Runtime.DefaultRuntime)
 			},

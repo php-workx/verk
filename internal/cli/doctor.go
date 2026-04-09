@@ -2,6 +2,7 @@ package cli
 
 import (
 	"fmt"
+	"strings"
 
 	"verk/internal/engine"
 
@@ -29,25 +30,60 @@ var doctorCmd = &cobra.Command{
 			}
 			return nil
 		}
-		fmt.Fprintf(w, "repo root: %s\n", report.RepoRoot)
+
+		color := shouldColorizeFunc()
+		r := doctorRenderer{color: color}
+
+		fmt.Fprintln(w, r.bold("verk Doctor"))
+		fmt.Fprintln(w, r.dim(strings.Repeat("─", 40)))
+		fmt.Fprintln(w)
+
+		warnings := 0
+		failures := 0
+
 		for _, check := range report.Checks {
-			fmt.Fprintf(w, "- %s: %s", check.Name, check.Status)
+			switch check.Status {
+			case "passed":
+				fmt.Fprintf(w, "  %s %s\n", r.ok("[OK]"), r.bold(humanizeName(check.Name)))
+			case "warning":
+				fmt.Fprintf(w, "  %s %s\n", r.warn("[WARN]"), r.bold(humanizeName(check.Name)))
+				warnings++
+			default:
+				fmt.Fprintf(w, "  %s %s\n", r.fail("[FAIL]"), r.bold(humanizeName(check.Name)))
+				failures++
+			}
 			if check.Details != "" {
-				fmt.Fprintf(w, " (%s)", check.Details)
+				fmt.Fprintf(w, "       %s\n", r.dim(check.Details))
 			}
-			fmt.Fprintln(w)
 		}
+
 		for _, rt := range report.Runtimes {
-			status := "unavailable"
+			name := "Runtime " + rt.Runtime
 			if rt.Available {
-				status = "available"
+				fmt.Fprintf(w, "  %s %s\n", r.ok("[OK]"), r.bold(name))
+			} else {
+				fmt.Fprintf(w, "  %s %s\n", r.fail("[FAIL]"), r.bold(name))
+				failures++
 			}
-			fmt.Fprintf(w, "- runtime %s: %s", rt.Runtime, status)
 			if rt.Details != "" {
-				fmt.Fprintf(w, " (%s)", rt.Details)
+				fmt.Fprintf(w, "       %s\n", r.dim(rt.Details))
 			}
-			fmt.Fprintln(w)
 		}
+
+		fmt.Fprintln(w)
+		if failures == 0 && warnings == 0 {
+			fmt.Fprintln(w, r.ok("All checks passed!"))
+		} else {
+			parts := make([]string, 0, 2)
+			if warnings > 0 {
+				parts = append(parts, fmt.Sprintf("%d warning(s)", warnings))
+			}
+			if failures > 0 {
+				parts = append(parts, fmt.Sprintf("%d failure(s)", failures))
+			}
+			fmt.Fprintln(w, r.warn(strings.Join(parts, ", ")))
+		}
+
 		if code != 0 {
 			return withExitCode(fmt.Errorf("doctor found issues"), code)
 		}
@@ -58,4 +94,49 @@ var doctorCmd = &cobra.Command{
 func initDoctorCmd() {
 	doctorCmd.Flags().BoolVar(&doctorJSONFlag, "json", false, "Output as JSON")
 	rootCmd.AddCommand(doctorCmd)
+}
+
+type doctorRenderer struct{ color bool }
+
+func (r doctorRenderer) bold(s string) string {
+	if !r.color {
+		return s
+	}
+	return ansiBold + s + ansiReset
+}
+
+func (r doctorRenderer) dim(s string) string {
+	if !r.color {
+		return s
+	}
+	return ansiDim + s + ansiReset
+}
+
+func (r doctorRenderer) ok(s string) string {
+	if !r.color {
+		return s
+	}
+	return "\033[32m" + s + ansiReset // green
+}
+
+func (r doctorRenderer) warn(s string) string {
+	if !r.color {
+		return s
+	}
+	return "\033[33m" + s + ansiReset // yellow
+}
+
+func (r doctorRenderer) fail(s string) string {
+	if !r.color {
+		return s
+	}
+	return "\033[31m" + s + ansiReset // red
+}
+
+func humanizeName(name string) string {
+	name = strings.ReplaceAll(name, "_", " ")
+	if len(name) > 0 {
+		return strings.ToUpper(name[:1]) + name[1:]
+	}
+	return name
 }

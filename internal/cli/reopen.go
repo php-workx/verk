@@ -13,13 +13,24 @@ import (
 var reopenToPhase string
 
 var reopenCmd = &cobra.Command{
-	Use:     "reopen <run-id> <ticket-id>",
-	Short:   "Reopen a blocked or closed ticket",
-	GroupID: groupExecution,
-	Args:    cobra.ExactArgs(2),
+	Use:   "reopen <run-id> <ticket-id>",
+	Short: "Reopen a blocked or closed ticket",
+	Long: `Reopen a blocked or closed ticket to a specific phase.
+
+Examples:
+  verk reopen run-ver-abc-123 ver-abc --to implement
+  verk reopen run-ver-abc-123 ver-abc --to repair`,
+	GroupID:      groupExecution,
+	SilenceUsage: true,
+	Args: func(cmd *cobra.Command, args []string) error {
+		if len(args) != 2 {
+			return fmt.Errorf("requires <run-id> and <ticket-id>\n\nUsage:\n  verk reopen <run-id> <ticket-id> --to <phase>")
+		}
+		return nil
+	},
 	RunE: func(cmd *cobra.Command, args []string) error {
 		if reopenToPhase == "" {
-			return withExitCode(fmt.Errorf("--to flag is required"), 2)
+			return withExitCode(fmt.Errorf("--to flag is required (implement or repair)"), 2)
 		}
 		if err := engine.ReopenTicket(context.Background(), engine.ReopenRequest{
 			RunID:    args[0],

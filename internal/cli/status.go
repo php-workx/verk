@@ -11,12 +11,18 @@ import (
 var statusJSONFlag bool
 
 var statusCmd = &cobra.Command{
-	Use:     "status <run-id>",
+	Use:     "status [run-id]",
 	Short:   "Show run status",
-	GroupID: groupObserve,
-	Args:    cobra.ExactArgs(1),
+	GroupID:      groupObserve,
+	SilenceUsage: true,
+	Args:         cobra.MaximumNArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
-		report, err := engine.DeriveStatus(engine.StatusRequest{RunID: args[0]})
+		runID, err := resolveRunID(args)
+		if err != nil {
+			return withExitCode(err, 1)
+		}
+
+		report, err := engine.DeriveStatus(engine.StatusRequest{RunID: runID})
 		if err != nil {
 			return withExitCode(err, 1)
 		}
