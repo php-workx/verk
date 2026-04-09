@@ -9,7 +9,7 @@ govulncheck_ver := "v1.1.4"
 version := `git describe --tags --always --dirty 2>/dev/null || echo "dev"`
 commit := `git rev-parse --short HEAD 2>/dev/null || echo "unknown"`
 build_date := `date -u +"%Y-%m-%dT%H:%M:%SZ"`
-ldflags := "-X main.Version=" + version + " -X main.GitCommit=" + commit + " -X main.BuildDate=" + build_date
+ldflags := "-X verk/internal/cli.Version=" + version + " -X verk/internal/cli.GitCommit=" + commit + " -X verk/internal/cli.BuildDate=" + build_date
 
 default:
     @just --list
