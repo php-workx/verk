@@ -1,3 +1,6 @@
 # AgentOps session artifacts (auto-added)
 .agents/
 .tickets/
+.serena/
+.verk/
+bin/
