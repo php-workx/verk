@@ -21,13 +21,19 @@ import (
 	"verk/internal/state"
 )
 
+var (
+	Version   = "dev"
+	GitCommit = "unknown"
+	BuildDate = "unknown"
+)
+
 func main() {
 	os.Exit(execute(os.Args[1:], os.Stdout, os.Stderr))
 }
 
 func execute(args []string, stdout, stderr io.Writer) int {
 	if len(args) == 0 {
-		fmt.Fprintln(stderr, "usage: verk <run|reopen|resume|status|doctor> ...")
+		printUsage(stderr)
 		return 2
 	}
 
@@ -42,10 +48,33 @@ func execute(args []string, stdout, stderr io.Writer) int {
 		return runStatus(args[1:], stdout, stderr)
 	case "doctor":
 		return runDoctor(args[1:], stdout, stderr)
+	case "version", "--version", "-v":
+		fmt.Fprintf(stdout, "verk %s (%s, %s)\n", Version, GitCommit, BuildDate)
+		return 0
+	case "help", "--help", "-h":
+		printUsage(stdout)
+		return 0
 	default:
 		fmt.Fprintf(stderr, "unknown command %q\n", args[0])
+		printUsage(stderr)
 		return 2
 	}
+}
+
+func printUsage(w io.Writer) {
+	fmt.Fprintln(w, `verk — deterministic engineering execution engine
+
+Usage: verk <command> [options]
+
+Commands:
+  run ticket <ticket-id>                    Run a single ticket
+  run epic <ticket-id>                      Run an epic (all child tickets)
+  resume <run-id>                           Resume an interrupted run
+  reopen <run-id> <ticket-id> --to <phase>  Reopen a blocked/closed ticket
+  status <run-id> [--json]                  Show run status
+  doctor [--json]                           Check environment health
+  version                                   Show version info
+  help                                      Show this help`)
 }
 
 func runRun(args []string, stdout, stderr io.Writer) int {
