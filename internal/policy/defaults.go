@@ -13,6 +13,9 @@ func DefaultConfig() Config {
 			MaxRepairCycles:           2,
 			AllowDirtyWorktree:        true,
 		},
+		Runtime: RuntimeConfig{
+			DefaultRuntime: "claude",
+		},
 		Verification: VerificationConfig{
 			DefaultTimeoutMinutes: 15,
 			EnvPassthrough:        []string{"PATH", "HOME", "CI"},

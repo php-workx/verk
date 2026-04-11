@@ -109,48 +109,13 @@ func TestRunEpicSchedulesOpenAndReadyTickets(t *testing.T) {
 	blocked := epicChildTicket("ticket-blocked", epic.ID, tkmd.StatusBlocked, nil, []string{"config"})
 	mustSaveTicket(t, repoRoot, blocked)
 
-	adapter := runtimefake.New(
-		[]runtime.WorkerResult{
-			{
-				Status:             runtime.WorkerStatusDone,
-				RetryClass:         runtime.RetryClassTerminal,
-				LeaseID:            "lease-run-ready-ticket-open",
-				StartedAt:          epicTestStart(),
-				FinishedAt:         epicTestStart().Add(time.Second),
-				ResultArtifactPath: filepath.Join(repoRoot, "worker1.json"),
-			},
-			{
-				Status:             runtime.WorkerStatusDone,
-				RetryClass:         runtime.RetryClassTerminal,
-				LeaseID:            "lease-run-ready-ticket-ready",
-				StartedAt:          epicTestStart(),
-				FinishedAt:         epicTestStart().Add(time.Second),
-				ResultArtifactPath: filepath.Join(repoRoot, "worker2.json"),
-			},
-		},
-		[]runtime.ReviewResult{
-			{
-				Status:             runtime.WorkerStatusDone,
-				RetryClass:         runtime.RetryClassTerminal,
-				LeaseID:            "lease-run-ready-ticket-open",
-				StartedAt:          epicTestStart().Add(2 * time.Second),
-				FinishedAt:         epicTestStart().Add(3 * time.Second),
-				ReviewStatus:       runtime.ReviewStatusPassed,
-				Summary:            "clean",
-				ResultArtifactPath: filepath.Join(repoRoot, "review1.json"),
-			},
-			{
-				Status:             runtime.WorkerStatusDone,
-				RetryClass:         runtime.RetryClassTerminal,
-				LeaseID:            "lease-run-ready-ticket-ready",
-				StartedAt:          epicTestStart().Add(2 * time.Second),
-				FinishedAt:         epicTestStart().Add(3 * time.Second),
-				ReviewStatus:       runtime.ReviewStatusPassed,
-				Summary:            "clean",
-				ResultArtifactPath: filepath.Join(repoRoot, "review2.json"),
-			},
-		},
-	)
+	// Use the blocking adapter which handles any ticket order (uses req.LeaseID)
+	adapter := newBlockingEpicAdapter(t)
+	go func() {
+		// Wait for 2 tickets to start, then release all
+		waitForStarted(t, adapter.started, 2)
+		close(adapter.release)
+	}()
 
 	result, err := RunEpic(context.Background(), RunEpicRequest{
 		RepoRoot:     repoRoot,
@@ -165,8 +130,8 @@ func TestRunEpicSchedulesOpenAndReadyTickets(t *testing.T) {
 	}
 
 	// Both open and ready tickets should have been scheduled
-	if len(adapter.WorkerRequests()) != 2 {
-		t.Fatalf("expected both open and ready tickets to run, got %d worker requests", len(adapter.WorkerRequests()))
+	if adapter.maxConcurrent() < 2 {
+		t.Fatalf("expected both open and ready tickets to run concurrently, max concurrent was %d", adapter.maxConcurrent())
 	}
 
 	// Epic should not be completed because blocked ticket remains

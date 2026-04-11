@@ -144,9 +144,6 @@ func ValidateTicketSchedulingFields(ticket Ticket) error {
 	if _, ok := canonicalStatuses[ticket.Status]; !ok {
 		return fmt.Errorf("invalid ticket status %q", ticket.Status)
 	}
-	if len(ticket.OwnedPaths) == 0 {
-		return errors.New("owned_paths is required")
-	}
 	for _, path := range ticket.OwnedPaths {
 		if err := validateOwnedPath(path); err != nil {
 			return err

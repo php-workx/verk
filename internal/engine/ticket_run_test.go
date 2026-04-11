@@ -761,6 +761,144 @@ func (a *sleepyRuntimeAdapter) RunReviewer(ctx context.Context, req runtime.Revi
 	return a.reviewResult, nil
 }
 
+func TestRunTicket_ChangedFilesCaptured(t *testing.T) {
+	repoRoot := t.TempDir()
+	baseCommit := initEpicRepo(t, repoRoot)
+	cfg := policy.DefaultConfig()
+	ticket := testTicket("ver-changed-files")
+	plan, claim := testPlanAndClaim(t, repoRoot, ticket, cfg, "run-changed-files", "lease-changed-files", []string{`true`})
+
+	// Simulate worker-created files: user files that should appear in ChangedFiles.
+	for _, entry := range []struct{ dir, name, content string }{
+		{"src", "app.go", "package app\n"},
+		{"docs", "readme.md", "# Docs\n"},
+	} {
+		dir := filepath.Join(repoRoot, entry.dir)
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatalf("mkdir %s: %v", dir, err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, entry.name), []byte(entry.content), 0o644); err != nil {
+			t.Fatalf("write %s/%s: %v", entry.dir, entry.name, err)
+		}
+	}
+
+	started, finished := testRunTimes()
+	adapter := runtimefake.New(
+		[]runtime.WorkerResult{{
+			Status:             runtime.WorkerStatusDone,
+			RetryClass:         runtime.RetryClassTerminal,
+			LeaseID:            claim.LeaseID,
+			StartedAt:          started,
+			FinishedAt:         finished,
+			ResultArtifactPath: filepath.Join(repoRoot, "worker.json"),
+		}},
+		[]runtime.ReviewResult{{
+			Status:             runtime.WorkerStatusDone,
+			RetryClass:         runtime.RetryClassTerminal,
+			LeaseID:            claim.LeaseID,
+			StartedAt:          finished.Add(time.Second),
+			FinishedAt:         finished.Add(2 * time.Second),
+			ReviewStatus:       runtime.ReviewStatusPassed,
+			Summary:            "clean",
+			ResultArtifactPath: filepath.Join(repoRoot, "review.json"),
+		}},
+	)
+
+	result, err := RunTicket(context.Background(), RunTicketRequest{
+		RepoRoot:   repoRoot,
+		RunID:      "run-changed-files",
+		BaseCommit: baseCommit,
+		Ticket:     ticket,
+		Plan:       plan,
+		Claim:      claim,
+		Adapter:    adapter,
+		Config:     cfg,
+	})
+	if err != nil {
+		t.Fatalf("RunTicket error: %v", err)
+	}
+	if result.Snapshot.Implementation == nil {
+		t.Fatal("expected implementation artifact, got nil")
+	}
+
+	changed := result.Snapshot.Implementation.ChangedFiles
+	if changed == nil {
+		t.Fatal("ChangedFiles must not be nil")
+	}
+
+	// User files must be present.
+	want := map[string]bool{"src/app.go": false, "docs/readme.md": false}
+	for _, f := range changed {
+		if _, ok := want[f]; ok {
+			want[f] = true
+		}
+		// Engine-owned files must be excluded.
+		if strings.HasPrefix(f, ".verk/") || strings.HasPrefix(f, ".tickets/") {
+			t.Errorf("engine-owned file %q must not appear in ChangedFiles", f)
+		}
+	}
+	for f, found := range want {
+		if !found {
+			t.Errorf("expected %q in ChangedFiles, got %v", f, changed)
+		}
+	}
+}
+
+func TestRunTicket_ChangedFilesEmptyWhenNoUserChanges(t *testing.T) {
+	repoRoot := t.TempDir()
+	baseCommit := initEpicRepo(t, repoRoot)
+	cfg := policy.DefaultConfig()
+	ticket := testTicket("ver-no-changes")
+	plan, claim := testPlanAndClaim(t, repoRoot, ticket, cfg, "run-no-changes", "lease-no-changes", []string{`true`})
+
+	started, finished := testRunTimes()
+	adapter := runtimefake.New(
+		[]runtime.WorkerResult{{
+			Status:             runtime.WorkerStatusDone,
+			RetryClass:         runtime.RetryClassTerminal,
+			LeaseID:            claim.LeaseID,
+			StartedAt:          started,
+			FinishedAt:         finished,
+			ResultArtifactPath: filepath.Join(repoRoot, "worker.json"),
+		}},
+		[]runtime.ReviewResult{{
+			Status:             runtime.WorkerStatusDone,
+			RetryClass:         runtime.RetryClassTerminal,
+			LeaseID:            claim.LeaseID,
+			StartedAt:          finished.Add(time.Second),
+			FinishedAt:         finished.Add(2 * time.Second),
+			ReviewStatus:       runtime.ReviewStatusPassed,
+			Summary:            "clean",
+			ResultArtifactPath: filepath.Join(repoRoot, "review.json"),
+		}},
+	)
+
+	result, err := RunTicket(context.Background(), RunTicketRequest{
+		RepoRoot:   repoRoot,
+		RunID:      "run-no-changes",
+		BaseCommit: baseCommit,
+		Ticket:     ticket,
+		Plan:       plan,
+		Claim:      claim,
+		Adapter:    adapter,
+		Config:     cfg,
+	})
+	if err != nil {
+		t.Fatalf("RunTicket error: %v", err)
+	}
+	if result.Snapshot.Implementation == nil {
+		t.Fatal("expected implementation artifact, got nil")
+	}
+
+	changed := result.Snapshot.Implementation.ChangedFiles
+	if changed == nil {
+		t.Fatal("ChangedFiles must be empty slice, not nil")
+	}
+	if len(changed) != 0 {
+		t.Fatalf("expected no changed files, got %v", changed)
+	}
+}
+
 func verifyToggleCommand() string {
 	return `count_file=.verk/verify-count; count=0; if [ -f "$count_file" ]; then count=$(cat "$count_file"); fi; count=$((count+1)); printf '%s' "$count" > "$count_file"; if [ "$count" -lt 2 ]; then exit 1; fi`
 }
