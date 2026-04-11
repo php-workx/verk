@@ -89,13 +89,42 @@ func writeCurrentRunID(repoRoot, runID string) error {
 
 func readCurrentRunID(repoRoot string) (string, error) {
 	data, err := os.ReadFile(filepath.Join(repoRoot, ".verk", "current"))
+	if err == nil {
+		if id := strings.TrimSpace(string(data)); id != "" {
+			return id, nil
+		}
+	} else if !os.IsNotExist(err) {
+		return "", err
+	}
+	// Fallback: find the most recent run directory.
+	return latestRunID(repoRoot)
+}
+
+func latestRunID(repoRoot string) (string, error) {
+	runsDir := filepath.Join(repoRoot, ".verk", "runs")
+	entries, err := os.ReadDir(runsDir)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return "", nil
 		}
 		return "", err
 	}
-	return strings.TrimSpace(string(data)), nil
+	var latest string
+	var latestTime time.Time
+	for _, entry := range entries {
+		if !entry.IsDir() || !strings.HasPrefix(entry.Name(), "run-") {
+			continue
+		}
+		info, err := entry.Info()
+		if err != nil {
+			continue
+		}
+		if latest == "" || info.ModTime().After(latestTime) {
+			latest = entry.Name()
+			latestTime = info.ModTime()
+		}
+	}
+	return latest, nil
 }
 
 func resolveRunID(args []string) (string, error) {
