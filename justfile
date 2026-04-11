@@ -134,7 +134,22 @@ install-dev:
     go install golang.org/x/vuln/cmd/govulncheck@{{govulncheck_ver}}
     @echo "Done!"
 
-# Remove build artifacts
+# Remove build artifacts (refuses to delete runs if any run lock is held)
 clean:
-    rm -rf bin/ coverage.out coverage.html .verk/runs/
+    #!/usr/bin/env bash
+    set -euo pipefail
+    rm -rf bin/ coverage.out coverage.html
+    if [ -d .verk/runs ]; then
+        for lockfile in .verk/runs/*/run.lock; do
+            [ -f "$lockfile" ] || continue
+            if flock -n "$lockfile" true 2>/dev/null; then
+                : # lock is free
+            else
+                echo "error: a verk run is active (locked: $lockfile)"
+                echo "wait for it to finish or kill the process before cleaning"
+                exit 1
+            fi
+        done
+        rm -rf .verk/runs/
+    fi
     go clean
