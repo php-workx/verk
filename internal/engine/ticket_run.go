@@ -153,6 +153,7 @@ func RunTicket(ctx context.Context, req RunTicketRequest) (RunTicketResult, erro
 				Instructions:    renderImplementInstructions(req.Plan, st.currentPhase, st.implementationAttempts+1),
 				ExecutionConfig: executionConfigFromPolicy(cfg),
 			}
+			st.progressDetail("launching %s worker...", chosenRuntime(req.Plan, cfg))
 			result, err := st.runWorkerWithRuntimeControls(ctx, workerReq)
 			if err != nil {
 				if errors.Is(err, errRuntimeExecutionBlocked) {
@@ -168,6 +169,10 @@ func RunTicket(ctx context.Context, req RunTicketRequest) (RunTicketResult, erro
 			}
 			if err := handleImplementResult(st, result, workerReq.Attempt, workerReq.InputArtifactPath); err != nil {
 				return RunTicketResult{}, err
+			}
+			st.progressDetail("worker %s (%s)", result.Status, result.CompletionCode)
+			if st.implementation != nil && len(st.implementation.ChangedFiles) > 0 {
+				st.progressDetail("%d file(s) changed", len(st.implementation.ChangedFiles))
 			}
 
 			if st.currentPhase == state.TicketPhaseVerify {
@@ -237,6 +242,7 @@ func RunTicket(ctx context.Context, req RunTicketRequest) (RunTicketResult, erro
 				EffectiveReviewThreshold: req.Plan.EffectiveReviewThreshold,
 				ExecutionConfig:          executionConfigFromPolicy(cfg),
 			}
+			st.progressDetail("launching %s reviewer...", chosenRuntime(req.Plan, cfg))
 			result, err := st.runReviewerWithRuntimeControls(ctx, reviewReq)
 			if err != nil {
 				if errors.Is(err, errRuntimeExecutionBlocked) {
@@ -252,6 +258,17 @@ func RunTicket(ctx context.Context, req RunTicketRequest) (RunTicketResult, erro
 			}
 			if err := handleReviewOutcome(st, result, reviewReq.Attempt); err != nil {
 				return RunTicketResult{}, err
+			}
+			if result.ReviewStatus == runtime.ReviewStatusPassed {
+				st.progressDetail("review passed (%d finding(s))", len(result.Findings))
+			} else {
+				blocking := 0
+				for _, f := range result.Findings {
+					if f.Disposition == runtime.ReviewDispositionOpen {
+						blocking++
+					}
+				}
+				st.progressDetail("review: %d finding(s), %d blocking", len(result.Findings), blocking)
 			}
 			if err := st.persist(); err != nil {
 				return RunTicketResult{}, err
@@ -275,6 +292,7 @@ func RunTicket(ctx context.Context, req RunTicketRequest) (RunTicketResult, erro
 				st.closeout = &closeout
 			}
 			if st.closeout.Closable {
+				st.progressDetail("all gates passed")
 				st.blockReason = ""
 				if err := st.transitionTo(state.TicketPhaseClosed); err != nil {
 					return RunTicketResult{}, err
@@ -305,6 +323,7 @@ func RunTicket(ctx context.Context, req RunTicketRequest) (RunTicketResult, erro
 				Instructions:    renderRepairInstructions(st),
 				ExecutionConfig: executionConfigFromPolicy(cfg),
 			}
+			st.progressDetail("launching %s worker for repair...", chosenRuntime(req.Plan, cfg))
 			result, err := st.runWorkerWithRuntimeControls(ctx, workerReq)
 			if err != nil {
 				if errors.Is(err, errRuntimeExecutionBlocked) {
@@ -648,6 +667,13 @@ func (st *ticketRunState) runVerification(ctx context.Context, repoRoot string) 
 		StartedAt:  verificationStartedAt(converted),
 		FinishedAt: verificationFinishedAt(converted),
 	}
+	for _, vr := range converted {
+		mark := "✓"
+		if !vr.Passed {
+			mark = "✗"
+		}
+		st.progressDetail("%s %s", vr.Command, mark)
+	}
 	return artifact, artifact.Passed, nil
 }
 
@@ -932,6 +958,13 @@ func (st *ticketRunState) emitProgress(phase state.TicketPhase) {
 			fmt.Fprintf(st.req.ProgressWriter, "[ticket] %s ✗ blocked\n", label)
 		}
 	}
+}
+
+func (st *ticketRunState) progressDetail(format string, args ...any) {
+	if st.req.ProgressWriter == nil {
+		return
+	}
+	fmt.Fprintf(st.req.ProgressWriter, "         "+format+"\n", args...)
 }
 
 func (st *ticketRunState) persist() error {
