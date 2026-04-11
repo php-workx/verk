@@ -128,14 +128,15 @@ func doRunTicket(w, errw io.Writer, ticketID string) (string, error) {
 	}
 
 	result, err := engine.RunTicket(context.Background(), engine.RunTicketRequest{
-		RepoRoot:   repoRoot,
-		RunID:      runID,
-		Ticket:     ticket,
-		Plan:       plan,
-		Claim:      claim,
-		Adapter:    adapter,
-		Config:     cfg,
-		BaseCommit: baseCommit,
+		RepoRoot:       repoRoot,
+		RunID:          runID,
+		Ticket:         ticket,
+		Plan:           plan,
+		Claim:          claim,
+		Adapter:        adapter,
+		Config:         cfg,
+		BaseCommit:     baseCommit,
+		ProgressWriter: w,
 	})
 	if err != nil {
 		return runID, err
@@ -197,8 +198,9 @@ func doRunEpic(w, errw io.Writer, ticketID string) (string, error) {
 		AdapterFactory: func(ticketPreference string) (runtime.Adapter, error) {
 			return runtimeAdapterFor(ticketPreference, cfg.Runtime.DefaultRuntime)
 		},
-		Adapter: adapter,
-		Config:  cfg,
+		Adapter:        adapter,
+		Config:         cfg,
+		ProgressWriter: w,
 	})
 	if err != nil {
 		return runID, err

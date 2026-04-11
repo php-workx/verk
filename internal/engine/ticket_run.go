@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"path/filepath"
 	"reflect"
 	"sort"
@@ -34,6 +35,7 @@ type RunTicketRequest struct {
 	Config               policy.Config
 	VerificationCommands  []string
 	EnforceSingleScope    bool
+	ProgressWriter        io.Writer
 }
 
 type RunTicketResult struct {
@@ -893,7 +895,39 @@ func (st *ticketRunState) transitionTo(next state.TicketPhase) error {
 		return err
 	}
 	st.currentPhase = next
+	st.emitProgress(next)
 	return nil
+}
+
+func (st *ticketRunState) emitProgress(phase state.TicketPhase) {
+	if st.req.ProgressWriter == nil {
+		return
+	}
+	id := st.req.Ticket.ID
+	switch phase {
+	case state.TicketPhaseImplement:
+		fmt.Fprintf(st.req.ProgressWriter, "[ticket] %s → implement (attempt %d)\n", id, st.implementationAttempts+1)
+	case state.TicketPhaseVerify:
+		fmt.Fprintf(st.req.ProgressWriter, "[ticket] %s → verify\n", id)
+	case state.TicketPhaseReview:
+		fmt.Fprintf(st.req.ProgressWriter, "[ticket] %s → review\n", id)
+	case state.TicketPhaseRepair:
+		fmt.Fprintf(st.req.ProgressWriter, "[ticket] %s → repair (cycle %d)\n", id, len(st.repairCycles))
+	case state.TicketPhaseCloseout:
+		fmt.Fprintf(st.req.ProgressWriter, "[ticket] %s → closeout\n", id)
+	case state.TicketPhaseClosed:
+		fmt.Fprintf(st.req.ProgressWriter, "[ticket] %s ✓ closed\n", id)
+	case state.TicketPhaseBlocked:
+		reason := st.blockReason
+		if len(reason) > 60 {
+			reason = reason[:57] + "..."
+		}
+		if reason != "" {
+			fmt.Fprintf(st.req.ProgressWriter, "[ticket] %s ✗ blocked (%s)\n", id, reason)
+		} else {
+			fmt.Fprintf(st.req.ProgressWriter, "[ticket] %s ✗ blocked\n", id)
+		}
+	}
 }
 
 func (st *ticketRunState) persist() error {

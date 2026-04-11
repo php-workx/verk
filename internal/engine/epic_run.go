@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"fmt"
+	"io"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -26,6 +27,7 @@ type RunEpicRequest struct {
 	AdapterFactory       func(ticketPreference string) (runtime.Adapter, error)
 	Config               policy.Config
 	VerificationByTicket map[string][]string
+	ProgressWriter       io.Writer
 }
 
 type RunEpicResult struct {
@@ -138,6 +140,7 @@ func RunEpic(ctx context.Context, req RunEpicRequest) (RunEpicResult, error) {
 		if err := state.SaveJSONAtomic(wavePath, wave); err != nil {
 			return result, err
 		}
+		epicProgress(req.ProgressWriter, "[wave %d] %s", waveOrdinal, strings.Join(wave.TicketIDs, ", "))
 
 		waveBaselineChangedFiles, err := repo.ChangedFilesAgainst(baseCommit)
 		if err != nil {
@@ -214,6 +217,12 @@ func RunEpic(ctx context.Context, req RunEpicRequest) (RunEpicResult, error) {
 		}
 		if err := state.SaveJSONAtomic(wavePath, acceptedWave); err != nil {
 			return result, err
+		}
+		closedCount := countClosedTickets(outcomes)
+		if acceptedWave.Status == state.WaveStatusAccepted {
+			epicProgress(req.ProgressWriter, "[wave %d] %d/%d closed ✓", waveOrdinal, closedCount, len(wave.TicketIDs))
+		} else {
+			epicProgress(req.ProgressWriter, "[wave %d] %d/%d closed ✗", waveOrdinal, closedCount, len(wave.TicketIDs))
 		}
 		result.Waves = append(result.Waves, acceptedWave)
 		result.Run.WaveIDs = append(result.Run.WaveIDs, acceptedWave.WaveID)
@@ -455,6 +464,7 @@ func executeEpicTicket(ctx context.Context, req RunEpicRequest, cfg policy.Confi
 		Adapter:              adapter,
 		Config:               cfg,
 		VerificationCommands: verificationCommandsFor(req, ticket),
+		ProgressWriter:       indentWriter(req.ProgressWriter),
 	})
 	if err != nil {
 		outcome.err = err
@@ -501,4 +511,45 @@ func ticketParent(ticket *tkmd.Ticket) string {
 	}
 	parent, _ := ticket.UnknownFrontmatter["parent"].(string)
 	return parent
+}
+
+func epicProgress(w io.Writer, format string, args ...any) {
+	if w != nil {
+		fmt.Fprintf(w, format+"\n", args...)
+	}
+}
+
+func countClosedTickets(outcomes []waveTicketOutcome) int {
+	count := 0
+	for _, o := range outcomes {
+		if o.phase == state.TicketPhaseClosed {
+			count++
+		}
+	}
+	return count
+}
+
+type prefixWriter struct {
+	prefix string
+	w      io.Writer
+}
+
+func (pw *prefixWriter) Write(p []byte) (int, error) {
+	lines := strings.Split(string(p), "\n")
+	for i, line := range lines {
+		if line == "" && i == len(lines)-1 {
+			break
+		}
+		if _, err := fmt.Fprintf(pw.w, "%s%s\n", pw.prefix, line); err != nil {
+			return 0, err
+		}
+	}
+	return len(p), nil
+}
+
+func indentWriter(w io.Writer) io.Writer {
+	if w == nil {
+		return nil
+	}
+	return &prefixWriter{prefix: "  ", w: w}
 }
