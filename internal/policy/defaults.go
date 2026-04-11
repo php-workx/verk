@@ -14,7 +14,9 @@ func DefaultConfig() Config {
 			AllowDirtyWorktree:        true,
 		},
 		Runtime: RuntimeConfig{
-			DefaultRuntime: "claude",
+			DefaultRuntime:         "claude",
+			WorkerTimeoutMinutes:   30,
+			ReviewerTimeoutMinutes: 15,
 		},
 		Verification: VerificationConfig{
 			DefaultTimeoutMinutes: 15,

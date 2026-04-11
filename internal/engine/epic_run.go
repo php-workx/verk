@@ -201,6 +201,21 @@ func RunEpic(ctx context.Context, req RunEpicRequest) (RunEpicResult, error) {
 			ticketID := ticketID
 			go func() {
 				defer wg.Done()
+				defer func() {
+					if r := recover(); r != nil {
+						outcomes[i] = waveTicketOutcome{
+							ticketID: ticketID,
+							phase:    state.TicketPhaseBlocked,
+							err:      fmt.Errorf("ticket goroutine panicked: %v", r),
+						}
+						SendProgress(req.Progress, ProgressEvent{
+							Type:     EventTicketPhaseChanged,
+							TicketID: ticketID,
+							Phase:    state.TicketPhaseBlocked,
+							Detail:   fmt.Sprintf("panic: %v", r),
+						})
+					}
+				}()
 				outcomes[i] = executeEpicTicket(ctx, req, cfg, wave, ticketID)
 			}()
 		}
