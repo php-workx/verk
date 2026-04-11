@@ -127,14 +127,16 @@ func RunEpic(ctx context.Context, req RunEpicRequest) (RunEpicResult, error) {
 			if len(currentChildren) == 0 {
 				SendProgress(req.Progress, ProgressEvent{
 					Type:   EventTicketDetail,
-					Detail: fmt.Sprintf("no child tickets found with parent=%s", req.RootTicketID),
+					Detail: fmt.Sprintf("no child tickets found for epic %s", req.RootTicketID),
 				})
 			} else {
 				for _, child := range currentChildren {
+					reason := describeNotReady(child)
 					SendProgress(req.Progress, ProgressEvent{
 						Type:     EventTicketDetail,
 						TicketID: child.ID,
-						Detail:   fmt.Sprintf("status=%s (not ready)", string(child.Status)),
+						Title:    child.Title,
+						Detail:   reason,
 					})
 				}
 			}
@@ -329,15 +331,22 @@ func normalizeEpicConfig(cfg policy.Config) policy.Config {
 }
 
 func listEpicChildren(repoRoot, parentID string) ([]tkmd.Ticket, error) {
-	// Load the epic ticket to get its deps list (alternative child discovery).
+	// Load the epic ticket to get its deps/links list for child discovery.
 	epicPath := filepath.Join(repoRoot, ".tickets", parentID+".md")
 	epicTicket, err := tkmd.LoadTicket(epicPath)
 	if err != nil {
 		return nil, fmt.Errorf("load epic %s: %w", parentID, err)
 	}
-	epicDeps := make(map[string]struct{}, len(epicTicket.Deps))
+	epicChildren := make(map[string]struct{})
 	for _, dep := range epicTicket.Deps {
-		epicDeps[dep] = struct{}{}
+		epicChildren[dep] = struct{}{}
+	}
+	if epicTicket.UnknownFrontmatter != nil {
+		if links, ok := epicTicket.UnknownFrontmatter["links"]; ok {
+			for _, link := range toStringSlice(links) {
+				epicChildren[link] = struct{}{}
+			}
+		}
 	}
 
 	paths, err := filepath.Glob(filepath.Join(repoRoot, ".tickets", "*.md"))
@@ -356,10 +365,10 @@ func listEpicChildren(repoRoot, parentID string) ([]tkmd.Ticket, error) {
 		if ticket.ID == parentID {
 			continue
 		}
-		// Child if: has parent field pointing to epic, OR is in epic's deps list
+		// Child if: has parent field, OR is in epic's deps list, OR is in epic's links list
 		isChild := ticketParent(&ticket) == parentID
 		if !isChild {
-			_, isChild = epicDeps[ticket.ID]
+			_, isChild = epicChildren[ticket.ID]
 		}
 		if !isChild {
 			continue
@@ -576,6 +585,46 @@ func ticketParent(ticket *tkmd.Ticket) string {
 	}
 	parent, _ := ticket.UnknownFrontmatter["parent"].(string)
 	return parent
+}
+
+func describeNotReady(ticket tkmd.Ticket) string {
+	switch ticket.Status {
+	case tkmd.StatusClosed:
+		return "closed"
+	case tkmd.StatusBlocked:
+		return "blocked"
+	case tkmd.StatusInProgress:
+		return "in_progress"
+	}
+	// Status is open/ready — must be deps not resolved
+	if len(ticket.Deps) > 0 {
+		unresolved := make([]string, 0)
+		for _, dep := range ticket.Deps {
+			unresolved = append(unresolved, dep)
+		}
+		if len(unresolved) <= 3 {
+			return fmt.Sprintf("waiting on deps: %s", strings.Join(unresolved, ", "))
+		}
+		return fmt.Sprintf("waiting on %d deps", len(unresolved))
+	}
+	return fmt.Sprintf("status=%s", string(ticket.Status))
+}
+
+func toStringSlice(value any) []string {
+	switch v := value.(type) {
+	case []string:
+		return v
+	case []any:
+		out := make([]string, 0, len(v))
+		for _, item := range v {
+			if s, ok := item.(string); ok {
+				out = append(out, s)
+			}
+		}
+		return out
+	default:
+		return nil
+	}
 }
 
 func countClosedTickets(outcomes []waveTicketOutcome) int {
