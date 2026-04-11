@@ -111,7 +111,7 @@ func (a *Adapter) RunWorker(ctx context.Context, req runtime.WorkerRequest) (run
 		Status:         deriveWorkerStatus(resultBlock, blockFound, cliOK, execResult.exitCode, execResult.stderr),
 		CompletionCode: deriveWorkerCompletionCode(resultBlock, blockFound, execResult.exitCode),
 		Concerns:       deriveWorkerConcerns(resultBlock, blockFound),
-		BlockReason:    deriveWorkerBlockReason(resultBlock, blockFound),
+		BlockReason:    deriveWorkerBlockReason(resultBlock, blockFound, resultText, execResult.exitCode),
 		RetryClass:     deriveWorkerRetryClass(resultBlock, blockFound, cliOK, execResult.exitCode, execResult.stderr),
 		LeaseID:        req.LeaseID,
 		StartedAt:      startedAt,
@@ -318,9 +318,18 @@ func deriveWorkerConcerns(block runtime.VerkResultBlock, found bool) []string {
 	return nil
 }
 
-func deriveWorkerBlockReason(block runtime.VerkResultBlock, found bool) string {
-	if found {
+func deriveWorkerBlockReason(block runtime.VerkResultBlock, found bool, resultText string, exitCode int) string {
+	if found && strings.TrimSpace(block.BlockReason) != "" {
 		return strings.TrimSpace(block.BlockReason)
+	}
+	// If the CLI failed without a verk result block, include the CLI's output
+	// so the user can see why (e.g., "Not logged in", auth errors).
+	if exitCode != 0 && resultText != "" {
+		reason := strings.TrimSpace(resultText)
+		if len(reason) > 120 {
+			reason = reason[:117] + "..."
+		}
+		return reason
 	}
 	return ""
 }

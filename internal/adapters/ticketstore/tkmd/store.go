@@ -48,6 +48,10 @@ func LoadTicket(path string) (Ticket, error) {
 	if err := decodeFrontMatter(frontmatter, ticket); err != nil {
 		return Ticket{}, err
 	}
+	// Extract title from body's first # heading if not in frontmatter
+	if ticket.Title == "" {
+		ticket.Title = extractHeadingTitle(ticket.Body)
+	}
 	return *ticket, nil
 }
 
@@ -170,6 +174,17 @@ func parentOf(ticket *Ticket) string {
 	}
 	parent, _ := raw.(string)
 	return parent
+}
+
+// extractHeadingTitle extracts the title from the first # heading in the body.
+func extractHeadingTitle(body string) string {
+	for _, line := range strings.Split(body, "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "# ") {
+			return strings.TrimSpace(strings.TrimPrefix(line, "# "))
+		}
+	}
+	return ""
 }
 
 // loadEpicDeps loads an epic ticket's deps list as a set for child discovery.
