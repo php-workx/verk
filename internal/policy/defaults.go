@@ -11,6 +11,7 @@ func DefaultConfig() Config {
 			ReviewThreshold:           state.SeverityP2,
 			MaxImplementationAttempts: 3,
 			MaxRepairCycles:           2,
+			AllowDirtyWorktree:        true,
 		},
 		Verification: VerificationConfig{
 			DefaultTimeoutMinutes: 15,

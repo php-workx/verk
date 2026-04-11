@@ -124,6 +124,20 @@ func RunEpic(ctx context.Context, req RunEpicRequest) (RunEpicResult, error) {
 			if err != nil {
 				return result, err
 			}
+			if len(currentChildren) == 0 {
+				SendProgress(req.Progress, ProgressEvent{
+					Type:   EventTicketDetail,
+					Detail: fmt.Sprintf("no child tickets found with parent=%s", req.RootTicketID),
+				})
+			} else {
+				for _, child := range currentChildren {
+					SendProgress(req.Progress, ProgressEvent{
+						Type:     EventTicketDetail,
+						TicketID: child.ID,
+						Detail:   fmt.Sprintf("status=%s (not ready)", string(child.Status)),
+					})
+				}
+			}
 			status := epicCompletionStatus(currentChildren)
 			result.Run.Status = status
 			switch status {
