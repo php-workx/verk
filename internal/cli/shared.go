@@ -23,7 +23,9 @@ func loadExecutionContext() (string, policy.Config, *repoadapter.Repo, error) {
 	if err != nil {
 		return "", policy.Config{}, nil, err
 	}
-	repoRoot, err := repo.RepoRoot()
+	// Use the main worktree root so .tickets/ and .verk/ are found
+	// even when running from a git worktree.
+	repoRoot, err := repo.MainWorktreeRoot()
 	if err != nil {
 		return "", policy.Config{}, nil, err
 	}
@@ -76,7 +78,7 @@ func resolveRepoRoot() (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return repo.RepoRoot()
+	return repo.MainWorktreeRoot()
 }
 
 func writeCurrentRunID(repoRoot, runID string) error {

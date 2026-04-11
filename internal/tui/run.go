@@ -10,22 +10,20 @@ import (
 )
 
 // RunProgress starts the appropriate progress display for a verk run.
-// Currently uses plain log output. Bubble Tea TUI is available via RunTUI
-// but needs more testing before becoming the default.
+// Uses Bubble Tea TUI if stdout is a terminal, plain log output otherwise.
 func RunProgress(runID string, ch <-chan engine.ProgressEvent, w io.Writer) error {
+	if isTerminal() {
+		return runTUI(runID, ch)
+	}
 	RunPlainProgress(w, ch)
 	return nil
 }
 
-// RunTUI starts the Bubble Tea TUI for run progress.
-// Use this when you want the interactive updating display.
-func RunTUI(runID string, ch <-chan engine.ProgressEvent) error {
-	return runTUI(runID, ch)
-}
-
 func runTUI(runID string, ch <-chan engine.ProgressEvent) error {
 	m := NewRunModel(runID, ch)
-	p := tea.NewProgram(m)
+	p := tea.NewProgram(m,
+		tea.WithInput(nil), // no keyboard input — prevents terminal capability queries that leak escape sequences
+	)
 	_, err := p.Run()
 	return err
 }

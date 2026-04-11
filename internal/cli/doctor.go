@@ -16,7 +16,11 @@ var doctorCmd = &cobra.Command{
 	Short:   "Check environment health",
 	GroupID: groupObserve,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		report, code, err := engine.RunDoctor(".")
+		repoRoot, err := resolveRepoRoot()
+		if err != nil {
+			repoRoot = "."
+		}
+		report, code, err := engine.RunDoctor(repoRoot)
 		if err != nil {
 			return withExitCode(err, 2)
 		}

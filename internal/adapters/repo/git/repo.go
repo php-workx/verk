@@ -98,6 +98,28 @@ func (r *Repo) RepoRoot() (string, error) {
 	return r.root, nil
 }
 
+// MainWorktreeRoot returns the root of the main (primary) worktree.
+// For regular repos this is the same as RepoRoot. For git worktrees,
+// this returns the parent of .git (the main checkout), which is where
+// shared untracked directories like .tickets/ live.
+func (r *Repo) MainWorktreeRoot() (string, error) {
+	if r == nil {
+		return "", fmt.Errorf("nil repo")
+	}
+	commonDir, err := gitOutput(r.root, "rev-parse", "--path-format=absolute", "--git-common-dir")
+	if err != nil {
+		// Fallback: if git doesn't support --path-format, use the current root
+		return r.root, nil
+	}
+	commonDir = filepath.Clean(strings.TrimRight(commonDir, "\r\n"))
+	// The main worktree root is the parent of the .git directory
+	mainRoot := filepath.Dir(commonDir)
+	if resolved, err := resolvePath(mainRoot); err == nil {
+		return resolved, nil
+	}
+	return mainRoot, nil
+}
+
 func (r *Repo) HeadCommit() (string, error) {
 	if r == nil {
 		return "", fmt.Errorf("nil repo")
