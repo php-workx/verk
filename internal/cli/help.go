@@ -22,7 +22,7 @@ const (
 )
 
 var groupCommandOrder = map[string][]string{
-	groupExecution: {"run", "resume", "reopen"},
+	groupExecution: {"run", "reopen"},
 	groupObserve:   {"status", "doctor"},
 }
 

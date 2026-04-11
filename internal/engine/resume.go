@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"fmt"
+	"io"
 	"path/filepath"
 	"sort"
 	"sync"
@@ -21,6 +22,7 @@ type ResumeRequest struct {
 	Adapter        runtime.Adapter
 	AdapterFactory func(ticketPreference string) (runtime.Adapter, error)
 	Config         policy.Config
+	ProgressWriter io.Writer
 }
 
 type ResumeReport struct {
@@ -40,6 +42,12 @@ func ResumeRun(ctx context.Context, req ResumeRequest) (ResumeReport, error) {
 	if req.RunID == "" {
 		return ResumeReport{}, fmt.Errorf("resume requires run id")
 	}
+
+	lock, err := AcquireRunLock(req.RepoRoot, req.RunID)
+	if err != nil {
+		return ResumeReport{}, err
+	}
+	defer lock.Release()
 
 	artifacts, err := loadRunArtifacts(req.RepoRoot, req.RunID)
 	if err != nil {
@@ -242,6 +250,7 @@ func resumeTicketMode(ctx context.Context, req ResumeRequest, artifacts *runArti
 			Adapter:              adapter,
 			Config:               req.Config,
 			VerificationCommands: plan.ValidationCommands,
+			ProgressWriter:       req.ProgressWriter,
 		})
 		if runErr != nil {
 			return resumed, fmt.Errorf("run ticket %s: %w", ticketID, runErr)
@@ -299,14 +308,15 @@ func resumeEpicMode(ctx context.Context, req ResumeRequest, artifacts *runArtifa
 
 	// Build an epic request for use by executeEpicTicket
 	epicReq := RunEpicRequest{
-		RepoRoot:     artifacts.RepoRoot,
-		RunID:        req.RunID,
-		RootTicketID: artifacts.Run.RootTicketID,
-		BaseBranch:   artifacts.Run.BaseBranch,
-		BaseCommit:   baseCommit,
-		Adapter:      req.Adapter,
+		RepoRoot:       artifacts.RepoRoot,
+		RunID:          req.RunID,
+		RootTicketID:   artifacts.Run.RootTicketID,
+		BaseBranch:     artifacts.Run.BaseBranch,
+		BaseCommit:     baseCommit,
+		Adapter:        req.Adapter,
 		AdapterFactory: req.AdapterFactory,
-		Config:       cfg,
+		Config:         cfg,
+		ProgressWriter: req.ProgressWriter,
 	}
 
 	var allResumed []string

@@ -44,6 +44,12 @@ func RunEpic(ctx context.Context, req RunEpicRequest) (RunEpicResult, error) {
 		return RunEpicResult{}, err
 	}
 
+	lock, err := AcquireRunLock(req.RepoRoot, req.RunID)
+	if err != nil {
+		return RunEpicResult{}, err
+	}
+	defer lock.Release()
+
 	cfg := normalizeEpicConfig(req.Config)
 	repo, err := git.New(req.RepoRoot)
 	if err != nil {

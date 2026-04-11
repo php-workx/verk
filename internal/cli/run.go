@@ -16,9 +16,13 @@ import (
 )
 
 var runCmd = &cobra.Command{
-	Use:     "run",
-	Short:   "Run a ticket or epic",
-	GroupID: groupExecution,
+	Use:          "run [command]",
+	Short:        "Run a ticket or epic, or resume the current run",
+	GroupID:      groupExecution,
+	SilenceUsage: true,
+	RunE: func(cmd *cobra.Command, args []string) error {
+		return doAutoResume(cmd.OutOrStdout(), cmd.ErrOrStderr())
+	},
 }
 
 var runTicketCmd = &cobra.Command{
@@ -81,6 +85,12 @@ func doRunTicket(w, errw io.Writer, ticketID string) (string, error) {
 	if wErr := writeCurrentRunID(repoRoot, runID); wErr != nil {
 		fmt.Fprintf(errw, "warning: could not write current run: %v\n", wErr)
 	}
+
+	lock, err := engine.AcquireRunLock(repoRoot, runID)
+	if err != nil {
+		return runID, err
+	}
+	defer lock.Release()
 
 	leaseID := fmt.Sprintf("lease-%s-%s", runID, ticketID)
 	claim, err := tkmd.AcquireClaim(repoRoot, runID, ticketID, leaseID, 30*time.Minute, time.Now().UTC())
@@ -208,4 +218,56 @@ func doRunEpic(w, errw io.Writer, ticketID string) (string, error) {
 
 	fmt.Fprintf(w, "status=%s phase=%s\n", result.Run.Status, result.Run.CurrentPhase)
 	return runID, nil
+}
+
+func doAutoResume(w, errw io.Writer) error {
+	repoRoot, cfg, _, err := loadExecutionContext()
+	if err != nil {
+		return err
+	}
+
+	runID, err := readCurrentRunID(repoRoot)
+	if err != nil {
+		return fmt.Errorf("could not read current run: %w", err)
+	}
+	if runID == "" {
+		return fmt.Errorf("no active run — start one with: verk run ticket <id>")
+	}
+
+	// Load the run to check its status before attempting resume.
+	var run state.RunArtifact
+	runPath := filepath.Join(repoRoot, ".verk", "runs", runID, "run.json")
+	if loadErr := state.LoadJSON(runPath, &run); loadErr != nil {
+		return fmt.Errorf("could not load run %s: %w", runID, loadErr)
+	}
+
+	switch run.Status {
+	case state.EpicRunStatusCompleted:
+		fmt.Fprintf(w, "Run %s is already completed.\n", runID)
+		fmt.Fprintf(w, "Start a new one with: verk run ticket <id>\n")
+		return nil
+	case state.EpicRunStatusBlocked:
+		fmt.Fprintf(w, "Run %s is blocked.\n", runID)
+		fmt.Fprintf(w, "Use 'verk reopen %s <ticket-id> --to implement' to unblock,\n", runID)
+		fmt.Fprintf(w, "then 'verk run' to continue.\n")
+		return nil
+	}
+
+	// Status is "running" — resume execution.
+	fmt.Fprintf(w, "Resuming run %s...\n", runID)
+
+	report, err := engine.ResumeRun(context.Background(), engine.ResumeRequest{
+		RepoRoot: repoRoot,
+		RunID:    runID,
+		AdapterFactory: func(ticketPreference string) (runtime.Adapter, error) {
+			return runtimeAdapterFor(ticketPreference, cfg.Runtime.DefaultRuntime)
+		},
+		Config:         cfg,
+		ProgressWriter: w,
+	})
+	if err != nil {
+		return err
+	}
+	fmt.Fprintf(w, "status=%s\n", report.Run.Status)
+	return nil
 }

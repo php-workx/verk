@@ -1,0 +1,50 @@
+package engine
+
+import (
+	"fmt"
+	"os"
+	"path/filepath"
+	"syscall"
+)
+
+// RunLock provides exclusive, advisory locking for a verk run.
+// Only one process can hold the lock for a given run at a time.
+// The OS automatically releases the lock if the process crashes.
+type RunLock struct {
+	file *os.File
+	path string
+}
+
+// AcquireRunLock attempts to acquire an exclusive, non-blocking lock for the
+// given run. Returns an error immediately if the lock is already held by
+// another process.
+func AcquireRunLock(repoRoot, runID string) (*RunLock, error) {
+	dir := filepath.Join(repoRoot, ".verk", "runs", runID)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return nil, fmt.Errorf("create run dir: %w", err)
+	}
+
+	lockPath := filepath.Join(dir, "run.lock")
+	file, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o644)
+	if err != nil {
+		return nil, fmt.Errorf("open run lock: %w", err)
+	}
+
+	if err := syscall.Flock(int(file.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		file.Close()
+		return nil, fmt.Errorf("run %s is already being executed by another process", runID)
+	}
+
+	return &RunLock{file: file, path: lockPath}, nil
+}
+
+// Release releases the run lock.
+func (l *RunLock) Release() error {
+	if l == nil || l.file == nil {
+		return nil
+	}
+	_ = syscall.Flock(int(l.file.Fd()), syscall.LOCK_UN)
+	err := l.file.Close()
+	l.file = nil
+	return err
+}

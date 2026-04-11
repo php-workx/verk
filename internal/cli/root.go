@@ -42,7 +42,6 @@ func init() {
 	rootCmd.AddCommand(versionCmd)
 	initHelp()
 	initRunCmd()
-	initResumeCmd()
 	initReopenCmd()
 	initStatusCmd()
 	initDoctorCmd()
