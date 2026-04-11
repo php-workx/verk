@@ -709,3 +709,44 @@ func gitOutput(dir string, args ...string) (string, error) {
 	}
 	return string(out), nil
 }
+
+func TestRunEpicConcurrentLockContention(t *testing.T) {
+	repoRoot := t.TempDir()
+	baseCommit := initEpicRepo(t, repoRoot)
+	cfg := policy.DefaultConfig()
+
+	epic := epicTicket("epic-lock")
+	mustSaveTicket(t, repoRoot, epic)
+	child := epicChildTicket("ticket-lock", epic.ID, tkmd.StatusReady, nil, []string{"internal/app"})
+	mustSaveTicket(t, repoRoot, child)
+
+	// Use a slow adapter so the first RunEpic holds the lock long enough
+	// for the second to attempt acquisition.
+	slowAdapter := newBlockingEpicAdapter(t)
+
+	runID := "run-lock-contention"
+
+	// Pre-acquire the lock to simulate a running process.
+	lock, err := AcquireRunLock(repoRoot, runID)
+	if err != nil {
+		t.Fatalf("pre-acquire lock: %v", err)
+	}
+
+	// Second RunEpic with same run ID should fail immediately.
+	_, err = RunEpic(context.Background(), RunEpicRequest{
+		RepoRoot:     repoRoot,
+		RunID:        runID,
+		RootTicketID: epic.ID,
+		BaseCommit:   baseCommit,
+		Adapter:      slowAdapter,
+		Config:       cfg,
+	})
+	if err == nil {
+		t.Fatal("expected concurrent RunEpic to fail with lock error")
+	}
+	if !strings.Contains(err.Error(), "already being executed") {
+		t.Fatalf("expected lock contention error, got: %v", err)
+	}
+
+	lock.Release()
+}

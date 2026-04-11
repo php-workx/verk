@@ -21,7 +21,12 @@ var runCmd = &cobra.Command{
 	GroupID:      groupExecution,
 	SilenceUsage: true,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		return doAutoResume(cmd.OutOrStdout(), cmd.ErrOrStderr())
+		err := doAutoResume(cmd.OutOrStdout(), cmd.ErrOrStderr())
+		if err != nil {
+			cmd.SilenceErrors = true
+			return err
+		}
+		return nil
 	},
 }
 
@@ -223,15 +228,20 @@ func doRunEpic(w, errw io.Writer, ticketID string) (string, error) {
 func doAutoResume(w, errw io.Writer) error {
 	repoRoot, cfg, _, err := loadExecutionContext()
 	if err != nil {
-		return err
+		fmt.Fprintf(w, "Error: %s\n", err)
+		return withExitCode(err, 1)
 	}
 
 	runID, err := readCurrentRunID(repoRoot)
 	if err != nil {
-		return fmt.Errorf("could not read current run: %w", err)
+		msg := fmt.Errorf("could not read current run: %w", err)
+		fmt.Fprintf(w, "Error: %s\n", msg)
+		return withExitCode(msg, 1)
 	}
 	if runID == "" {
-		return fmt.Errorf("no active run — start one with: verk run ticket <id>")
+		msg := fmt.Errorf("no active run — start one with: verk run ticket <id>")
+		fmt.Fprintf(w, "Error: %s\n", msg)
+		return withExitCode(msg, 1)
 	}
 
 	// Load the run to check its status before attempting resume.

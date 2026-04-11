@@ -203,3 +203,74 @@ func runGit(t *testing.T, dir string, args ...string) {
 		t.Fatalf("git %v failed: %v\n%s", args, err, string(out))
 	}
 }
+
+func TestRunNoArgs_NoCurrentRun(t *testing.T) {
+	repoRoot := t.TempDir()
+	writeCLIRepo(t, repoRoot)
+
+	stdout, _, code := runCLIFromDir(t, repoRoot, "run")
+	if code == 0 {
+		t.Fatalf("expected non-zero exit code, got 0")
+	}
+	if !strings.Contains(stdout, "no active run") {
+		t.Fatalf("expected 'no active run' message, got: %s", stdout)
+	}
+}
+
+func TestRunNoArgs_CompletedRun(t *testing.T) {
+	repoRoot := t.TempDir()
+	writeCLIRepo(t, repoRoot)
+	runID := "run-completed"
+
+	writeJSONFixture(t, filepath.Join(repoRoot, ".verk", "runs", runID, "run.json"), state.RunArtifact{
+		ArtifactMeta: state.ArtifactMeta{SchemaVersion: 1, RunID: runID},
+		Mode:         "ticket",
+		RootTicketID: "ticket-1",
+		Status:       state.EpicRunStatusCompleted,
+		CurrentPhase: state.TicketPhaseClosed,
+		TicketIDs:    []string{"ticket-1"},
+	})
+
+	// Write .verk/current so verk run finds it
+	if err := os.WriteFile(filepath.Join(repoRoot, ".verk", "current"), []byte(runID+"\n"), 0o644); err != nil {
+		t.Fatalf("write current: %v", err)
+	}
+
+	stdout, _, code := runCLIFromDir(t, repoRoot, "run")
+	if code != 0 {
+		t.Fatalf("expected exit code 0 for completed run info, got %d", code)
+	}
+	if !strings.Contains(stdout, "completed") {
+		t.Fatalf("expected 'completed' message, got: %s", stdout)
+	}
+}
+
+func TestRunNoArgs_BlockedRun(t *testing.T) {
+	repoRoot := t.TempDir()
+	writeCLIRepo(t, repoRoot)
+	runID := "run-blocked"
+
+	writeJSONFixture(t, filepath.Join(repoRoot, ".verk", "runs", runID, "run.json"), state.RunArtifact{
+		ArtifactMeta: state.ArtifactMeta{SchemaVersion: 1, RunID: runID},
+		Mode:         "ticket",
+		RootTicketID: "ticket-1",
+		Status:       state.EpicRunStatusBlocked,
+		CurrentPhase: state.TicketPhaseBlocked,
+		TicketIDs:    []string{"ticket-1"},
+	})
+
+	if err := os.WriteFile(filepath.Join(repoRoot, ".verk", "current"), []byte(runID+"\n"), 0o644); err != nil {
+		t.Fatalf("write current: %v", err)
+	}
+
+	stdout, _, code := runCLIFromDir(t, repoRoot, "run")
+	if code != 0 {
+		t.Fatalf("expected exit code 0 for blocked run info, got %d", code)
+	}
+	if !strings.Contains(stdout, "blocked") {
+		t.Fatalf("expected 'blocked' message, got: %s", stdout)
+	}
+	if !strings.Contains(stdout, "reopen") {
+		t.Fatalf("expected reopen guidance, got: %s", stdout)
+	}
+}
