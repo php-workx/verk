@@ -903,10 +903,14 @@ func (st *ticketRunState) emitProgress(phase state.TicketPhase) {
 	if st.req.ProgressWriter == nil {
 		return
 	}
+	label := st.req.Ticket.ID
+	if st.req.Plan.Title != "" {
+		label = fmt.Sprintf("%s %s", st.req.Ticket.ID, st.req.Plan.Title)
+	}
 	id := st.req.Ticket.ID
 	switch phase {
 	case state.TicketPhaseImplement:
-		fmt.Fprintf(st.req.ProgressWriter, "[ticket] %s → implement (attempt %d)\n", id, st.implementationAttempts+1)
+		fmt.Fprintf(st.req.ProgressWriter, "[ticket] %s → implement (attempt %d)\n", label, st.implementationAttempts+1)
 	case state.TicketPhaseVerify:
 		fmt.Fprintf(st.req.ProgressWriter, "[ticket] %s → verify\n", id)
 	case state.TicketPhaseReview:
@@ -916,16 +920,16 @@ func (st *ticketRunState) emitProgress(phase state.TicketPhase) {
 	case state.TicketPhaseCloseout:
 		fmt.Fprintf(st.req.ProgressWriter, "[ticket] %s → closeout\n", id)
 	case state.TicketPhaseClosed:
-		fmt.Fprintf(st.req.ProgressWriter, "[ticket] %s ✓ closed\n", id)
+		fmt.Fprintf(st.req.ProgressWriter, "[ticket] %s ✓ closed\n", label)
 	case state.TicketPhaseBlocked:
 		reason := st.blockReason
 		if len(reason) > 60 {
 			reason = reason[:57] + "..."
 		}
 		if reason != "" {
-			fmt.Fprintf(st.req.ProgressWriter, "[ticket] %s ✗ blocked (%s)\n", id, reason)
+			fmt.Fprintf(st.req.ProgressWriter, "[ticket] %s ✗ blocked (%s)\n", label, reason)
 		} else {
-			fmt.Fprintf(st.req.ProgressWriter, "[ticket] %s ✗ blocked\n", id)
+			fmt.Fprintf(st.req.ProgressWriter, "[ticket] %s ✗ blocked\n", label)
 		}
 	}
 }
