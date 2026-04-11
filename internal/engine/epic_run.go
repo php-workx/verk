@@ -67,6 +67,18 @@ func RunEpic(ctx context.Context, req RunEpicRequest) (RunEpicResult, error) {
 	if err != nil {
 		return RunEpicResult{}, err
 	}
+
+	// Reset orphaned in_progress tickets (from crashed prior runs) to ready
+	// so the wave scheduler can pick them up.
+	for _, child := range children {
+		if child.Status == tkmd.StatusInProgress {
+			if err := updateTicketStoreStatus(req.RepoRoot, child.ID, tkmd.StatusReady); err != nil {
+				return RunEpicResult{}, fmt.Errorf("reset orphaned ticket %s: %w", child.ID, err)
+			}
+			epicProgress(req.ProgressWriter, "[reset] %s → ready (was in_progress from prior run)", child.ID)
+		}
+	}
+
 	runPath := filepath.Join(req.RepoRoot, ".verk", "runs", req.RunID, "run.json")
 	run := state.RunArtifact{
 		ArtifactMeta: state.ArtifactMeta{
