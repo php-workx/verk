@@ -2,6 +2,7 @@ package engine
 
 import (
 	"fmt"
+	"path/filepath"
 	"sort"
 
 	"verk/internal/adapters/ticketstore/tkmd"
@@ -60,9 +61,13 @@ func DeriveStatus(req StatusRequest) (StatusReport, error) {
 	for _, ticketID := range ticketIDs {
 		snapshot := artifacts.Tickets[ticketID]
 		plan := artifacts.Plans[ticketID]
+		title := plan.Title
+		if title == "" {
+			title = loadTicketTitle(artifacts.RepoRoot, ticketID)
+		}
 		entry := StatusTicket{
 			TicketID:                 ticketID,
-			Title:                    plan.Title,
+			Title:                    title,
 			Phase:                    snapshot.CurrentPhase,
 			EffectiveReviewThreshold: plan.EffectiveReviewThreshold,
 			BlockReason:              snapshot.BlockReason,
@@ -97,6 +102,14 @@ func DeriveStatus(req StatusRequest) (StatusReport, error) {
 		return report.ActiveClaims[i].TicketID < report.ActiveClaims[j].TicketID
 	})
 	return report, nil
+}
+
+func loadTicketTitle(repoRoot, ticketID string) string {
+	ticket, err := tkmd.LoadTicket(filepath.Join(repoRoot, ".tickets", ticketID+".md"))
+	if err != nil {
+		return ""
+	}
+	return ticket.Title
 }
 
 func deriveCurrentWaveID(waves map[string]state.WaveArtifact) string {
