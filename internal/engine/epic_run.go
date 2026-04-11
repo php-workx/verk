@@ -205,15 +205,17 @@ func RunEpic(ctx context.Context, req RunEpicRequest) (RunEpicResult, error) {
 					if r := recover(); r != nil {
 						outcomes[i] = waveTicketOutcome{
 							ticketID: ticketID,
-							phase:    state.TicketPhaseBlocked,
-							err:      fmt.Errorf("ticket goroutine panicked: %v", r),
+							phase:    state.TicketPhaseImplement, // not blocked — will be retried in next wave
+							err:      fmt.Errorf("ticket goroutine crashed: %v", r),
 						}
 						SendProgress(req.Progress, ProgressEvent{
-							Type:     EventTicketPhaseChanged,
+							Type:     EventTicketDetail,
 							TicketID: ticketID,
-							Phase:    state.TicketPhaseBlocked,
-							Detail:   fmt.Sprintf("panic: %v", r),
+							Detail:   fmt.Sprintf("worker crashed, will retry: %v", r),
 						})
+						// Release claim so the ticket can be re-scheduled
+						_ = tkmd.ReleaseClaim(req.RepoRoot, req.RunID, ticketID,
+							fmt.Sprintf("lease-%s-%s", req.RunID, ticketID), "crash recovery")
 					}
 				}()
 				outcomes[i] = executeEpicTicket(ctx, req, cfg, wave, ticketID)
@@ -287,9 +289,15 @@ func RunEpic(ctx context.Context, req RunEpicRequest) (RunEpicResult, error) {
 		result.Run.UpdatedAt = time.Now().UTC()
 
 		for i, outcome := range outcomes {
-			status := tkmd.StatusBlocked
-			if acceptedWave.Status == state.WaveStatusAccepted && outcome.err == nil && outcome.phase == state.TicketPhaseClosed {
+			var status tkmd.Status
+			switch {
+			case acceptedWave.Status == state.WaveStatusAccepted && outcome.err == nil && outcome.phase == state.TicketPhaseClosed:
 				status = tkmd.StatusClosed
+			case outcome.phase == state.TicketPhaseBlocked:
+				status = tkmd.StatusBlocked
+			default:
+				// Crashed or incomplete tickets go back to open for retry
+				status = tkmd.StatusOpen
 			}
 			if err := updateTicketStoreStatus(req.RepoRoot, wave.TicketIDs[i], status); err != nil {
 				result.Run.Status = state.EpicRunStatusBlocked
