@@ -166,6 +166,7 @@ func TestUsesCanonicalReadinessPredicate(t *testing.T) {
 	}
 
 	want := map[string]struct{}{
+		"dep-open":        {}, // open tickets with resolved deps are now schedulable
 		"ready-unclaimed": {},
 		"ready-same-run":  {},
 	}

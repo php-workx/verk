@@ -90,7 +90,7 @@ func TestAcceptWaveRejectsScopeViolation(t *testing.T) {
 	}
 }
 
-func TestRunEpicUsesReadyPredicate(t *testing.T) {
+func TestRunEpicSchedulesOpenAndReadyTickets(t *testing.T) {
 	repoRoot := t.TempDir()
 	baseCommit := initEpicRepo(t, repoRoot)
 	cfg := policy.DefaultConfig()
@@ -101,21 +101,44 @@ func TestRunEpicUsesReadyPredicate(t *testing.T) {
 	ready := epicChildTicket("ticket-ready", epic.ID, tkmd.StatusReady, nil, []string{"internal/app"})
 	mustSaveTicket(t, repoRoot, ready)
 
-	ignored := epicChildTicket("ticket-open", epic.ID, tkmd.StatusOpen, nil, []string{"docs"})
-	mustSaveTicket(t, repoRoot, ignored)
+	// Open tickets with resolved deps should also be scheduled (tk creates tickets as open)
+	open := epicChildTicket("ticket-open", epic.ID, tkmd.StatusOpen, nil, []string{"docs"})
+	mustSaveTicket(t, repoRoot, open)
+
+	// Blocked tickets should NOT be scheduled
+	blocked := epicChildTicket("ticket-blocked", epic.ID, tkmd.StatusBlocked, nil, []string{"config"})
+	mustSaveTicket(t, repoRoot, blocked)
 
 	adapter := runtimefake.New(
 		[]runtime.WorkerResult{
 			{
 				Status:             runtime.WorkerStatusDone,
 				RetryClass:         runtime.RetryClassTerminal,
+				LeaseID:            "lease-run-ready-ticket-open",
+				StartedAt:          epicTestStart(),
+				FinishedAt:         epicTestStart().Add(time.Second),
+				ResultArtifactPath: filepath.Join(repoRoot, "worker1.json"),
+			},
+			{
+				Status:             runtime.WorkerStatusDone,
+				RetryClass:         runtime.RetryClassTerminal,
 				LeaseID:            "lease-run-ready-ticket-ready",
 				StartedAt:          epicTestStart(),
 				FinishedAt:         epicTestStart().Add(time.Second),
-				ResultArtifactPath: filepath.Join(repoRoot, "worker.json"),
+				ResultArtifactPath: filepath.Join(repoRoot, "worker2.json"),
 			},
 		},
 		[]runtime.ReviewResult{
+			{
+				Status:             runtime.WorkerStatusDone,
+				RetryClass:         runtime.RetryClassTerminal,
+				LeaseID:            "lease-run-ready-ticket-open",
+				StartedAt:          epicTestStart().Add(2 * time.Second),
+				FinishedAt:         epicTestStart().Add(3 * time.Second),
+				ReviewStatus:       runtime.ReviewStatusPassed,
+				Summary:            "clean",
+				ResultArtifactPath: filepath.Join(repoRoot, "review1.json"),
+			},
 			{
 				Status:             runtime.WorkerStatusDone,
 				RetryClass:         runtime.RetryClassTerminal,
@@ -124,7 +147,7 @@ func TestRunEpicUsesReadyPredicate(t *testing.T) {
 				FinishedAt:         epicTestStart().Add(3 * time.Second),
 				ReviewStatus:       runtime.ReviewStatusPassed,
 				Summary:            "clean",
-				ResultArtifactPath: filepath.Join(repoRoot, "review.json"),
+				ResultArtifactPath: filepath.Join(repoRoot, "review2.json"),
 			},
 		},
 	)
@@ -141,22 +164,14 @@ func TestRunEpicUsesReadyPredicate(t *testing.T) {
 		t.Fatalf("RunEpic returned error: %v", err)
 	}
 
-	if len(adapter.WorkerRequests()) != 1 {
-		t.Fatalf("expected only the ready ticket to run, got %d worker requests", len(adapter.WorkerRequests()))
-	}
-	if len(adapter.ReviewRequests()) != 1 {
-		t.Fatalf("expected one review request, got %d", len(adapter.ReviewRequests()))
-	}
-	if result.Run.Status == state.EpicRunStatusCompleted {
-		t.Fatalf("expected epic to stay incomplete while open ticket remains")
+	// Both open and ready tickets should have been scheduled
+	if len(adapter.WorkerRequests()) != 2 {
+		t.Fatalf("expected both open and ready tickets to run, got %d worker requests", len(adapter.WorkerRequests()))
 	}
 
-	loadedOpen, err := tkmd.LoadTicket(filepath.Join(repoRoot, ".tickets", ignored.ID+".md"))
-	if err != nil {
-		t.Fatalf("load open ticket: %v", err)
-	}
-	if loadedOpen.Status != tkmd.StatusOpen {
-		t.Fatalf("expected open ticket to remain open, got %q", loadedOpen.Status)
+	// Epic should not be completed because blocked ticket remains
+	if result.Run.Status == state.EpicRunStatusCompleted {
+		t.Fatalf("expected epic to stay incomplete while blocked ticket remains")
 	}
 }
 

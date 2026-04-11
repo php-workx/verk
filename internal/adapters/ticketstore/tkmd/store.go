@@ -99,16 +99,26 @@ func ListReadyChildren(rootDir, parentID string, currentRunID ...string) ([]Tick
 		runID = currentRunID[0]
 	}
 
+	// Load the epic's deps list for alternative child discovery.
+	epicDeps := loadEpicDeps(ticketsDir, parentID)
+
 	var ready []Ticket
 	for _, path := range paths {
 		ticket, err := LoadTicket(path)
 		if err != nil {
 			return nil, err
 		}
-		if parentOf(&ticket) != parentID {
+		if ticket.ID == parentID {
 			continue
 		}
-		if ticket.Status != StatusReady {
+		isChild := parentOf(&ticket) == parentID
+		if !isChild {
+			_, isChild = epicDeps[ticket.ID]
+		}
+		if !isChild {
+			continue
+		}
+		if ticket.Status != StatusReady && ticket.Status != StatusOpen {
 			continue
 		}
 		ok, err := depsClosed(ticketsDir, ticket.Deps)
@@ -163,6 +173,21 @@ func parentOf(ticket *Ticket) string {
 	}
 	parent, _ := raw.(string)
 	return parent
+}
+
+// loadEpicDeps loads an epic ticket's deps list as a set for child discovery.
+// Returns empty map if the epic doesn't exist or has no deps.
+func loadEpicDeps(ticketsDir, epicID string) map[string]struct{} {
+	path := filepath.Join(ticketsDir, epicID+".md")
+	ticket, err := LoadTicket(path)
+	if err != nil {
+		return nil
+	}
+	deps := make(map[string]struct{}, len(ticket.Deps))
+	for _, dep := range ticket.Deps {
+		deps[dep] = struct{}{}
+	}
+	return deps
 }
 
 func depsClosed(ticketsDir string, deps []string) (bool, error) {

@@ -329,6 +329,17 @@ func normalizeEpicConfig(cfg policy.Config) policy.Config {
 }
 
 func listEpicChildren(repoRoot, parentID string) ([]tkmd.Ticket, error) {
+	// Load the epic ticket to get its deps list (alternative child discovery).
+	epicPath := filepath.Join(repoRoot, ".tickets", parentID+".md")
+	epicTicket, err := tkmd.LoadTicket(epicPath)
+	if err != nil {
+		return nil, fmt.Errorf("load epic %s: %w", parentID, err)
+	}
+	epicDeps := make(map[string]struct{}, len(epicTicket.Deps))
+	for _, dep := range epicTicket.Deps {
+		epicDeps[dep] = struct{}{}
+	}
+
 	paths, err := filepath.Glob(filepath.Join(repoRoot, ".tickets", "*.md"))
 	if err != nil {
 		return nil, err
@@ -336,14 +347,27 @@ func listEpicChildren(repoRoot, parentID string) ([]tkmd.Ticket, error) {
 	sort.Strings(paths)
 
 	children := make([]tkmd.Ticket, 0, len(paths))
+	seen := make(map[string]struct{})
 	for _, path := range paths {
 		ticket, err := tkmd.LoadTicket(path)
 		if err != nil {
 			return nil, err
 		}
-		if ticketParent(&ticket) != parentID {
+		if ticket.ID == parentID {
 			continue
 		}
+		// Child if: has parent field pointing to epic, OR is in epic's deps list
+		isChild := ticketParent(&ticket) == parentID
+		if !isChild {
+			_, isChild = epicDeps[ticket.ID]
+		}
+		if !isChild {
+			continue
+		}
+		if _, ok := seen[ticket.ID]; ok {
+			continue
+		}
+		seen[ticket.ID] = struct{}{}
 		children = append(children, ticket)
 	}
 	return children, nil
