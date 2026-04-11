@@ -38,6 +38,26 @@ func AcquireRunLock(repoRoot, runID string) (*RunLock, error) {
 	return &RunLock{file: file, path: lockPath}, nil
 }
 
+// IsRunLockHeld checks if the run lock is currently held by another process.
+// Returns true if the lock is held, false if it's free or doesn't exist.
+func IsRunLockHeld(repoRoot, runID string) bool {
+	lockPath := filepath.Join(repoRoot, ".verk", "runs", runID, "run.lock")
+	file, err := os.OpenFile(lockPath, os.O_RDWR, 0o644)
+	if err != nil {
+		return false // lock file doesn't exist = not held
+	}
+	defer file.Close()
+
+	// Try non-blocking lock — if it succeeds, nobody holds it
+	err = syscall.Flock(int(file.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+	if err != nil {
+		return true // can't acquire = someone holds it
+	}
+	// We got the lock — release it immediately
+	_ = syscall.Flock(int(file.Fd()), syscall.LOCK_UN)
+	return false
+}
+
 // Release releases the run lock.
 func (l *RunLock) Release() error {
 	if l == nil || l.file == nil {

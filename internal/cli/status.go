@@ -43,7 +43,14 @@ var statusCmd = &cobra.Command{
 		fmt.Fprintln(w)
 
 		fmt.Fprintf(w, "  Run:    %s\n", report.RunID)
-		fmt.Fprintf(w, "  Status: %s\n", formatRunStatus(r, report.RunStatus))
+		runStatus := formatRunStatus(r, report.RunStatus)
+		if report.RunStatus == state.EpicRunStatusRunning {
+			repoRoot, _ := resolveRepoRoot()
+			if repoRoot != "" && !engine.IsRunLockHeld(repoRoot, report.RunID) {
+				runStatus = r.fail("stale") + r.dim(" (process died — use 'verk run' to resume)")
+			}
+		}
+		fmt.Fprintf(w, "  Status: %s\n", runStatus)
 		if report.CurrentWave != "" {
 			fmt.Fprintf(w, "  Wave:   %s\n", report.CurrentWave)
 		}
