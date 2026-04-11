@@ -102,35 +102,35 @@ func (r doctorRenderer) bold(s string) string {
 	if !r.color {
 		return s
 	}
-	return ansiBold + s + ansiReset
+	return styleBold.Render(s)
 }
 
 func (r doctorRenderer) dim(s string) string {
 	if !r.color {
 		return s
 	}
-	return ansiDim + s + ansiReset
+	return styleDim.Render(s)
 }
 
 func (r doctorRenderer) ok(s string) string {
 	if !r.color {
 		return s
 	}
-	return "\033[32m" + s + ansiReset // green
+	return styleOK.Render(s)
 }
 
 func (r doctorRenderer) warn(s string) string {
 	if !r.color {
 		return s
 	}
-	return "\033[33m" + s + ansiReset // yellow
+	return styleWarn.Render(s)
 }
 
 func (r doctorRenderer) fail(s string) string {
 	if !r.color {
 		return s
 	}
-	return "\033[31m" + s + ansiReset // red
+	return styleFail.Render(s)
 }
 
 func humanizeName(name string) string {

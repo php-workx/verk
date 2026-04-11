@@ -3,7 +3,6 @@ package engine
 import (
 	"context"
 	"fmt"
-	"io"
 	"path/filepath"
 	"sort"
 	"sync"
@@ -22,7 +21,7 @@ type ResumeRequest struct {
 	Adapter        runtime.Adapter
 	AdapterFactory func(ticketPreference string) (runtime.Adapter, error)
 	Config         policy.Config
-	ProgressWriter io.Writer
+	Progress       chan<- ProgressEvent
 }
 
 type ResumeReport struct {
@@ -250,7 +249,7 @@ func resumeTicketMode(ctx context.Context, req ResumeRequest, artifacts *runArti
 			Adapter:              adapter,
 			Config:               req.Config,
 			VerificationCommands: plan.ValidationCommands,
-			ProgressWriter:       req.ProgressWriter,
+			Progress:             req.Progress,
 		})
 		if runErr != nil {
 			return resumed, fmt.Errorf("run ticket %s: %w", ticketID, runErr)
@@ -316,7 +315,7 @@ func resumeEpicMode(ctx context.Context, req ResumeRequest, artifacts *runArtifa
 		Adapter:        req.Adapter,
 		AdapterFactory: req.AdapterFactory,
 		Config:         cfg,
-		ProgressWriter: req.ProgressWriter,
+		Progress:       req.Progress,
 	}
 
 	var allResumed []string

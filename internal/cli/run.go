@@ -11,6 +11,7 @@ import (
 	"verk/internal/adapters/ticketstore/tkmd"
 	"verk/internal/engine"
 	"verk/internal/state"
+	"verk/internal/tui"
 
 	"github.com/spf13/cobra"
 )
@@ -85,7 +86,6 @@ func doRunTicket(w, errw io.Writer, ticketID string) (string, error) {
 	plan.CreatedAt = time.Now().UTC()
 	plan.UpdatedAt = plan.CreatedAt
 
-	// Print run_id immediately so the user has it before the long-running engine call.
 	fmt.Fprintf(w, "run_id=%s\n", runID)
 	if wErr := writeCurrentRunID(repoRoot, runID); wErr != nil {
 		fmt.Fprintf(errw, "warning: could not write current run: %v\n", wErr)
@@ -142,20 +142,33 @@ func doRunTicket(w, errw io.Writer, ticketID string) (string, error) {
 		return runID, err
 	}
 
-	result, err := engine.RunTicket(context.Background(), engine.RunTicketRequest{
-		RepoRoot:       repoRoot,
-		RunID:          runID,
-		Ticket:         ticket,
-		Plan:           plan,
-		Claim:          claim,
-		Adapter:        adapter,
-		Config:         cfg,
-		BaseCommit:     baseCommit,
-		ProgressWriter: w,
-	})
-	if err != nil {
-		return runID, err
+	// Run engine with progress channel
+	ch := make(chan engine.ProgressEvent, 64)
+	var result engine.RunTicketResult
+	var runErr error
+	go func() {
+		defer close(ch)
+		result, runErr = engine.RunTicket(context.Background(), engine.RunTicketRequest{
+			RepoRoot:   repoRoot,
+			RunID:      runID,
+			Ticket:     ticket,
+			Plan:       plan,
+			Claim:      claim,
+			Adapter:    adapter,
+			Config:     cfg,
+			BaseCommit: baseCommit,
+			Progress:   ch,
+		})
+	}()
+
+	if tuiErr := tui.RunProgress(runID, ch, w); tuiErr != nil {
+		fmt.Fprintf(errw, "warning: TUI error: %v\n", tuiErr)
 	}
+
+	if runErr != nil {
+		return runID, runErr
+	}
+
 	switch result.Snapshot.CurrentPhase {
 	case state.TicketPhaseClosed:
 		ticket.Status = tkmd.StatusClosed
@@ -198,27 +211,38 @@ func doRunEpic(w, errw io.Writer, ticketID string) (string, error) {
 	}
 	runID := newRunID(ticketID)
 
-	// Print run_id immediately so the user has it before the long-running engine call.
 	fmt.Fprintf(w, "run_id=%s\n", runID)
 	if wErr := writeCurrentRunID(repoRoot, runID); wErr != nil {
 		fmt.Fprintf(errw, "warning: could not write current run: %v\n", wErr)
 	}
 
-	result, err := engine.RunEpic(context.Background(), engine.RunEpicRequest{
-		RepoRoot:     repoRoot,
-		RunID:        runID,
-		RootTicketID: ticketID,
-		BaseBranch:   baseBranch,
-		BaseCommit:   baseCommit,
-		AdapterFactory: func(ticketPreference string) (runtime.Adapter, error) {
-			return runtimeAdapterFor(ticketPreference, cfg.Runtime.DefaultRuntime)
-		},
-		Adapter:        adapter,
-		Config:         cfg,
-		ProgressWriter: w,
-	})
-	if err != nil {
-		return runID, err
+	// Run engine with progress channel
+	ch := make(chan engine.ProgressEvent, 64)
+	var result engine.RunEpicResult
+	var runErr error
+	go func() {
+		defer close(ch)
+		result, runErr = engine.RunEpic(context.Background(), engine.RunEpicRequest{
+			RepoRoot:     repoRoot,
+			RunID:        runID,
+			RootTicketID: ticketID,
+			BaseBranch:   baseBranch,
+			BaseCommit:   baseCommit,
+			AdapterFactory: func(ticketPreference string) (runtime.Adapter, error) {
+				return runtimeAdapterFor(ticketPreference, cfg.Runtime.DefaultRuntime)
+			},
+			Adapter:  adapter,
+			Config:   cfg,
+			Progress: ch,
+		})
+	}()
+
+	if tuiErr := tui.RunProgress(runID, ch, w); tuiErr != nil {
+		fmt.Fprintf(errw, "warning: TUI error: %v\n", tuiErr)
+	}
+
+	if runErr != nil {
+		return runID, runErr
 	}
 
 	fmt.Fprintf(w, "status=%s phase=%s\n", result.Run.Status, result.Run.CurrentPhase)
@@ -244,11 +268,12 @@ func doAutoResume(w, errw io.Writer) error {
 		return withExitCode(msg, 1)
 	}
 
-	// Load the run to check its status before attempting resume.
 	var run state.RunArtifact
 	runPath := filepath.Join(repoRoot, ".verk", "runs", runID, "run.json")
 	if loadErr := state.LoadJSON(runPath, &run); loadErr != nil {
-		return fmt.Errorf("could not load run %s: %w", runID, loadErr)
+		msg := fmt.Errorf("could not load run %s: %w", runID, loadErr)
+		fmt.Fprintf(w, "Error: %s\n", msg)
+		return withExitCode(msg, 1)
 	}
 
 	switch run.Status {
@@ -263,20 +288,31 @@ func doAutoResume(w, errw io.Writer) error {
 		return nil
 	}
 
-	// Status is "running" — resume execution.
 	fmt.Fprintf(w, "Resuming run %s...\n", runID)
 
-	report, err := engine.ResumeRun(context.Background(), engine.ResumeRequest{
-		RepoRoot: repoRoot,
-		RunID:    runID,
-		AdapterFactory: func(ticketPreference string) (runtime.Adapter, error) {
-			return runtimeAdapterFor(ticketPreference, cfg.Runtime.DefaultRuntime)
-		},
-		Config:         cfg,
-		ProgressWriter: w,
-	})
-	if err != nil {
-		return err
+	// Resume with progress channel
+	ch := make(chan engine.ProgressEvent, 64)
+	var report engine.ResumeReport
+	var resumeErr error
+	go func() {
+		defer close(ch)
+		report, resumeErr = engine.ResumeRun(context.Background(), engine.ResumeRequest{
+			RepoRoot: repoRoot,
+			RunID:    runID,
+			AdapterFactory: func(ticketPreference string) (runtime.Adapter, error) {
+				return runtimeAdapterFor(ticketPreference, cfg.Runtime.DefaultRuntime)
+			},
+			Config:   cfg,
+			Progress: ch,
+		})
+	}()
+
+	if tuiErr := tui.RunProgress(runID, ch, w); tuiErr != nil {
+		fmt.Fprintf(errw, "warning: TUI error: %v\n", tuiErr)
+	}
+
+	if resumeErr != nil {
+		return resumeErr
 	}
 	fmt.Fprintf(w, "status=%s\n", report.Run.Status)
 	return nil

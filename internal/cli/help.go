@@ -14,11 +14,6 @@ import (
 const (
 	maxBoxWidth = 72
 	minBoxWidth = 40
-
-	ansiReset    = "\033[0m"
-	ansiBold     = "\033[1m"
-	ansiDim      = "\033[2m"
-	ansiBoldCyan = "\033[1;36m"
 )
 
 var groupCommandOrder = map[string][]string{
@@ -55,21 +50,21 @@ func (r helpRenderer) dim(s string) string {
 	if !r.color {
 		return s
 	}
-	return ansiDim + s + ansiReset
+	return styleDim.Render(s)
 }
 
 func (r helpRenderer) bold(s string) string {
 	if !r.color {
 		return s
 	}
-	return ansiBold + s + ansiReset
+	return styleBold.Render(s)
 }
 
 func (r helpRenderer) titleStyle(s string) string {
 	if !r.color {
 		return s
 	}
-	return ansiBoldCyan + s + ansiReset
+	return styleBoldCyan.Render(s)
 }
 
 func boxTopFill(title string, width int) int {

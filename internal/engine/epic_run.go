@@ -3,7 +3,6 @@ package engine
 import (
 	"context"
 	"fmt"
-	"io"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -27,7 +26,7 @@ type RunEpicRequest struct {
 	AdapterFactory       func(ticketPreference string) (runtime.Adapter, error)
 	Config               policy.Config
 	VerificationByTicket map[string][]string
-	ProgressWriter       io.Writer
+	Progress             chan<- ProgressEvent
 }
 
 type RunEpicResult struct {
@@ -75,7 +74,11 @@ func RunEpic(ctx context.Context, req RunEpicRequest) (RunEpicResult, error) {
 			if err := updateTicketStoreStatus(req.RepoRoot, child.ID, tkmd.StatusReady); err != nil {
 				return RunEpicResult{}, fmt.Errorf("reset orphaned ticket %s: %w", child.ID, err)
 			}
-			epicProgress(req.ProgressWriter, "[reset] %s → ready (was in_progress from prior run)", child.ID)
+			SendProgress(req.Progress, ProgressEvent{
+				Type:     EventTicketDetail,
+				TicketID: child.ID,
+				Detail:   "reset to ready (was in_progress from prior run)",
+			})
 		}
 	}
 
@@ -158,7 +161,11 @@ func RunEpic(ctx context.Context, req RunEpicRequest) (RunEpicResult, error) {
 		if err := state.SaveJSONAtomic(wavePath, wave); err != nil {
 			return result, err
 		}
-		epicProgress(req.ProgressWriter, "[wave %d] %s", waveOrdinal, strings.Join(wave.TicketIDs, ", "))
+		SendProgress(req.Progress, ProgressEvent{
+			Type:    EventWaveStarted,
+			WaveID:  waveOrdinal,
+			Tickets: append([]string(nil), wave.TicketIDs...),
+		})
 
 		waveBaselineChangedFiles, err := repo.ChangedFilesAgainst(baseCommit)
 		if err != nil {
@@ -237,11 +244,13 @@ func RunEpic(ctx context.Context, req RunEpicRequest) (RunEpicResult, error) {
 			return result, err
 		}
 		closedCount := countClosedTickets(outcomes)
-		if acceptedWave.Status == state.WaveStatusAccepted {
-			epicProgress(req.ProgressWriter, "[wave %d] %d/%d closed ✓", waveOrdinal, closedCount, len(wave.TicketIDs))
-		} else {
-			epicProgress(req.ProgressWriter, "[wave %d] %d/%d closed ✗", waveOrdinal, closedCount, len(wave.TicketIDs))
-		}
+		SendProgress(req.Progress, ProgressEvent{
+			Type:    EventWaveCompleted,
+			WaveID:  waveOrdinal,
+			Closed:  closedCount,
+			Total:   len(wave.TicketIDs),
+			Success: acceptedWave.Status == state.WaveStatusAccepted,
+		})
 		result.Waves = append(result.Waves, acceptedWave)
 		result.Run.WaveIDs = append(result.Run.WaveIDs, acceptedWave.WaveID)
 		result.Run.UpdatedAt = time.Now().UTC()
@@ -482,7 +491,7 @@ func executeEpicTicket(ctx context.Context, req RunEpicRequest, cfg policy.Confi
 		Adapter:              adapter,
 		Config:               cfg,
 		VerificationCommands: verificationCommandsFor(req, ticket),
-		ProgressWriter:       indentWriter(req.ProgressWriter),
+		Progress:             req.Progress,
 	})
 	if err != nil {
 		outcome.err = err
@@ -531,12 +540,6 @@ func ticketParent(ticket *tkmd.Ticket) string {
 	return parent
 }
 
-func epicProgress(w io.Writer, format string, args ...any) {
-	if w != nil {
-		fmt.Fprintf(w, format+"\n", args...)
-	}
-}
-
 func countClosedTickets(outcomes []waveTicketOutcome) int {
 	count := 0
 	for _, o := range outcomes {
@@ -545,29 +548,4 @@ func countClosedTickets(outcomes []waveTicketOutcome) int {
 		}
 	}
 	return count
-}
-
-type prefixWriter struct {
-	prefix string
-	w      io.Writer
-}
-
-func (pw *prefixWriter) Write(p []byte) (int, error) {
-	lines := strings.Split(string(p), "\n")
-	for i, line := range lines {
-		if line == "" && i == len(lines)-1 {
-			break
-		}
-		if _, err := fmt.Fprintf(pw.w, "%s%s\n", pw.prefix, line); err != nil {
-			return 0, err
-		}
-	}
-	return len(p), nil
-}
-
-func indentWriter(w io.Writer) io.Writer {
-	if w == nil {
-		return nil
-	}
-	return &prefixWriter{prefix: "  ", w: w}
 }

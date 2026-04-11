@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"path/filepath"
 	"reflect"
 	"sort"
@@ -35,7 +34,7 @@ type RunTicketRequest struct {
 	Config               policy.Config
 	VerificationCommands  []string
 	EnforceSingleScope    bool
-	ProgressWriter        io.Writer
+	Progress              chan<- ProgressEvent
 }
 
 type RunTicketResult struct {
@@ -153,7 +152,7 @@ func RunTicket(ctx context.Context, req RunTicketRequest) (RunTicketResult, erro
 				Instructions:    renderImplementInstructions(req.Plan, st.currentPhase, st.implementationAttempts+1),
 				ExecutionConfig: executionConfigFromPolicy(cfg),
 			}
-			st.progressDetail("launching %s worker...", chosenRuntime(req.Plan, cfg))
+			st.progressDetail(fmt.Sprintf("launching %s worker...", chosenRuntime(req.Plan, cfg)))
 			result, err := st.runWorkerWithRuntimeControls(ctx, workerReq)
 			if err != nil {
 				if errors.Is(err, errRuntimeExecutionBlocked) {
@@ -170,9 +169,9 @@ func RunTicket(ctx context.Context, req RunTicketRequest) (RunTicketResult, erro
 			if err := handleImplementResult(st, result, workerReq.Attempt, workerReq.InputArtifactPath); err != nil {
 				return RunTicketResult{}, err
 			}
-			st.progressDetail("worker %s (%s)", result.Status, result.CompletionCode)
+			st.progressDetail(fmt.Sprintf("worker %s (%s)", result.Status, result.CompletionCode))
 			if st.implementation != nil && len(st.implementation.ChangedFiles) > 0 {
-				st.progressDetail("%d file(s) changed", len(st.implementation.ChangedFiles))
+				st.progressDetail(fmt.Sprintf("%d file(s) changed", len(st.implementation.ChangedFiles)))
 			}
 
 			if st.currentPhase == state.TicketPhaseVerify {
@@ -242,7 +241,7 @@ func RunTicket(ctx context.Context, req RunTicketRequest) (RunTicketResult, erro
 				EffectiveReviewThreshold: req.Plan.EffectiveReviewThreshold,
 				ExecutionConfig:          executionConfigFromPolicy(cfg),
 			}
-			st.progressDetail("launching %s reviewer...", chosenRuntime(req.Plan, cfg))
+			st.progressDetail(fmt.Sprintf("launching %s reviewer...", chosenRuntime(req.Plan, cfg)))
 			result, err := st.runReviewerWithRuntimeControls(ctx, reviewReq)
 			if err != nil {
 				if errors.Is(err, errRuntimeExecutionBlocked) {
@@ -260,7 +259,7 @@ func RunTicket(ctx context.Context, req RunTicketRequest) (RunTicketResult, erro
 				return RunTicketResult{}, err
 			}
 			if result.ReviewStatus == runtime.ReviewStatusPassed {
-				st.progressDetail("review passed (%d finding(s))", len(result.Findings))
+				st.progressDetail(fmt.Sprintf("review passed (%d finding(s))", len(result.Findings)))
 			} else {
 				blocking := 0
 				for _, f := range result.Findings {
@@ -268,7 +267,7 @@ func RunTicket(ctx context.Context, req RunTicketRequest) (RunTicketResult, erro
 						blocking++
 					}
 				}
-				st.progressDetail("review: %d finding(s), %d blocking", len(result.Findings), blocking)
+				st.progressDetail(fmt.Sprintf("review: %d finding(s), %d blocking", len(result.Findings), blocking))
 			}
 			if err := st.persist(); err != nil {
 				return RunTicketResult{}, err
@@ -323,7 +322,7 @@ func RunTicket(ctx context.Context, req RunTicketRequest) (RunTicketResult, erro
 				Instructions:    renderRepairInstructions(st),
 				ExecutionConfig: executionConfigFromPolicy(cfg),
 			}
-			st.progressDetail("launching %s worker for repair...", chosenRuntime(req.Plan, cfg))
+			st.progressDetail(fmt.Sprintf("launching %s worker for repair...", chosenRuntime(req.Plan, cfg)))
 			result, err := st.runWorkerWithRuntimeControls(ctx, workerReq)
 			if err != nil {
 				if errors.Is(err, errRuntimeExecutionBlocked) {
@@ -672,7 +671,7 @@ func (st *ticketRunState) runVerification(ctx context.Context, repoRoot string) 
 		if !vr.Passed {
 			mark = "✗"
 		}
-		st.progressDetail("%s %s", vr.Command, mark)
+		st.progressDetail(fmt.Sprintf("%s %s", vr.Command, mark))
 	}
 	return artifact, artifact.Passed, nil
 }
@@ -926,45 +925,34 @@ func (st *ticketRunState) transitionTo(next state.TicketPhase) error {
 }
 
 func (st *ticketRunState) emitProgress(phase state.TicketPhase) {
-	if st.req.ProgressWriter == nil {
-		return
-	}
-	label := st.req.Ticket.ID
-	if st.req.Plan.Title != "" {
-		label = fmt.Sprintf("%s %s", st.req.Ticket.ID, st.req.Plan.Title)
-	}
-	id := st.req.Ticket.ID
+	detail := ""
 	switch phase {
 	case state.TicketPhaseImplement:
-		fmt.Fprintf(st.req.ProgressWriter, "[ticket] %s → implement (attempt %d)\n", label, st.implementationAttempts+1)
-	case state.TicketPhaseVerify:
-		fmt.Fprintf(st.req.ProgressWriter, "[ticket] %s → verify\n", id)
-	case state.TicketPhaseReview:
-		fmt.Fprintf(st.req.ProgressWriter, "[ticket] %s → review\n", id)
+		detail = fmt.Sprintf("attempt %d", st.implementationAttempts+1)
 	case state.TicketPhaseRepair:
-		fmt.Fprintf(st.req.ProgressWriter, "[ticket] %s → repair (cycle %d)\n", id, len(st.repairCycles))
-	case state.TicketPhaseCloseout:
-		fmt.Fprintf(st.req.ProgressWriter, "[ticket] %s → closeout\n", id)
-	case state.TicketPhaseClosed:
-		fmt.Fprintf(st.req.ProgressWriter, "[ticket] %s ✓ closed\n", label)
+		detail = fmt.Sprintf("cycle %d", len(st.repairCycles))
 	case state.TicketPhaseBlocked:
-		reason := st.blockReason
-		if len(reason) > 60 {
-			reason = reason[:57] + "..."
-		}
-		if reason != "" {
-			fmt.Fprintf(st.req.ProgressWriter, "[ticket] %s ✗ blocked (%s)\n", label, reason)
-		} else {
-			fmt.Fprintf(st.req.ProgressWriter, "[ticket] %s ✗ blocked\n", label)
+		detail = st.blockReason
+		if len(detail) > 60 {
+			detail = detail[:57] + "..."
 		}
 	}
+	SendProgress(st.req.Progress, ProgressEvent{
+		Type:     EventTicketPhaseChanged,
+		TicketID: st.req.Ticket.ID,
+		Title:    st.req.Plan.Title,
+		Phase:    phase,
+		Detail:   detail,
+	})
 }
 
-func (st *ticketRunState) progressDetail(format string, args ...any) {
-	if st.req.ProgressWriter == nil {
-		return
-	}
-	fmt.Fprintf(st.req.ProgressWriter, "         "+format+"\n", args...)
+func (st *ticketRunState) progressDetail(detail string) {
+	SendProgress(st.req.Progress, ProgressEvent{
+		Type:     EventTicketDetail,
+		TicketID: st.req.Ticket.ID,
+		Title:    st.req.Plan.Title,
+		Detail:   detail,
+	})
 }
 
 func (st *ticketRunState) persist() error {
