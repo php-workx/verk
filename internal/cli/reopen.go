@@ -32,7 +32,9 @@ Examples:
 		if reopenToPhase == "" {
 			return withExitCode(fmt.Errorf("--to flag is required (implement or repair)"), 2)
 		}
+		repoRoot, _ := resolveRepoRoot()
 		if err := engine.ReopenTicket(context.Background(), engine.ReopenRequest{
+			RepoRoot: repoRoot,
 			RunID:    args[0],
 			TicketID: args[1],
 			ToPhase:  state.TicketPhase(reopenToPhase),

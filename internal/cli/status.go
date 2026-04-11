@@ -24,8 +24,9 @@ var statusCmd = &cobra.Command{
 		if err != nil {
 			return cmdError(cmd, err, 1)
 		}
+		repoRoot, _ := resolveRepoRoot()
 
-		report, err := engine.DeriveStatus(engine.StatusRequest{RunID: runID})
+		report, err := engine.DeriveStatus(engine.StatusRequest{RepoRoot: repoRoot, RunID: runID})
 		if err != nil {
 			return cmdError(cmd, err, 1)
 		}
