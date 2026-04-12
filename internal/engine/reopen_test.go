@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -219,6 +220,102 @@ func TestReopenTicket_UpdatesTicketStoreAfterCommit(t *testing.T) {
 	}
 	if ticket.Status != tkmd.StatusOpen {
 		t.Fatalf("expected ticket status open after reopen, got %q", ticket.Status)
+	}
+}
+
+func TestReopenTicket_CommitFailureDoesNotMutateTicketStore(t *testing.T) {
+	// G7 regression test: If WriteTransitionCommit fails, setTicketReady must
+	// NOT be called. The ticket markdown should remain in its original state.
+	repoRoot := t.TempDir()
+	runID := "run-reopen-fail"
+	ticketID := "ticket-fail"
+
+	writeOpRunFixture(t, repoRoot, runID, state.RunArtifact{
+		ArtifactMeta: state.ArtifactMeta{SchemaVersion: 1, RunID: runID},
+		Mode:         "epic",
+		RootTicketID: "epic-1",
+		Status:       state.EpicRunStatusBlocked,
+		CurrentPhase: state.TicketPhaseBlocked,
+		TicketIDs:    []string{ticketID},
+		WaveIDs:      []string{"wave-1"},
+	})
+	writeWaveFixture(t, repoRoot, runID, state.WaveArtifact{
+		ArtifactMeta: state.ArtifactMeta{SchemaVersion: 1, RunID: runID},
+		WaveID:       "wave-1",
+		Ordinal:      1,
+		Status:       state.WaveStatusFailed,
+		TicketIDs:    []string{ticketID},
+	})
+	writeTicketRunFixture(t, repoRoot, runID, TicketRunSnapshot{
+		ArtifactMeta: state.ArtifactMeta{SchemaVersion: 1, RunID: runID},
+		TicketID:     ticketID,
+		CurrentPhase: state.TicketPhaseBlocked,
+		BlockReason:  "needs operator input",
+	})
+	writePlanFixture(t, repoRoot, runID, state.PlanArtifact{
+		ArtifactMeta:             state.ArtifactMeta{SchemaVersion: 1, RunID: runID},
+		TicketID:                 ticketID,
+		EffectiveReviewThreshold: state.SeverityP2,
+	})
+	writeTicketMarkdownFixture(t, repoRoot, tkmd.Ticket{
+		ID:                 ticketID,
+		Title:              "Fail ticket",
+		Status:             tkmd.StatusBlocked,
+		OwnedPaths:         []string{"internal/app"},
+		UnknownFrontmatter: map[string]any{"type": "task"},
+	})
+
+	// Record the original run.json content so we can corrupt it after reading.
+	runPath := runJSONPath(repoRoot, runID)
+	originalRunData, err := os.ReadFile(runPath)
+	if err != nil {
+		t.Fatalf("read original run.json: %v", err)
+	}
+
+	// Corrupt the run.json to make WriteTransitionCommit fail when it tries
+	// to marshal + write the updated run artifact. We do this by writing
+	// invalid JSON that can be loaded (LoadJSON tolerates extra data) but
+	// whose re-serialization after update would still succeed. Instead, we
+	// make the run artifact file read-only so the atomic write fails.
+	// Remove write permissions from the run.json directory to force the write to fail.
+	runDir := filepath.Dir(runPath)
+	// Make the run.json file read-only to cause WriteTransitionCommit to fail.
+	if err := os.Chmod(runPath, 0o444); err != nil {
+		t.Fatalf("chmod run.json read-only: %v", err)
+	}
+	// Also make the directory read-only so SaveJSONAtomic can't create temp files.
+	if err := os.Chmod(runDir, 0o555); err != nil {
+		t.Fatalf("chmod run dir read-only: %v", err)
+	}
+	defer func() {
+		_ = os.Chmod(runDir, 0o755)
+		_ = os.Chmod(runPath, 0o644)
+	}()
+
+	err = ReopenTicket(context.Background(), ReopenRequest{
+		RepoRoot: repoRoot,
+		RunID:    runID,
+		TicketID: ticketID,
+		ToPhase:  state.TicketPhaseImplement,
+	})
+	if err == nil {
+		t.Fatal("expected ReopenTicket to fail when WriteTransitionCommit cannot write")
+	}
+
+	// Restore permissions and verify the ticket markdown was NOT mutated.
+	_ = os.Chmod(runDir, 0o755)
+	_ = os.Chmod(runPath, 0o644)
+
+	// Restore original run.json so we can read the ticket markdown path.
+	_ = os.WriteFile(runPath, originalRunData, 0o644)
+
+	// The critical check: ticket markdown should still be "blocked", NOT "open".
+	ticket, err := tkmd.LoadTicket(ticketMarkdownPath(repoRoot, ticketID))
+	if err != nil {
+		t.Fatalf("load ticket markdown after failure: %v", err)
+	}
+	if ticket.Status != tkmd.StatusBlocked {
+		t.Fatalf("G7 violation: ticket markdown was mutated to %q even though commit failed — should still be blocked", ticket.Status)
 	}
 }
 
