@@ -398,6 +398,6 @@ func setTicketReady(repoRoot, ticketID string) error {
 	if err != nil {
 		return err
 	}
-	ticket.Status = tkmd.StatusReady
+	ticket.Status = tkmd.StatusOpen
 	return tkmd.SaveTicket(ticketMarkdownPath(repoRoot, ticketID), ticket)
 }

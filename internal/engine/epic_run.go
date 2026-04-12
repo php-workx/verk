@@ -71,7 +71,7 @@ func RunEpic(ctx context.Context, req RunEpicRequest) (RunEpicResult, error) {
 	// so the wave scheduler can pick them up.
 	for _, child := range children {
 		if child.Status == tkmd.StatusInProgress {
-			if err := updateTicketStoreStatus(req.RepoRoot, child.ID, tkmd.StatusReady); err != nil {
+			if err := updateTicketStoreStatus(req.RepoRoot, child.ID, tkmd.StatusOpen); err != nil {
 				return RunEpicResult{}, fmt.Errorf("reset orphaned ticket %s: %w", child.ID, err)
 			}
 			SendProgress(req.Progress, ProgressEvent{
@@ -290,23 +290,11 @@ func RunEpic(ctx context.Context, req RunEpicRequest) (RunEpicResult, error) {
 		result.Run.WaveIDs = append(result.Run.WaveIDs, acceptedWave.WaveID)
 		result.Run.UpdatedAt = time.Now().UTC()
 
+		// Ticket store is updated by RunTicket's defer for normal completions.
+		// Only handle crashed tickets (panicked goroutines that never entered RunTicket).
 		for i, outcome := range outcomes {
-			var status tkmd.Status
-			switch {
-			case outcome.err == nil && outcome.phase == state.TicketPhaseClosed:
-				status = tkmd.StatusClosed
-			case outcome.phase == state.TicketPhaseBlocked:
-				status = tkmd.StatusBlocked
-			default:
-				// Crashed or incomplete tickets go back to open for retry
-				status = tkmd.StatusOpen
-			}
-			if err := updateTicketStoreStatus(req.RepoRoot, wave.TicketIDs[i], status); err != nil {
-				result.Run.Status = state.EpicRunStatusBlocked
-				result.Run.CurrentPhase = state.TicketPhaseBlocked
-				result.Run.UpdatedAt = time.Now().UTC()
-				_ = state.SaveJSONAtomic(runPath, result.Run)
-				return result, err
+			if outcome.err != nil && outcome.phase != state.TicketPhaseClosed && outcome.phase != state.TicketPhaseBlocked {
+				_ = updateTicketStoreStatus(req.RepoRoot, wave.TicketIDs[i], tkmd.StatusOpen)
 			}
 		}
 
@@ -440,6 +428,10 @@ func epicCompletionStatus(children []tkmd.Ticket) state.EpicRunStatus {
 
 func updateTicketStoreStatus(repoRoot, ticketID string, status tkmd.Status) error {
 	path := filepath.Join(repoRoot, ".tickets", ticketID+".md")
+	return updateTicketStatus(path, status)
+}
+
+func updateTicketStatus(path string, status tkmd.Status) error {
 	ticket, err := tkmd.LoadTicket(path)
 	if err != nil {
 		return err

@@ -85,8 +85,8 @@ func TestReopenTicket_BlockedToImplement(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load ticket markdown: %v", err)
 	}
-	if ticket.Status != tkmd.StatusReady {
-		t.Fatalf("expected ticket markdown status ready, got %q", ticket.Status)
+	if ticket.Status != tkmd.StatusOpen {
+		t.Fatalf("expected ticket markdown status open, got %q", ticket.Status)
 	}
 }
 

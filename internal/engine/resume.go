@@ -486,23 +486,12 @@ func resumeEpicMode(ctx context.Context, req ResumeRequest, artifacts *runArtifa
 		artifacts.Run.WaveIDs = append(artifacts.Run.WaveIDs, acceptedWave.WaveID)
 		artifacts.Run.UpdatedAt = time.Now().UTC()
 
+		// Ticket store is updated by RunTicket's defer for normal completions.
+		// Only handle crashed tickets here.
 		for i, outcome := range outcomes {
 			tid := wave.TicketIDs[i]
-			var status tkmd.Status
-			switch {
-			case outcome.err == nil && outcome.phase == state.TicketPhaseClosed:
-				status = tkmd.StatusClosed
-			case outcome.phase == state.TicketPhaseBlocked:
-				status = tkmd.StatusBlocked
-			default:
-				status = tkmd.StatusOpen
-			}
-			if err := updateTicketStoreStatus(artifacts.RepoRoot, tid, status); err != nil {
-				artifacts.Run.Status = state.EpicRunStatusBlocked
-				artifacts.Run.CurrentPhase = state.TicketPhaseBlocked
-				artifacts.Run.UpdatedAt = time.Now().UTC()
-				_ = state.SaveJSONAtomic(runPath, artifacts.Run)
-				return allResumed, err
+			if outcome.err != nil && outcome.phase != state.TicketPhaseClosed && outcome.phase != state.TicketPhaseBlocked {
+				_ = updateTicketStoreStatus(artifacts.RepoRoot, tid, tkmd.StatusOpen)
 			}
 			allResumed = appendIfMissing(allResumed, tid)
 		}

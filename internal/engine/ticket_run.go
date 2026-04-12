@@ -116,6 +116,20 @@ func RunTicket(ctx context.Context, req RunTicketRequest) (RunTicketResult, erro
 		repoRoot:     absRepoRoot,
 		currentPhase: req.Plan.Phase,
 	}
+
+	// Update ticket store on exit — the ticket's own phase determines its store status.
+	defer func() {
+		ticketPath := filepath.Join(absRepoRoot, ".tickets", req.Ticket.ID+".md")
+		switch st.currentPhase {
+		case state.TicketPhaseClosed:
+			_ = updateTicketStatus(ticketPath, tkmd.StatusClosed)
+		case state.TicketPhaseBlocked:
+			_ = updateTicketStatus(ticketPath, tkmd.StatusBlocked)
+		default:
+			_ = updateTicketStatus(ticketPath, tkmd.StatusOpen)
+		}
+	}()
+
 	if st.currentPhase == "" {
 		st.currentPhase = state.TicketPhaseIntake
 	}

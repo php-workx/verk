@@ -15,7 +15,7 @@ import (
 
 var canonicalStatuses = map[Status]struct{}{
 	StatusOpen:       {},
-	StatusReady:      {},
+	StatusReady:      {}, // kept for backward compat — treated same as open
 	StatusInProgress: {},
 	StatusBlocked:    {},
 	StatusClosed:     {},
@@ -122,7 +122,7 @@ func ListReadyChildren(rootDir, parentID string, currentRunID ...string) ([]Tick
 if !isChild {
 			continue
 		}
-		if ticket.Status != StatusReady && ticket.Status != StatusOpen {
+		if ticket.Status != StatusOpen && ticket.Status != StatusReady {
 			continue
 		}
 		ok, err := depsClosed(ticketsDir, ticket.Deps)
