@@ -1,6 +1,7 @@
 package claude
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/sha256"
@@ -96,12 +97,19 @@ func (a *Adapter) RunWorker(ctx context.Context, req runtime.WorkerRequest) (run
 	req.Runtime = ensureRuntime(req.Runtime, runtimeName)
 	startedAt := now().UTC()
 
+	var err error
 	prompt := runtime.BuildWorkerPrompt(req)
 	args := buildWorkerArgs(req)
-	execResult, err := runCommand(ctx, a.binary(), args, []byte(prompt), runtimeCommandEnv(req.ExecutionConfig), runtimeCommandTimeout(req.ExecutionConfig.WorkerTimeoutMinutes))
+	var execResult commandResult
+	var execErr error
+	if req.OnProgress != nil {
+		execResult, execErr = runStreamingCommand(ctx, a.binary(), args, []byte(prompt), runtimeCommandEnv(req.ExecutionConfig), runtimeCommandTimeout(req.ExecutionConfig.WorkerTimeoutMinutes), req.OnProgress)
+	} else {
+		execResult, execErr = runCommand(ctx, a.binary(), args, []byte(prompt), runtimeCommandEnv(req.ExecutionConfig), runtimeCommandTimeout(req.ExecutionConfig.WorkerTimeoutMinutes))
+	}
 	finishedAt := now().UTC()
-	if err != nil {
-		return runtime.WorkerResult{}, fmt.Errorf("run %s worker: %w", runtimeName, err)
+	if execErr != nil {
+		return runtime.WorkerResult{}, fmt.Errorf("run %s worker: %w", runtimeName, execErr)
 	}
 
 	resultText, cliOK := runtime.ExtractCLIResultText(execResult.stdout)
@@ -163,12 +171,19 @@ func (a *Adapter) RunReviewer(ctx context.Context, req runtime.ReviewRequest) (r
 	req.Runtime = ensureRuntime(req.Runtime, runtimeName)
 	startedAt := now().UTC()
 
+	var err error
 	prompt := runtime.BuildReviewPrompt(req)
 	args := buildReviewArgs(req)
-	execResult, err := runCommand(ctx, a.binary(), args, []byte(prompt), runtimeCommandEnv(req.ExecutionConfig), runtimeCommandTimeout(req.ExecutionConfig.ReviewerTimeoutMinutes))
+	var execResult commandResult
+	var execErr error
+	if req.OnProgress != nil {
+		execResult, execErr = runStreamingCommand(ctx, a.binary(), args, []byte(prompt), runtimeCommandEnv(req.ExecutionConfig), runtimeCommandTimeout(req.ExecutionConfig.ReviewerTimeoutMinutes), req.OnProgress)
+	} else {
+		execResult, execErr = runCommand(ctx, a.binary(), args, []byte(prompt), runtimeCommandEnv(req.ExecutionConfig), runtimeCommandTimeout(req.ExecutionConfig.ReviewerTimeoutMinutes))
+	}
 	finishedAt := now().UTC()
-	if err != nil {
-		return runtime.ReviewResult{}, fmt.Errorf("run %s reviewer: %w", runtimeName, err)
+	if execErr != nil {
+		return runtime.ReviewResult{}, fmt.Errorf("run %s reviewer: %w", runtimeName, execErr)
 	}
 
 	resultText, cliOK := runtime.ExtractCLIResultText(execResult.stdout)
@@ -259,25 +274,33 @@ func validateReviewRequest(req runtime.ReviewRequest) error {
 // buildWorkerArgs constructs CLI args for `claude -p --output-format json`.
 // The user prompt is passed via stdin.
 func buildWorkerArgs(req runtime.WorkerRequest) []string {
-	args := []string{
-		"-p",
-		"--output-format", "json",
-		"--system-prompt", runtime.WorkerSystemPrompt(),
+	outputFormat := "json"
+	args := []string{"-p"}
+	if req.OnProgress != nil {
+		outputFormat = "stream-json"
+		args = append(args, "--verbose")
 	}
+	args = append(args,
+		"--output-format", outputFormat,
+		"--system-prompt", runtime.WorkerSystemPrompt(),
+	)
 	if req.ExecutionConfig.WorkerTimeoutMinutes > 0 {
 		args = append(args, "--max-turns", "50")
 	}
 	return args
 }
 
-// buildReviewArgs constructs CLI args for `claude -p --output-format json`.
-// The user prompt is passed via stdin.
 func buildReviewArgs(req runtime.ReviewRequest) []string {
-	args := []string{
-		"-p",
-		"--output-format", "json",
-		"--system-prompt", runtime.ReviewerSystemPrompt(),
+	outputFormat := "json"
+	args := []string{"-p"}
+	if req.OnProgress != nil {
+		outputFormat = "stream-json"
+		args = append(args, "--verbose")
 	}
+	args = append(args,
+		"--output-format", outputFormat,
+		"--system-prompt", runtime.ReviewerSystemPrompt(),
+	)
 	if req.ExecutionConfig.ReviewerTimeoutMinutes > 0 {
 		args = append(args, "--max-turns", "30")
 	}
@@ -694,6 +717,189 @@ func runtimeCommandTimeout(minutes int) time.Duration {
 		return 0
 	}
 	return time.Duration(minutes) * time.Minute
+}
+
+// streamEvent represents a parsed line from stream-json output.
+type streamEvent struct {
+	Type    string          `json:"type"`
+	Subtype string          `json:"subtype,omitempty"`
+	Message json.RawMessage `json:"message,omitempty"`
+
+	// Fields from the "result" event
+	IsError    bool   `json:"is_error,omitempty"`
+	Result     string `json:"result,omitempty"`
+	DurationMS int64  `json:"duration_ms,omitempty"`
+	NumTurns   int    `json:"num_turns,omitempty"`
+}
+
+// toolUseContent is embedded in assistant message content.
+type toolUseContent struct {
+	Type  string          `json:"type"`
+	Name  string          `json:"name,omitempty"`
+	Input json.RawMessage `json:"input,omitempty"`
+}
+
+// assistantMessage is the structure of an assistant stream event.
+type assistantMessage struct {
+	Content []toolUseContent `json:"content"`
+}
+
+// runStreamingCommand executes a command and processes stdout as stream-json,
+// calling onProgress for each tool-use event. Returns the collected output.
+func runStreamingCommand(ctx context.Context, binary string, args []string, stdin []byte, env []string, timeout time.Duration, onProgress func(string)) (commandResult, error) {
+	if timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, timeout)
+		defer cancel()
+	}
+	cmd := exec.CommandContext(ctx, binary, args...)
+	cmd.Stdin = bytes.NewReader(stdin)
+	cmd.Env = env
+
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return commandResult{}, fmt.Errorf("stdout pipe: %w", err)
+	}
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+
+	if err := cmd.Start(); err != nil {
+		return commandResult{}, fmt.Errorf("start command: %w", err)
+	}
+
+	// Process stream-json output line by line
+	var allOutput bytes.Buffer
+	var resultEvent *streamEvent
+	scanner := bufio.NewScanner(stdout)
+	scanner.Buffer(make([]byte, 1024*1024), 1024*1024) // 1MB line buffer
+	for scanner.Scan() {
+		line := scanner.Bytes()
+		allOutput.Write(line)
+		allOutput.WriteByte('\n')
+
+		var evt streamEvent
+		if err := json.Unmarshal(line, &evt); err != nil {
+			continue
+		}
+
+		switch evt.Type {
+		case "assistant":
+			// Parse tool-use events from assistant messages
+			if onProgress != nil {
+				var msg assistantMessage
+				if err := json.Unmarshal(evt.Message, &msg); err == nil {
+					for _, content := range msg.Content {
+						if content.Type == "tool_use" {
+							summary := summarizeToolUse(content.Name, content.Input)
+							if summary != "" {
+								onProgress(summary)
+							}
+						}
+					}
+				}
+			}
+		case "result":
+			resultEvent = &evt
+		}
+	}
+
+	waitErr := cmd.Wait()
+	result := commandResult{
+		stdout: allOutput.Bytes(),
+		stderr: stderr.Bytes(),
+	}
+
+	// Extract the result text from the result event
+	if resultEvent != nil {
+		// For stream-json, the result text is in the result event's Result field
+		result.stdout = mustMarshalResultAsJSON(resultEvent)
+	}
+
+	if waitErr == nil {
+		return result, nil
+	}
+	if ctx.Err() != nil {
+		return result, ctx.Err()
+	}
+	var exitErr *exec.ExitError
+	if errors.As(waitErr, &exitErr) {
+		result.exitCode = exitErr.ExitCode()
+		return result, nil
+	}
+	return result, waitErr
+}
+
+// mustMarshalResultAsJSON converts a stream result event to the JSON format
+// that ExtractCLIResultText expects (same as --output-format json).
+func mustMarshalResultAsJSON(evt *streamEvent) []byte {
+	cliOutput := runtime.CLIOutputJSON{
+		Type:       "result",
+		Subtype:    evt.Subtype,
+		IsError:    evt.IsError,
+		Result:     evt.Result,
+		DurationMS: evt.DurationMS,
+		NumTurns:   evt.NumTurns,
+	}
+	data, _ := json.Marshal(cliOutput)
+	return data
+}
+
+// summarizeToolUse creates a human-readable summary of a tool call.
+func summarizeToolUse(name string, input json.RawMessage) string {
+	var params map[string]any
+	_ = json.Unmarshal(input, &params)
+
+	switch name {
+	case "Read":
+		if fp, ok := params["file_path"].(string); ok {
+			return fmt.Sprintf("reading %s", shortenPath(fp))
+		}
+	case "Write":
+		if fp, ok := params["file_path"].(string); ok {
+			return fmt.Sprintf("writing %s", shortenPath(fp))
+		}
+	case "Edit":
+		if fp, ok := params["file_path"].(string); ok {
+			return fmt.Sprintf("editing %s", shortenPath(fp))
+		}
+	case "Bash":
+		if cmd, ok := params["command"].(string); ok {
+			if len(cmd) > 50 {
+				cmd = cmd[:47] + "..."
+			}
+			return fmt.Sprintf("$ %s", cmd)
+		}
+	case "Glob":
+		if pattern, ok := params["pattern"].(string); ok {
+			return fmt.Sprintf("searching %s", pattern)
+		}
+	case "Grep":
+		if pattern, ok := params["pattern"].(string); ok {
+			return fmt.Sprintf("grep %s", pattern)
+		}
+	default:
+		return name
+	}
+	return name
+}
+
+// shortenPath strips the repo root prefix to show relative paths.
+func shortenPath(path string) string {
+	// Find common prefixes and strip them
+	if idx := strings.Index(path, "/internal/"); idx >= 0 {
+		return path[idx+1:]
+	}
+	if idx := strings.Index(path, "/cmd/"); idx >= 0 {
+		return path[idx+1:]
+	}
+	if idx := strings.Index(path, "/pkg/"); idx >= 0 {
+		return path[idx+1:]
+	}
+	// Strip home directory prefix
+	if home, err := os.UserHomeDir(); err == nil && strings.HasPrefix(path, home) {
+		return "~" + path[len(home):]
+	}
+	return path
 }
 
 func safeRawJSON(data []byte) json.RawMessage {

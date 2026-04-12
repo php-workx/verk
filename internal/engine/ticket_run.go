@@ -151,6 +151,7 @@ func RunTicket(ctx context.Context, req RunTicketRequest) (RunTicketResult, erro
 				WorktreePath:    absRepoRoot,
 				Instructions:    renderImplementInstructions(req.Plan, st.currentPhase, st.implementationAttempts+1),
 				ExecutionConfig: executionConfigFromPolicy(cfg),
+				OnProgress:      func(detail string) { st.progressDetail(detail) },
 			}
 			st.progressDetail(fmt.Sprintf("%s worker running", chosenRuntime(req.Plan, cfg)))
 			result, err := st.runWorkerWithRuntimeControls(ctx, workerReq)
@@ -240,6 +241,7 @@ func RunTicket(ctx context.Context, req RunTicketRequest) (RunTicketResult, erro
 				Diff:                     collectDiff(absRepoRoot, req.BaseCommit),
 				EffectiveReviewThreshold: req.Plan.EffectiveReviewThreshold,
 				ExecutionConfig:          executionConfigFromPolicy(cfg),
+				OnProgress:               func(detail string) { st.progressDetail(detail) },
 			}
 			st.progressDetail(fmt.Sprintf("%s reviewer running", chosenRuntime(req.Plan, cfg)))
 			result, err := st.runReviewerWithRuntimeControls(ctx, reviewReq)
@@ -321,6 +323,7 @@ func RunTicket(ctx context.Context, req RunTicketRequest) (RunTicketResult, erro
 				WorktreePath:    absRepoRoot,
 				Instructions:    renderRepairInstructions(st),
 				ExecutionConfig: executionConfigFromPolicy(cfg),
+				OnProgress:      func(detail string) { st.progressDetail(detail) },
 			}
 			st.progressDetail(fmt.Sprintf("%s repair worker running", chosenRuntime(req.Plan, cfg)))
 			result, err := st.runWorkerWithRuntimeControls(ctx, workerReq)

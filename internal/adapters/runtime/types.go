@@ -58,6 +58,7 @@ type WorkerRequest struct {
 	InputArtifactPath string          `json:"input_artifact_path,omitempty"`
 	Instructions      string          `json:"instructions,omitempty"`
 	ExecutionConfig   ExecutionConfig `json:"execution_config,omitempty"`
+	OnProgress        func(detail string) `json:"-"` // called with tool-use summaries during execution
 }
 
 type ReviewRequest struct {
@@ -72,6 +73,7 @@ type ReviewRequest struct {
 	Diff                     string          `json:"diff,omitempty"`
 	EffectiveReviewThreshold Severity        `json:"effective_review_threshold"`
 	ExecutionConfig          ExecutionConfig `json:"execution_config,omitempty"`
+	OnProgress               func(detail string) `json:"-"`
 }
 
 type ExecutionConfig struct {
