@@ -152,7 +152,7 @@ func RunTicket(ctx context.Context, req RunTicketRequest) (RunTicketResult, erro
 				Instructions:    renderImplementInstructions(req.Plan, st.currentPhase, st.implementationAttempts+1),
 				ExecutionConfig: executionConfigFromPolicy(cfg),
 			}
-			st.progressDetail(fmt.Sprintf("launching %s worker...", chosenRuntime(req.Plan, cfg)))
+			st.progressDetail(fmt.Sprintf("%s worker running", chosenRuntime(req.Plan, cfg)))
 			result, err := st.runWorkerWithRuntimeControls(ctx, workerReq)
 			if err != nil {
 				if errors.Is(err, errRuntimeExecutionBlocked) {
@@ -241,7 +241,7 @@ func RunTicket(ctx context.Context, req RunTicketRequest) (RunTicketResult, erro
 				EffectiveReviewThreshold: req.Plan.EffectiveReviewThreshold,
 				ExecutionConfig:          executionConfigFromPolicy(cfg),
 			}
-			st.progressDetail(fmt.Sprintf("launching %s reviewer...", chosenRuntime(req.Plan, cfg)))
+			st.progressDetail(fmt.Sprintf("%s reviewer running", chosenRuntime(req.Plan, cfg)))
 			result, err := st.runReviewerWithRuntimeControls(ctx, reviewReq)
 			if err != nil {
 				if errors.Is(err, errRuntimeExecutionBlocked) {
@@ -322,7 +322,7 @@ func RunTicket(ctx context.Context, req RunTicketRequest) (RunTicketResult, erro
 				Instructions:    renderRepairInstructions(st),
 				ExecutionConfig: executionConfigFromPolicy(cfg),
 			}
-			st.progressDetail(fmt.Sprintf("launching %s worker for repair...", chosenRuntime(req.Plan, cfg)))
+			st.progressDetail(fmt.Sprintf("%s repair worker running", chosenRuntime(req.Plan, cfg)))
 			result, err := st.runWorkerWithRuntimeControls(ctx, workerReq)
 			if err != nil {
 				if errors.Is(err, errRuntimeExecutionBlocked) {
