@@ -373,6 +373,11 @@ func resumeEpicMode(ctx context.Context, req ResumeRequest, artifacts *runArtifa
 		if err := state.SaveJSONAtomic(wavePath, wave); err != nil {
 			return allResumed, err
 		}
+		SendProgress(req.Progress, ProgressEvent{
+			Type:    EventWaveStarted,
+			WaveID:  waveOrdinal,
+			Tickets: append([]string(nil), wave.TicketIDs...),
+		})
 
 		waveBaselineChangedFiles, err := repo.ChangedFilesAgainst(baseCommit)
 		if err != nil {
@@ -384,7 +389,7 @@ func resumeEpicMode(ctx context.Context, req ResumeRequest, artifacts *runArtifa
 		}
 		artifacts.Run.ResumeCursor["wave_baseline_changed_files"] = append([]string(nil), waveBaselineChangedFiles...)
 
-		// Execute wave tickets in parallel
+		// Execute wave tickets in parallel with crash recovery
 		outcomes := make([]waveTicketOutcome, len(wave.TicketIDs))
 		var wg sync.WaitGroup
 		for i, ticketID := range wave.TicketIDs {
@@ -393,7 +398,26 @@ func resumeEpicMode(ctx context.Context, req ResumeRequest, artifacts *runArtifa
 			ticketID := ticketID
 			go func() {
 				defer wg.Done()
-				outcomes[i] = executeEpicTicket(ctx, epicReq, cfg, wave, ticketID)
+				const maxCrashRetries = 2
+				for attempt := 0; attempt <= maxCrashRetries; attempt++ {
+					outcome, crashed := executeWithRecovery(ctx, epicReq, cfg, wave, ticketID)
+					if !crashed {
+						outcomes[i] = outcome
+						return
+					}
+					SendProgress(req.Progress, ProgressEvent{
+						Type:     EventTicketDetail,
+						TicketID: ticketID,
+						Detail:   fmt.Sprintf("worker crashed (attempt %d/%d), retrying: %v", attempt+1, maxCrashRetries+1, outcome.err),
+					})
+					_ = tkmd.ReleaseClaim(artifacts.RepoRoot, req.RunID, ticketID,
+						fmt.Sprintf("lease-%s-%s", req.RunID, ticketID), "crash recovery")
+					if attempt == maxCrashRetries {
+						outcome.phase = state.TicketPhaseBlocked
+						outcomes[i] = outcome
+						return
+					}
+				}
 			}()
 		}
 		wg.Wait()
@@ -451,14 +475,27 @@ func resumeEpicMode(ctx context.Context, req ResumeRequest, artifacts *runArtifa
 		if err := state.SaveJSONAtomic(wavePath, acceptedWave); err != nil {
 			return allResumed, err
 		}
+		closedCount := countClosedTickets(outcomes)
+		SendProgress(req.Progress, ProgressEvent{
+			Type:    EventWaveCompleted,
+			WaveID:  waveOrdinal,
+			Closed:  closedCount,
+			Total:   len(wave.TicketIDs),
+			Success: acceptedWave.Status == state.WaveStatusAccepted,
+		})
 		artifacts.Run.WaveIDs = append(artifacts.Run.WaveIDs, acceptedWave.WaveID)
 		artifacts.Run.UpdatedAt = time.Now().UTC()
 
 		for i, outcome := range outcomes {
 			tid := wave.TicketIDs[i]
-			status := tkmd.StatusBlocked
-			if acceptedWave.Status == state.WaveStatusAccepted && outcome.err == nil && outcome.phase == state.TicketPhaseClosed {
+			var status tkmd.Status
+			switch {
+			case acceptedWave.Status == state.WaveStatusAccepted && outcome.err == nil && outcome.phase == state.TicketPhaseClosed:
 				status = tkmd.StatusClosed
+			case outcome.phase == state.TicketPhaseBlocked:
+				status = tkmd.StatusBlocked
+			default:
+				status = tkmd.StatusOpen
 			}
 			if err := updateTicketStoreStatus(artifacts.RepoRoot, tid, status); err != nil {
 				artifacts.Run.Status = state.EpicRunStatusBlocked
