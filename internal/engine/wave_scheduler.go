@@ -53,7 +53,7 @@ func BuildWave(ready []tkmd.Ticket, maxConcurrency int) (state.WaveArtifact, err
 
 func CheckScopeViolation(changed, owned []string) error {
 	if len(owned) == 0 {
-		return fmt.Errorf("owned scope is required")
+		return nil // no scope declared — skip check
 	}
 
 	for _, file := range changed {

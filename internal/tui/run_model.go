@@ -20,13 +20,14 @@ type tickMsg time.Time
 
 // ticketLine tracks the progress of a single ticket.
 type ticketLine struct {
-	id        string
-	title     string
-	phases    []string
-	active    string // current active operation (e.g., "claude worker running")
-	done      bool
-	ok        bool
-	startedAt time.Time
+	id         string
+	title      string
+	phases     []string
+	active     string // current active operation (e.g., "claude worker running")
+	done       bool
+	ok         bool
+	startedAt  time.Time
+	finishedAt time.Time
 }
 
 // waveState tracks a wave.
@@ -127,11 +128,13 @@ func (m *Model) handleEvent(evt engine.ProgressEvent) {
 			tl.done = true
 			tl.ok = true
 			tl.active = ""
+			tl.finishedAt = time.Now()
 		} else if evt.Phase == state.TicketPhaseBlocked {
 			tl.phases = append(tl.phases, "✗")
 			tl.done = true
 			tl.ok = false
 			tl.active = ""
+			tl.finishedAt = time.Now()
 		} else {
 			tl.phases = append(tl.phases, shortPhaseName(evt.Phase))
 			tl.active = ""
@@ -242,12 +245,16 @@ func (m Model) renderTicket(b *strings.Builder, tl *ticketLine) {
 	// Phase chain + active state
 	chain := m.renderPhaseChain(tl)
 
-	// Elapsed time
+	// Elapsed time — frozen for done tickets, live for active
 	elapsed := ""
-	if !tl.startedAt.IsZero() && !tl.done {
-		elapsed = styleElapsed.Render(fmt.Sprintf(" (%s)", formatDuration(time.Since(tl.startedAt))))
-	} else if tl.done && !tl.startedAt.IsZero() {
-		elapsed = styleElapsed.Render(fmt.Sprintf(" (%s)", formatDuration(time.Since(tl.startedAt))))
+	if !tl.startedAt.IsZero() {
+		var dur time.Duration
+		if tl.done && !tl.finishedAt.IsZero() {
+			dur = tl.finishedAt.Sub(tl.startedAt)
+		} else {
+			dur = time.Since(tl.startedAt)
+		}
+		elapsed = styleElapsed.Render(fmt.Sprintf(" (%s)", formatDuration(dur)))
 	}
 
 	b.WriteString(id + " " + title + " " + chain + elapsed + "\n")
