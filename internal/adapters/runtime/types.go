@@ -71,6 +71,7 @@ type ReviewRequest struct {
 	InputArtifactPath        string          `json:"input_artifact_path,omitempty"`
 	Instructions             string          `json:"instructions,omitempty"`
 	Diff                     string          `json:"diff,omitempty"`
+	Standards                string          `json:"standards,omitempty"`
 	EffectiveReviewThreshold Severity        `json:"effective_review_threshold"`
 	ExecutionConfig          ExecutionConfig `json:"execution_config,omitempty"`
 	OnProgress               func(detail string) `json:"-"`

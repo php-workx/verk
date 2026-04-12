@@ -48,9 +48,6 @@ func RunCommands(ctx context.Context, repoRoot string, cmds []string, cfg policy
 	}
 
 	env := verificationEnv(cfg.EnvPassthrough)
-	if env == nil {
-		env = []string{}
-	}
 	timeout := time.Duration(cfg.DefaultTimeoutMinutes) * time.Minute
 	if timeout <= 0 {
 		timeout = defaultVerificationTimeout
@@ -132,6 +129,115 @@ func RunCommands(ctx context.Context, repoRoot string, cmds []string, cfg policy
 	return results, nil
 }
 
+// RunQualityCommands runs structured quality commands before per-ticket validation
+// commands. Each QualityCommand specifies an optional subdirectory (relative to
+// repoRoot) and one or more shell commands to run sequentially from that directory.
+// This supports monorepo setups where different packages have different quality gates.
+func RunQualityCommands(ctx context.Context, repoRoot string, cmds []policy.QualityCommand, cfg policy.VerificationConfig) ([]CommandResult, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if len(cmds) == 0 {
+		return nil, nil
+	}
+
+	absRepoRoot, err := filepath.Abs(repoRoot)
+	if err != nil {
+		return nil, fmt.Errorf("resolve repo root %q: %w", repoRoot, err)
+	}
+	absRepoRoot = filepath.Clean(absRepoRoot)
+
+	env := verificationEnv(cfg.EnvPassthrough)
+	timeout := time.Duration(cfg.DefaultTimeoutMinutes) * time.Minute
+	if timeout <= 0 {
+		timeout = defaultVerificationTimeout
+	}
+
+	verificationRoot := filepath.Join(absRepoRoot, ".verk", "verification")
+	if err := os.MkdirAll(verificationRoot, 0o755); err != nil {
+		return nil, fmt.Errorf("create verification root %q: %w", verificationRoot, err)
+	}
+	runDir, err := os.MkdirTemp(verificationRoot, "quality-")
+	if err != nil {
+		return nil, fmt.Errorf("create quality run directory: %w", err)
+	}
+
+	var results []CommandResult
+	cmdIndex := 0
+	for _, qc := range cmds {
+		workDir := absRepoRoot
+		if qc.Path != "" {
+			workDir = filepath.Join(absRepoRoot, filepath.Clean(qc.Path))
+		}
+
+		for _, rawCmd := range qc.Run {
+			command := strings.TrimSpace(rawCmd)
+			if command == "" {
+				return results, fmt.Errorf("quality command %d is empty", cmdIndex+1)
+			}
+
+			stdoutPath := filepath.Join(runDir, fmt.Sprintf("command-%02d.stdout.log", cmdIndex+1))
+			stderrPath := filepath.Join(runDir, fmt.Sprintf("command-%02d.stderr.log", cmdIndex+1))
+			stdoutFile, err := os.Create(stdoutPath)
+			if err != nil {
+				return results, fmt.Errorf("create stdout artifact for quality command %d: %w", cmdIndex+1, err)
+			}
+			stderrFile, err := os.Create(stderrPath)
+			if err != nil {
+				_ = stdoutFile.Close()
+				return results, fmt.Errorf("create stderr artifact for quality command %d: %w", cmdIndex+1, err)
+			}
+
+			startedAt := time.Now().UTC()
+			cmdCtx, cancel := context.WithTimeout(ctx, timeout)
+			cmd := exec.CommandContext(cmdCtx, "/bin/sh", "-c", command)
+			cmd.Dir = workDir
+			cmd.Env = env
+			cmd.Stdout = stdoutFile
+			cmd.Stderr = stderrFile
+
+			runErr := cmd.Run()
+			finishedAt := time.Now().UTC()
+			cmdErr := cmdCtx.Err()
+			parentErr := ctx.Err()
+			cancel()
+
+			_ = stdoutFile.Close()
+			_ = stderrFile.Close()
+
+			timedOut := errors.Is(cmdErr, context.DeadlineExceeded) || errors.Is(parentErr, context.DeadlineExceeded)
+			if runErr != nil && !timedOut && !isExpectedExecutionFailure(runErr) {
+				return results, fmt.Errorf("run quality command %d: %w", cmdIndex+1, runErr)
+			}
+
+			exitCode := 0
+			switch {
+			case timedOut:
+				exitCode = -1
+			case cmd.ProcessState != nil:
+				exitCode = cmd.ProcessState.ExitCode()
+			case runErr != nil:
+				exitCode = exitCodeFromError(runErr)
+			}
+
+			results = append(results, CommandResult{
+				Command:    command,
+				Cwd:        workDir,
+				ExitCode:   exitCode,
+				TimedOut:   timedOut,
+				DurationMS: finishedAt.Sub(startedAt).Milliseconds(),
+				StdoutPath: stdoutPath,
+				StderrPath: stderrPath,
+				StartedAt:  startedAt,
+				FinishedAt: finishedAt,
+			})
+			cmdIndex++
+		}
+	}
+
+	return results, nil
+}
+
 func DeriveVerificationPassed(results []CommandResult) bool {
 	if len(results) == 0 {
 		return false
@@ -144,27 +250,41 @@ func DeriveVerificationPassed(results []CommandResult) bool {
 	return true
 }
 
+// defaultEnvAllowlist contains the minimum set of environment variables always
+// included in the verification environment. This ensures PATH-dependent commands
+// (go, git, npm, cargo, etc.) can locate their executables while keeping the
+// environment deterministic and free of unintended variable leakage.
+var defaultEnvAllowlist = []string{
+	"CI",
+	"HOME",
+	"LOGNAME",
+	"PATH",
+	"TERM",
+	"USER",
+}
+
+// verificationEnv builds a deterministic environment for verification commands
+// by allowlisting variables from the host environment. It always includes the
+// defaultEnvAllowlist entries, then overlays any caller-configured passthrough
+// variables. The returned slice is never nil — commands always run with an
+// explicit environment rather than inheriting the full parent environment.
 func verificationEnv(allowlist []string) []string {
-	if len(allowlist) == 0 {
-		return nil
+	keys := make(map[string]bool, len(defaultEnvAllowlist)+len(allowlist))
+	for _, k := range defaultEnvAllowlist {
+		keys[k] = true
 	}
-
-	seen := make(map[string]struct{}, len(allowlist))
-	pairs := make([]string, 0, len(allowlist))
-	for _, name := range allowlist {
-		key := strings.TrimSpace(name)
-		if key == "" {
-			continue
-		}
-		if _, ok := seen[key]; ok {
-			continue
-		}
-		seen[key] = struct{}{}
-		if value, ok := os.LookupEnv(key); ok {
-			pairs = append(pairs, key+"="+value)
+	for _, k := range allowlist {
+		if k = strings.TrimSpace(k); k != "" {
+			keys[k] = true
 		}
 	}
 
+	pairs := make([]string, 0, len(keys))
+	for k := range keys {
+		if value, ok := os.LookupEnv(k); ok {
+			pairs = append(pairs, k+"="+value)
+		}
+	}
 	sort.Strings(pairs)
 	return pairs
 }

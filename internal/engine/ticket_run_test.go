@@ -911,3 +911,110 @@ func testRunTimes() (time.Time, time.Time) {
 	start := testRunTime()
 	return start, start.Add(2 * time.Second)
 }
+
+func TestCollectDiff_ReturnsErrorOnInvalidRepo(t *testing.T) {
+	_, err := collectDiff("/nonexistent/path/that/does/not/exist", "abc123")
+	if err == nil {
+		t.Fatal("expected error from collectDiff with invalid repo path")
+	}
+}
+
+func TestCollectDiff_ReturnsErrorOnInvalidBaseCommit(t *testing.T) {
+	repoRoot := t.TempDir()
+	mustRunGit(t, repoRoot, "init")
+	mustRunGit(t, repoRoot, "config", "user.email", "test@example.com")
+	mustRunGit(t, repoRoot, "config", "user.name", "Test User")
+	if err := os.WriteFile(filepath.Join(repoRoot, "file.txt"), []byte("hello\n"), 0o644); err != nil {
+		t.Fatalf("write file: %v", err)
+	}
+	mustRunGit(t, repoRoot, "add", "file.txt")
+	mustRunGit(t, repoRoot, "commit", "-m", "initial")
+
+	_, err := collectDiff(repoRoot, "nonexistent-commit-hash")
+	if err == nil {
+		t.Fatal("expected error from collectDiff with invalid base commit")
+	}
+}
+
+func TestCollectChangedFiles_ReturnsErrorOnInvalidRepo(t *testing.T) {
+	_, err := collectChangedFiles("/nonexistent/path/that/does/not/exist", "abc123")
+	if err == nil {
+		t.Fatal("expected error from collectChangedFiles with invalid repo path")
+	}
+}
+
+func TestCollectChangedFiles_ReturnsErrorOnInvalidBaseCommit(t *testing.T) {
+	repoRoot := t.TempDir()
+	mustRunGit(t, repoRoot, "init")
+	mustRunGit(t, repoRoot, "config", "user.email", "test@example.com")
+	mustRunGit(t, repoRoot, "config", "user.name", "Test User")
+	if err := os.WriteFile(filepath.Join(repoRoot, "file.txt"), []byte("hello\n"), 0o644); err != nil {
+		t.Fatalf("write file: %v", err)
+	}
+	mustRunGit(t, repoRoot, "add", "file.txt")
+	mustRunGit(t, repoRoot, "commit", "-m", "initial")
+
+	_, err := collectChangedFiles(repoRoot, "nonexistent-commit-hash")
+	if err == nil {
+		t.Fatal("expected error from collectChangedFiles with invalid base commit")
+	}
+}
+
+func TestRemainingTTL_ComputesFromNow(t *testing.T) {
+	now := time.Now().UTC()
+	st := &ticketRunState{
+		req: RunTicketRequest{
+			Claim: state.ClaimArtifact{
+				LeasedAt:  now.Add(-10 * time.Minute),
+				ExpiresAt: now.Add(20 * time.Minute),
+			},
+		},
+	}
+
+	ttl := st.claimTTL()
+	if ttl != 30*time.Minute {
+		t.Fatalf("expected claimTTL to be 30m (original full TTL), got %v", ttl)
+	}
+
+	remaining := st.remainingTTL()
+	// remainingTTL should be approximately 20m, not 30m
+	if remaining >= 30*time.Minute {
+		t.Fatalf("expected remainingTTL < 30m (should be ~20m), got %v", remaining)
+	}
+	if remaining < 15*time.Minute {
+		t.Fatalf("expected remainingTTL > 15m (should be ~20m), got %v", remaining)
+	}
+}
+
+func TestRemainingTTL_ZeroExpiresAt(t *testing.T) {
+	st := &ticketRunState{
+		req: RunTicketRequest{
+			Claim: state.ClaimArtifact{},
+		},
+	}
+	if st.remainingTTL() != 0 {
+		t.Fatalf("expected 0 remainingTTL for zero ExpiresAt, got %v", st.remainingTTL())
+	}
+}
+
+func TestNormalizeRunTicketConfig_SetsMaxRepairCyclesDefault(t *testing.T) {
+	cfg := policy.Config{}
+	// Zero-value config should have MaxRepairCycles == 0.
+	if cfg.Policy.MaxRepairCycles != 0 {
+		t.Fatalf("expected zero-value MaxRepairCycles, got %d", cfg.Policy.MaxRepairCycles)
+	}
+
+	normalized := normalizeRunTicketConfig(cfg)
+	defaults := policy.DefaultConfig()
+	if normalized.Policy.MaxRepairCycles != defaults.Policy.MaxRepairCycles {
+		t.Fatalf("expected normalized MaxRepairCycles to be %d (default), got %d",
+			defaults.Policy.MaxRepairCycles, normalized.Policy.MaxRepairCycles)
+	}
+
+	// Non-zero value should be preserved.
+	cfg.Policy.MaxRepairCycles = 5
+	normalized = normalizeRunTicketConfig(cfg)
+	if normalized.Policy.MaxRepairCycles != 5 {
+		t.Fatalf("expected MaxRepairCycles to stay 5, got %d", normalized.Policy.MaxRepairCycles)
+	}
+}

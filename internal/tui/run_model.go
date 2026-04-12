@@ -80,7 +80,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case engine.ProgressEvent:
-		m.handleEvent(msg)
+		cmd := m.handleEvent(msg)
+		if cmd != nil {
+			return m, cmd
+		}
 		return m, waitForEvent(m.ch)
 
 	case doneMsg:
@@ -99,7 +102,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-func (m *Model) handleEvent(evt engine.ProgressEvent) {
+func (m *Model) handleEvent(evt engine.ProgressEvent) tea.Cmd {
 	switch evt.Type {
 	case engine.EventWaveStarted:
 		m.waves = append(m.waves, waveState{
@@ -147,7 +150,9 @@ func (m *Model) handleEvent(evt engine.ProgressEvent) {
 
 	case engine.EventRunCompleted:
 		m.done = true
+		return tea.Quit
 	}
+	return nil
 }
 
 func (m *Model) ensureTicket(id, title string) *ticketLine {

@@ -38,7 +38,7 @@ func New(worktree string) (*Repo, error) {
 	}
 
 	return &Repo{
-		root:         physicalRoot,
+		root:         displayRoot,
 		physicalRoot: physicalRoot,
 	}, nil
 }

@@ -78,8 +78,8 @@ func DeriveStatus(req StatusRequest) (StatusReport, error) {
 				report.LastFailedGate = snapshot.Closeout.FailedGate
 			}
 		}
-		if report.EffectiveReviewThreshold == "" && plan.EffectiveReviewThreshold != "" {
-			report.EffectiveReviewThreshold = plan.EffectiveReviewThreshold
+		if plan.EffectiveReviewThreshold != "" {
+			report.EffectiveReviewThreshold = mostRestrictiveThreshold(report.EffectiveReviewThreshold, plan.EffectiveReviewThreshold)
 		}
 
 		claim, claimErr := deriveTicketClaim(artifacts.RepoRoot, artifacts.RunID, ticketID, snapshot)
@@ -150,4 +150,26 @@ func deriveTicketClaim(repoRoot, runID, ticketID string, snapshot TicketRunSnaps
 		return nil, fmt.Errorf("ticket %s lease mismatch between implementation artifact %q and claim %q", ticketID, snapshot.Implementation.LeaseID, claim.LeaseID)
 	}
 	return &claim, nil
+}
+
+// mostRestrictiveThreshold returns the more restrictive of two review thresholds.
+// Precedence: strict > standard > lenient > ""(empty).
+// If both are equal, either is returned. If one is empty, the other is returned.
+func mostRestrictiveThreshold(a, b state.Severity) state.Severity {
+	thresholdPrecedence := map[state.Severity]int{
+		state.SeverityP0: 4, // strict
+		"strict":         4,
+		state.SeverityP1: 3, // standard
+		"standard":       3,
+		state.SeverityP2: 2, // lenient
+		"lenient":        2,
+		state.SeverityP3: 1,
+		state.SeverityP4: 0,
+	}
+	aRank := thresholdPrecedence[a]
+	bRank := thresholdPrecedence[b]
+	if aRank >= bRank {
+		return a
+	}
+	return b
 }

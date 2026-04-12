@@ -26,5 +26,6 @@ type Ticket struct {
 	Body               string
 	UnknownFrontmatter map[string]any
 
-	present map[string]bool
+	present      map[string]bool
+	titleDerived bool // true if Title was extracted from body heading, not frontmatter
 }

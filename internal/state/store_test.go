@@ -51,6 +51,54 @@ func TestLoadJSON_MalformedFails(t *testing.T) {
 	}
 }
 
+func TestSaveFileAtomic_WritesAndSyncs(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "subdir", "data.txt")
+	content := []byte("hello world")
+
+	if err := SaveFileAtomic(path, content, 0o644); err != nil {
+		t.Fatalf("SaveFileAtomic returned error: %v", err)
+	}
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read file: %v", err)
+	}
+	if string(data) != string(content) {
+		t.Fatalf("expected %q, got %q", content, data)
+	}
+
+	// No temp files left behind.
+	matches, err := filepath.Glob(filepath.Join(dir, "subdir", "*.tmp"))
+	if err != nil {
+		t.Fatalf("glob tmp files: %v", err)
+	}
+	if len(matches) != 0 {
+		t.Fatalf("expected no tmp files left behind, found %v", matches)
+	}
+}
+
+func TestSaveFileAtomic_ReplacesExisting(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "data.txt")
+
+	if err := os.WriteFile(path, []byte("old"), 0o644); err != nil {
+		t.Fatalf("seed file: %v", err)
+	}
+
+	if err := SaveFileAtomic(path, []byte("new"), 0o644); err != nil {
+		t.Fatalf("SaveFileAtomic returned error: %v", err)
+	}
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read file: %v", err)
+	}
+	if string(data) != "new" {
+		t.Fatalf("expected content to be replaced, got %q", string(data))
+	}
+}
+
 func TestWriteTransitionCommit_CrashBeforeRunJSONLeavesUncommittedState(t *testing.T) {
 	dir := t.TempDir()
 	now := time.Now().UTC()

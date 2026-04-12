@@ -179,3 +179,38 @@ func TestUsesCanonicalReadinessPredicate(t *testing.T) {
 		}
 	}
 }
+
+func TestRoundTripNoTitleInFrontmatter(t *testing.T) {
+	// A ticket whose title comes from the # heading (not frontmatter)
+	// must produce identical content after a load-save round-trip.
+	dir := t.TempDir()
+	path := filepath.Join(dir, "derived-title.md")
+	original := "---\nid: tk-dt\nstatus: open\n---\n# Derived Title\n\nSome body text.\n"
+	if err := os.WriteFile(path, []byte(original), 0o644); err != nil {
+		t.Fatalf("seed ticket: %v", err)
+	}
+
+	ticket, err := LoadTicket(path)
+	if err != nil {
+		t.Fatalf("LoadTicket: %v", err)
+	}
+	if ticket.Title != "Derived Title" {
+		t.Fatalf("expected title from heading, got %q", ticket.Title)
+	}
+	if !ticket.titleDerived {
+		t.Fatal("expected titleDerived to be true when title comes from heading")
+	}
+
+	outPath := filepath.Join(dir, "roundtrip.md")
+	if err := SaveTicket(outPath, ticket); err != nil {
+		t.Fatalf("SaveTicket: %v", err)
+	}
+
+	saved, err := os.ReadFile(outPath)
+	if err != nil {
+		t.Fatalf("read saved ticket: %v", err)
+	}
+	if string(saved) != original {
+		t.Fatalf("round-trip mismatch\nwant:\n%s\ngot:\n%s", original, string(saved))
+	}
+}

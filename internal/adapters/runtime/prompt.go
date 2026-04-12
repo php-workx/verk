@@ -124,6 +124,12 @@ func BuildReviewPrompt(req ReviewRequest) string {
 		b.WriteString(req.Instructions)
 	}
 
+	if req.Standards != "" {
+		b.WriteString("\n### Review Standards\n\n")
+		b.WriteString(req.Standards)
+		b.WriteString("\n")
+	}
+
 	if req.Diff != "" {
 		b.WriteString("\n### Diff\n\n")
 		b.WriteString("```diff\n")

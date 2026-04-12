@@ -159,6 +159,38 @@ func TestRunCommands_StartsWithCleanEnv(t *testing.T) {
 	}
 }
 
+func TestRunCommands_DefaultEnvIncludesPath(t *testing.T) {
+	// When no EnvPassthrough is configured, verification commands must still
+	// be able to find executables via PATH. This tests the fix for ver-93kv:
+	// nil env must NOT become []string{} (which would strip all env vars
+	// including PATH), and verificationEnv must always include the default
+	// allowlist (PATH, HOME, etc.).
+	repoRoot := t.TempDir()
+
+	results, err := RunCommands(context.Background(), repoRoot, []string{
+		`printf '%s' "${PATH:-missing}"`,
+	}, policy.VerificationConfig{
+		DefaultTimeoutMinutes: 1,
+	})
+	if err != nil {
+		t.Fatalf("RunCommands returned error: %v", err)
+	}
+	if len(results) != 1 {
+		t.Fatalf("expected 1 command result, got %d", len(results))
+	}
+	if results[0].ExitCode != 0 {
+		t.Fatalf("expected exit code 0, got %d (command must find PATH)", results[0].ExitCode)
+	}
+
+	stdoutData, err := os.ReadFile(results[0].StdoutPath)
+	if err != nil {
+		t.Fatalf("read stdout artifact: %v", err)
+	}
+	if strings.TrimSpace(string(stdoutData)) == "missing" {
+		t.Fatalf("PATH must be available in default verification environment")
+	}
+}
+
 func TestDeriveVerificationPassed_FailsOnNonZeroExit(t *testing.T) {
 	if DeriveVerificationPassed(nil) {
 		t.Fatalf("expected empty results to fail verification")

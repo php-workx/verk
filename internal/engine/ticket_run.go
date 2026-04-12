@@ -244,6 +244,10 @@ func RunTicket(ctx context.Context, req RunTicketRequest) (RunTicketResult, erro
 			}
 
 		case state.TicketPhaseReview:
+			diffForReview, err := collectDiff(absRepoRoot, req.BaseCommit)
+			if err != nil {
+				return RunTicketResult{}, fmt.Errorf("collect diff for review: %w", err)
+			}
 			reviewReq := runtime.ReviewRequest{
 				RunID:                    req.RunID,
 				TicketID:                 req.Ticket.ID,
@@ -252,7 +256,8 @@ func RunTicket(ctx context.Context, req RunTicketRequest) (RunTicketResult, erro
 				Runtime:                  chosenRuntime(req.Plan, cfg),
 				InputArtifactPath:        st.paths.verificationPath,
 				Instructions:             renderReviewInstructions(req.Plan, st.reviewAttempts+1),
-				Diff:                     collectDiff(absRepoRoot, req.BaseCommit),
+				Diff:                     diffForReview,
+				Standards:                runtime.BuildReviewStandards(runtime.DetectLanguages(diffForReview)),
 				EffectiveReviewThreshold: req.Plan.EffectiveReviewThreshold,
 				ExecutionConfig:          executionConfigFromPolicy(cfg),
 				OnProgress:               func(detail string) { st.progressDetail(detail) },
@@ -466,7 +471,11 @@ func handleImplementResult(st *ticketRunState, result runtime.WorkerResult, atte
 		}
 		st.blockReason = ""
 		st.implementation.BlockReason = ""
-		st.implementation.ChangedFiles = collectChangedFiles(st.repoRoot, st.req.BaseCommit)
+		changedFiles, err := collectChangedFiles(st.repoRoot, st.req.BaseCommit)
+		if err != nil {
+			return fmt.Errorf("collect changed files: %w", err)
+		}
+		st.implementation.ChangedFiles = changedFiles
 	case runtime.WorkerStatusNeedsContext, runtime.WorkerStatusBlocked:
 		reason := workerBlockReason(result)
 		st.blockReason = reason
@@ -506,40 +515,37 @@ func checkSingleTicketScope(st *ticketRunState) error {
 	return nil
 }
 
-func collectDiff(repoRoot, baseCommit string) string {
+func collectDiff(repoRoot, baseCommit string) (string, error) {
 	baseCommit = strings.TrimSpace(baseCommit)
 	if baseCommit == "" {
-		return ""
+		return "", nil
 	}
 	repo, err := git.New(repoRoot)
 	if err != nil {
-		return ""
+		return "", fmt.Errorf("open git repo for diff: %w", err)
 	}
 	diff, err := repo.DiffAgainst(baseCommit)
 	if err != nil {
-		return ""
+		return "", fmt.Errorf("collect diff against %s: %w", baseCommit, err)
 	}
-	return diff
+	return diff, nil
 }
 
-func collectChangedFiles(repoRoot, baseCommit string) []string {
+func collectChangedFiles(repoRoot, baseCommit string) ([]string, error) {
 	baseCommit = strings.TrimSpace(baseCommit)
 	if baseCommit == "" {
-		return []string{}
+		return nil, nil
 	}
 	repo, err := git.New(repoRoot)
 	if err != nil {
-		return []string{}
+		return nil, fmt.Errorf("open git repo for changed files: %w", err)
 	}
 	files, err := repo.ChangedFilesAgainst(baseCommit)
 	if err != nil {
-		return []string{}
+		return nil, fmt.Errorf("collect changed files against %s: %w", baseCommit, err)
 	}
 	filtered := filterEngineOwnedFiles(files)
-	if filtered == nil {
-		return []string{}
-	}
-	return filtered
+	return filtered, nil
 }
 
 func handleVerificationFailure(st *ticketRunState, verification state.VerificationArtifact) error {
@@ -661,12 +667,33 @@ func (st *ticketRunState) runVerification(ctx context.Context, repoRoot string) 
 		commands = st.req.Plan.ValidationCommands
 	}
 
-	results, err := verifycommand.RunCommands(ctx, repoRoot, commands, st.cfg.Verification)
-	if err != nil {
-		return nil, false, err
+	// Quality commands run first (from global config) and gate validation commands.
+	// They are prepended to the combined result set so the artifact records all runs.
+	var allResults []verifycommand.CommandResult
+	if len(st.cfg.Verification.QualityCommands) > 0 {
+		qualityResults, err := verifycommand.RunQualityCommands(ctx, repoRoot, st.cfg.Verification.QualityCommands, st.cfg.Verification)
+		if err != nil {
+			return nil, false, fmt.Errorf("run quality commands: %w", err)
+		}
+		allResults = append(allResults, qualityResults...)
 	}
 
-	converted := convertVerificationResults(commands, results)
+	// Only run per-ticket validation commands when there are any declared.
+	if len(commands) > 0 {
+		validationResults, err := verifycommand.RunCommands(ctx, repoRoot, commands, st.cfg.Verification)
+		if err != nil {
+			return nil, false, fmt.Errorf("run validation commands: %w", err)
+		}
+		allResults = append(allResults, validationResults...)
+	}
+
+	// Build flat command list for the artifact (CommandResult.Command is canonical).
+	allCommands := make([]string, 0, len(allResults))
+	for _, r := range allResults {
+		allCommands = append(allCommands, r.Command)
+	}
+
+	converted := convertVerificationResults(nil, allResults)
 	artifact := &state.VerificationArtifact{
 		ArtifactMeta: state.ArtifactMeta{
 			SchemaVersion: artifactSchemaVersion,
@@ -676,9 +703,9 @@ func (st *ticketRunState) runVerification(ctx context.Context, repoRoot string) 
 		},
 		TicketID:   st.req.Ticket.ID,
 		Attempt:    st.verificationAttempts + 1,
-		Commands:   append([]string(nil), commands...),
+		Commands:   allCommands,
 		Results:    converted,
-		Passed:     verifycommand.DeriveVerificationPassed(results),
+		Passed:     verifycommand.DeriveVerificationPassed(allResults),
 		RepoRoot:   repoRoot,
 		StartedAt:  verificationStartedAt(converted),
 		FinishedAt: verificationFinishedAt(converted),
@@ -846,7 +873,11 @@ func (st *ticketRunState) startClaimRenewal(ctx context.Context) (context.Contex
 	if ttl <= 0 {
 		ttl = 30 * time.Minute
 	}
-	interval := ttl / 3
+	remaining := st.remainingTTL()
+	if remaining <= 0 {
+		remaining = 30 * time.Minute
+	}
+	interval := remaining / 3
 	if interval < 25*time.Millisecond {
 		interval = 25 * time.Millisecond
 	}
@@ -899,6 +930,20 @@ func (st *ticketRunState) claimTTL() time.Duration {
 		return 30 * time.Minute
 	}
 	return ttl
+}
+
+// remainingTTL computes the time remaining until the claim expires,
+// used for scheduling renewal intervals. Unlike claimTTL which returns
+// the original full TTL, this reflects the actual remaining time.
+func (st *ticketRunState) remainingTTL() time.Duration {
+	if st.req.Claim.ExpiresAt.IsZero() {
+		return 0
+	}
+	remaining := st.req.Claim.ExpiresAt.Sub(time.Now().UTC())
+	if remaining <= 0 {
+		return 0
+	}
+	return remaining
 }
 
 func shouldRetryRuntimeError(err error) bool {
@@ -1107,6 +1152,9 @@ func normalizeRunTicketConfig(cfg policy.Config) policy.Config {
 	}
 	if cfg.Policy.MaxImplementationAttempts <= 0 {
 		cfg.Policy.MaxImplementationAttempts = defaults.Policy.MaxImplementationAttempts
+	}
+	if cfg.Policy.MaxRepairCycles <= 0 {
+		cfg.Policy.MaxRepairCycles = defaults.Policy.MaxRepairCycles
 	}
 	if cfg.Verification.DefaultTimeoutMinutes <= 0 {
 		cfg.Verification.DefaultTimeoutMinutes = defaults.Verification.DefaultTimeoutMinutes

@@ -29,7 +29,7 @@ var versionCmd = &cobra.Command{
 	Use:   "version",
 	Short: "Print version information",
 	Run: func(cmd *cobra.Command, args []string) {
-		fmt.Printf("verk %s (%s, %s)\n", Version, GitCommit, BuildDate)
+		fmt.Fprintf(cmd.OutOrStdout(), "verk %s (%s, %s)\n", Version, GitCommit, BuildDate)
 	},
 }
 

@@ -114,10 +114,10 @@ func TestReopen_ValidatesTargetPhase(t *testing.T) {
 	}
 
 	_, stderr, code := runCLIFromDir(t, repoRoot, "reopen", runID, ticketID, "--to", "closed")
-	if code != 1 {
-		t.Fatalf("expected validation failure exit code 1, got %d", code)
+	if code != 2 {
+		t.Fatalf("expected validation failure exit code 2, got %d stderr=%s", code, stderr)
 	}
-	if !strings.Contains(stderr, "not allowed") {
+	if !strings.Contains(stderr, "must be one of") {
 		t.Fatalf("expected validation error, got %s", stderr)
 	}
 }

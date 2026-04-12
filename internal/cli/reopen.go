@@ -30,16 +30,22 @@ Examples:
 	},
 	RunE: func(cmd *cobra.Command, args []string) error {
 		if reopenToPhase == "" {
-			return withExitCode(fmt.Errorf("--to flag is required (implement or repair)"), 2)
+			return cmdError(cmd, fmt.Errorf("--to flag is required (implement or repair)"), 2)
 		}
-		repoRoot, _ := resolveRepoRoot()
+		if !isValidReopenPhase(reopenToPhase) {
+			return cmdError(cmd, fmt.Errorf("--to must be one of: implement, repair (got %q)", reopenToPhase), 2)
+		}
+		repoRoot, err := resolveRepoRoot()
+		if err != nil {
+			return cmdError(cmd, fmt.Errorf("resolve repo root: %w", err), 1)
+		}
 		if err := engine.ReopenTicket(context.Background(), engine.ReopenRequest{
 			RepoRoot: repoRoot,
 			RunID:    args[0],
 			TicketID: args[1],
 			ToPhase:  state.TicketPhase(reopenToPhase),
 		}); err != nil {
-			return withExitCode(err, 1)
+			return cmdError(cmd, err, 1)
 		}
 		fmt.Fprintf(cmd.OutOrStdout(), "reopened %s in %s to %s\n", args[1], args[0], reopenToPhase)
 		return nil
@@ -49,4 +55,15 @@ Examples:
 func initReopenCmd() {
 	reopenCmd.Flags().StringVar(&reopenToPhase, "to", "", "Target phase (implement, repair)")
 	rootCmd.AddCommand(reopenCmd)
+}
+
+// isValidReopenPhase checks whether the given phase string is a valid
+// target for the reopen command.
+func isValidReopenPhase(phase string) bool {
+	switch state.TicketPhase(phase) {
+	case state.TicketPhaseImplement, state.TicketPhaseRepair:
+		return true
+	default:
+		return false
+	}
 }

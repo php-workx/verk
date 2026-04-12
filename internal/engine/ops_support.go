@@ -8,6 +8,7 @@ import (
 	"sort"
 	"time"
 
+	"verk/internal/adapters/repo/git"
 	"verk/internal/adapters/ticketstore/tkmd"
 	"verk/internal/state"
 )
@@ -23,11 +24,11 @@ type runArtifacts struct {
 
 func resolveEngineRepoRoot(repoRoot string) (string, error) {
 	if repoRoot == "" {
-		cwd, err := os.Getwd()
+		root, err := git.RepoRoot()
 		if err != nil {
-			return "", fmt.Errorf("resolve cwd: %w", err)
+			return "", fmt.Errorf("resolve git repo root: %w", err)
 		}
-		repoRoot = cwd
+		repoRoot = root
 	}
 	abs, err := filepath.Abs(repoRoot)
 	if err != nil {
@@ -349,11 +350,26 @@ func configMap(v any) map[string]any {
 	return out
 }
 
+// phasePriority defines the ordering of active ticket phases.
+// Higher values indicate higher priority (later in the workflow).
+// When computing the run's current phase from multiple tickets,
+// the highest-priority active phase is used so the run reflects
+// the most advanced work in progress.
+var phasePriority = map[state.TicketPhase]int{
+	state.TicketPhaseImplement: 1,
+	state.TicketPhaseVerify:    2,
+	state.TicketPhaseReview:    3,
+	state.TicketPhaseRepair:    4,
+	state.TicketPhaseCloseout:  5,
+}
+
 func updateRunStatusFromTickets(run *state.RunArtifact, tickets map[string]TicketRunSnapshot) {
 	if run == nil {
 		return
 	}
 	anyRunning := false
+	var highestPhase state.TicketPhase
+	highestPriority := -1
 	for _, snapshot := range tickets {
 		switch snapshot.CurrentPhase {
 		case state.TicketPhaseBlocked:
@@ -362,13 +378,22 @@ func updateRunStatusFromTickets(run *state.RunArtifact, tickets map[string]Ticke
 			run.UpdatedAt = time.Now().UTC()
 			return
 		case state.TicketPhaseClosed:
+			// Terminal — does not contribute to the active phase.
 		default:
 			anyRunning = true
+			if p, ok := phasePriority[snapshot.CurrentPhase]; ok && p > highestPriority {
+				highestPriority = p
+				highestPhase = snapshot.CurrentPhase
+			}
 		}
 	}
 	if anyRunning {
 		run.Status = state.EpicRunStatusRunning
-		run.CurrentPhase = state.TicketPhaseImplement
+		if highestPriority >= 0 {
+			run.CurrentPhase = highestPhase
+		} else {
+			run.CurrentPhase = state.TicketPhaseImplement
+		}
 	} else {
 		run.Status = state.EpicRunStatusCompleted
 		run.CurrentPhase = state.TicketPhaseClosed

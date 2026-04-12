@@ -112,18 +112,15 @@ func latestRunID(repoRoot string) (string, error) {
 		return "", err
 	}
 	var latest string
-	var latestTime time.Time
 	for _, entry := range entries {
 		if !entry.IsDir() || !strings.HasPrefix(entry.Name(), "run-") {
 			continue
 		}
-		info, err := entry.Info()
-		if err != nil {
-			continue
-		}
-		if latest == "" || info.ModTime().After(latestTime) {
+		// Run IDs contain timestamps in the format run-<ticketID>-<unixNano>,
+		// so lexicographic comparison of directory names gives correct
+		// chronological order without relying on filesystem mtime.
+		if latest == "" || entry.Name() > latest {
 			latest = entry.Name()
-			latestTime = info.ModTime()
 		}
 	}
 	return latest, nil
@@ -147,11 +144,10 @@ func resolveRunID(args []string) (string, error) {
 	return runID, nil
 }
 
-// cmdError prints an error to the command's stdout (so it's always visible,
-// even when stderr is suppressed) and returns it as a cobra error.
+// cmdError prints an error to the command's stderr and returns it as a cobra error.
 // It silences cobra's own error output to avoid duplication.
 func cmdError(cmd *cobra.Command, err error, code int) error {
-	fmt.Fprintf(cmd.OutOrStdout(), "Error: %s\n", err)
+	fmt.Fprintf(cmd.ErrOrStderr(), "Error: %s\n", err)
 	cmd.SilenceErrors = true
 	return withExitCode(err, code)
 }

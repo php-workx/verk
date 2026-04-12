@@ -112,8 +112,20 @@ func TestRunEpicSchedulesOpenAndReadyTickets(t *testing.T) {
 	// Use the blocking adapter which handles any ticket order (uses req.LeaseID)
 	adapter := newBlockingEpicAdapter(t)
 	go func() {
-		// Wait for 2 tickets to start, then release all
-		waitForStarted(t, adapter.started, 2)
+		// Collect started ticket IDs from the channel and relay them.
+		// Do NOT call t.Fatalf from this goroutine — Go 1.22+ panics on that.
+		ids := make([]string, 0, 2)
+		timeout := time.NewTimer(10 * time.Second)
+		defer timeout.Stop()
+		for len(ids) < 2 {
+			select {
+			case id := <-adapter.started:
+				ids = append(ids, id)
+			case <-timeout.C:
+				close(adapter.release)
+				return
+			}
+		}
 		close(adapter.release)
 	}()
 

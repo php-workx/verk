@@ -24,7 +24,10 @@ var statusCmd = &cobra.Command{
 		if err != nil {
 			return cmdError(cmd, err, 1)
 		}
-		repoRoot, _ := resolveRepoRoot()
+		repoRoot, err := resolveRepoRoot()
+		if err != nil {
+			return cmdError(cmd, fmt.Errorf("resolve repo root: %w", err), 1)
+		}
 
 		report, err := engine.DeriveStatus(engine.StatusRequest{RepoRoot: repoRoot, RunID: runID})
 		if err != nil {
@@ -45,7 +48,6 @@ var statusCmd = &cobra.Command{
 		fmt.Fprintf(w, "  Run:    %s\n", report.RunID)
 		runStatus := formatRunStatus(r, report.RunStatus)
 		if report.RunStatus == state.EpicRunStatusRunning {
-			repoRoot, _ := resolveRepoRoot()
 			if repoRoot != "" && !engine.IsRunLockHeld(repoRoot, report.RunID) {
 				runStatus = r.fail("stale") + r.dim(" (process died — use 'verk run' to resume)")
 			}

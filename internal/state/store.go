@@ -21,16 +21,29 @@ type TransitionPayloads struct {
 	RunArtifact    any
 }
 
+// SaveJSONAtomic marshals v to JSON and writes it to path atomically using
+// write-temp+rename. On Unix, os.Rename is atomic on the same filesystem.
+// On Windows, os.Rename is replace-only (not atomic); callers that need
+// true atomicity on Windows should use platform-specific APIs.
 func SaveJSONAtomic(path string, v any) error {
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return fmt.Errorf("create parent dir: %w", err)
-	}
-
 	data, err := json.MarshalIndent(v, "", "  ")
 	if err != nil {
 		return fmt.Errorf("marshal json: %w", err)
 	}
 	data = append(data, '\n')
+	return SaveFileAtomic(path, data, 0o644)
+}
+
+// SaveFileAtomic writes data to a temporary file in the same directory as path,
+// syncs the temp file to stable storage, then renames it to path.
+// On Unix, os.Rename is atomic on the same filesystem.
+// On Windows, os.Rename replaces the target but is not atomic;
+// callers that need true atomicity on Windows should use platform-specific
+// APIs such as ReplaceFileEx.
+func SaveFileAtomic(path string, data []byte, perm os.FileMode) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return fmt.Errorf("create parent dir: %w", err)
+	}
 
 	tmp, err := os.CreateTemp(filepath.Dir(path), filepath.Base(path)+".*.tmp")
 	if err != nil {
@@ -42,6 +55,10 @@ func SaveJSONAtomic(path string, v any) error {
 	if _, err := tmp.Write(data); err != nil {
 		tmp.Close()
 		return fmt.Errorf("write temp file: %w", err)
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return fmt.Errorf("sync temp file: %w", err)
 	}
 	if err := tmp.Close(); err != nil {
 		return fmt.Errorf("close temp file: %w", err)

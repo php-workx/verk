@@ -11,6 +11,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"verk/internal/state"
 )
 
 var canonicalStatuses = map[Status]struct{}{
@@ -51,6 +53,7 @@ func LoadTicket(path string) (Ticket, error) {
 	// Extract title from body's first # heading if not in frontmatter
 	if ticket.Title == "" {
 		ticket.Title = extractHeadingTitle(ticket.Body)
+		ticket.titleDerived = true
 	}
 	return *ticket, nil
 }
@@ -67,10 +70,7 @@ func SaveTicket(path string, ticket Ticket) error {
 	buf.WriteString("---\n")
 	buf.WriteString(ticket.Body)
 
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return fmt.Errorf("create ticket dir: %w", err)
-	}
-	if err := os.WriteFile(path, buf.Bytes(), 0o644); err != nil {
+	if err := state.SaveFileAtomic(path, buf.Bytes(), 0o644); err != nil {
 		return fmt.Errorf("write ticket: %w", err)
 	}
 	return nil
@@ -376,7 +376,11 @@ func encodeFrontMatter(ticket *Ticket) string {
 	}
 
 	writeString("id", ticket.ID)
-	writeString("title", ticket.Title)
+	// Only write title to frontmatter if it was originally present there.
+	// If the title was derived from a body heading, skip it to preserve round-trip idempotency.
+	if !ticket.titleDerived {
+		writeString("title", ticket.Title)
+	}
 	writeString("status", string(ticket.Status))
 	writeSlice("deps", ticket.Deps)
 	if fieldPresent(ticket, "priority") || ticket.Priority != 0 {

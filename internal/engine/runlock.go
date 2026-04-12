@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -32,7 +33,10 @@ func AcquireRunLock(repoRoot, runID string) (*RunLock, error) {
 
 	if err := syscall.Flock(int(file.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
 		file.Close()
-		return nil, fmt.Errorf("run %s is already being executed by another process", runID)
+		if errors.Is(err, syscall.EWOULDBLOCK) || errors.Is(err, syscall.EAGAIN) {
+			return nil, fmt.Errorf("run %s is already being executed by another process", runID)
+		}
+		return nil, fmt.Errorf("acquire run lock for %s: %w", runID, err)
 	}
 
 	return &RunLock{file: file, path: lockPath}, nil
@@ -51,7 +55,11 @@ func IsRunLockHeld(repoRoot, runID string) bool {
 	// Try non-blocking lock — if it succeeds, nobody holds it
 	err = syscall.Flock(int(file.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
 	if err != nil {
-		return true // can't acquire = someone holds it
+		if errors.Is(err, syscall.EWOULDBLOCK) || errors.Is(err, syscall.EAGAIN) {
+			return true // lock is held by another process
+		}
+		// Other errors (EBADF, EINVAL, etc.) — can't determine, assume not held
+		return false
 	}
 	// We got the lock — release it immediately
 	_ = syscall.Flock(int(file.Fd()), syscall.LOCK_UN)
