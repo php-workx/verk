@@ -160,6 +160,68 @@ func TestReopenTicket_ClosedRepairMarksWaveFailedReopened(t *testing.T) {
 	}
 }
 
+func TestReopenTicket_UpdatesTicketStoreAfterCommit(t *testing.T) {
+	// Verifies G7: ticket markdown is mutated AFTER the atomic commit succeeds,
+	// not before. When ReopenTicket succeeds, the ticket store should reflect
+	// the "open" status.
+	repoRoot := t.TempDir()
+	runID := "run-reopen-g7"
+	ticketID := "ticket-g7"
+
+	writeOpRunFixture(t, repoRoot, runID, state.RunArtifact{
+		ArtifactMeta: state.ArtifactMeta{SchemaVersion: 1, RunID: runID},
+		Mode:         "epic",
+		RootTicketID: "epic-1",
+		Status:       state.EpicRunStatusBlocked,
+		CurrentPhase: state.TicketPhaseBlocked,
+		TicketIDs:    []string{ticketID},
+		WaveIDs:      []string{"wave-1"},
+	})
+	writeWaveFixture(t, repoRoot, runID, state.WaveArtifact{
+		ArtifactMeta: state.ArtifactMeta{SchemaVersion: 1, RunID: runID},
+		WaveID:       "wave-1",
+		Ordinal:      1,
+		Status:       state.WaveStatusFailed,
+		TicketIDs:    []string{ticketID},
+	})
+	writeTicketRunFixture(t, repoRoot, runID, TicketRunSnapshot{
+		ArtifactMeta: state.ArtifactMeta{SchemaVersion: 1, RunID: runID},
+		TicketID:     ticketID,
+		CurrentPhase: state.TicketPhaseBlocked,
+		BlockReason:  "needs operator input",
+	})
+	writePlanFixture(t, repoRoot, runID, state.PlanArtifact{
+		ArtifactMeta:             state.ArtifactMeta{SchemaVersion: 1, RunID: runID},
+		TicketID:                 ticketID,
+		EffectiveReviewThreshold: state.SeverityP2,
+	})
+	writeTicketMarkdownFixture(t, repoRoot, tkmd.Ticket{
+		ID:                 ticketID,
+		Title:              "G7 ticket",
+		Status:             tkmd.StatusBlocked,
+		OwnedPaths:         []string{"internal/app"},
+		UnknownFrontmatter: map[string]any{"type": "task"},
+	})
+
+	if err := ReopenTicket(context.Background(), ReopenRequest{
+		RepoRoot: repoRoot,
+		RunID:    runID,
+		TicketID: ticketID,
+		ToPhase:  state.TicketPhaseImplement,
+	}); err != nil {
+		t.Fatalf("ReopenTicket returned error: %v", err)
+	}
+
+	// After successful reopen, the ticket markdown should be updated to open.
+	ticket, err := tkmd.LoadTicket(ticketMarkdownPath(repoRoot, ticketID))
+	if err != nil {
+		t.Fatalf("load ticket markdown: %v", err)
+	}
+	if ticket.Status != tkmd.StatusOpen {
+		t.Fatalf("expected ticket status open after reopen, got %q", ticket.Status)
+	}
+}
+
 func writeTicketMarkdownFixture(t *testing.T, repoRoot string, ticket tkmd.Ticket) {
 	t.Helper()
 	if err := tkmd.SaveTicket(filepath.Join(repoRoot, ".tickets", ticket.ID+".md"), ticket); err != nil {

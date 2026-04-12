@@ -330,6 +330,7 @@ func resumeEpicMode(ctx context.Context, req ResumeRequest, artifacts *runArtifa
 		if err != nil {
 			return allResumed, err
 		}
+		ticketScopes := buildTicketScopes(ready)
 		if len(ready) == 0 {
 			// Determine final epic status
 			currentChildren, err := listEpicChildren(artifacts.RepoRoot, artifacts.Run.RootTicketID)
@@ -451,6 +452,7 @@ func resumeEpicMode(ctx context.Context, req ResumeRequest, artifacts *runArtifa
 			Wave:                 wave,
 			TicketPhases:         ticketPhases,
 			ChangedFiles:         changedFiles,
+			TicketScopes:         ticketScopes,
 			ClaimsReleased:       claimsReleased,
 			PersistenceSucceeded: true,
 		})

@@ -119,6 +119,7 @@ func RunEpic(ctx context.Context, req RunEpicRequest) (RunEpicResult, error) {
 		if err != nil {
 			return result, err
 		}
+		ticketScopes := buildTicketScopes(ready)
 		if len(ready) == 0 {
 			currentChildren, err := listEpicChildren(req.RepoRoot, req.RootTicketID)
 			if err != nil {
@@ -254,6 +255,7 @@ func RunEpic(ctx context.Context, req RunEpicRequest) (RunEpicResult, error) {
 			Wave:                 wave,
 			TicketPhases:         ticketPhases,
 			ChangedFiles:         changedFiles,
+			TicketScopes:         ticketScopes,
 			ClaimsReleased:       claimsReleased,
 			PersistenceSucceeded: true,
 		})
@@ -518,6 +520,16 @@ type waveTicketOutcome struct {
 	ticketID string
 	phase    state.TicketPhase
 	err      error
+}
+
+// buildTicketScopes creates a map of ticket ID -> owned paths from a ticket list.
+// This is used for per-ticket scope validation during wave acceptance.
+func buildTicketScopes(tickets []tkmd.Ticket) map[string][]string {
+	scopes := make(map[string][]string, len(tickets))
+	for _, t := range tickets {
+		scopes[t.ID] = t.OwnedPaths
+	}
+	return scopes
 }
 
 func executeWithRecovery(ctx context.Context, req RunEpicRequest, cfg policy.Config, wave state.WaveArtifact, ticketID string) (outcome waveTicketOutcome, crashed bool) {

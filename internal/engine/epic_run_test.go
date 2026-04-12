@@ -81,6 +81,7 @@ func TestAcceptWaveRejectsScopeViolation(t *testing.T) {
 		Wave:                 wave,
 		TicketPhases:         []state.TicketPhase{state.TicketPhaseClosed},
 		ChangedFiles:         []string{"internal/other.go"},
+		TicketScopes:         map[string][]string{"ticket-a": {"internal/app"}},
 		ClaimsReleased:       true,
 		PersistenceSucceeded: true,
 	}

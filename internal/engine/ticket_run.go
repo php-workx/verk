@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"path/filepath"
 	"reflect"
 	"sort"
@@ -120,13 +121,17 @@ func RunTicket(ctx context.Context, req RunTicketRequest) (RunTicketResult, erro
 	// Update ticket store on exit — the ticket's own phase determines its store status.
 	defer func() {
 		ticketPath := filepath.Join(absRepoRoot, ".tickets", req.Ticket.ID+".md")
+		var targetStatus tkmd.Status
 		switch st.currentPhase {
 		case state.TicketPhaseClosed:
-			_ = updateTicketStatus(ticketPath, tkmd.StatusClosed)
+			targetStatus = tkmd.StatusClosed
 		case state.TicketPhaseBlocked:
-			_ = updateTicketStatus(ticketPath, tkmd.StatusBlocked)
+			targetStatus = tkmd.StatusBlocked
 		default:
-			_ = updateTicketStatus(ticketPath, tkmd.StatusOpen)
+			targetStatus = tkmd.StatusOpen
+		}
+		if err := updateTicketStatus(ticketPath, targetStatus); err != nil {
+			log.Printf("failed to update ticket %s status to %s: %v", req.Ticket.ID, targetStatus, err)
 		}
 	}()
 
@@ -499,7 +504,7 @@ func checkSingleTicketScope(st *ticketRunState) error {
 	}
 	ownedPaths := st.req.Ticket.OwnedPaths
 	if len(ownedPaths) == 0 {
-		return nil
+		return fmt.Errorf("single-ticket scope violation: ticket %q has no scope declarations", st.req.Ticket.ID)
 	}
 	var changedFiles []string
 	if st.implementation != nil {

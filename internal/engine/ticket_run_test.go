@@ -511,7 +511,7 @@ func TestRunTicket_ScopeViolationBlocksTicket(t *testing.T) {
 	}
 }
 
-func TestRunTicket_ScopeCheckSkippedWhenOwnedPathsEmpty(t *testing.T) {
+func TestRunTicket_ScopeCheckBlocksWhenOwnedPathsEmpty(t *testing.T) {
 	repoRoot := t.TempDir()
 
 	// Initialize a real git repo with a file change outside any scope.
@@ -541,7 +541,7 @@ func TestRunTicket_ScopeCheckSkippedWhenOwnedPathsEmpty(t *testing.T) {
 	mustRunGit(t, repoRoot, "commit", "-m", "change")
 
 	cfg := policy.DefaultConfig()
-	// No OwnedPaths set — scope check should be skipped.
+	// No OwnedPaths set — scope check must fail closed (G9).
 	ticket := testTicket("ver-no-scope")
 	plan, claim := testPlanAndClaim(t, repoRoot, ticket, cfg, "run-no-scope", "lease-no-scope", []string{`true`})
 
@@ -582,15 +582,12 @@ func TestRunTicket_ScopeCheckSkippedWhenOwnedPathsEmpty(t *testing.T) {
 		Config:             cfg,
 		EnforceSingleScope: true,
 	})
-	if err != nil {
-		t.Fatalf("RunTicket returned error: %v", err)
+	// With no owned_paths, scope check must fail closed (G9) — should return an error.
+	if err == nil {
+		t.Fatalf("expected error when owned_paths empty, got nil result phase=%q", result.Snapshot.CurrentPhase)
 	}
-	// With no owned_paths, scope check is skipped — ticket should close normally.
-	if result.Snapshot.CurrentPhase != state.TicketPhaseClosed {
-		t.Fatalf("expected closed phase, got %q", result.Snapshot.CurrentPhase)
-	}
-	if result.Snapshot.BlockReason != "" {
-		t.Fatalf("expected no block reason, got %q", result.Snapshot.BlockReason)
+	if !strings.Contains(err.Error(), "scope") {
+		t.Fatalf("expected scope-related error, got %q", err.Error())
 	}
 }
 

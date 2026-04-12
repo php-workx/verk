@@ -14,6 +14,7 @@ type WaveAcceptanceRequest struct {
 	Wave                 state.WaveArtifact
 	TicketPhases         []state.TicketPhase
 	ChangedFiles         []string
+	TicketScopes         map[string][]string // ticket ID -> owned paths for per-ticket scope validation
 	ClaimsReleased       bool
 	PersistenceSucceeded bool
 }
@@ -53,7 +54,7 @@ func BuildWave(ready []tkmd.Ticket, maxConcurrency int) (state.WaveArtifact, err
 
 func CheckScopeViolation(changed, owned []string) error {
 	if len(owned) == 0 {
-		return nil // no scope declared — skip check
+		return fmt.Errorf("scope violation: cannot verify scope — ticket has no scope declarations")
 	}
 
 	for _, file := range changed {
@@ -67,6 +68,30 @@ func CheckScopeViolation(changed, owned []string) error {
 	}
 
 	return nil
+}
+
+// validatePerTicketScope checks that each changed file falls within at least one
+// ticket's declared scope, and that every ticket declares a non-empty scope.
+// This is stricter than checking against the wave-wide union (PlannedScope) because
+// it also catches tickets with no scope declarations (G9: fail closed).
+func validatePerTicketScope(ticketIDs []string, changedFiles []string, ticketScopes map[string][]string) error {
+	if len(ticketScopes) == 0 {
+		return fmt.Errorf("scope violation: cannot verify scope — no ticket scope declarations provided")
+	}
+	// Every ticket in the wave must declare scope (G9).
+	for _, id := range ticketIDs {
+		scopes, ok := ticketScopes[id]
+		if !ok || len(scopes) == 0 {
+			return fmt.Errorf("scope violation: ticket %q has no scope declarations", id)
+		}
+	}
+	// Build the union of all per-ticket scopes and validate changed files against it.
+	// This ensures each changed file belongs to at least one ticket's owned scope.
+	var allOwned []string
+	for _, scopes := range ticketScopes {
+		allOwned = append(allOwned, scopes...)
+	}
+	return CheckScopeViolation(changedFiles, allOwned)
 }
 
 func AcceptWave(req WaveAcceptanceRequest) (state.WaveArtifact, error) {
@@ -108,7 +133,7 @@ func AcceptWave(req WaveAcceptanceRequest) (state.WaveArtifact, error) {
 		wave.Acceptance["reason"] = "persistence failed"
 		return wave, fmt.Errorf("wave persistence failed")
 	}
-	if err := CheckScopeViolation(req.ChangedFiles, wave.PlannedScope); err != nil {
+	if err := validatePerTicketScope(wave.TicketIDs, req.ChangedFiles, req.TicketScopes); err != nil {
 		wave.Status = state.WaveStatusFailed
 		wave.Acceptance["reason"] = err.Error()
 		return wave, err

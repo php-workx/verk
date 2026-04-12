@@ -43,9 +43,6 @@ func ReopenTicket(ctx context.Context, req ReopenRequest) error {
 	if err := validateReopenTransition(snapshot.CurrentPhase, req.ToPhase); err != nil {
 		return err
 	}
-	if err := setTicketReady(artifacts.RepoRoot, req.TicketID); err != nil {
-		return err
-	}
 
 	fromPhase := snapshot.CurrentPhase
 	snapshot.CurrentPhase = req.ToPhase
@@ -76,7 +73,7 @@ func ReopenTicket(ctx context.Context, req ReopenRequest) error {
 		"to_phase":   string(req.ToPhase),
 	})
 
-	return state.WriteTransitionCommit(
+	if err := state.WriteTransitionCommit(
 		state.TransitionPaths{
 			TicketArtifactPath: ticketSnapshotPath(artifacts.RepoRoot, req.RunID, req.TicketID),
 			WaveArtifactPath:   wavePath,
@@ -87,7 +84,17 @@ func ReopenTicket(ctx context.Context, req ReopenRequest) error {
 			WaveArtifact:   wavePayload,
 			RunArtifact:    artifacts.Run,
 		},
-	)
+	); err != nil {
+		return err
+	}
+
+	// Update ticket markdown status only after the atomic commit succeeds.
+	// If setTicketReady fails, the run state is consistent — the markdown
+	// is stale but can be reconciled on the next status update.
+	if err := setTicketReady(artifacts.RepoRoot, req.TicketID); err != nil {
+		return fmt.Errorf("reopen committed but ticket store update failed: %w", err)
+	}
+	return nil
 }
 
 func validateReopenTransition(from, to state.TicketPhase) error {
