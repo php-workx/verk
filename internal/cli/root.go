@@ -45,6 +45,7 @@ func init() {
 	initReopenCmd()
 	initStatusCmd()
 	initDoctorCmd()
+	initInitCmd()
 }
 
 func Execute() {

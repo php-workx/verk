@@ -17,7 +17,7 @@ const (
 )
 
 var groupCommandOrder = map[string][]string{
-	groupExecution: {"run", "reopen"},
+	groupExecution: {"init", "run", "reopen"},
 	groupObserve:   {"status", "doctor"},
 }
 
