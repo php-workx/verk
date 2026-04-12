@@ -293,7 +293,7 @@ func RunEpic(ctx context.Context, req RunEpicRequest) (RunEpicResult, error) {
 		for i, outcome := range outcomes {
 			var status tkmd.Status
 			switch {
-			case acceptedWave.Status == state.WaveStatusAccepted && outcome.err == nil && outcome.phase == state.TicketPhaseClosed:
+			case outcome.err == nil && outcome.phase == state.TicketPhaseClosed:
 				status = tkmd.StatusClosed
 			case outcome.phase == state.TicketPhaseBlocked:
 				status = tkmd.StatusBlocked

@@ -490,7 +490,7 @@ func resumeEpicMode(ctx context.Context, req ResumeRequest, artifacts *runArtifa
 			tid := wave.TicketIDs[i]
 			var status tkmd.Status
 			switch {
-			case acceptedWave.Status == state.WaveStatusAccepted && outcome.err == nil && outcome.phase == state.TicketPhaseClosed:
+			case outcome.err == nil && outcome.phase == state.TicketPhaseClosed:
 				status = tkmd.StatusClosed
 			case outcome.phase == state.TicketPhaseBlocked:
 				status = tkmd.StatusBlocked
