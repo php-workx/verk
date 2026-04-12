@@ -1,20 +1,21 @@
 {
   "schema_version": 1,
-  "wave": 8,
-  "timestamp": "2026-04-02T17:40:15+02:00",
-  "tasks_completed": ["ver-ey5v"],
+  "wave": 2,
+  "timestamp": "2026-04-12T13:54:59+02:00",
+  "tasks_completed": ["ver-inwj","ver-0rch"],
   "tasks_failed": [],
   "files_changed": [
-    ".tickets/ver-ey5v.md",
-    ".tickets/ver-rfnc.md",
-    ".tickets/ver-tn5l.md",
-    "internal/e2e/epic_multi_wave_test.go",
-    "internal/e2e/helpers_test.go",
-    "internal/e2e/resume_claim_recovery_test.go",
-    "internal/e2e/ticket_happy_path_test.go",
-    "internal/e2e/ticket_repair_cycle_test.go"
-  ],
-  "git_sha": "bdccc688b527e172ecff79ca4905228d3ff2942d",
+  "internal/engine/epic_run.go",
+  "internal/engine/epic_run_test.go",
+  "internal/engine/reopen.go",
+  "internal/engine/reopen_test.go",
+  "internal/engine/resume.go",
+  "internal/engine/ticket_run.go",
+  "internal/engine/ticket_run_test.go",
+  "internal/engine/wave_scheduler.go",
+  "internal/engine/wave_scheduler_test.go"
+],
+  "git_sha": "41cf2a3badc2a70edc8ebf7d440d132a6fe35858",
   "acceptance_verdict": "PASS",
   "commit_strategy": "wave-batch"
 }

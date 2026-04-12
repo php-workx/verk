@@ -4,6 +4,7 @@
 .serena/
 .verk/
 bin/
+.DS_Store
 
 # Crank checkpoint files may contain unrendered shell substitutions
 .agents/crank/*.json
