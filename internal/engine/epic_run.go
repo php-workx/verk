@@ -201,24 +201,26 @@ func RunEpic(ctx context.Context, req RunEpicRequest) (RunEpicResult, error) {
 			ticketID := ticketID
 			go func() {
 				defer wg.Done()
-				defer func() {
-					if r := recover(); r != nil {
-						outcomes[i] = waveTicketOutcome{
-							ticketID: ticketID,
-							phase:    state.TicketPhaseImplement, // not blocked — will be retried in next wave
-							err:      fmt.Errorf("ticket goroutine crashed: %v", r),
-						}
-						SendProgress(req.Progress, ProgressEvent{
-							Type:     EventTicketDetail,
-							TicketID: ticketID,
-							Detail:   fmt.Sprintf("worker crashed, will retry: %v", r),
-						})
-						// Release claim so the ticket can be re-scheduled
-						_ = tkmd.ReleaseClaim(req.RepoRoot, req.RunID, ticketID,
-							fmt.Sprintf("lease-%s-%s", req.RunID, ticketID), "crash recovery")
+				const maxCrashRetries = 2
+				for attempt := 0; attempt <= maxCrashRetries; attempt++ {
+					outcome, crashed := executeWithRecovery(ctx, req, cfg, wave, ticketID)
+					if !crashed {
+						outcomes[i] = outcome
+						return
 					}
-				}()
-				outcomes[i] = executeEpicTicket(ctx, req, cfg, wave, ticketID)
+					SendProgress(req.Progress, ProgressEvent{
+						Type:     EventTicketDetail,
+						TicketID: ticketID,
+						Detail:   fmt.Sprintf("worker crashed (attempt %d/%d), retrying: %v", attempt+1, maxCrashRetries+1, outcome.err),
+					})
+					_ = tkmd.ReleaseClaim(req.RepoRoot, req.RunID, ticketID,
+						fmt.Sprintf("lease-%s-%s", req.RunID, ticketID), "crash recovery")
+					if attempt == maxCrashRetries {
+						outcome.phase = state.TicketPhaseBlocked
+						outcomes[i] = outcome
+						return
+					}
+				}
 			}()
 		}
 		wg.Wait()
@@ -524,6 +526,20 @@ type waveTicketOutcome struct {
 	ticketID string
 	phase    state.TicketPhase
 	err      error
+}
+
+func executeWithRecovery(ctx context.Context, req RunEpicRequest, cfg policy.Config, wave state.WaveArtifact, ticketID string) (outcome waveTicketOutcome, crashed bool) {
+	defer func() {
+		if r := recover(); r != nil {
+			outcome = waveTicketOutcome{
+				ticketID: ticketID,
+				phase:    state.TicketPhaseImplement,
+				err:      fmt.Errorf("ticket goroutine crashed: %v", r),
+			}
+			crashed = true
+		}
+	}()
+	return executeEpicTicket(ctx, req, cfg, wave, ticketID), false
 }
 
 func executeEpicTicket(ctx context.Context, req RunEpicRequest, cfg policy.Config, wave state.WaveArtifact, ticketID string) waveTicketOutcome {
