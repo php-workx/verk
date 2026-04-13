@@ -284,10 +284,17 @@ Claim fields:
 - `release_reason`
 - `state`
 
+Claim identifier safety:
+
+- `ticket_id` and `run_id` must be validated before any path construction
+- identifiers containing path separators, dot-dot sequences (`..`), or absolute-path prefixes must be rejected
+- validation must apply at every claim entry point (acquire, renew, release, reconcile), not just one helper
+
 Lease semantics:
 
 - default lease TTL is 10 minutes
-- active tickets renew their lease every 3 minutes
+- fresh claims schedule renewal at one-third of the total lease TTL
+- resumed claims schedule their first renewal based on remaining time (`expires_at - now`), not the original full TTL, so short-remaining claims renew before expiry
 - renewal is valid only from the current `lease_id`
 - acquisition uses atomic create
 - renewal uses atomic compare-and-replace

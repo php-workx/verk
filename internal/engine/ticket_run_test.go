@@ -541,7 +541,7 @@ func TestRunTicket_ScopeCheckBlocksWhenOwnedPathsEmpty(t *testing.T) {
 	mustRunGit(t, repoRoot, "commit", "-m", "change")
 
 	cfg := policy.DefaultConfig()
-	// No OwnedPaths set — scope check must fail closed (G9).
+	// No OwnedPaths set - G9 requires scope checks to default to deny/fail-closed.
 	ticket := testTicket("ver-no-scope")
 	plan, claim := testPlanAndClaim(t, repoRoot, ticket, cfg, "run-no-scope", "lease-no-scope", []string{`true`})
 
@@ -582,12 +582,18 @@ func TestRunTicket_ScopeCheckBlocksWhenOwnedPathsEmpty(t *testing.T) {
 		Config:             cfg,
 		EnforceSingleScope: true,
 	})
-	// With no owned_paths, scope check must fail closed (G9) — should return an error.
-	if err == nil {
-		t.Fatalf("expected error when owned_paths empty, got nil result phase=%q", result.Snapshot.CurrentPhase)
+	// With no owned_paths, G9 requires scope checks to fail closed, so the ticket transitions to blocked.
+	if err != nil {
+		t.Fatalf("RunTicket returned error: %v", err)
 	}
-	if !strings.Contains(err.Error(), "scope") {
-		t.Fatalf("expected scope-related error, got %q", err.Error())
+	if result.Snapshot.CurrentPhase != state.TicketPhaseBlocked {
+		t.Fatalf("expected blocked phase, got %q", result.Snapshot.CurrentPhase)
+	}
+	if !strings.Contains(result.Snapshot.BlockReason, "single-ticket scope violation") {
+		t.Fatalf("expected scope violation block reason, got %q", result.Snapshot.BlockReason)
+	}
+	if !strings.Contains(result.Snapshot.BlockReason, ticket.ID) {
+		t.Fatalf("expected block reason to contain ticket ID %q, got %q", ticket.ID, result.Snapshot.BlockReason)
 	}
 }
 
@@ -1013,5 +1019,268 @@ func TestNormalizeRunTicketConfig_SetsMaxRepairCyclesDefault(t *testing.T) {
 	normalized = normalizeRunTicketConfig(cfg)
 	if normalized.Policy.MaxRepairCycles != 5 {
 		t.Fatalf("expected MaxRepairCycles to stay 5, got %d", normalized.Policy.MaxRepairCycles)
+	}
+}
+
+// TestRunTicket_NeedsContextBlocksWorkflow is a regression test for ver-dmnr:
+// WorkerStatusNeedsContext must transition to TicketPhaseBlocked (not success).
+// This guards against the engine advancing workflows that should pause for
+// operator input.
+func TestRunTicket_NeedsContextBlocksWorkflow(t *testing.T) {
+	repoRoot := t.TempDir()
+	cfg := policy.DefaultConfig()
+	ticket := testTicket("ver-needs-ctx")
+	plan, claim := testPlanAndClaim(t, repoRoot, ticket, cfg, "run-needs-ctx", "lease-needs-ctx", []string{`true`})
+
+	started, finished := testRunTimes()
+	adapter := runtimefake.New(
+		[]runtime.WorkerResult{
+			{
+				Status:             runtime.WorkerStatusNeedsContext,
+				CompletionCode:     "needs_more_context",
+				BlockReason:        "acceptance criteria unclear",
+				RetryClass:         runtime.RetryClassBlockedByOperatorInput,
+				LeaseID:            claim.LeaseID,
+				StartedAt:          started,
+				FinishedAt:         finished,
+				ResultArtifactPath: filepath.Join(repoRoot, "worker.json"),
+			},
+		},
+		nil, // no review results — should never reach review
+	)
+
+	result, err := RunTicket(context.Background(), RunTicketRequest{
+		RepoRoot: repoRoot,
+		RunID:    "run-needs-ctx",
+		Ticket:   ticket,
+		Plan:     plan,
+		Claim:    claim,
+		Adapter:  adapter,
+		Config:   cfg,
+	})
+	if err != nil {
+		t.Fatalf("RunTicket returned error: %v", err)
+	}
+
+	// Must block, not advance to verify or closed.
+	if result.Snapshot.CurrentPhase != state.TicketPhaseBlocked {
+		t.Fatalf("expected blocked phase for needs_context, got %q", result.Snapshot.CurrentPhase)
+	}
+	if !strings.Contains(result.Snapshot.BlockReason, "acceptance criteria unclear") {
+		t.Fatalf("expected block reason to contain worker's reason, got %q", result.Snapshot.BlockReason)
+	}
+}
+
+// TestRunTicket_ReleasesClaimOnStartupFailure verifies that every startup/setup
+// failure after claim acquisition releases the live claim so that retries are
+// not blocked by a leaked claim (ver-m8d1).
+func TestRunTicket_ReleasesClaimOnStartupFailure(t *testing.T) {
+	assertClaimReleased := func(t *testing.T, repoRoot, runID, ticketID string) {
+		t.Helper()
+		// Live claim file should have been removed by release.
+		livePath := filepath.Join(repoRoot, ".tickets", ".claims", ticketID+".json")
+		if _, err := os.Stat(livePath); err == nil {
+			t.Fatalf("expected live claim file to be removed, but it still exists: %s", livePath)
+		}
+		// Durable claim should be in released state.
+		durablePath := filepath.Join(repoRoot, ".verk", "runs", runID, "claims", "claim-"+ticketID+".json")
+		var durable state.ClaimArtifact
+		if err := state.LoadJSON(durablePath, &durable); err != nil {
+			t.Fatalf("load durable claim: %v", err)
+		}
+		if durable.State != "released" {
+			t.Fatalf("expected durable claim state 'released', got %q", durable.State)
+		}
+	}
+
+	t.Run("invalid_start_phase", func(t *testing.T) {
+		repoRoot := t.TempDir()
+		cfg := policy.DefaultConfig()
+		ticket := testTicket("ver-phase-fail")
+		plan, claim := testPlanAndClaim(t, repoRoot, ticket, cfg, "run-phase-fail", "lease-phase-fail", nil)
+		plan.Phase = state.TicketPhaseReview // not a valid starting phase
+
+		_, err := RunTicket(context.Background(), RunTicketRequest{
+			RepoRoot: repoRoot,
+			RunID:    "run-phase-fail",
+			Ticket:   ticket,
+			Plan:     plan,
+			Claim:    claim,
+			Adapter:  runtimefake.New(nil, nil),
+			Config:   cfg,
+		})
+		if err == nil {
+			t.Fatal("expected error for invalid start phase, got nil")
+		}
+		assertClaimReleased(t, repoRoot, "run-phase-fail", ticket.ID)
+	})
+
+	t.Run("artifact_write_failure", func(t *testing.T) {
+		repoRoot := t.TempDir()
+		cfg := policy.DefaultConfig()
+		ticket := testTicket("ver-write-fail")
+		plan, claim := testPlanAndClaim(t, repoRoot, ticket, cfg, "run-write-fail", "lease-write-fail", nil)
+
+		// Make the ticket run directory unwritable so SaveJSONAtomic fails.
+		runDir := filepath.Join(repoRoot, ".verk", "runs", "run-write-fail", "tickets", ticket.ID)
+		if err := os.MkdirAll(runDir, 0o755); err != nil {
+			t.Fatalf("mkdir: %v", err)
+		}
+		// Create a non-directory file at plan.json's path to force a write error.
+		planPath := filepath.Join(runDir, "plan.json")
+		if err := os.WriteFile(planPath, []byte("{}"), 0o444); err != nil {
+			t.Fatalf("write blocking file: %v", err)
+		}
+		if err := os.Chmod(runDir, 0o555); err != nil {
+			t.Fatalf("chmod: %v", err)
+		}
+		t.Cleanup(func() { _ = os.Chmod(runDir, 0o755) })
+
+		_, err := RunTicket(context.Background(), RunTicketRequest{
+			RepoRoot: repoRoot,
+			RunID:    "run-write-fail",
+			Ticket:   ticket,
+			Plan:     plan,
+			Claim:    claim,
+			Adapter:  runtimefake.New(nil, nil),
+			Config:   cfg,
+		})
+		if err == nil {
+			t.Fatal("expected error for artifact write failure, got nil")
+		}
+		assertClaimReleased(t, repoRoot, "run-write-fail", ticket.ID)
+	})
+
+	t.Run("early_engine_error_cancelled_context", func(t *testing.T) {
+		repoRoot := t.TempDir()
+		cfg := policy.DefaultConfig()
+		ticket := testTicket("ver-ctx-cancel")
+		plan, claim := testPlanAndClaim(t, repoRoot, ticket, cfg, "run-ctx-cancel", "lease-ctx-cancel", nil)
+
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel() // cancel immediately
+
+		_, err := RunTicket(ctx, RunTicketRequest{
+			RepoRoot: repoRoot,
+			RunID:    "run-ctx-cancel",
+			Ticket:   ticket,
+			Plan:     plan,
+			Claim:    claim,
+			Adapter:  runtimefake.New(nil, nil),
+			Config:   cfg,
+		})
+		if err == nil {
+			t.Fatal("expected error for cancelled context, got nil")
+		}
+		assertClaimReleased(t, repoRoot, "run-ctx-cancel", ticket.ID)
+	})
+
+	t.Run("retry_not_blocked_after_transient_failure", func(t *testing.T) {
+		repoRoot := t.TempDir()
+		cfg := policy.DefaultConfig()
+		ticket := testTicket("ver-retry")
+		plan, claim := testPlanAndClaim(t, repoRoot, ticket, cfg, "run-retry", "lease-retry", nil)
+		plan.Phase = state.TicketPhaseReview // invalid phase causes failure
+
+		_, err := RunTicket(context.Background(), RunTicketRequest{
+			RepoRoot: repoRoot,
+			RunID:    "run-retry",
+			Ticket:   ticket,
+			Plan:     plan,
+			Claim:    claim,
+			Adapter:  runtimefake.New(nil, nil),
+			Config:   cfg,
+		})
+		if err == nil {
+			t.Fatal("expected error for invalid start phase, got nil")
+		}
+		assertClaimReleased(t, repoRoot, "run-retry", ticket.ID)
+
+		// Verify we can re-acquire the claim after the transient failure.
+		_, err = tkmd.AcquireClaim(repoRoot, "run-retry-2", ticket.ID, "lease-retry-2", 10*time.Minute, time.Now().UTC())
+		if err != nil {
+			t.Fatalf("expected claim re-acquisition after transient failure, got error: %v", err)
+		}
+	})
+}
+
+// TestRunTicket_RenewsResumedClaimBeforeExpiry verifies that a resumed claim
+// whose LeasedAt was long ago but ExpiresAt is imminent gets renewed before it
+// expires (ver-exae). The renewal cadence must use remainingTTL(), not
+// claimTTL(), so a claim with a 30-minute total TTL acquired 29m55s ago
+// schedules its first renewal within seconds instead of waiting 10 minutes.
+func TestRunTicket_RenewsResumedClaimBeforeExpiry(t *testing.T) {
+	repoRoot := t.TempDir()
+	cfg := policy.DefaultConfig()
+	ticket := testTicket("ver-resumed-renew")
+	plan, claim := testPlanAndClaim(t, repoRoot, ticket, cfg, "run-resumed-renew", "lease-resumed-renew", []string{`true`})
+
+	// Simulate a resumed claim: original TTL 30 minutes, leased almost 30
+	// minutes ago, leaving only ~500ms until expiry.
+	originalTTL := 30 * time.Minute
+	claim.LeasedAt = time.Now().UTC().Add(-(originalTTL - 500*time.Millisecond))
+	claim.ExpiresAt = time.Now().UTC().Add(500 * time.Millisecond)
+
+	// Update the live and durable claim snapshots to reflect the simulated
+	// resumed state so RenewClaim checks and updates the same near-expiry lease.
+	liveClaimPath := filepath.Join(repoRoot, ".tickets", ".claims", ticket.ID+".json")
+	if err := state.SaveJSONAtomic(liveClaimPath, claim); err != nil {
+		t.Fatalf("seed live claim: %v", err)
+	}
+	durableClaimPath := filepath.Join(repoRoot, ".verk", "runs", "run-resumed-renew", "claims", "claim-"+ticket.ID+".json")
+	if err := state.SaveJSONAtomic(durableClaimPath, claim); err != nil {
+		t.Fatalf("seed durable claim: %v", err)
+	}
+
+	// Worker completes in 250ms — within the 500ms expiry window. With the old
+	// cadence (claimTTL/3 ≈ 10min) renewal would never fire. With the fix
+	// (remainingTTL/3 ≈ 167ms) renewal fires well before expiry.
+	adapter := &sleepyRuntimeAdapter{
+		workerDelay: 250 * time.Millisecond,
+		workerResult: runtime.WorkerResult{
+			Status:             runtime.WorkerStatusDone,
+			RetryClass:         runtime.RetryClassTerminal,
+			LeaseID:            claim.LeaseID,
+			StartedAt:          testRunTime(),
+			FinishedAt:         testRunTime().Add(time.Second),
+			ResultArtifactPath: filepath.Join(repoRoot, "worker.json"),
+		},
+		reviewResult: runtime.ReviewResult{
+			Status:             runtime.WorkerStatusDone,
+			RetryClass:         runtime.RetryClassTerminal,
+			LeaseID:            claim.LeaseID,
+			StartedAt:          testRunTime().Add(2 * time.Second),
+			FinishedAt:         testRunTime().Add(3 * time.Second),
+			ReviewStatus:       runtime.ReviewStatusPassed,
+			Summary:            "clean",
+			ResultArtifactPath: filepath.Join(repoRoot, "review.json"),
+		},
+	}
+
+	result, err := RunTicket(context.Background(), RunTicketRequest{
+		RepoRoot: repoRoot,
+		RunID:    "run-resumed-renew",
+		Ticket:   ticket,
+		Plan:     plan,
+		Claim:    claim,
+		Adapter:  adapter,
+		Config:   cfg,
+	})
+	if err != nil {
+		t.Fatalf("RunTicket returned error: %v", err)
+	}
+	if result.Path == "" {
+		t.Fatal("expected run result path to be populated")
+	}
+
+	// The durable claim must show a renewed ExpiresAt beyond the near-expiry
+	// window we set — proving renewal fired before the claim expired.
+	var durableClaim state.ClaimArtifact
+	if err := state.LoadJSON(durableClaimPath, &durableClaim); err != nil {
+		t.Fatalf("load durable claim: %v", err)
+	}
+	if !durableClaim.ExpiresAt.After(claim.ExpiresAt) {
+		t.Fatalf("expected durable claim to be renewed past %s, got %s — resumed near-expiry claim must renew before expiry",
+			claim.ExpiresAt.Format(time.RFC3339Nano), durableClaim.ExpiresAt.Format(time.RFC3339Nano))
 	}
 }

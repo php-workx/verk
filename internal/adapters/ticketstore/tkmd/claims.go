@@ -516,17 +516,43 @@ func claimPaths(rootDir, runID, ticketID string) (string, string, error) {
 	if rootDir == "" {
 		return "", "", errors.New("root dir is required")
 	}
-	if runID == "" {
-		return "", "", errors.New("run_id is required")
+	if err := validateClaimIdentifier(runID, "run_id"); err != nil {
+		return "", "", err
 	}
-	if ticketID == "" {
-		return "", "", errors.New("ticket_id is required")
+	if err := validateClaimIdentifier(ticketID, "ticket_id"); err != nil {
+		return "", "", err
 	}
 	repoRoot := resolveRepoRoot(rootDir)
 	ticketsDir := resolveTicketsDir(rootDir)
 	livePath := filepath.Join(ticketsDir, ".claims", ticketID+".json")
 	durablePath := filepath.Join(repoRoot, ".verk", "runs", runID, "claims", "claim-"+ticketID+".json")
 	return livePath, durablePath, nil
+}
+
+// validateClaimIdentifier rejects identifiers that could escape the intended
+// claim storage directories via path traversal, absolute paths, or embedded
+// path separators. A valid identifier is a single path component with no
+// directory semantics.
+func validateClaimIdentifier(id, label string) error {
+	if id == "" {
+		return fmt.Errorf("%s is required", label)
+	}
+	if id == "." || id == ".." {
+		return fmt.Errorf("%s contains path traversal", label)
+	}
+	if filepath.IsAbs(id) {
+		return fmt.Errorf("%s contains absolute path", label)
+	}
+	if strings.Contains(id, "..") {
+		return fmt.Errorf("%s contains path traversal", label)
+	}
+	if strings.ContainsAny(id, "/\\") {
+		return fmt.Errorf("%s contains path separator", label)
+	}
+	if cleaned := filepath.Clean(id); cleaned != id {
+		return fmt.Errorf("%s is not a clean identifier", label)
+	}
+	return nil
 }
 
 func resolveRepoRoot(rootDir string) string {

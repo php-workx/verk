@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -274,4 +275,132 @@ func TestRunNoArgs_BlockedRun(t *testing.T) {
 		t.Fatalf("expected resume/Resuming message, got: %s", stdout)
 	}
 	_ = code // exit code depends on whether resume succeeds (adapter-dependent)
+}
+
+// TestRunTicket_AdapterFailure_ReleasesClaim verifies that a runtime adapter
+// selection failure after claim acquisition releases the live claim so that
+// retries are not blocked by a leaked claim (ver-m8d1 AC#3: adapter lookup failure).
+func TestRunTicket_AdapterFailure_ReleasesClaim(t *testing.T) {
+	repoRoot := t.TempDir()
+	writeCLIRepo(t, repoRoot)
+
+	ticketID := "ver-adapter-fail"
+	if err := tkmd.SaveTicket(filepath.Join(repoRoot, ".tickets", ticketID+".md"), tkmd.Ticket{
+		ID:                 ticketID,
+		Title:              "Adapter failure ticket",
+		Status:             tkmd.StatusOpen,
+		OwnedPaths:         []string{"internal/app"},
+		Runtime:            "unsupported_runtime_xyz",
+		UnknownFrontmatter: map[string]any{"type": "task"},
+	}); err != nil {
+		t.Fatalf("SaveTicket: %v", err)
+	}
+
+	// Write a config that overrides default_runtime to also be unsupported,
+	// ensuring normalizeRuntime picks the ticket's bogus value.
+	cfgPath := filepath.Join(repoRoot, ".verk", "config.yaml")
+	if err := os.WriteFile(cfgPath, []byte("runtime:\n  default_runtime: \"\"\n"), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	stdout, _, code := runCLIFromDir(t, repoRoot, "run", "ticket", ticketID)
+	if code == 0 {
+		t.Fatalf("expected non-zero exit for unsupported runtime, got 0")
+	}
+
+	// Extract run ID from stdout (format: run_id=<id>)
+	runID := extractRunID(t, stdout)
+	assertCLIClaimReleased(t, repoRoot, runID, ticketID)
+
+	// Verify re-acquisition is not blocked.
+	_, err := tkmd.AcquireClaim(repoRoot, "run-retry-adapter", ticketID, "lease-retry-adapter", 10*time.Minute, time.Now().UTC())
+	if err != nil {
+		t.Fatalf("expected claim re-acquisition after adapter failure, got error: %v", err)
+	}
+}
+
+// TestRunTicket_GitMetadataFailure_ReleasesClaim verifies that a git metadata
+// lookup failure (HeadCommit) after claim acquisition releases the live claim
+// (ver-m8d1 AC#3: git metadata failure).
+func TestRunTicket_GitMetadataFailure_ReleasesClaim(t *testing.T) {
+	repoRoot := t.TempDir()
+	// Create a git repo with NO commits — HeadCommit will fail.
+	runGit(t, repoRoot, "init")
+	runGit(t, repoRoot, "config", "user.email", "test@example.com")
+	runGit(t, repoRoot, "config", "user.name", "Test User")
+	if err := os.MkdirAll(filepath.Join(repoRoot, ".tickets", ".claims"), 0o755); err != nil {
+		t.Fatalf("mkdir .tickets: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(repoRoot, ".verk", "runs"), 0o755); err != nil {
+		t.Fatalf("mkdir .verk: %v", err)
+	}
+
+	ticketID := "ver-git-fail"
+	if err := tkmd.SaveTicket(filepath.Join(repoRoot, ".tickets", ticketID+".md"), tkmd.Ticket{
+		ID:                 ticketID,
+		Title:              "Git metadata failure ticket",
+		Status:             tkmd.StatusOpen,
+		OwnedPaths:         []string{"internal/app"},
+		UnknownFrontmatter: map[string]any{"type": "task"},
+	}); err != nil {
+		t.Fatalf("SaveTicket: %v", err)
+	}
+
+	stdout, _, code := runCLIFromDir(t, repoRoot, "run", "ticket", ticketID)
+	if code == 0 {
+		t.Fatalf("expected non-zero exit for git metadata failure, got 0")
+	}
+
+	runID := extractRunID(t, stdout)
+	if runID == "" {
+		// If the failure happened before run_id was printed, the claim was
+		// never acquired — no release needed. Verify no live claim exists.
+		livePath := filepath.Join(repoRoot, ".tickets", ".claims", ticketID+".json")
+		if _, err := os.Stat(livePath); err == nil {
+			t.Fatalf("live claim file should not exist when run_id was not assigned")
+		}
+		return
+	}
+	assertCLIClaimReleased(t, repoRoot, runID, ticketID)
+
+	// Verify re-acquisition is not blocked.
+	_, err := tkmd.AcquireClaim(repoRoot, "run-retry-git", ticketID, "lease-retry-git", 10*time.Minute, time.Now().UTC())
+	if err != nil {
+		t.Fatalf("expected claim re-acquisition after git metadata failure, got error: %v", err)
+	}
+}
+
+// extractRunID parses "run_id=<id>" from CLI stdout.
+func extractRunID(t *testing.T, stdout string) string {
+	t.Helper()
+	for _, line := range strings.Split(stdout, "\n") {
+		if strings.HasPrefix(line, "run_id=") {
+			return strings.TrimPrefix(line, "run_id=")
+		}
+	}
+	return ""
+}
+
+// assertCLIClaimReleased verifies that the claim was released: the live claim
+// file is removed and the durable claim has state "released".
+func assertCLIClaimReleased(t *testing.T, repoRoot, runID, ticketID string) {
+	t.Helper()
+	// Live claim file should have been removed by release.
+	livePath := filepath.Join(repoRoot, ".tickets", ".claims", ticketID+".json")
+	if _, err := os.Stat(livePath); err == nil {
+		t.Fatalf("expected live claim file to be removed, but it still exists: %s", livePath)
+	}
+	// Durable claim should be in released state.
+	durablePath := filepath.Join(repoRoot, ".verk", "runs", runID, "claims", "claim-"+ticketID+".json")
+	data, err := os.ReadFile(durablePath)
+	if err != nil {
+		t.Fatalf("read durable claim: %v", err)
+	}
+	var durable state.ClaimArtifact
+	if err := json.Unmarshal(data, &durable); err != nil {
+		t.Fatalf("decode durable claim: %v", err)
+	}
+	if durable.State != "released" {
+		t.Fatalf("expected durable claim state 'released', got %q", durable.State)
+	}
 }

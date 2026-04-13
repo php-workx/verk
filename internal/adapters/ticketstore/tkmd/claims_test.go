@@ -233,6 +233,71 @@ func TestReconcileClaim_MismatchedLeaseBlocks(t *testing.T) {
 	}
 }
 
+func TestAcquireClaim_RejectsPathTraversalIdentifiers(t *testing.T) {
+	dir := t.TempDir()
+
+	maliciousIDs := []struct {
+		name     string
+		runID    string
+		ticketID string
+	}{
+		{"dotdot in runID", "../escape", "ticket-1"},
+		{"dotdot in ticketID", "run-a", "../escape"},
+		{"slash in runID", "run/evil", "ticket-1"},
+		{"slash in ticketID", "run-a", "ticket/evil"},
+		{"backslash in runID", "run\\evil", "ticket-1"},
+		{"backslash in ticketID", "run-a", "ticket\\evil"},
+		{"absolute runID", "/etc/passwd", "ticket-1"},
+		{"absolute ticketID", "run-a", "/etc/passwd"},
+		{"dotdot with slash in runID", "../../etc", "ticket-1"},
+		{"dotdot with slash in ticketID", "run-a", "../../etc"},
+		{"embedded dotdot in runID", "foo/../bar", "ticket-1"},
+		{"embedded dotdot in ticketID", "run-a", "foo/../bar"},
+		{"single dot runID", ".", "ticket-1"},
+		{"single dot ticketID", "run-a", "."},
+		{"double dot runID", "..", "ticket-1"},
+		{"double dot ticketID", "run-a", ".."},
+	}
+
+	for _, tc := range maliciousIDs {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := AcquireClaim(dir, tc.runID, tc.ticketID, "lease-x", 10*time.Minute)
+			if err == nil {
+				t.Fatalf("expected claim to be rejected for %s", tc.name)
+			}
+		})
+	}
+}
+
+func TestClaimPaths_PreservesValidIdentifiers(t *testing.T) {
+	dir := t.TempDir()
+
+	validIDs := []struct {
+		name     string
+		runID    string
+		ticketID string
+	}{
+		{"simple", "run-a", "ticket-1"},
+		{"with prefix", "run-ticket-1-1234567890", "ver-l3yx"},
+		{"alphanumeric", "run123", "abc456"},
+		{"with dots", "run-1.0", "ticket-1.0"},
+		{"with underscores", "run_a", "ticket_1"},
+		{"long id", "run-some-very-long-ticket-id-1234567890123456789", "some-very-long-ticket-id"},
+	}
+
+	for _, tc := range validIDs {
+		t.Run(tc.name, func(t *testing.T) {
+			livePath, durablePath, err := claimPaths(dir, tc.runID, tc.ticketID)
+			if err != nil {
+				t.Fatalf("expected valid ID pair to be accepted: %v", err)
+			}
+			if livePath == "" || durablePath == "" {
+				t.Fatal("expected non-empty paths")
+			}
+		})
+	}
+}
+
 func TestValidateLeaseFence_RejectsLateResult(t *testing.T) {
 	if err := ValidateLeaseFence("lease-current", "lease-old"); err == nil {
 		t.Fatal("expected mismatched lease fence to fail")

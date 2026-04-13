@@ -86,7 +86,7 @@ type ticketRunPaths struct {
 	runDir             string
 }
 
-func RunTicket(ctx context.Context, req RunTicketRequest) (RunTicketResult, error) {
+func RunTicket(ctx context.Context, req RunTicketRequest) (result RunTicketResult, retErr error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -119,6 +119,14 @@ func RunTicket(ctx context.Context, req RunTicketRequest) (RunTicketResult, erro
 		repoRoot:     absRepoRoot,
 		currentPhase: req.Plan.Phase,
 	}
+
+	// Release claim on any error return to prevent leaked claims blocking retries.
+	// Successful paths release the claim explicitly before returning nil.
+	defer func() {
+		if retErr != nil {
+			_ = st.releaseClaim()
+		}
+	}()
 
 	// Update ticket store on exit — the ticket's own phase determines its store status.
 	defer func() {
@@ -506,7 +514,8 @@ func checkSingleTicketScope(st *ticketRunState) error {
 	}
 	ownedPaths := st.req.Ticket.OwnedPaths
 	if len(ownedPaths) == 0 {
-		return fmt.Errorf("single-ticket scope violation: ticket %q has no scope declarations", st.req.Ticket.ID)
+		st.blockReason = fmt.Sprintf("single-ticket scope violation: ticket %q has no scope declarations", st.req.Ticket.ID)
+		return st.transitionTo(state.TicketPhaseBlocked)
 	}
 	var changedFiles []string
 	if st.implementation != nil {

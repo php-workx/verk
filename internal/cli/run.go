@@ -102,6 +102,16 @@ func doRunTicket(w, errw io.Writer, ticketID string) (string, error) {
 	if err != nil {
 		return runID, err
 	}
+	// Release claim on startup/setup failure before engine takes ownership.
+	// The engine releases the claim on its own error/success paths, so we
+	// only need this guard for failures that occur before RunTicket is called.
+	claimOwned := false
+	defer func() {
+		if !claimOwned {
+			_ = tkmd.ReleaseClaim(repoRoot, runID, ticketID, leaseID, "startup_failure")
+		}
+	}()
+
 	adapter, err := runtimeAdapterFor(ticket.Runtime, cfg.Runtime.DefaultRuntime)
 	if err != nil {
 		return runID, err
@@ -142,7 +152,8 @@ func doRunTicket(w, errw io.Writer, ticketID string) (string, error) {
 		return runID, err
 	}
 
-	// Run engine with progress channel
+	// Run engine with progress channel — engine now owns claim lifecycle.
+	claimOwned = true
 	ch := make(chan engine.ProgressEvent, 64)
 	var result engine.RunTicketResult
 	var runErr error
