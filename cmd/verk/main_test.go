@@ -264,13 +264,14 @@ func TestRunNoArgs_BlockedRun(t *testing.T) {
 	}
 
 	stdout, _, code := runCLIFromDir(t, repoRoot, "run")
-	if code != 0 {
-		t.Fatalf("expected exit code 0 for blocked run info, got %d", code)
-	}
+	// Blocked runs now fall through to resume — they attempt re-execution
+	// which will fail without a runtime adapter, but the blocked message
+	// and resume intent should be visible.
 	if !strings.Contains(stdout, "blocked") {
 		t.Fatalf("expected 'blocked' message, got: %s", stdout)
 	}
-	if !strings.Contains(stdout, "reopen") {
-		t.Fatalf("expected reopen guidance, got: %s", stdout)
+	if !strings.Contains(stdout, "resum") {
+		t.Fatalf("expected resume/Resuming message, got: %s", stdout)
 	}
+	_ = code // exit code depends on whether resume succeeds (adapter-dependent)
 }

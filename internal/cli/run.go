@@ -282,10 +282,8 @@ func doAutoResume(w, errw io.Writer) error {
 		_, _ = fmt.Fprintf(w, "Start a new one with: verk run ticket <id>\n")
 		return nil
 	case state.EpicRunStatusBlocked:
-		_, _ = fmt.Fprintf(w, "Run %s is blocked.\n", runID)
-		_, _ = fmt.Fprintf(w, "Use 'verk reopen %s <ticket-id> --to implement' to unblock,\n", runID)
-		_, _ = fmt.Fprintf(w, "then 'verk run' to continue.\n")
-		return nil
+		_, _ = fmt.Fprintf(w, "Run %s is blocked — resuming with blocked tickets reset.\n", runID)
+		// Fall through to resume: the engine will reset blocked tickets and retry.
 	}
 
 	_, _ = fmt.Fprintf(w, "Resuming run %s...\n", runID)

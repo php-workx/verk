@@ -184,11 +184,13 @@ func ResumeRun(ctx context.Context, req ResumeRequest) (ResumeReport, error) {
 
 // resumeExecutionAllowed returns true if the run has non-terminal tickets
 // and the caller provided a runtime adapter for re-execution.
+// Blocked runs are allowed to resume — blocked tickets will be reset to
+// ready and re-executed, giving them another chance after conditions change.
 func resumeExecutionAllowed(run state.RunArtifact, req ResumeRequest) bool {
 	if req.Adapter == nil && req.AdapterFactory == nil {
 		return false
 	}
-	return run.Status == state.EpicRunStatusRunning
+	return run.Status == state.EpicRunStatusRunning || run.Status == state.EpicRunStatusBlocked
 }
 
 // resumeTicketMode re-executes non-terminal tickets in a ticket-mode run.
