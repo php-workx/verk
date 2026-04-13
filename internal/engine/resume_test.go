@@ -167,3 +167,75 @@ func TestResumeRun_RepairsCommittedTransitionAfterCrash(t *testing.T) {
 		t.Fatalf("expected closeout artifact to be rebuilt: %v", err)
 	}
 }
+
+func TestReloadTicketSnapshots_UpdatesStalePhases(t *testing.T) {
+	repoRoot := t.TempDir()
+	runID := "run-reload"
+
+	// Set up an epic run with two tickets
+	writeOpRunFixture(t, repoRoot, runID, state.RunArtifact{
+		ArtifactMeta: state.ArtifactMeta{SchemaVersion: 1, RunID: runID},
+		Mode:         "epic",
+		RootTicketID: "epic-1",
+		Status:       state.EpicRunStatusBlocked,
+		CurrentPhase: state.TicketPhaseBlocked,
+		TicketIDs:    []string{"ticket-1", "ticket-2"},
+	})
+
+	// Write initial "blocked" and "implement" phases
+	writeTicketRunFixture(t, repoRoot, runID, TicketRunSnapshot{
+		ArtifactMeta: state.ArtifactMeta{SchemaVersion: 1, RunID: runID},
+		TicketID:     "ticket-1",
+		CurrentPhase: state.TicketPhaseBlocked,
+		BlockReason:  "failed verification",
+	})
+	writeTicketRunFixture(t, repoRoot, runID, TicketRunSnapshot{
+		ArtifactMeta: state.ArtifactMeta{SchemaVersion: 1, RunID: runID},
+		TicketID:     "ticket-2",
+		CurrentPhase: state.TicketPhaseImplement,
+	})
+
+	// Load artifacts — snapshots will have stale phases
+	artifacts, err := loadRunArtifacts(repoRoot, runID)
+	if err != nil {
+		t.Fatalf("loadRunArtifacts: %v", err)
+	}
+	if artifacts.Tickets["ticket-1"].CurrentPhase != state.TicketPhaseBlocked {
+		t.Fatalf("expected stale blocked phase for ticket-1, got %q", artifacts.Tickets["ticket-1"].CurrentPhase)
+	}
+
+	// Simulate: RunTicket wrote updated snapshots to disk (both closed)
+	writeTicketRunFixture(t, repoRoot, runID, TicketRunSnapshot{
+		ArtifactMeta: state.ArtifactMeta{SchemaVersion: 1, RunID: runID},
+		TicketID:     "ticket-1",
+		CurrentPhase: state.TicketPhaseClosed,
+	})
+	writeTicketRunFixture(t, repoRoot, runID, TicketRunSnapshot{
+		ArtifactMeta: state.ArtifactMeta{SchemaVersion: 1, RunID: runID},
+		TicketID:     "ticket-2",
+		CurrentPhase: state.TicketPhaseClosed,
+	})
+
+	// Before reload, in-memory data still has stale phases
+	if artifacts.Tickets["ticket-1"].CurrentPhase != state.TicketPhaseBlocked {
+		t.Fatalf("expected stale blocked phase before reload, got %q", artifacts.Tickets["ticket-1"].CurrentPhase)
+	}
+
+	// Reload snapshots from disk
+	reloadTicketSnapshots(repoRoot, runID, artifacts.Tickets)
+
+	// After reload, phases should match on-disk state
+	if artifacts.Tickets["ticket-1"].CurrentPhase != state.TicketPhaseClosed {
+		t.Fatalf("expected closed phase for ticket-1 after reload, got %q", artifacts.Tickets["ticket-1"].CurrentPhase)
+	}
+	if artifacts.Tickets["ticket-2"].CurrentPhase != state.TicketPhaseClosed {
+		t.Fatalf("expected closed phase for ticket-2 after reload, got %q", artifacts.Tickets["ticket-2"].CurrentPhase)
+	}
+
+	// Now updateRunStatusFromTickets should see all tickets closed
+	run := artifacts.Run
+	updateRunStatusFromTickets(&run, artifacts.Tickets)
+	if run.Status != state.EpicRunStatusCompleted {
+		t.Fatalf("expected completed run after reload, got %q", run.Status)
+	}
+}

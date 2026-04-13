@@ -158,7 +158,11 @@ func ResumeRun(ctx context.Context, req ResumeRequest) (ResumeReport, error) {
 			return ResumeReport{}, err
 		}
 
-		// Re-derive run status after execution
+		// Re-derive run status after execution.
+		// Reload ticket snapshots from disk because resumeEpicMode does not
+		// update artifacts.Tickets in-place — RunTicket writes new snapshots
+		// to disk via its defer, but the in-memory map stays stale.
+		reloadTicketSnapshots(artifacts.RepoRoot, req.RunID, artifacts.Tickets)
 		updateRunStatusFromTickets(&artifacts.Run, artifacts.Tickets)
 		if len(resumed) > 0 {
 			appendRunAuditEvent(&artifacts.Run, "resume_reexecution_complete", "", artifacts.Run.CurrentPhase, map[string]any{
@@ -581,6 +585,21 @@ func reconcileTicketClaimForResume(repoRoot, runID, ticketID string, snapshot Ti
 		return nil, false, fmt.Errorf("ticket %s lease mismatch between implementation artifact %q and claim %q", ticketID, snapshot.Implementation.LeaseID, claim.LeaseID)
 	}
 	return &claim, repaired, nil
+}
+
+// reloadTicketSnapshots re-reads ticket snapshot data from disk into the
+// provided map, replacing stale in-memory entries with the latest persisted
+// state. This is needed after resumeEpicMode because RunTicket updates
+// snapshot artifacts on disk via its defer, but the in-memory tickets map
+// is never refreshed — causing updateRunStatusFromTickets to operate on
+// outdated phase data.
+func reloadTicketSnapshots(repoRoot, runID string, tickets map[string]TicketRunSnapshot) {
+	for ticketID := range tickets {
+		var snapshot TicketRunSnapshot
+		if err := loadTicketSnapshot(repoRoot, runID, ticketID, &snapshot); err == nil {
+			tickets[ticketID] = snapshot
+		}
+	}
 }
 
 func appendIfMissing(values []string, value string) []string {
