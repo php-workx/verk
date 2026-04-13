@@ -468,8 +468,7 @@ func resumeEpicMode(ctx context.Context, req ResumeRequest, artifacts *runArtifa
 				acceptedWave.Acceptance = map[string]any{}
 			}
 			if waveErr != nil {
-				acceptedWave.Acceptance["reason"] = waveErr.Error()
-				acceptErr = waveErr
+				acceptedWave.Acceptance["crash_reason"] = waveErr.Error()
 			}
 		}
 		if acceptedWave.Acceptance == nil {

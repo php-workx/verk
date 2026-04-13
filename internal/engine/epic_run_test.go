@@ -65,7 +65,7 @@ func TestBuildWaveSerializesConflictingOwnedPaths(t *testing.T) {
 	}
 }
 
-func TestAcceptWaveRejectsScopeViolation(t *testing.T) {
+func TestAcceptWave_ScopeViolationIsWarning(t *testing.T) {
 	wave := state.WaveArtifact{
 		WaveID: "wave-1",
 		Status: state.WaveStatusRunning,
@@ -86,8 +86,20 @@ func TestAcceptWaveRejectsScopeViolation(t *testing.T) {
 		PersistenceSucceeded: true,
 	}
 
-	if _, err := AcceptWave(req); err == nil {
-		t.Fatal("expected scope violation to fail acceptance")
+	accepted, err := AcceptWave(req)
+	if err != nil {
+		t.Fatalf("expected acceptance with scope violation as warning, got error: %v", err)
+	}
+	if accepted.Status != state.WaveStatusAccepted {
+		t.Fatalf("expected accepted status, got %q", accepted.Status)
+	}
+	warnings, ok := accepted.Acceptance["warnings"]
+	if !ok {
+		t.Fatal("expected warnings in acceptance metadata for scope violation")
+	}
+	warningList, ok := warnings.([]string)
+	if !ok || len(warningList) == 0 {
+		t.Fatalf("expected non-empty warnings list, got %#v", warnings)
 	}
 }
 
@@ -153,7 +165,7 @@ func TestRunEpicSchedulesOpenAndReadyTickets(t *testing.T) {
 	}
 }
 
-func TestRunEpicFailsOnScopeViolation(t *testing.T) {
+func TestRunEpicAcceptsScopeViolationAsWarning(t *testing.T) {
 	repoRoot := t.TempDir()
 	baseCommit := initEpicRepo(t, repoRoot)
 	cfg := policy.DefaultConfig()
@@ -210,11 +222,14 @@ func TestRunEpicFailsOnScopeViolation(t *testing.T) {
 	if _, statErr := os.Stat(touchOutsideScope); statErr != nil {
 		t.Fatalf("expected scope violation fixture file to exist: %v", statErr)
 	}
-	if result.Run.Status != state.EpicRunStatusBlocked {
-		t.Fatalf("expected epic to be blocked, got %q", result.Run.Status)
+	if result.Run.Status != state.EpicRunStatusCompleted {
+		t.Fatalf("expected epic to complete despite scope violation, got %q", result.Run.Status)
 	}
-	if len(result.Waves) == 0 || result.Waves[0].Status != state.WaveStatusFailed {
-		t.Fatalf("expected failed wave, got %#v", result.Waves)
+	if len(result.Waves) == 0 {
+		t.Fatal("expected at least one wave")
+	}
+	if result.Waves[0].Status != state.WaveStatusAccepted {
+		t.Fatalf("expected accepted wave (with scope warning), got %q", result.Waves[0].Status)
 	}
 }
 

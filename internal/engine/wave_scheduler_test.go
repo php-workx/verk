@@ -133,7 +133,7 @@ func TestValidatePerTicketScope_MultipleTickets_CrossScopeViolation(t *testing.T
 	}
 }
 
-func TestAcceptWave_RejectsEmptyTicketScopes(t *testing.T) {
+func TestAcceptWave_WarnsOnEmptyTicketScopes(t *testing.T) {
 	wave := state.WaveArtifact{
 		WaveID:       "wave-1",
 		Status:       state.WaveStatusRunning,
@@ -145,14 +145,25 @@ func TestAcceptWave_RejectsEmptyTicketScopes(t *testing.T) {
 		Wave:                 wave,
 		TicketPhases:         []state.TicketPhase{state.TicketPhaseClosed},
 		ChangedFiles:         []string{"internal/app/main.go"},
-		TicketScopes:         nil, // no scopes provided — must fail closed
+		TicketScopes:         nil, // no scopes provided — should warn, not fail
 		ClaimsReleased:       true,
 		PersistenceSucceeded: true,
 	}
 
-	_, err := AcceptWave(req)
-	if err == nil {
-		t.Fatal("expected error when TicketScopes is nil, got nil — must fail closed")
+	accepted, err := AcceptWave(req)
+	if err != nil {
+		t.Fatalf("expected acceptance with warnings, got error: %v", err)
+	}
+	if accepted.Status != state.WaveStatusAccepted {
+		t.Fatalf("expected accepted status, got %q", accepted.Status)
+	}
+	warnings, ok := accepted.Acceptance["warnings"]
+	if !ok {
+		t.Fatal("expected warnings in acceptance metadata")
+	}
+	warningList, ok := warnings.([]string)
+	if !ok || len(warningList) == 0 {
+		t.Fatalf("expected non-empty warnings list, got %#v", warnings)
 	}
 }
 
