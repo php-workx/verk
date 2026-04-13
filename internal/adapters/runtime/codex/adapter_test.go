@@ -257,6 +257,79 @@ func TestCheckAvailability_UsesVersionProbe(t *testing.T) {
 	}
 }
 
+func TestRunWorker_NeedsContextStatus(t *testing.T) {
+	oldRunCommand := runCommand
+	oldNow := now
+	defer func() {
+		runCommand = oldRunCommand
+		now = oldNow
+	}()
+
+	now = func() time.Time {
+		return time.Date(2026, 4, 2, 12, 0, 0, 0, time.UTC)
+	}
+
+	runCommand = func(ctx context.Context, binary string, args []string, stdin []byte, env []string, timeout time.Duration) (commandResult, error) {
+		resultJSON := `{"status":"needs_context","completion_code":"missing_spec","block_reason":"acceptance criteria unclear"}`
+		return commandResult{
+			stdout:   []byte(resultJSON),
+			exitCode: 0,
+		}, nil
+	}
+
+	adapter := NewWithCommand("codex-test")
+	result, err := adapter.RunWorker(context.Background(), runtime.WorkerRequest{
+		LeaseID:  "lease-1",
+		TicketID: "ticket-1",
+	})
+	if err != nil {
+		t.Fatalf("RunWorker returned error: %v", err)
+	}
+	if result.Status != runtime.WorkerStatusNeedsContext {
+		t.Fatalf("expected needs_context, got %q", result.Status)
+	}
+	if result.RetryClass != runtime.RetryClassBlockedByOperatorInput {
+		t.Fatalf("expected blocked_by_operator_input, got %q", result.RetryClass)
+	}
+}
+
+func TestRunWorker_NeedsMoreContextHyphenated(t *testing.T) {
+	oldRunCommand := runCommand
+	oldNow := now
+	defer func() {
+		runCommand = oldRunCommand
+		now = oldNow
+	}()
+
+	now = func() time.Time {
+		return time.Date(2026, 4, 2, 12, 0, 0, 0, time.UTC)
+	}
+
+	// Simulate a runtime returning the hyphenated form "needs-more-context"
+	runCommand = func(ctx context.Context, binary string, args []string, stdin []byte, env []string, timeout time.Duration) (commandResult, error) {
+		resultJSON := `{"status":"needs-more-context","completion_code":"missing_spec","block_reason":"need operator input"}`
+		return commandResult{
+			stdout:   []byte(resultJSON),
+			exitCode: 0,
+		}, nil
+	}
+
+	adapter := NewWithCommand("codex-test")
+	result, err := adapter.RunWorker(context.Background(), runtime.WorkerRequest{
+		LeaseID:  "lease-1",
+		TicketID: "ticket-1",
+	})
+	if err != nil {
+		t.Fatalf("RunWorker returned error: %v", err)
+	}
+	if result.Status != runtime.WorkerStatusNeedsContext {
+		t.Fatalf("expected needs_context from hyphenated input, got %q", result.Status)
+	}
+	if result.RetryClass != runtime.RetryClassBlockedByOperatorInput {
+		t.Fatalf("expected blocked_by_operator_input, got %q", result.RetryClass)
+	}
+}
+
 func TestRunWorker_FallbackWhenNoJSON(t *testing.T) {
 	oldRunCommand := runCommand
 	oldNow := now

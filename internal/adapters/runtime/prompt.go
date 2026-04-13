@@ -192,12 +192,12 @@ func ParseResultBlock(text string) (VerkResultBlock, bool) {
 	}
 
 	// 2. Sentinel-prefixed line fallback.
-	if b, ok := parseSentinelLine[VerkResultBlock](text, ResultSentinel); ok {
+	if b, ok := parseSentinelLine[VerkResultBlock](text, ResultSentinel); ok && ValidateWorkerStatus(WorkerStatus(b.Status)) == nil {
 		return b, true
 	}
 
 	// 3. Last JSON object fallback.
-	if b, ok := parseLastJSON[VerkResultBlock](text); ok && b.Status != "" {
+	if b, ok := parseLastJSON[VerkResultBlock](stripSentinelLines(text, ResultSentinel)); ok && b.Status != "" {
 		return b, true
 	}
 
@@ -214,11 +214,11 @@ func ParseReviewBlock(text string) (VerkReviewBlock, bool) {
 		return block, true
 	}
 
-	if b, ok := parseSentinelLine[VerkReviewBlock](text, ReviewSentinel); ok {
+	if b, ok := parseSentinelLine[VerkReviewBlock](text, ReviewSentinel); ok && ValidateReviewStatus(ReviewStatus(b.ReviewStatus)) == nil {
 		return b, true
 	}
 
-	if b, ok := parseLastJSON[VerkReviewBlock](text); ok && b.ReviewStatus != "" {
+	if b, ok := parseLastJSON[VerkReviewBlock](stripSentinelLines(text, ReviewSentinel)); ok && b.ReviewStatus != "" {
 		return b, true
 	}
 
@@ -240,6 +240,17 @@ func parseSentinelLine[T any](text, prefix string) (T, bool) {
 		}
 	}
 	return zero, false
+}
+
+func stripSentinelLines(text, prefix string) string {
+	var lines []string
+	for _, line := range strings.Split(text, "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), prefix) {
+			continue
+		}
+		lines = append(lines, line)
+	}
+	return strings.Join(lines, "\n")
 }
 
 // parseLastJSON finds the last { ... } block in the text and tries to parse it.

@@ -135,6 +135,46 @@ VERK_REVIEW:{"review_status":"passed","summary":"clean","findings":[]}`
 	}
 }
 
+func TestParseResultBlock_SentinelEmptyDiscriminator(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+	}{
+		{"empty object", "VERK_RESULT:{}"},
+		{"empty status", `VERK_RESULT:{"status":""}`},
+		{"invalid status", `VERK_RESULT:{"status":"finished","completion_code":"ok"}`},
+		{"prose with empty object", "Some prose\nVERK_RESULT:{}"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, found := ParseResultBlock(tt.input)
+			if found {
+				t.Fatalf("expected sentinel with empty discriminator to be rejected, input=%q", tt.input)
+			}
+		})
+	}
+}
+
+func TestParseReviewBlock_SentinelEmptyDiscriminator(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+	}{
+		{"empty object", "VERK_REVIEW:{}"},
+		{"empty review_status", `VERK_REVIEW:{"review_status":""}`},
+		{"invalid review_status", `VERK_REVIEW:{"review_status":"clean","summary":"ok","findings":[]}`},
+		{"prose with empty object", "Some prose\nVERK_REVIEW:{}"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, found := ParseReviewBlock(tt.input)
+			if found {
+				t.Fatalf("expected sentinel with empty discriminator to be rejected, input=%q", tt.input)
+			}
+		})
+	}
+}
+
 func TestExtractCLIResultText_ValidJSON(t *testing.T) {
 	output := CLIOutputJSON{
 		Type:    "result",

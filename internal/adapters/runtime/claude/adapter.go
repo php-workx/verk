@@ -580,24 +580,11 @@ func retryClassForStatus(status runtime.WorkerStatus, exitCode int, stderr []byt
 }
 
 func normalizeWorkerStatusString(raw string) (runtime.WorkerStatus, bool) {
-	switch normalizeKey(raw) {
-	case "done", "completed", "complete", "success", "passed", "ok":
-		return runtime.WorkerStatusDone, true
-	case "done_with_concerns", "donewithconcerns", "concerns":
-		return runtime.WorkerStatusDoneWithConcerns, true
-	case "needs_context", "needscontext", "context_needed", "needs_more_context":
-		return runtime.WorkerStatusNeedsContext, true
-	case "blocked", "blocked_by_operator_input", "blockedbyoperatorinput":
-		return runtime.WorkerStatusBlocked, true
-	default:
-		return "", false
-	}
+	return runtime.NormalizeWorkerStatusString(raw)
 }
 
 func normalizeKey(raw string) string {
-	raw = strings.TrimSpace(strings.ToLower(raw))
-	replacer := strings.NewReplacer("-", "_", " ", "_")
-	return replacer.Replace(raw)
+	return runtime.NormalizeKey(raw)
 }
 
 func looksLikeTransientFailure(stderr []byte) bool {
