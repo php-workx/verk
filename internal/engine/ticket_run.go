@@ -21,8 +21,10 @@ import (
 
 const maxRuntimeRetryAttempts = 2
 
-var errRuntimeExecutionBlocked = errors.New("runtime execution blocked")
-var errClaimRenewalLost = errors.New("claim renewal failed")
+var (
+	errRuntimeExecutionBlocked = errors.New("runtime execution blocked")
+	errClaimRenewalLost        = errors.New("claim renewal failed")
+)
 
 type RunTicketRequest struct {
 	RepoRoot             string
@@ -33,9 +35,9 @@ type RunTicketRequest struct {
 	Claim                state.ClaimArtifact
 	Adapter              runtime.Adapter
 	Config               policy.Config
-	VerificationCommands  []string
-	EnforceSingleScope    bool
-	Progress              chan<- ProgressEvent
+	VerificationCommands []string
+	EnforceSingleScope   bool
+	Progress             chan<- ProgressEvent
 }
 
 type RunTicketResult struct {
@@ -454,12 +456,12 @@ func handleImplementResult(st *ticketRunState, result runtime.WorkerResult, atte
 			CreatedAt:     stateTime(),
 			UpdatedAt:     stateTime(),
 		},
-		TicketID:       st.req.Ticket.ID,
-		Attempt:        st.implementationAttempts,
-		Runtime:        chosenRuntime(st.req.Plan, st.cfg),
-		Status:         string(result.Status),
-		CompletionCode: result.CompletionCode,
-		RetryClass:     state.RetryClass(result.RetryClass),
+		TicketID:          st.req.Ticket.ID,
+		Attempt:           st.implementationAttempts,
+		Runtime:           chosenRuntime(st.req.Plan, st.cfg),
+		Status:            string(result.Status),
+		CompletionCode:    result.CompletionCode,
+		RetryClass:        state.RetryClass(result.RetryClass),
 		Concerns:          result.Concerns,
 		LeaseID:           result.LeaseID,
 		InputArtifactPath: inputArtifactPath,
@@ -1097,10 +1099,6 @@ func (st *ticketRunState) releaseClaim() error {
 		reason = "released"
 	}
 	return tkmd.ReleaseClaim(st.repoRoot, st.req.RunID, st.req.Ticket.ID, st.req.Claim.LeaseID, reason)
-}
-
-func (st *ticketRunState) repairCyclePath(cycle int) string {
-	return st.paths.repairCyclePath(cycle)
 }
 
 func buildTicketRunPaths(repoRoot, runID, ticketID string) ticketRunPaths {

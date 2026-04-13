@@ -2,6 +2,7 @@ package command
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -10,6 +11,15 @@ import (
 
 	"verk/internal/policy"
 )
+
+// failingCloser is an io.WriteCloser whose Close method returns a configurable
+// error. It is used in tests to verify that close errors are propagated.
+type failingCloser struct {
+	closeErr error
+}
+
+func (f *failingCloser) Write(p []byte) (int, error) { return len(p), nil }
+func (f *failingCloser) Close() error                { return f.closeErr }
 
 func TestRunCommands_CapturesExitCodeAndArtifacts(t *testing.T) {
 	repoRoot := t.TempDir()
@@ -210,5 +220,127 @@ func TestDeriveVerificationPassed_FailsOnNonZeroExit(t *testing.T) {
 	}
 	if DeriveVerificationPassed(results) {
 		t.Fatalf("expected timeout to fail verification")
+	}
+}
+
+// TestRunCommands_CloseErrorPropagated verifies that a Close() failure on an
+// artifact file is returned as an error rather than silently discarded.
+func TestRunCommands_CloseErrorPropagated(t *testing.T) {
+	orig := createArtifactFile
+	t.Cleanup(func() { createArtifactFile = orig })
+
+	createArtifactFile = func(_ string) (artifactFile, error) {
+		return &failingCloser{closeErr: fmt.Errorf("simulated disk full")}, nil
+	}
+
+	repoRoot := t.TempDir()
+	_, err := RunCommands(context.Background(), repoRoot, []string{"true"}, policy.VerificationConfig{
+		DefaultTimeoutMinutes: 1,
+	})
+	if err == nil {
+		t.Fatal("expected RunCommands to return an error when Close() fails")
+	}
+	if !strings.Contains(err.Error(), "close stdout artifact") && !strings.Contains(err.Error(), "close stderr artifact") {
+		t.Fatalf("expected a close artifact error, got: %v", err)
+	}
+}
+
+// TestRunCommands_CloseSucceeds verifies that no spurious close errors are
+// returned when files close normally.
+func TestRunCommands_CloseSucceeds(t *testing.T) {
+	repoRoot := t.TempDir()
+	results, err := RunCommands(context.Background(), repoRoot, []string{"true"}, policy.VerificationConfig{
+		DefaultTimeoutMinutes: 1,
+	})
+	if err != nil {
+		t.Fatalf("expected no error on successful close, got: %v", err)
+	}
+	if len(results) != 1 {
+		t.Fatalf("expected 1 result, got %d", len(results))
+	}
+}
+
+// TestRunQualityCommands_CloseErrorPropagated verifies that a Close() failure
+// on an artifact file is returned rather than silently discarded.
+func TestRunQualityCommands_CloseErrorPropagated(t *testing.T) {
+	orig := createArtifactFile
+	t.Cleanup(func() { createArtifactFile = orig })
+
+	createArtifactFile = func(_ string) (artifactFile, error) {
+		return &failingCloser{closeErr: fmt.Errorf("simulated disk full")}, nil
+	}
+
+	repoRoot := t.TempDir()
+	_, err := RunQualityCommands(context.Background(), repoRoot, []policy.QualityCommand{
+		{Run: []string{"true"}},
+	}, policy.VerificationConfig{
+		DefaultTimeoutMinutes: 1,
+	})
+	if err == nil {
+		t.Fatal("expected RunQualityCommands to return an error when Close() fails")
+	}
+	if !strings.Contains(err.Error(), "close stdout artifact") && !strings.Contains(err.Error(), "close stderr artifact") {
+		t.Fatalf("expected a close artifact error, got: %v", err)
+	}
+}
+
+// TestRunQualityCommands_NonexistentRepoRoot verifies that a missing repoRoot
+// is rejected before any filesystem side-effects occur.
+func TestRunQualityCommands_NonexistentRepoRoot(t *testing.T) {
+	_, err := RunQualityCommands(
+		context.Background(),
+		"/nonexistent/path/that/does/not/exist/ver-7anh",
+		[]policy.QualityCommand{{Run: []string{"true"}}},
+		policy.VerificationConfig{DefaultTimeoutMinutes: 1},
+	)
+	if err == nil {
+		t.Fatal("expected error for nonexistent repoRoot")
+	}
+	if !strings.Contains(err.Error(), "stat repo root") {
+		t.Fatalf("expected 'stat repo root' error, got: %v", err)
+	}
+}
+
+// TestRunQualityCommands_RepoRootIsFile verifies that a repoRoot that points
+// to a file (not a directory) is rejected with a clear error.
+func TestRunQualityCommands_RepoRootIsFile(t *testing.T) {
+	tmpDir := t.TempDir()
+	filePath := filepath.Join(tmpDir, "not-a-dir")
+	if err := os.WriteFile(filePath, []byte("file content"), 0o644); err != nil {
+		t.Fatalf("create test file: %v", err)
+	}
+
+	_, err := RunQualityCommands(
+		context.Background(),
+		filePath,
+		[]policy.QualityCommand{{Run: []string{"true"}}},
+		policy.VerificationConfig{DefaultTimeoutMinutes: 1},
+	)
+	if err == nil {
+		t.Fatal("expected error when repoRoot points to a file")
+	}
+	if !strings.Contains(err.Error(), "not a directory") {
+		t.Fatalf("expected 'not a directory' error, got: %v", err)
+	}
+}
+
+// TestRunQualityCommands_ValidRepoRoot verifies that a well-formed repoRoot
+// succeeds end-to-end.
+func TestRunQualityCommands_ValidRepoRoot(t *testing.T) {
+	repoRoot := t.TempDir()
+	results, err := RunQualityCommands(
+		context.Background(),
+		repoRoot,
+		[]policy.QualityCommand{{Run: []string{"true"}}},
+		policy.VerificationConfig{DefaultTimeoutMinutes: 1},
+	)
+	if err != nil {
+		t.Fatalf("RunQualityCommands returned error for valid repoRoot: %v", err)
+	}
+	if len(results) != 1 {
+		t.Fatalf("expected 1 result, got %d", len(results))
+	}
+	if results[0].ExitCode != 0 {
+		t.Fatalf("expected exit code 0, got %d", results[0].ExitCode)
 	}
 }

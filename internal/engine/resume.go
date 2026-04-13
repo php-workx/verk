@@ -46,7 +46,7 @@ func ResumeRun(ctx context.Context, req ResumeRequest) (ResumeReport, error) {
 	if err != nil {
 		return ResumeReport{}, err
 	}
-	defer lock.Release()
+	defer func() { _ = lock.Release() }()
 
 	artifacts, err := loadRunArtifacts(req.RepoRoot, req.RunID)
 	if err != nil {

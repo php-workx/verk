@@ -12,20 +12,20 @@ import (
 )
 
 const (
-	gateCriteriaEvidence  = "criteria_evidence"
-	gateVerification      = "verification"
-	gateRequiredArtifacts = "required_artifacts"
-	gateReview            = "review"
-	gateDeclaredChecks    = "declared_checks"
-	gateArtifactIntegrity = "artifact_integrity"
-	gatePassed            = "passed"
-	gateFailed            = "failed"
-	defaultEvidenceSource        = "verification.json"
-	defaultReviewSource          = "review-findings.json"
-	defaultArtifactSource        = "artifact.json"
-	defaultDiffSource            = "implementation.json"
-	defaultResultArtifactSource  = "result-artifacts.json"
-	defaultCriteriaPrefix        = "criterion-"
+	gateCriteriaEvidence        = "criteria_evidence"
+	gateVerification            = "verification"
+	gateRequiredArtifacts       = "required_artifacts"
+	gateReview                  = "review"
+	gateDeclaredChecks          = "declared_checks"
+	gateArtifactIntegrity       = "artifact_integrity"
+	gatePassed                  = "passed"
+	gateFailed                  = "failed"
+	defaultEvidenceSource       = "verification.json"
+	defaultReviewSource         = "review-findings.json"
+	defaultArtifactSource       = "artifact.json"
+	defaultDiffSource           = "implementation.json"
+	defaultResultArtifactSource = "result-artifacts.json"
+	defaultCriteriaPrefix       = "criterion-"
 )
 
 type closeoutRequest struct {

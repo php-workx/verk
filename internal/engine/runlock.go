@@ -32,7 +32,7 @@ func AcquireRunLock(repoRoot, runID string) (*RunLock, error) {
 	}
 
 	if err := syscall.Flock(int(file.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
-		file.Close()
+		_ = file.Close()
 		if errors.Is(err, syscall.EWOULDBLOCK) || errors.Is(err, syscall.EAGAIN) {
 			return nil, fmt.Errorf("run %s is already being executed by another process", runID)
 		}
@@ -50,7 +50,7 @@ func IsRunLockHeld(repoRoot, runID string) bool {
 	if err != nil {
 		return false // lock file doesn't exist = not held
 	}
-	defer file.Close()
+	defer func() { _ = file.Close() }()
 
 	// Try non-blocking lock — if it succeeds, nobody holds it
 	err = syscall.Flock(int(file.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)

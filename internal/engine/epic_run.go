@@ -47,7 +47,7 @@ func RunEpic(ctx context.Context, req RunEpicRequest) (RunEpicResult, error) {
 	if err != nil {
 		return RunEpicResult{}, err
 	}
-	defer lock.Release()
+	defer func() { _ = lock.Release() }()
 
 	cfg := normalizeEpicConfig(req.Config)
 	repo, err := git.New(req.RepoRoot)
@@ -489,33 +489,6 @@ func filterEngineOwnedFiles(changed []string) []string {
 	return out
 }
 
-func filterCoveredFiles(changed, covered []string) []string {
-	if len(changed) == 0 {
-		return nil
-	}
-	if len(covered) == 0 {
-		return append([]string(nil), changed...)
-	}
-
-	out := make([]string, 0, len(changed))
-	for _, file := range changed {
-		if coveredByAny(file, covered) {
-			continue
-		}
-		out = append(out, file)
-	}
-	return out
-}
-
-func coveredByAny(file string, scopes []string) bool {
-	for _, scope := range scopes {
-		if git.PathsOverlap(file, scope) {
-			return true
-		}
-	}
-	return false
-}
-
 type waveTicketOutcome struct {
 	ticketID string
 	phase    state.TicketPhase
@@ -642,9 +615,7 @@ func describeNotReady(ticket tkmd.Ticket) string {
 	// Status is open/ready — must be deps not resolved
 	if len(ticket.Deps) > 0 {
 		unresolved := make([]string, 0)
-		for _, dep := range ticket.Deps {
-			unresolved = append(unresolved, dep)
-		}
+		unresolved = append(unresolved, ticket.Deps...)
 		if len(unresolved) <= 3 {
 			return fmt.Sprintf("waiting on deps: %s", strings.Join(unresolved, ", "))
 		}

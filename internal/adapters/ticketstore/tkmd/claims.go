@@ -216,7 +216,7 @@ func ReleaseClaim(rootDir string, args ...any) error {
 	return nil
 }
 
-func ReconcileClaim(live *state.ClaimArtifact, durable *state.ClaimArtifact, runID string, terminal bool) (state.ClaimArtifact, error) {
+func ReconcileClaim(live, durable *state.ClaimArtifact, runID string, terminal bool) (state.ClaimArtifact, error) {
 	switch {
 	case live == nil && durable == nil:
 		return state.ClaimArtifact{}, errors.New("missing live and durable claim state")

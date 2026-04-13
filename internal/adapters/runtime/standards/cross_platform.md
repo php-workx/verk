@@ -1,6 +1,6 @@
 # Cross-Platform Review Checklist
 
-Auto-injected when the diff touches file I/O, process management, or OS-specific APIs.
+Always injected unconditionally by standards.go.
 
 ---
 

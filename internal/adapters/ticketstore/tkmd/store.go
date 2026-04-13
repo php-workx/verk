@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	"verk/internal/state"
 )
@@ -119,7 +120,7 @@ func ListReadyChildren(rootDir, parentID string, currentRunID ...string) ([]Tick
 		if !isChild {
 			_, isChild = epicDeps[ticket.ID]
 		}
-if !isChild {
+		if !isChild {
 			continue
 		}
 		if ticket.Status != StatusOpen && ticket.Status != StatusReady {
@@ -589,8 +590,8 @@ func isPlainString(v string) bool {
 		return false
 	}
 	for _, r := range v {
-		if !(r == '/' || r == '-' || r == '_' || r == '.' || r == ' ' || r == '@' || r == '+' ||
-			(r >= '0' && r <= '9') || (r >= 'A' && r <= 'Z') || (r >= 'a' && r <= 'z')) {
+		if !unicode.IsLetter(r) && !unicode.IsDigit(r) && r != '/' && r != '-' && r != '_' &&
+			r != '.' && r != ' ' && r != '@' && r != '+' {
 			return false
 		}
 	}

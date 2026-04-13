@@ -140,16 +140,16 @@ func runCLIFromDir(t *testing.T, dir string, args ...string) (string, string, in
 
 	code := cli.ExecuteArgs(args, stdoutW, stderrW)
 
-	stdoutW.Close()
-	stderrW.Close()
+	_ = stdoutW.Close()
+	_ = stderrW.Close()
 
 	stdoutBuf := make([]byte, 64*1024)
 	n, _ := stdoutR.Read(stdoutBuf)
-	stdoutR.Close()
+	_ = stdoutR.Close()
 
 	stderrBuf := make([]byte, 64*1024)
 	m, _ := stderrR.Read(stderrBuf)
-	stderrR.Close()
+	_ = stderrR.Close()
 
 	return string(stdoutBuf[:n]), string(stderrBuf[:m]), code
 }

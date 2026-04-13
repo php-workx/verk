@@ -66,8 +66,7 @@ func ReopenTicket(ctx context.Context, req ReopenRequest) error {
 		wavePayload = wave
 	}
 
-	artifacts.Run.Status = state.EpicRunStatusRunning
-	artifacts.Run.CurrentPhase = req.ToPhase
+	updateRunStatusFromTickets(&artifacts.Run, artifacts.Tickets)
 	appendRunAuditEvent(&artifacts.Run, "ticket_reopened", req.TicketID, req.ToPhase, map[string]any{
 		"from_phase": string(fromPhase),
 		"to_phase":   string(req.ToPhase),

@@ -40,26 +40,26 @@ var initCmd = &cobra.Command{
 		color := shouldColorizeFunc()
 		r := doctorRenderer{color: color}
 
-		fmt.Fprintln(w, r.bold("verk init"))
-		fmt.Fprintln(w, r.dim(strings.Repeat("─", 40)))
-		fmt.Fprintln(w)
+		_, _ = fmt.Fprintln(w, r.bold("verk init"))
+		_, _ = fmt.Fprintln(w, r.dim(strings.Repeat("─", 40)))
+		_, _ = fmt.Fprintln(w)
 
 		// --- Quality commands ---
 		toolings := policy.DetectProjectTooling(repoRoot)
 		var qualityCommands []policy.QualityCommand
 
 		if len(toolings) > 0 {
-			fmt.Fprintln(w, r.bold("Detected project tooling:"))
+			_, _ = fmt.Fprintln(w, r.bold("Detected project tooling:"))
 			for _, t := range toolings {
-				fmt.Fprintf(w, "  %s %s → %s\n",
+				_, _ = fmt.Fprintf(w, "  %s %s → %s\n",
 					r.ok("✓"),
 					r.bold(t.File),
 					strings.Join(t.SuggestedCommands, ", "))
 			}
-			fmt.Fprintln(w)
+			_, _ = fmt.Fprintln(w)
 
 			suggested := toolings[0].SuggestedCommands
-			fmt.Fprintf(w, "Use suggested quality commands [%s]? (Y/n or enter custom): ",
+			_, _ = fmt.Fprintf(w, "Use suggested quality commands [%s]? (Y/n or enter custom): ",
 				strings.Join(suggested, ", "))
 
 			if scanner.Scan() {
@@ -77,9 +77,9 @@ var initCmd = &cobra.Command{
 				}
 			}
 		} else {
-			fmt.Fprintln(w, r.dim("No recognized build tooling detected (Justfile, Makefile, package.json, go.mod, Cargo.toml, pyproject.toml)."))
-			fmt.Fprintln(w)
-			fmt.Fprint(w, "Enter quality commands (comma-separated, or empty to skip): ")
+			_, _ = fmt.Fprintln(w, r.dim("No recognized build tooling detected (Justfile, Makefile, package.json, go.mod, Cargo.toml, pyproject.toml)."))
+			_, _ = fmt.Fprintln(w)
+			_, _ = fmt.Fprint(w, "Enter quality commands (comma-separated, or empty to skip): ")
 			if scanner.Scan() {
 				if run := splitCommands(scanner.Text()); len(run) > 0 {
 					qualityCommands = append(qualityCommands, policy.QualityCommand{Run: run})
@@ -89,7 +89,7 @@ var initCmd = &cobra.Command{
 
 		// Optional monorepo subdirectory commands.
 		for {
-			fmt.Fprint(w, "Add quality commands for a subdirectory? (path or empty to finish): ")
+			_, _ = fmt.Fprint(w, "Add quality commands for a subdirectory? (path or empty to finish): ")
 			if !scanner.Scan() {
 				break
 			}
@@ -97,7 +97,7 @@ var initCmd = &cobra.Command{
 			if path == "" {
 				break
 			}
-			fmt.Fprintf(w, "Commands for %q (comma-separated): ", path)
+			_, _ = fmt.Fprintf(w, "Commands for %q (comma-separated): ", path)
 			if !scanner.Scan() {
 				break
 			}
@@ -110,10 +110,10 @@ var initCmd = &cobra.Command{
 			cfg.Verification.QualityCommands = qualityCommands
 		}
 
-		fmt.Fprintln(w)
+		_, _ = fmt.Fprintln(w)
 
 		// --- Policy settings ---
-		fmt.Fprintln(w, r.bold("Policy settings:"))
+		_, _ = fmt.Fprintln(w, r.bold("Policy settings:"))
 		cfg.Policy.ReviewThreshold = promptSeverity(w, scanner,
 			"  Review threshold (P0–P4)", cfg.Policy.ReviewThreshold)
 		cfg.Policy.MaxImplementationAttempts = promptInt(w, scanner,
@@ -121,25 +121,25 @@ var initCmd = &cobra.Command{
 		cfg.Policy.MaxRepairCycles = promptInt(w, scanner,
 			"  Max repair cycles", cfg.Policy.MaxRepairCycles, 0, 10)
 
-		fmt.Fprintln(w)
+		_, _ = fmt.Fprintln(w)
 
 		// --- Runtime settings ---
-		fmt.Fprintln(w, r.bold("Runtime settings:"))
+		_, _ = fmt.Fprintln(w, r.bold("Runtime settings:"))
 		cfg.Runtime.WorkerTimeoutMinutes = promptInt(w, scanner,
 			"  Worker timeout (minutes)", cfg.Runtime.WorkerTimeoutMinutes, 1, 240)
 		cfg.Runtime.ReviewerTimeoutMinutes = promptInt(w, scanner,
 			"  Reviewer timeout (minutes)", cfg.Runtime.ReviewerTimeoutMinutes, 1, 120)
 
-		fmt.Fprintln(w)
+		_, _ = fmt.Fprintln(w)
 
 		// Write config.
 		if err := policy.WriteConfig(repoRoot, cfg); err != nil {
 			return cmdError(cmd, err, 1)
 		}
 
-		fmt.Fprintf(w, "%s Configuration written to .verk/config.yaml\n", r.ok("[OK]"))
+		_, _ = fmt.Fprintf(w, "%s Configuration written to .verk/config.yaml\n", r.ok("[OK]"))
 		if loadErr == nil {
-			fmt.Fprintln(w, r.dim("    (existing config updated)"))
+			_, _ = fmt.Fprintln(w, r.dim("    (existing config updated)"))
 		}
 		return nil
 	},
@@ -163,7 +163,7 @@ func splitCommands(input string) []string {
 }
 
 func promptSeverity(w io.Writer, scanner *bufio.Scanner, label string, defaultVal state.Severity) state.Severity {
-	fmt.Fprintf(w, "%s [%s]: ", label, defaultVal)
+	_, _ = fmt.Fprintf(w, "%s [%s]: ", label, defaultVal)
 	if scanner.Scan() {
 		input := strings.TrimSpace(strings.ToUpper(scanner.Text()))
 		if input == "" {
@@ -178,7 +178,7 @@ func promptSeverity(w io.Writer, scanner *bufio.Scanner, label string, defaultVa
 }
 
 func promptInt(w io.Writer, scanner *bufio.Scanner, label string, defaultVal, min, max int) int {
-	fmt.Fprintf(w, "%s [%d]: ", label, defaultVal)
+	_, _ = fmt.Fprintf(w, "%s [%d]: ", label, defaultVal)
 	if scanner.Scan() {
 		input := strings.TrimSpace(scanner.Text())
 		if input == "" {

@@ -570,7 +570,7 @@ func epicTicket(id string) tkmd.Ticket {
 	}
 }
 
-func epicChildTicket(id, parent string, status tkmd.Status, deps []string, owned []string) tkmd.Ticket {
+func epicChildTicket(id, parent string, status tkmd.Status, deps, owned []string) tkmd.Ticket {
 	return tkmd.Ticket{
 		ID:         id,
 		Title:      "Child " + id,
@@ -741,5 +741,5 @@ func TestRunEpicConcurrentLockContention(t *testing.T) {
 		t.Fatalf("expected lock contention error, got: %v", err)
 	}
 
-	lock.Release()
+	_ = lock.Release()
 }

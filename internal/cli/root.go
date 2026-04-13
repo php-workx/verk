@@ -29,7 +29,7 @@ var versionCmd = &cobra.Command{
 	Use:   "version",
 	Short: "Print version information",
 	Run: func(cmd *cobra.Command, args []string) {
-		fmt.Fprintf(cmd.OutOrStdout(), "verk %s (%s, %s)\n", Version, GitCommit, BuildDate)
+		_, _ = fmt.Fprintf(cmd.OutOrStdout(), "verk %s (%s, %s)\n", Version, GitCommit, BuildDate)
 	},
 }
 
@@ -65,7 +65,7 @@ func ExecuteArgs(args []string, stdout, stderr *os.File) int {
 	rootCmd.SetErr(stderr)
 	rootCmd.SetArgs(args)
 	if err := rootCmd.Execute(); err != nil {
-		fmt.Fprintln(stderr, err)
+		_, _ = fmt.Fprintln(stderr, err)
 		var exitErr interface{ ExitCode() int }
 		if errors.As(err, &exitErr) {
 			return exitErr.ExitCode()
@@ -80,9 +80,9 @@ type cliExitError struct {
 	exitCode int
 }
 
-func (e *cliExitError) Error() string   { return e.err.Error() }
-func (e *cliExitError) Unwrap() error   { return e.err }
-func (e *cliExitError) ExitCode() int   { return e.exitCode }
+func (e *cliExitError) Error() string { return e.err.Error() }
+func (e *cliExitError) Unwrap() error { return e.err }
+func (e *cliExitError) ExitCode() int { return e.exitCode }
 
 func withExitCode(err error, exitCode int) error {
 	if err == nil {

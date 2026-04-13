@@ -38,9 +38,9 @@ var doctorCmd = &cobra.Command{
 		color := shouldColorizeFunc()
 		r := doctorRenderer{color: color}
 
-		fmt.Fprintln(w, r.bold("verk Doctor"))
-		fmt.Fprintln(w, r.dim(strings.Repeat("─", 40)))
-		fmt.Fprintln(w)
+		_, _ = fmt.Fprintln(w, r.bold("verk Doctor"))
+		_, _ = fmt.Fprintln(w, r.dim(strings.Repeat("─", 40)))
+		_, _ = fmt.Fprintln(w)
 
 		warnings := 0
 		failures := 0
@@ -48,35 +48,35 @@ var doctorCmd = &cobra.Command{
 		for _, check := range report.Checks {
 			switch check.Status {
 			case "passed":
-				fmt.Fprintf(w, "  %s %s\n", r.ok("[OK]"), r.bold(humanizeName(check.Name)))
+				_, _ = fmt.Fprintf(w, "  %s %s\n", r.ok("[OK]"), r.bold(humanizeName(check.Name)))
 			case "warning":
-				fmt.Fprintf(w, "  %s %s\n", r.warn("[WARN]"), r.bold(humanizeName(check.Name)))
+				_, _ = fmt.Fprintf(w, "  %s %s\n", r.warn("[WARN]"), r.bold(humanizeName(check.Name)))
 				warnings++
 			default:
-				fmt.Fprintf(w, "  %s %s\n", r.fail("[FAIL]"), r.bold(humanizeName(check.Name)))
+				_, _ = fmt.Fprintf(w, "  %s %s\n", r.fail("[FAIL]"), r.bold(humanizeName(check.Name)))
 				failures++
 			}
 			if check.Details != "" {
-				fmt.Fprintf(w, "       %s\n", r.dim(check.Details))
+				_, _ = fmt.Fprintf(w, "       %s\n", r.dim(check.Details))
 			}
 		}
 
 		for _, rt := range report.Runtimes {
 			name := "Runtime " + rt.Runtime
 			if rt.Available {
-				fmt.Fprintf(w, "  %s %s\n", r.ok("[OK]"), r.bold(name))
+				_, _ = fmt.Fprintf(w, "  %s %s\n", r.ok("[OK]"), r.bold(name))
 			} else {
-				fmt.Fprintf(w, "  %s %s\n", r.fail("[FAIL]"), r.bold(name))
+				_, _ = fmt.Fprintf(w, "  %s %s\n", r.fail("[FAIL]"), r.bold(name))
 				failures++
 			}
 			if rt.Details != "" {
-				fmt.Fprintf(w, "       %s\n", r.dim(rt.Details))
+				_, _ = fmt.Fprintf(w, "       %s\n", r.dim(rt.Details))
 			}
 		}
 
-		fmt.Fprintln(w)
+		_, _ = fmt.Fprintln(w)
 		if failures == 0 && warnings == 0 {
-			fmt.Fprintln(w, r.ok("All checks passed!"))
+			_, _ = fmt.Fprintln(w, r.ok("All checks passed!"))
 		} else {
 			parts := make([]string, 0, 2)
 			if warnings > 0 {
@@ -85,7 +85,7 @@ var doctorCmd = &cobra.Command{
 			if failures > 0 {
 				parts = append(parts, fmt.Sprintf("%d failure(s)", failures))
 			}
-			fmt.Fprintln(w, r.warn(strings.Join(parts, ", ")))
+			_, _ = fmt.Fprintln(w, r.warn(strings.Join(parts, ", ")))
 		}
 
 		if code != 0 {

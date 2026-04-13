@@ -41,26 +41,26 @@ var statusCmd = &cobra.Command{
 		color := shouldColorizeFunc()
 		r := doctorRenderer{color: color}
 
-		fmt.Fprintln(w, r.bold("verk status"))
-		fmt.Fprintln(w, r.dim(strings.Repeat("─", 40)))
-		fmt.Fprintln(w)
+		_, _ = fmt.Fprintln(w, r.bold("verk status"))
+		_, _ = fmt.Fprintln(w, r.dim(strings.Repeat("─", 40)))
+		_, _ = fmt.Fprintln(w)
 
-		fmt.Fprintf(w, "  Run:    %s\n", report.RunID)
+		_, _ = fmt.Fprintf(w, "  Run:    %s\n", report.RunID)
 		runStatus := formatRunStatus(r, report.RunStatus)
 		if report.RunStatus == state.EpicRunStatusRunning {
 			if repoRoot != "" && !engine.IsRunLockHeld(repoRoot, report.RunID) {
 				runStatus = r.fail("stale") + r.dim(" (process died — use 'verk run' to resume)")
 			}
 		}
-		fmt.Fprintf(w, "  Status: %s\n", runStatus)
+		_, _ = fmt.Fprintf(w, "  Status: %s\n", runStatus)
 		if report.CurrentWave != "" {
-			fmt.Fprintf(w, "  Wave:   %s\n", report.CurrentWave)
+			_, _ = fmt.Fprintf(w, "  Wave:   %s\n", report.CurrentWave)
 		}
 		if report.LastFailedGate != "" {
-			fmt.Fprintf(w, "  Gate:   %s\n", r.fail(report.LastFailedGate))
+			_, _ = fmt.Fprintf(w, "  Gate:   %s\n", r.fail(report.LastFailedGate))
 		}
 
-		fmt.Fprintf(w, "\n  %s\n\n", r.bold("Tickets:"))
+		_, _ = fmt.Fprintf(w, "\n  %s\n\n", r.bold("Tickets:"))
 
 		tickets := sortTicketsByPhase(report.Tickets)
 		closed, blocked, active, pending := 0, 0, 0, 0
@@ -71,11 +71,11 @@ var statusCmd = &cobra.Command{
 				title = fmt.Sprintf("%-10s %s", ticket.TicketID, ticket.Title)
 			}
 
-			fmt.Fprintf(w, "  %s %s\n", tagFn(r, tag), title)
+			_, _ = fmt.Fprintf(w, "  %s %s\n", tagFn(r, tag), title)
 
 			if ticket.BlockReason != "" {
 				reason := shortenBlockReason(ticket.BlockReason)
-				fmt.Fprintf(w, "  %s %s\n", strings.Repeat(" ", len(tag)), r.dim(reason))
+				_, _ = fmt.Fprintf(w, "  %s %s\n", strings.Repeat(" ", len(tag)), r.dim(reason))
 			}
 
 			switch ticket.Phase {
@@ -90,7 +90,7 @@ var statusCmd = &cobra.Command{
 			}
 		}
 
-		fmt.Fprintln(w)
+		_, _ = fmt.Fprintln(w)
 		parts := make([]string, 0, 4)
 		if closed > 0 {
 			parts = append(parts, fmt.Sprintf("%d closed", closed))
@@ -105,7 +105,7 @@ var statusCmd = &cobra.Command{
 			parts = append(parts, fmt.Sprintf("%d pending", pending))
 		}
 		if len(parts) > 0 {
-			fmt.Fprintf(w, "  %s\n", strings.Join(parts, ", "))
+			_, _ = fmt.Fprintf(w, "  %s\n", strings.Join(parts, ", "))
 		}
 
 		return nil

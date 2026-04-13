@@ -382,28 +382,6 @@ func TestRunWorker_NeedsContextStatus(t *testing.T) {
 	}
 }
 
-func assertEnvValue(t *testing.T, env []string, key, want string) {
-	t.Helper()
-	for _, pair := range env {
-		if strings.HasPrefix(pair, key+"=") {
-			if got := strings.TrimPrefix(pair, key+"="); got != want {
-				t.Fatalf("expected %s=%q, got %q", key, want, got)
-			}
-			return
-		}
-	}
-	t.Fatalf("expected %s in env, got %v", key, env)
-}
-
-func assertEnvMissing(t *testing.T, env []string, key string) {
-	t.Helper()
-	for _, pair := range env {
-		if strings.HasPrefix(pair, key+"=") {
-			t.Fatalf("expected %s to be omitted, got env %v", key, env)
-		}
-	}
-}
-
 func hasArg(args []string, value string) bool {
 	for _, arg := range args {
 		if arg == value {

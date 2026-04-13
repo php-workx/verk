@@ -5,8 +5,8 @@ import (
 	"strings"
 	"time"
 
-	tea "charm.land/bubbletea/v2"
 	"charm.land/bubbles/v2/spinner"
+	tea "charm.land/bubbletea/v2"
 
 	"verk/internal/engine"
 	"verk/internal/state"
@@ -32,12 +32,12 @@ type ticketLine struct {
 
 // waveState tracks a wave.
 type waveState struct {
-	id       int
-	tickets  []string
-	closed   int
-	total    int
-	done     bool
-	ok       bool
+	id      int
+	tickets []string
+	closed  int
+	total   int
+	done    bool
+	ok      bool
 }
 
 // Model is the Bubble Tea model for verk run progress.
@@ -48,7 +48,6 @@ type Model struct {
 	waves     []waveState
 	details   []string // rolling activity log (last 3)
 	done      bool
-	err       error
 	spinner   spinner.Model
 	startTime time.Time
 }
@@ -126,19 +125,20 @@ func (m *Model) handleEvent(evt engine.ProgressEvent) tea.Cmd {
 
 	case engine.EventTicketPhaseChanged:
 		tl := m.ensureTicket(evt.TicketID, evt.Title)
-		if evt.Phase == state.TicketPhaseClosed {
+		switch evt.Phase {
+		case state.TicketPhaseClosed:
 			tl.phases = append(tl.phases, "✓")
 			tl.done = true
 			tl.ok = true
 			tl.active = ""
 			tl.finishedAt = time.Now()
-		} else if evt.Phase == state.TicketPhaseBlocked {
+		case state.TicketPhaseBlocked:
 			tl.phases = append(tl.phases, "✗")
 			tl.done = true
 			tl.ok = false
 			tl.active = ""
 			tl.finishedAt = time.Now()
-		} else {
+		default:
 			tl.phases = append(tl.phases, shortPhaseName(evt.Phase))
 			tl.active = ""
 		}

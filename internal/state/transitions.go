@@ -42,7 +42,7 @@ func ValidateTicketTransition(from, to TicketPhase) error {
 	return nil
 }
 
-func EffectiveReviewThreshold(cli *Severity, ticket *Severity, cfg Severity) Severity {
+func EffectiveReviewThreshold(cli, ticket *Severity, cfg Severity) Severity {
 	if cli != nil {
 		return *cli
 	}

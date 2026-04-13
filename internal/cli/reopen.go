@@ -47,7 +47,7 @@ Examples:
 		}); err != nil {
 			return cmdError(cmd, err, 1)
 		}
-		fmt.Fprintf(cmd.OutOrStdout(), "reopened %s in %s to %s\n", args[1], args[0], reopenToPhase)
+		_, _ = fmt.Fprintf(cmd.OutOrStdout(), "reopened %s in %s to %s\n", args[1], args[0], reopenToPhase)
 		return nil
 	},
 }

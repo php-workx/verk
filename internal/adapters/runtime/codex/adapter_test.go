@@ -326,28 +326,6 @@ func TestRunWorker_SentinelFallback(t *testing.T) {
 	}
 }
 
-func assertEnvValue(t *testing.T, env []string, key, want string) {
-	t.Helper()
-	for _, pair := range env {
-		if strings.HasPrefix(pair, key+"=") {
-			if got := strings.TrimPrefix(pair, key+"="); got != want {
-				t.Fatalf("expected %s=%q, got %q", key, want, got)
-			}
-			return
-		}
-	}
-	t.Fatalf("expected %s in env, got %v", key, env)
-}
-
-func assertEnvMissing(t *testing.T, env []string, key string) {
-	t.Helper()
-	for _, pair := range env {
-		if strings.HasPrefix(pair, key+"=") {
-			t.Fatalf("expected %s to be omitted, got env %v", key, env)
-		}
-	}
-}
-
 func hasArg(args []string, value string) bool {
 	for _, arg := range args {
 		if arg == value {
@@ -355,17 +333,4 @@ func hasArg(args []string, value string) bool {
 		}
 	}
 	return false
-}
-
-func assertArgValue(t *testing.T, args []string, flag, want string) {
-	t.Helper()
-	for i := 0; i+1 < len(args); i++ {
-		if args[i] == flag {
-			if args[i+1] != want {
-				t.Fatalf("expected %s %q, got %q", flag, want, args[i+1])
-			}
-			return
-		}
-	}
-	t.Fatalf("expected flag %s in args: %v", flag, args)
 }

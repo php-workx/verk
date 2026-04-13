@@ -135,9 +135,9 @@ func TestValidatePerTicketScope_MultipleTickets_CrossScopeViolation(t *testing.T
 
 func TestAcceptWave_RejectsEmptyTicketScopes(t *testing.T) {
 	wave := state.WaveArtifact{
-		WaveID:      "wave-1",
-		Status:      state.WaveStatusRunning,
-		TicketIDs:   []string{"ticket-a"},
+		WaveID:       "wave-1",
+		Status:       state.WaveStatusRunning,
+		TicketIDs:    []string{"ticket-a"},
 		PlannedScope: []string{"internal/app"},
 	}
 
@@ -156,11 +156,11 @@ func TestAcceptWave_RejectsEmptyTicketScopes(t *testing.T) {
 	}
 }
 
-func TestAcceptWave_PericTicketScopeValidation(t *testing.T) {
+func TestAcceptWave_PerTicketScopeValidation(t *testing.T) {
 	wave := state.WaveArtifact{
-		WaveID:      "wave-1",
-		Status:      state.WaveStatusRunning,
-		TicketIDs:   []string{"ticket-a"},
+		WaveID:       "wave-1",
+		Status:       state.WaveStatusRunning,
+		TicketIDs:    []string{"ticket-a"},
 		PlannedScope: []string{"internal/app"},
 	}
 

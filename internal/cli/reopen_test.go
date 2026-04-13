@@ -19,7 +19,7 @@ func TestIsValidReopenPhase(t *testing.T) {
 		{"blocked", false},
 		{"closed", false},
 		{"review", false},
-		{"IMPLEMENT", false}, // case-sensitive
+		{"IMPLEMENT", false},  // case-sensitive
 		{"implement ", false}, // whitespace not trimmed
 	}
 	for _, tt := range tests {
@@ -108,7 +108,7 @@ func osPipe(t *testing.T) (*os.File, *os.File) {
 	if err != nil {
 		t.Fatalf("os.Pipe: %v", err)
 	}
-	t.Cleanup(func() { r.Close() })
-	t.Cleanup(func() { w.Close() })
+	t.Cleanup(func() { _ = r.Close() })
+	t.Cleanup(func() { _ = w.Close() })
 	return r, w
 }

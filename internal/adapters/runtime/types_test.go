@@ -53,7 +53,8 @@ func TestWorkerResultValidate_AllowsOnlyCanonicalImplementerStatuses(t *testing.
 
 func TestReviewResultValidate_NormalizesFindings(t *testing.T) {
 	startedAt, finishedAt := fixedRuntimeTimes()
-	waiverExpiresAt := finishedAt.Add(24 * time.Hour)
+	// Use time.Now() to ensure the expiry is always in the future regardless of when the test runs.
+	waiverExpiresAt := time.Now().Add(24 * time.Hour)
 
 	valid := runtime.ReviewResult{
 		Status:             runtime.WorkerStatusDone,
@@ -207,6 +208,114 @@ func TestReviewResultValidate_RequiresDerivedStatusToMatchFindings(t *testing.T)
 	}
 	if err := result.Validate(runtime.SeverityP2); err == nil {
 		t.Fatalf("expected contradictory review status to be rejected")
+	}
+}
+
+func TestIsBlockingFinding_ExpiredWaiverIsReElevated(t *testing.T) {
+	past := time.Now().Add(-1 * time.Hour)
+	future := time.Now().Add(1 * time.Hour)
+
+	makeResult := func(disposition runtime.ReviewDisposition, waiverExpiresAt *time.Time) runtime.ReviewResult {
+		finding := runtime.ReviewFinding{
+			ID:          "f-1",
+			Severity:    runtime.SeverityP2,
+			Title:       "finding",
+			Body:        "finding body",
+			File:        "internal/example.go",
+			Line:        1,
+			Disposition: disposition,
+		}
+		if disposition == runtime.ReviewDispositionWaived {
+			finding.WaivedBy = "reviewer"
+			finding.WaivedAt = time.Now().Add(-2 * time.Hour)
+			finding.WaiverReason = "temporary waiver"
+			finding.WaiverExpiresAt = waiverExpiresAt
+		}
+		return runtime.ReviewResult{
+			Findings: []runtime.ReviewFinding{finding},
+		}
+	}
+
+	for _, tc := range []struct {
+		name            string
+		disposition     runtime.ReviewDisposition
+		waiverExpiresAt *time.Time
+		wantStatus      runtime.ReviewStatus
+	}{
+		{
+			name:            "waived with expired waiver is re-elevated to blocking",
+			disposition:     runtime.ReviewDispositionWaived,
+			waiverExpiresAt: &past,
+			wantStatus:      runtime.ReviewStatusFindings,
+		},
+		{
+			name:            "waived with future expiry remains non-blocking",
+			disposition:     runtime.ReviewDispositionWaived,
+			waiverExpiresAt: &future,
+			wantStatus:      runtime.ReviewStatusPassed,
+		},
+		{
+			name:            "waived with nil expiry is permanent waiver (non-blocking)",
+			disposition:     runtime.ReviewDispositionWaived,
+			waiverExpiresAt: nil,
+			wantStatus:      runtime.ReviewStatusPassed,
+		},
+		{
+			name:        "open finding is blocking",
+			disposition: runtime.ReviewDispositionOpen,
+			wantStatus:  runtime.ReviewStatusFindings,
+		},
+		{
+			name:        "resolved finding is non-blocking",
+			disposition: runtime.ReviewDispositionResolved,
+			wantStatus:  runtime.ReviewStatusPassed,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			result := makeResult(tc.disposition, tc.waiverExpiresAt)
+			got := result.DerivedReviewStatus(runtime.SeverityP2)
+			if got != tc.wantStatus {
+				t.Fatalf("expected DerivedReviewStatus to be %q, got %q", tc.wantStatus, got)
+			}
+		})
+	}
+}
+
+func TestIsBlockingFinding_ExpiredWaiverRespectsSeverityThreshold(t *testing.T) {
+	past := time.Now().Add(-1 * time.Hour)
+
+	makeResult := func(severity runtime.Severity) runtime.ReviewResult {
+		waivedAt := time.Now().Add(-2 * time.Hour)
+		return runtime.ReviewResult{
+			Findings: []runtime.ReviewFinding{
+				{
+					ID:              "f-1",
+					Severity:        severity,
+					Title:           "expired waiver finding",
+					Body:            "expired waiver finding",
+					File:            "internal/example.go",
+					Line:            1,
+					Disposition:     runtime.ReviewDispositionWaived,
+					WaivedBy:        "reviewer",
+					WaivedAt:        waivedAt,
+					WaiverReason:    "temporary",
+					WaiverExpiresAt: &past,
+				},
+			},
+		}
+	}
+
+	// Expired waiver with severity at/above threshold (P2) → blocking
+	if got := makeResult(runtime.SeverityP2).DerivedReviewStatus(runtime.SeverityP2); got != runtime.ReviewStatusFindings {
+		t.Fatalf("expected expired waived P2 finding at P2 threshold to be findings, got %q", got)
+	}
+	if got := makeResult(runtime.SeverityP1).DerivedReviewStatus(runtime.SeverityP2); got != runtime.ReviewStatusFindings {
+		t.Fatalf("expected expired waived P1 finding at P2 threshold to be findings, got %q", got)
+	}
+
+	// Expired waiver with severity below threshold (P3 below P2) → not blocking
+	if got := makeResult(runtime.SeverityP3).DerivedReviewStatus(runtime.SeverityP2); got != runtime.ReviewStatusPassed {
+		t.Fatalf("expected expired waived P3 finding at P2 threshold to be passed, got %q", got)
 	}
 }
 

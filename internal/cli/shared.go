@@ -147,7 +147,7 @@ func resolveRunID(args []string) (string, error) {
 // cmdError prints an error to the command's stderr and returns it as a cobra error.
 // It silences cobra's own error output to avoid duplication.
 func cmdError(cmd *cobra.Command, err error, code int) error {
-	fmt.Fprintf(cmd.ErrOrStderr(), "Error: %s\n", err)
+	_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "Error: %s\n", err)
 	cmd.SilenceErrors = true
 	return withExitCode(err, code)
 }

@@ -8,12 +8,16 @@ import (
 	"verk/internal/state"
 )
 
-type WorkerStatus string
-type ReviewStatus string
-type ReviewDisposition string
+type (
+	WorkerStatus      string
+	ReviewStatus      string
+	ReviewDisposition string
+)
 
-type RetryClass = state.RetryClass
-type Severity = state.Severity
+type (
+	RetryClass = state.RetryClass
+	Severity   = state.Severity
+)
 
 const (
 	WorkerStatusDone             WorkerStatus = "done"
@@ -48,32 +52,32 @@ const (
 )
 
 type WorkerRequest struct {
-	RunID             string          `json:"run_id,omitempty"`
-	TicketID          string          `json:"ticket_id,omitempty"`
-	WaveID            string          `json:"wave_id,omitempty"`
-	LeaseID           string          `json:"lease_id"`
-	Attempt           int             `json:"attempt,omitempty"`
-	Runtime           string          `json:"runtime,omitempty"`
-	WorktreePath      string          `json:"worktree_path,omitempty"`
-	InputArtifactPath string          `json:"input_artifact_path,omitempty"`
-	Instructions      string          `json:"instructions,omitempty"`
-	ExecutionConfig   ExecutionConfig `json:"execution_config,omitempty"`
+	RunID             string              `json:"run_id,omitempty"`
+	TicketID          string              `json:"ticket_id,omitempty"`
+	WaveID            string              `json:"wave_id,omitempty"`
+	LeaseID           string              `json:"lease_id"`
+	Attempt           int                 `json:"attempt,omitempty"`
+	Runtime           string              `json:"runtime,omitempty"`
+	WorktreePath      string              `json:"worktree_path,omitempty"`
+	InputArtifactPath string              `json:"input_artifact_path,omitempty"`
+	Instructions      string              `json:"instructions,omitempty"`
+	ExecutionConfig   ExecutionConfig     `json:"execution_config,omitempty"`
 	OnProgress        func(detail string) `json:"-"` // called with tool-use summaries during execution
 }
 
 type ReviewRequest struct {
-	RunID                    string          `json:"run_id,omitempty"`
-	TicketID                 string          `json:"ticket_id,omitempty"`
-	WaveID                   string          `json:"wave_id,omitempty"`
-	LeaseID                  string          `json:"lease_id"`
-	Attempt                  int             `json:"attempt,omitempty"`
-	Runtime                  string          `json:"runtime,omitempty"`
-	InputArtifactPath        string          `json:"input_artifact_path,omitempty"`
-	Instructions             string          `json:"instructions,omitempty"`
-	Diff                     string          `json:"diff,omitempty"`
-	Standards                string          `json:"standards,omitempty"`
-	EffectiveReviewThreshold Severity        `json:"effective_review_threshold"`
-	ExecutionConfig          ExecutionConfig `json:"execution_config,omitempty"`
+	RunID                    string              `json:"run_id,omitempty"`
+	TicketID                 string              `json:"ticket_id,omitempty"`
+	WaveID                   string              `json:"wave_id,omitempty"`
+	LeaseID                  string              `json:"lease_id"`
+	Attempt                  int                 `json:"attempt,omitempty"`
+	Runtime                  string              `json:"runtime,omitempty"`
+	InputArtifactPath        string              `json:"input_artifact_path,omitempty"`
+	Instructions             string              `json:"instructions,omitempty"`
+	Diff                     string              `json:"diff,omitempty"`
+	Standards                string              `json:"standards,omitempty"`
+	EffectiveReviewThreshold Severity            `json:"effective_review_threshold"`
+	ExecutionConfig          ExecutionConfig     `json:"execution_config,omitempty"`
 	OnProgress               func(detail string) `json:"-"`
 }
 
@@ -302,7 +306,12 @@ func isCanonicalSeverity(severity Severity) bool {
 
 func isBlockingFinding(finding ReviewFinding, threshold Severity) bool {
 	if finding.Disposition != ReviewDispositionOpen {
-		return false
+		// Re-evaluate expired waivers as if they were open.
+		if finding.Disposition == ReviewDispositionWaived && finding.WaiverExpiresAt != nil && !finding.WaiverExpiresAt.After(time.Now()) {
+			// Waiver has expired: fall through to severity comparison below.
+		} else {
+			return false
+		}
 	}
 	findingRank := severityOrder[finding.Severity]
 	thresholdRank := severityOrder[threshold]

@@ -40,23 +40,23 @@ type commandResult struct {
 }
 
 type workerArtifact struct {
-	Runtime              string                   `json:"runtime"`
-	Request              runtime.WorkerRequest    `json:"request"`
-	CLIOutput            json.RawMessage          `json:"cli_output"`
-	ResultBlock          *runtime.VerkResultBlock `json:"result_block,omitempty"`
-	Normalized           runtime.WorkerResult     `json:"normalized"`
-	CapturedStdoutPath   string                   `json:"captured_stdout_path"`
-	CapturedStderrPath   string                   `json:"captured_stderr_path"`
+	Runtime            string                   `json:"runtime"`
+	Request            runtime.WorkerRequest    `json:"request"`
+	CLIOutput          json.RawMessage          `json:"cli_output"`
+	ResultBlock        *runtime.VerkResultBlock `json:"result_block,omitempty"`
+	Normalized         runtime.WorkerResult     `json:"normalized"`
+	CapturedStdoutPath string                   `json:"captured_stdout_path"`
+	CapturedStderrPath string                   `json:"captured_stderr_path"`
 }
 
 type reviewArtifact struct {
-	Runtime              string                    `json:"runtime"`
-	Request              runtime.ReviewRequest     `json:"request"`
-	CLIOutput            json.RawMessage           `json:"cli_output"`
-	ReviewBlock          *runtime.VerkReviewBlock  `json:"review_block,omitempty"`
-	Normalized           runtime.ReviewResult      `json:"normalized"`
-	CapturedStdoutPath   string                    `json:"captured_stdout_path"`
-	CapturedStderrPath   string                    `json:"captured_stderr_path"`
+	Runtime            string                   `json:"runtime"`
+	Request            runtime.ReviewRequest    `json:"request"`
+	CLIOutput          json.RawMessage          `json:"cli_output"`
+	ReviewBlock        *runtime.VerkReviewBlock `json:"review_block,omitempty"`
+	Normalized         runtime.ReviewResult     `json:"normalized"`
+	CapturedStdoutPath string                   `json:"captured_stdout_path"`
+	CapturedStderrPath string                   `json:"captured_stderr_path"`
 }
 
 func New() *Adapter {
@@ -631,12 +631,12 @@ func writeBytesArtifact(prefix string, data []byte) (string, error) {
 		return "", err
 	}
 	if _, err := file.Write(data); err != nil {
-		file.Close()
-		os.Remove(file.Name())
+		_ = file.Close()
+		_ = os.Remove(file.Name())
 		return "", err
 	}
 	if err := file.Close(); err != nil {
-		os.Remove(file.Name())
+		_ = os.Remove(file.Name())
 		return "", err
 	}
 	return file.Name(), nil
@@ -648,12 +648,12 @@ func writeJSONArtifact(prefix string, payload any) (string, error) {
 		return "", err
 	}
 	if err := encodeJSON(file, payload); err != nil {
-		file.Close()
-		os.Remove(file.Name())
+		_ = file.Close()
+		_ = os.Remove(file.Name())
 		return "", err
 	}
 	if err := file.Close(); err != nil {
-		os.Remove(file.Name())
+		_ = os.Remove(file.Name())
 		return "", err
 	}
 	return file.Name(), nil
@@ -667,7 +667,7 @@ func rewriteJSONArtifact(path string, payload any) error {
 	if err != nil {
 		return err
 	}
-	defer file.Close()
+	defer func() { _ = file.Close() }()
 	return encodeJSON(file, payload)
 }
 

@@ -2,11 +2,13 @@ package state
 
 import "time"
 
-type TicketPhase string
-type EpicRunStatus string
-type WaveStatus string
-type RetryClass string
-type Severity string
+type (
+	TicketPhase   string
+	EpicRunStatus string
+	WaveStatus    string
+	RetryClass    string
+	Severity      string
+)
 
 const (
 	TicketPhaseIntake    TicketPhase = "intake"

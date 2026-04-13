@@ -86,16 +86,16 @@ func doRunTicket(w, errw io.Writer, ticketID string) (string, error) {
 	plan.CreatedAt = time.Now().UTC()
 	plan.UpdatedAt = plan.CreatedAt
 
-	fmt.Fprintf(w, "run_id=%s\n", runID)
+	_, _ = fmt.Fprintf(w, "run_id=%s\n", runID)
 	if wErr := writeCurrentRunID(repoRoot, runID); wErr != nil {
-		fmt.Fprintf(errw, "warning: could not write current run: %v\n", wErr)
+		_, _ = fmt.Fprintf(errw, "warning: could not write current run: %v\n", wErr)
 	}
 
 	lock, err := engine.AcquireRunLock(repoRoot, runID)
 	if err != nil {
 		return runID, err
 	}
-	defer lock.Release()
+	defer func() { _ = lock.Release() }()
 
 	leaseID := fmt.Sprintf("lease-%s-%s", runID, ticketID)
 	claim, err := tkmd.AcquireClaim(repoRoot, runID, ticketID, leaseID, 30*time.Minute, time.Now().UTC())
@@ -162,7 +162,7 @@ func doRunTicket(w, errw io.Writer, ticketID string) (string, error) {
 	}()
 
 	if tuiErr := tui.RunProgress(runID, ch, w); tuiErr != nil {
-		fmt.Fprintf(errw, "warning: TUI error: %v\n", tuiErr)
+		_, _ = fmt.Fprintf(errw, "warning: TUI error: %v\n", tuiErr)
 	}
 
 	if runErr != nil {
@@ -183,7 +183,7 @@ func doRunTicket(w, errw io.Writer, ticketID string) (string, error) {
 	_ = tkmd.SaveTicket(filepath.Join(repoRoot, ".tickets", ticketID+".md"), ticket)
 	_ = state.SaveJSONAtomic(filepath.Join(repoRoot, ".verk", "runs", runID, "run.json"), run)
 
-	fmt.Fprintf(w, "status=%s phase=%s\n", run.Status, run.CurrentPhase)
+	_, _ = fmt.Fprintf(w, "status=%s phase=%s\n", run.Status, run.CurrentPhase)
 	return runID, nil
 }
 
@@ -211,9 +211,9 @@ func doRunEpic(w, errw io.Writer, ticketID string) (string, error) {
 	}
 	runID := newRunID(ticketID)
 
-	fmt.Fprintf(w, "run_id=%s\n", runID)
+	_, _ = fmt.Fprintf(w, "run_id=%s\n", runID)
 	if wErr := writeCurrentRunID(repoRoot, runID); wErr != nil {
-		fmt.Fprintf(errw, "warning: could not write current run: %v\n", wErr)
+		_, _ = fmt.Fprintf(errw, "warning: could not write current run: %v\n", wErr)
 	}
 
 	// Run engine with progress channel
@@ -238,33 +238,33 @@ func doRunEpic(w, errw io.Writer, ticketID string) (string, error) {
 	}()
 
 	if tuiErr := tui.RunProgress(runID, ch, w); tuiErr != nil {
-		fmt.Fprintf(errw, "warning: TUI error: %v\n", tuiErr)
+		_, _ = fmt.Fprintf(errw, "warning: TUI error: %v\n", tuiErr)
 	}
 
 	if runErr != nil {
 		return runID, runErr
 	}
 
-	fmt.Fprintf(w, "status=%s phase=%s\n", result.Run.Status, result.Run.CurrentPhase)
+	_, _ = fmt.Fprintf(w, "status=%s phase=%s\n", result.Run.Status, result.Run.CurrentPhase)
 	return runID, nil
 }
 
 func doAutoResume(w, errw io.Writer) error {
 	repoRoot, cfg, _, err := loadExecutionContext()
 	if err != nil {
-		fmt.Fprintf(w, "Error: %s\n", err)
+		_, _ = fmt.Fprintf(w, "Error: %s\n", err)
 		return withExitCode(err, 1)
 	}
 
 	runID, err := readCurrentRunID(repoRoot)
 	if err != nil {
 		msg := fmt.Errorf("could not read current run: %w", err)
-		fmt.Fprintf(w, "Error: %s\n", msg)
+		_, _ = fmt.Fprintf(w, "Error: %s\n", msg)
 		return withExitCode(msg, 1)
 	}
 	if runID == "" {
 		msg := fmt.Errorf("no active run — start one with: verk run ticket <id>")
-		fmt.Fprintf(w, "Error: %s\n", msg)
+		_, _ = fmt.Fprintf(w, "Error: %s\n", msg)
 		return withExitCode(msg, 1)
 	}
 
@@ -272,23 +272,23 @@ func doAutoResume(w, errw io.Writer) error {
 	runPath := filepath.Join(repoRoot, ".verk", "runs", runID, "run.json")
 	if loadErr := state.LoadJSON(runPath, &run); loadErr != nil {
 		msg := fmt.Errorf("could not load run %s: %w", runID, loadErr)
-		fmt.Fprintf(w, "Error: %s\n", msg)
+		_, _ = fmt.Fprintf(w, "Error: %s\n", msg)
 		return withExitCode(msg, 1)
 	}
 
 	switch run.Status {
 	case state.EpicRunStatusCompleted:
-		fmt.Fprintf(w, "Run %s is already completed.\n", runID)
-		fmt.Fprintf(w, "Start a new one with: verk run ticket <id>\n")
+		_, _ = fmt.Fprintf(w, "Run %s is already completed.\n", runID)
+		_, _ = fmt.Fprintf(w, "Start a new one with: verk run ticket <id>\n")
 		return nil
 	case state.EpicRunStatusBlocked:
-		fmt.Fprintf(w, "Run %s is blocked.\n", runID)
-		fmt.Fprintf(w, "Use 'verk reopen %s <ticket-id> --to implement' to unblock,\n", runID)
-		fmt.Fprintf(w, "then 'verk run' to continue.\n")
+		_, _ = fmt.Fprintf(w, "Run %s is blocked.\n", runID)
+		_, _ = fmt.Fprintf(w, "Use 'verk reopen %s <ticket-id> --to implement' to unblock,\n", runID)
+		_, _ = fmt.Fprintf(w, "then 'verk run' to continue.\n")
 		return nil
 	}
 
-	fmt.Fprintf(w, "Resuming run %s...\n", runID)
+	_, _ = fmt.Fprintf(w, "Resuming run %s...\n", runID)
 
 	// Resume with progress channel
 	ch := make(chan engine.ProgressEvent, 64)
@@ -308,12 +308,12 @@ func doAutoResume(w, errw io.Writer) error {
 	}()
 
 	if tuiErr := tui.RunProgress(runID, ch, w); tuiErr != nil {
-		fmt.Fprintf(errw, "warning: TUI error: %v\n", tuiErr)
+		_, _ = fmt.Fprintf(errw, "warning: TUI error: %v\n", tuiErr)
 	}
 
 	if resumeErr != nil {
 		return resumeErr
 	}
-	fmt.Fprintf(w, "status=%s\n", report.Run.Status)
+	_, _ = fmt.Fprintf(w, "status=%s\n", report.Run.Status)
 	return nil
 }

@@ -319,6 +319,253 @@ func TestReopenTicket_CommitFailureDoesNotMutateTicketStore(t *testing.T) {
 	}
 }
 
+func TestReopenTicket_MultiTicket_RunPhaseNotRolledBack(t *testing.T) {
+	// Regression: when ticket-a is in review and ticket-b is reopened to
+	// implement, the run phase must remain review (the most advanced active
+	// phase), not regress to implement.
+	repoRoot := t.TempDir()
+	runID := "run-multi-reopen"
+	ticketA := "ticket-a"
+	ticketB := "ticket-b"
+
+	writeOpRunFixture(t, repoRoot, runID, state.RunArtifact{
+		ArtifactMeta: state.ArtifactMeta{SchemaVersion: 1, RunID: runID},
+		Mode:         "epic",
+		RootTicketID: "epic-1",
+		Status:       state.EpicRunStatusBlocked,
+		CurrentPhase: state.TicketPhaseBlocked,
+		TicketIDs:    []string{ticketA, ticketB},
+		WaveIDs:      []string{"wave-1"},
+	})
+	writeWaveFixture(t, repoRoot, runID, state.WaveArtifact{
+		ArtifactMeta: state.ArtifactMeta{SchemaVersion: 1, RunID: runID},
+		WaveID:       "wave-1",
+		Ordinal:      1,
+		Status:       state.WaveStatusFailed,
+		TicketIDs:    []string{ticketB},
+	})
+	// ticket-a is already in review — it is the more advanced active phase.
+	writeTicketRunFixture(t, repoRoot, runID, TicketRunSnapshot{
+		ArtifactMeta: state.ArtifactMeta{SchemaVersion: 1, RunID: runID},
+		TicketID:     ticketA,
+		CurrentPhase: state.TicketPhaseReview,
+	})
+	writePlanFixture(t, repoRoot, runID, state.PlanArtifact{
+		ArtifactMeta:             state.ArtifactMeta{SchemaVersion: 1, RunID: runID},
+		TicketID:                 ticketA,
+		EffectiveReviewThreshold: state.SeverityP2,
+	})
+	writeTicketMarkdownFixture(t, repoRoot, tkmd.Ticket{
+		ID:                 ticketA,
+		Title:              "Ticket A in review",
+		Status:             tkmd.StatusOpen,
+		OwnedPaths:         []string{"internal/app"},
+		UnknownFrontmatter: map[string]any{"type": "task"},
+	})
+	// ticket-b is blocked and will be reopened to implement.
+	writeTicketRunFixture(t, repoRoot, runID, TicketRunSnapshot{
+		ArtifactMeta: state.ArtifactMeta{SchemaVersion: 1, RunID: runID},
+		TicketID:     ticketB,
+		CurrentPhase: state.TicketPhaseBlocked,
+		BlockReason:  "needs operator input",
+	})
+	writePlanFixture(t, repoRoot, runID, state.PlanArtifact{
+		ArtifactMeta:             state.ArtifactMeta{SchemaVersion: 1, RunID: runID},
+		TicketID:                 ticketB,
+		EffectiveReviewThreshold: state.SeverityP2,
+	})
+	writeTicketMarkdownFixture(t, repoRoot, tkmd.Ticket{
+		ID:                 ticketB,
+		Title:              "Ticket B blocked",
+		Status:             tkmd.StatusBlocked,
+		OwnedPaths:         []string{"internal/app"},
+		UnknownFrontmatter: map[string]any{"type": "task"},
+	})
+
+	if err := ReopenTicket(context.Background(), ReopenRequest{
+		RepoRoot: repoRoot,
+		RunID:    runID,
+		TicketID: ticketB,
+		ToPhase:  state.TicketPhaseImplement,
+	}); err != nil {
+		t.Fatalf("ReopenTicket returned error: %v", err)
+	}
+
+	var run state.RunArtifact
+	if err := state.LoadJSON(runJSONPath(repoRoot, runID), &run); err != nil {
+		t.Fatalf("load run.json: %v", err)
+	}
+	if run.Status != state.EpicRunStatusRunning {
+		t.Fatalf("expected run status running, got %q", run.Status)
+	}
+	// Review (priority 3) beats implement (priority 1): run must stay at review.
+	if run.CurrentPhase != state.TicketPhaseReview {
+		t.Fatalf("expected run phase review (ticket-a is still in review), got %q", run.CurrentPhase)
+	}
+}
+
+func TestReopenTicket_SingleTicket_CurrentPhaseSet(t *testing.T) {
+	// When a single ticket is reopened to implement, the run phase must be
+	// implement (not left as whatever the previous direct assignment set it to).
+	repoRoot := t.TempDir()
+	runID := "run-single-phase"
+	ticketID := "ticket-single"
+
+	writeOpRunFixture(t, repoRoot, runID, state.RunArtifact{
+		ArtifactMeta: state.ArtifactMeta{SchemaVersion: 1, RunID: runID},
+		Mode:         "epic",
+		RootTicketID: "epic-1",
+		Status:       state.EpicRunStatusBlocked,
+		CurrentPhase: state.TicketPhaseBlocked,
+		TicketIDs:    []string{ticketID},
+		WaveIDs:      []string{"wave-single"},
+	})
+	writeWaveFixture(t, repoRoot, runID, state.WaveArtifact{
+		ArtifactMeta: state.ArtifactMeta{SchemaVersion: 1, RunID: runID},
+		WaveID:       "wave-single",
+		Ordinal:      1,
+		Status:       state.WaveStatusFailed,
+		TicketIDs:    []string{ticketID},
+	})
+	writeTicketRunFixture(t, repoRoot, runID, TicketRunSnapshot{
+		ArtifactMeta: state.ArtifactMeta{SchemaVersion: 1, RunID: runID},
+		TicketID:     ticketID,
+		CurrentPhase: state.TicketPhaseBlocked,
+		BlockReason:  "operator input needed",
+	})
+	writePlanFixture(t, repoRoot, runID, state.PlanArtifact{
+		ArtifactMeta:             state.ArtifactMeta{SchemaVersion: 1, RunID: runID},
+		TicketID:                 ticketID,
+		EffectiveReviewThreshold: state.SeverityP2,
+	})
+	writeTicketMarkdownFixture(t, repoRoot, tkmd.Ticket{
+		ID:                 ticketID,
+		Title:              "Single ticket",
+		Status:             tkmd.StatusBlocked,
+		OwnedPaths:         []string{"internal/app"},
+		UnknownFrontmatter: map[string]any{"type": "task"},
+	})
+
+	if err := ReopenTicket(context.Background(), ReopenRequest{
+		RepoRoot: repoRoot,
+		RunID:    runID,
+		TicketID: ticketID,
+		ToPhase:  state.TicketPhaseImplement,
+	}); err != nil {
+		t.Fatalf("ReopenTicket returned error: %v", err)
+	}
+
+	var run state.RunArtifact
+	if err := state.LoadJSON(runJSONPath(repoRoot, runID), &run); err != nil {
+		t.Fatalf("load run.json: %v", err)
+	}
+	if run.Status != state.EpicRunStatusRunning {
+		t.Fatalf("expected run status running, got %q", run.Status)
+	}
+	if run.CurrentPhase != state.TicketPhaseImplement {
+		t.Fatalf("expected run phase implement, got %q", run.CurrentPhase)
+	}
+}
+
+func TestReopenTicket_MultiTicket_BothReopened_MostAdvancedPhaseWins(t *testing.T) {
+	// When two tickets in a run are both reopened (in separate calls) — one
+	// to implement and the other to repair — the run phase should reflect
+	// repair (higher priority) after the second reopen.
+	repoRoot := t.TempDir()
+	runID := "run-both-reopened"
+	ticketA := "ticket-aa"
+	ticketB := "ticket-bb"
+
+	writeOpRunFixture(t, repoRoot, runID, state.RunArtifact{
+		ArtifactMeta: state.ArtifactMeta{SchemaVersion: 1, RunID: runID},
+		Mode:         "epic",
+		RootTicketID: "epic-1",
+		Status:       state.EpicRunStatusBlocked,
+		CurrentPhase: state.TicketPhaseBlocked,
+		TicketIDs:    []string{ticketA, ticketB},
+		WaveIDs:      []string{"wave-both"},
+	})
+	writeWaveFixture(t, repoRoot, runID, state.WaveArtifact{
+		ArtifactMeta: state.ArtifactMeta{SchemaVersion: 1, RunID: runID},
+		WaveID:       "wave-both",
+		Ordinal:      1,
+		Status:       state.WaveStatusFailed,
+		TicketIDs:    []string{ticketA, ticketB},
+	})
+	writeTicketRunFixture(t, repoRoot, runID, TicketRunSnapshot{
+		ArtifactMeta: state.ArtifactMeta{SchemaVersion: 1, RunID: runID},
+		TicketID:     ticketA,
+		CurrentPhase: state.TicketPhaseBlocked,
+		BlockReason:  "blocked-a",
+	})
+	writePlanFixture(t, repoRoot, runID, state.PlanArtifact{
+		ArtifactMeta:             state.ArtifactMeta{SchemaVersion: 1, RunID: runID},
+		TicketID:                 ticketA,
+		EffectiveReviewThreshold: state.SeverityP2,
+	})
+	writeTicketMarkdownFixture(t, repoRoot, tkmd.Ticket{
+		ID:                 ticketA,
+		Title:              "Ticket AA",
+		Status:             tkmd.StatusBlocked,
+		OwnedPaths:         []string{"internal/app"},
+		UnknownFrontmatter: map[string]any{"type": "task"},
+	})
+	writeTicketRunFixture(t, repoRoot, runID, TicketRunSnapshot{
+		ArtifactMeta: state.ArtifactMeta{SchemaVersion: 1, RunID: runID},
+		TicketID:     ticketB,
+		CurrentPhase: state.TicketPhaseBlocked,
+		BlockReason:  "blocked-b",
+	})
+	writePlanFixture(t, repoRoot, runID, state.PlanArtifact{
+		ArtifactMeta:             state.ArtifactMeta{SchemaVersion: 1, RunID: runID},
+		TicketID:                 ticketB,
+		EffectiveReviewThreshold: state.SeverityP2,
+	})
+	writeTicketMarkdownFixture(t, repoRoot, tkmd.Ticket{
+		ID:                 ticketB,
+		Title:              "Ticket BB",
+		Status:             tkmd.StatusBlocked,
+		OwnedPaths:         []string{"internal/app"},
+		UnknownFrontmatter: map[string]any{"type": "task"},
+	})
+
+	// Reopen ticket-a to implement.
+	if err := ReopenTicket(context.Background(), ReopenRequest{
+		RepoRoot: repoRoot,
+		RunID:    runID,
+		TicketID: ticketA,
+		ToPhase:  state.TicketPhaseImplement,
+	}); err != nil {
+		t.Fatalf("first ReopenTicket returned error: %v", err)
+	}
+
+	// Before the second reopen, update ticket-b's markdown so it can be
+	// loaded as blocked again (the first reopen only touched ticket-a).
+	// Nothing to do: ticket-b is still blocked in its snapshot.
+
+	// Reopen ticket-b to repair (higher priority than implement).
+	if err := ReopenTicket(context.Background(), ReopenRequest{
+		RepoRoot: repoRoot,
+		RunID:    runID,
+		TicketID: ticketB,
+		ToPhase:  state.TicketPhaseRepair,
+	}); err != nil {
+		t.Fatalf("second ReopenTicket returned error: %v", err)
+	}
+
+	var run state.RunArtifact
+	if err := state.LoadJSON(runJSONPath(repoRoot, runID), &run); err != nil {
+		t.Fatalf("load run.json: %v", err)
+	}
+	if run.Status != state.EpicRunStatusRunning {
+		t.Fatalf("expected run status running, got %q", run.Status)
+	}
+	// repair (priority 4) beats implement (priority 1).
+	if run.CurrentPhase != state.TicketPhaseRepair {
+		t.Fatalf("expected run phase repair (most advanced of implement+repair), got %q", run.CurrentPhase)
+	}
+}
+
 func writeTicketMarkdownFixture(t *testing.T, repoRoot string, ticket tkmd.Ticket) {
 	t.Helper()
 	if err := tkmd.SaveTicket(filepath.Join(repoRoot, ".tickets", ticket.ID+".md"), ticket); err != nil {

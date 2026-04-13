@@ -74,7 +74,7 @@ func CheckScopeViolation(changed, owned []string) error {
 // ticket's declared scope, and that every ticket declares a non-empty scope.
 // This is stricter than checking against the wave-wide union (PlannedScope) because
 // it also catches tickets with no scope declarations (G9: fail closed).
-func validatePerTicketScope(ticketIDs []string, changedFiles []string, ticketScopes map[string][]string) error {
+func validatePerTicketScope(ticketIDs, changedFiles []string, ticketScopes map[string][]string) error {
 	if len(ticketScopes) == 0 {
 		return fmt.Errorf("scope violation: cannot verify scope — no ticket scope declarations provided")
 	}

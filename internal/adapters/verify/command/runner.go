@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -15,6 +16,21 @@ import (
 )
 
 const defaultVerificationTimeout = 15 * time.Minute
+
+// artifactFile is the interface for command output artifact files.
+// Declared as an interface to allow test injection of closers that simulate
+// write or close errors.
+type artifactFile interface {
+	io.Writer
+	io.Closer
+}
+
+// createArtifactFile creates a stdout/stderr artifact file at the given path.
+// It is a package-level variable so tests can inject a failing implementation
+// to verify that Close() errors are propagated.
+var createArtifactFile = func(name string) (artifactFile, error) {
+	return os.Create(name)
+}
 
 type CommandResult struct {
 	Command    string    `json:"command"`
@@ -71,59 +87,72 @@ func RunCommands(ctx context.Context, repoRoot string, cmds []string, cfg policy
 
 		stdoutPath := filepath.Join(runDir, fmt.Sprintf("command-%02d.stdout.log", i+1))
 		stderrPath := filepath.Join(runDir, fmt.Sprintf("command-%02d.stderr.log", i+1))
-		stdoutFile, err := os.Create(stdoutPath)
+
+		result, err := func() (r CommandResult, retErr error) {
+			stdoutFile, err := createArtifactFile(stdoutPath)
+			if err != nil {
+				return r, fmt.Errorf("create stdout artifact for command %d: %w", i+1, err)
+			}
+			defer func() {
+				if cerr := stdoutFile.Close(); cerr != nil && retErr == nil {
+					retErr = fmt.Errorf("close stdout artifact for command %d: %w", i+1, cerr)
+				}
+			}()
+			stderrFile, err := createArtifactFile(stderrPath)
+			if err != nil {
+				return r, fmt.Errorf("create stderr artifact for command %d: %w", i+1, err)
+			}
+			defer func() {
+				if cerr := stderrFile.Close(); cerr != nil && retErr == nil {
+					retErr = fmt.Errorf("close stderr artifact for command %d: %w", i+1, cerr)
+				}
+			}()
+
+			startedAt := time.Now().UTC()
+			cmdCtx, cancel := context.WithTimeout(ctx, timeout)
+			defer cancel()
+			cmd := exec.CommandContext(cmdCtx, "/bin/sh", "-c", command)
+			cmd.Dir = absRepoRoot
+			cmd.Env = env
+			cmd.Stdout = stdoutFile
+			cmd.Stderr = stderrFile
+
+			execErr := cmd.Run()
+			finishedAt := time.Now().UTC()
+			cmdErr := cmdCtx.Err()
+			parentErr := ctx.Err()
+
+			timedOut := errors.Is(cmdErr, context.DeadlineExceeded) || errors.Is(parentErr, context.DeadlineExceeded)
+			if execErr != nil && !timedOut && !isExpectedExecutionFailure(execErr) {
+				return r, fmt.Errorf("run verification command %d: %w", i+1, execErr)
+			}
+
+			exitCode := 0
+			switch {
+			case timedOut:
+				exitCode = -1
+			case cmd.ProcessState != nil:
+				exitCode = cmd.ProcessState.ExitCode()
+			case execErr != nil:
+				exitCode = exitCodeFromError(execErr)
+			}
+
+			return CommandResult{
+				Command:    command,
+				Cwd:        absRepoRoot,
+				ExitCode:   exitCode,
+				TimedOut:   timedOut,
+				DurationMS: finishedAt.Sub(startedAt).Milliseconds(),
+				StdoutPath: stdoutPath,
+				StderrPath: stderrPath,
+				StartedAt:  startedAt,
+				FinishedAt: finishedAt,
+			}, nil
+		}()
 		if err != nil {
-			return results, fmt.Errorf("create stdout artifact for command %d: %w", i+1, err)
+			return results, err
 		}
-		stderrFile, err := os.Create(stderrPath)
-		if err != nil {
-			_ = stdoutFile.Close()
-			return results, fmt.Errorf("create stderr artifact for command %d: %w", i+1, err)
-		}
-
-		startedAt := time.Now().UTC()
-		cmdCtx, cancel := context.WithTimeout(ctx, timeout)
-		cmd := exec.CommandContext(cmdCtx, "/bin/sh", "-c", command)
-		cmd.Dir = absRepoRoot
-		cmd.Env = env
-		cmd.Stdout = stdoutFile
-		cmd.Stderr = stderrFile
-
-		runErr := cmd.Run()
-		finishedAt := time.Now().UTC()
-		cmdErr := cmdCtx.Err()
-		parentErr := ctx.Err()
-		cancel()
-
-		_ = stdoutFile.Close()
-		_ = stderrFile.Close()
-
-		timedOut := errors.Is(cmdErr, context.DeadlineExceeded) || errors.Is(parentErr, context.DeadlineExceeded)
-		if runErr != nil && !timedOut && !isExpectedExecutionFailure(runErr) {
-			return results, fmt.Errorf("run verification command %d: %w", i+1, runErr)
-		}
-
-		exitCode := 0
-		switch {
-		case timedOut:
-			exitCode = -1
-		case cmd.ProcessState != nil:
-			exitCode = cmd.ProcessState.ExitCode()
-		case runErr != nil:
-			exitCode = exitCodeFromError(runErr)
-		}
-
-		results = append(results, CommandResult{
-			Command:    command,
-			Cwd:        absRepoRoot,
-			ExitCode:   exitCode,
-			TimedOut:   timedOut,
-			DurationMS: finishedAt.Sub(startedAt).Milliseconds(),
-			StdoutPath: stdoutPath,
-			StderrPath: stderrPath,
-			StartedAt:  startedAt,
-			FinishedAt: finishedAt,
-		})
+		results = append(results, result)
 	}
 
 	return results, nil
@@ -146,6 +175,14 @@ func RunQualityCommands(ctx context.Context, repoRoot string, cmds []policy.Qual
 		return nil, fmt.Errorf("resolve repo root %q: %w", repoRoot, err)
 	}
 	absRepoRoot = filepath.Clean(absRepoRoot)
+
+	info, err := os.Stat(absRepoRoot)
+	if err != nil {
+		return nil, fmt.Errorf("stat repo root %q: %w", absRepoRoot, err)
+	}
+	if !info.IsDir() {
+		return nil, fmt.Errorf("repo root %q is not a directory", absRepoRoot)
+	}
 
 	env := verificationEnv(cfg.EnvPassthrough)
 	timeout := time.Duration(cfg.DefaultTimeoutMinutes) * time.Minute
@@ -178,59 +215,74 @@ func RunQualityCommands(ctx context.Context, repoRoot string, cmds []policy.Qual
 
 			stdoutPath := filepath.Join(runDir, fmt.Sprintf("command-%02d.stdout.log", cmdIndex+1))
 			stderrPath := filepath.Join(runDir, fmt.Sprintf("command-%02d.stderr.log", cmdIndex+1))
-			stdoutFile, err := os.Create(stdoutPath)
+
+			// Capture cmdIndex for use in the closure; it is mutated after this block.
+			idx := cmdIndex
+			result, err := func() (r CommandResult, retErr error) {
+				stdoutFile, err := createArtifactFile(stdoutPath)
+				if err != nil {
+					return r, fmt.Errorf("create stdout artifact for quality command %d: %w", idx+1, err)
+				}
+				defer func() {
+					if cerr := stdoutFile.Close(); cerr != nil && retErr == nil {
+						retErr = fmt.Errorf("close stdout artifact for quality command %d: %w", idx+1, cerr)
+					}
+				}()
+				stderrFile, err := createArtifactFile(stderrPath)
+				if err != nil {
+					return r, fmt.Errorf("create stderr artifact for quality command %d: %w", idx+1, err)
+				}
+				defer func() {
+					if cerr := stderrFile.Close(); cerr != nil && retErr == nil {
+						retErr = fmt.Errorf("close stderr artifact for quality command %d: %w", idx+1, cerr)
+					}
+				}()
+
+				startedAt := time.Now().UTC()
+				cmdCtx, cancel := context.WithTimeout(ctx, timeout)
+				defer cancel()
+				cmd := exec.CommandContext(cmdCtx, "/bin/sh", "-c", command)
+				cmd.Dir = workDir
+				cmd.Env = env
+				cmd.Stdout = stdoutFile
+				cmd.Stderr = stderrFile
+
+				execErr := cmd.Run()
+				finishedAt := time.Now().UTC()
+				cmdErr := cmdCtx.Err()
+				parentErr := ctx.Err()
+
+				timedOut := errors.Is(cmdErr, context.DeadlineExceeded) || errors.Is(parentErr, context.DeadlineExceeded)
+				if execErr != nil && !timedOut && !isExpectedExecutionFailure(execErr) {
+					return r, fmt.Errorf("run quality command %d: %w", idx+1, execErr)
+				}
+
+				exitCode := 0
+				switch {
+				case timedOut:
+					exitCode = -1
+				case cmd.ProcessState != nil:
+					exitCode = cmd.ProcessState.ExitCode()
+				case execErr != nil:
+					exitCode = exitCodeFromError(execErr)
+				}
+
+				return CommandResult{
+					Command:    command,
+					Cwd:        workDir,
+					ExitCode:   exitCode,
+					TimedOut:   timedOut,
+					DurationMS: finishedAt.Sub(startedAt).Milliseconds(),
+					StdoutPath: stdoutPath,
+					StderrPath: stderrPath,
+					StartedAt:  startedAt,
+					FinishedAt: finishedAt,
+				}, nil
+			}()
 			if err != nil {
-				return results, fmt.Errorf("create stdout artifact for quality command %d: %w", cmdIndex+1, err)
+				return results, err
 			}
-			stderrFile, err := os.Create(stderrPath)
-			if err != nil {
-				_ = stdoutFile.Close()
-				return results, fmt.Errorf("create stderr artifact for quality command %d: %w", cmdIndex+1, err)
-			}
-
-			startedAt := time.Now().UTC()
-			cmdCtx, cancel := context.WithTimeout(ctx, timeout)
-			cmd := exec.CommandContext(cmdCtx, "/bin/sh", "-c", command)
-			cmd.Dir = workDir
-			cmd.Env = env
-			cmd.Stdout = stdoutFile
-			cmd.Stderr = stderrFile
-
-			runErr := cmd.Run()
-			finishedAt := time.Now().UTC()
-			cmdErr := cmdCtx.Err()
-			parentErr := ctx.Err()
-			cancel()
-
-			_ = stdoutFile.Close()
-			_ = stderrFile.Close()
-
-			timedOut := errors.Is(cmdErr, context.DeadlineExceeded) || errors.Is(parentErr, context.DeadlineExceeded)
-			if runErr != nil && !timedOut && !isExpectedExecutionFailure(runErr) {
-				return results, fmt.Errorf("run quality command %d: %w", cmdIndex+1, runErr)
-			}
-
-			exitCode := 0
-			switch {
-			case timedOut:
-				exitCode = -1
-			case cmd.ProcessState != nil:
-				exitCode = cmd.ProcessState.ExitCode()
-			case runErr != nil:
-				exitCode = exitCodeFromError(runErr)
-			}
-
-			results = append(results, CommandResult{
-				Command:    command,
-				Cwd:        workDir,
-				ExitCode:   exitCode,
-				TimedOut:   timedOut,
-				DurationMS: finishedAt.Sub(startedAt).Milliseconds(),
-				StdoutPath: stdoutPath,
-				StderrPath: stderrPath,
-				StartedAt:  startedAt,
-				FinishedAt: finishedAt,
-			})
+			results = append(results, result)
 			cmdIndex++
 		}
 	}
@@ -297,7 +349,7 @@ func isExpectedExecutionFailure(err error) bool {
 func exitCodeFromError(err error) int {
 	var exitErr *exec.ExitError
 	if errors.As(err, &exitErr) && exitErr.ProcessState != nil {
-		return exitErr.ProcessState.ExitCode()
+		return exitErr.ExitCode()
 	}
 	return -1
 }

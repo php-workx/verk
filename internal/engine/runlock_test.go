@@ -14,7 +14,7 @@ func TestAcquireRunLock_Success(t *testing.T) {
 	if err != nil {
 		t.Fatalf("AcquireRunLock failed: %v", err)
 	}
-	defer lock.Release()
+	defer func() { _ = lock.Release() }()
 
 	lockPath := filepath.Join(dir, ".verk", "runs", "run-test-1", "run.lock")
 	if lock.path != lockPath {
@@ -28,7 +28,7 @@ func TestAcquireRunLock_SecondAcquireFails(t *testing.T) {
 	if err != nil {
 		t.Fatalf("first AcquireRunLock failed: %v", err)
 	}
-	defer lock1.Release()
+	defer func() { _ = lock1.Release() }()
 
 	_, err = AcquireRunLock(dir, "run-test-2")
 	if err == nil {
@@ -53,7 +53,7 @@ func TestAcquireRunLock_ReleaseAllowsReacquire(t *testing.T) {
 	if err != nil {
 		t.Fatalf("second AcquireRunLock after release failed: %v", err)
 	}
-	defer lock2.Release()
+	defer func() { _ = lock2.Release() }()
 }
 
 func TestAcquireRunLock_DifferentRunsIndependent(t *testing.T) {
@@ -62,13 +62,13 @@ func TestAcquireRunLock_DifferentRunsIndependent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("AcquireRunLock run-a failed: %v", err)
 	}
-	defer lock1.Release()
+	defer func() { _ = lock1.Release() }()
 
 	lock2, err := AcquireRunLock(dir, "run-b")
 	if err != nil {
 		t.Fatalf("AcquireRunLock run-b failed: %v", err)
 	}
-	defer lock2.Release()
+	defer func() { _ = lock2.Release() }()
 }
 
 func TestAcquireRunLock_ConcurrentOnlyOneWinsAcrossProcesses(t *testing.T) {
@@ -90,7 +90,7 @@ func TestAcquireRunLock_ConcurrentOnlyOneWinsAcrossProcesses(t *testing.T) {
 				return
 			}
 			atomic.AddInt32(&acquired, 1)
-			lock.Release()
+			_ = lock.Release()
 		}()
 	}
 	wg.Wait()
@@ -134,7 +134,7 @@ func TestAcquireRunLock_MutualExclusionHeldAtAnyInstant(t *testing.T) {
 	}
 
 	// Step 4: Release and verify IsRunLockHeld now reports false.
-	lock1.Release()
+	_ = lock1.Release()
 	if IsRunLockHeld(dir, runID) {
 		t.Fatal("expected IsRunLockHeld to return false after release")
 	}
@@ -144,7 +144,7 @@ func TestAcquireRunLock_MutualExclusionHeldAtAnyInstant(t *testing.T) {
 	if err != nil {
 		t.Fatalf("AcquireRunLock after release: %v", err)
 	}
-	lock2.Release()
+	_ = lock2.Release()
 }
 
 func TestAcquireRunLock_MutualExclusionAcrossProcesses(t *testing.T) {
@@ -165,13 +165,13 @@ func TestAcquireRunLock_MutualExclusionAcrossProcesses(t *testing.T) {
 	}
 
 	// After releasing, acquisition should succeed.
-	lock1.Release()
+	_ = lock1.Release()
 
 	lock2, err := AcquireRunLock(dir, runID)
 	if err != nil {
 		t.Fatalf("AcquireRunLock after release failed: %v", err)
 	}
-	lock2.Release()
+	_ = lock2.Release()
 }
 
 func TestRunLock_ReleaseNil(t *testing.T) {
@@ -187,7 +187,7 @@ func TestAcquireRunLock_ContentionErrorMessage(t *testing.T) {
 	if err != nil {
 		t.Fatalf("AcquireRunLock failed: %v", err)
 	}
-	defer lock.Release()
+	defer func() { _ = lock.Release() }()
 
 	_, err = AcquireRunLock(dir, "run-contention-msg")
 	if err == nil {
