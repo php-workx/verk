@@ -69,46 +69,41 @@ func TestReopenCmd_ValidPhasesPassValidation(t *testing.T) {
 	}
 }
 
-func TestValidateReopenTransition(t *testing.T) {
+func TestReopenPhaseAllowList(t *testing.T) {
 	tests := []struct {
-		name    string
-		from    state.TicketPhase
-		to      state.TicketPhase
-		wantErr bool
+		name string
+		to   state.TicketPhase
+		want bool
 	}{
-		{"blocked -> implement", state.TicketPhaseBlocked, state.TicketPhaseImplement, false},
-		{"blocked -> repair", state.TicketPhaseBlocked, state.TicketPhaseRepair, false},
-		{"closed -> repair", state.TicketPhaseClosed, state.TicketPhaseRepair, false},
-		{"closed -> implement", state.TicketPhaseClosed, state.TicketPhaseImplement, true},
-		{"implement -> repair", state.TicketPhaseImplement, state.TicketPhaseRepair, true},
-		{"blocked -> blocked", state.TicketPhaseBlocked, state.TicketPhaseBlocked, true},
-		{"blocked -> closed", state.TicketPhaseBlocked, state.TicketPhaseClosed, true},
+		{"implement allowed", state.TicketPhaseImplement, true},
+		{"repair allowed", state.TicketPhaseRepair, true},
+		{"blocked rejected", state.TicketPhaseBlocked, false},
+		{"closed rejected", state.TicketPhaseClosed, false},
+		{"review rejected", state.TicketPhaseReview, false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			// We can't call validateReopenTransition directly from this package
-			// (it's in the engine package), so we verify that the CLI's
-			// isValidReopenPhase correctly gates the same set of transitions.
-			validPhase := isValidReopenPhase(string(tt.to))
-			if tt.wantErr && validPhase {
-				// The CLI would allow a phase that the engine rejects — but
-				// for the allowed phases {implement, repair}, all transitions
-				// that the CLI permits are also valid in the engine for
-				// blocked/closed tickets.
-				t.Logf("isValidReopenPhase(%q)=true — engine may still reject based on from-phase", tt.to)
+			got := isValidReopenPhase(string(tt.to))
+			if got != tt.want {
+				t.Fatalf("isValidReopenPhase(%q)=%v, want %v", tt.to, got, tt.want)
 			}
 		})
 	}
 }
 
-// osPipe creates a pair of connected *os.File for capturing CLI output.
+// osPipe creates a pair of writable temp files for capturing CLI stdout and stderr.
+// Using temp files avoids read-end/write-end confusion that arises with os.Pipe.
 func osPipe(t *testing.T) (*os.File, *os.File) {
 	t.Helper()
-	r, w, err := os.Pipe()
+	stdout, err := os.CreateTemp(t.TempDir(), "stdout-*")
 	if err != nil {
-		t.Fatalf("os.Pipe: %v", err)
+		t.Fatalf("create stdout temp file: %v", err)
 	}
-	t.Cleanup(func() { _ = r.Close() })
-	t.Cleanup(func() { _ = w.Close() })
-	return r, w
+	stderr, err := os.CreateTemp(t.TempDir(), "stderr-*")
+	if err != nil {
+		t.Fatalf("create stderr temp file: %v", err)
+	}
+	t.Cleanup(func() { _ = stdout.Close() })
+	t.Cleanup(func() { _ = stderr.Close() })
+	return stdout, stderr
 }

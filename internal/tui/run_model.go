@@ -198,7 +198,9 @@ func (m Model) View() tea.View {
 		b.WriteString("\n")
 	}
 
-	return tea.NewView(b.String())
+	v := tea.NewView(b.String())
+	v.DisableBracketedPasteMode = true
+	return v
 }
 
 func (m Model) renderWave(b *strings.Builder, w *waveState, isCurrent bool) {

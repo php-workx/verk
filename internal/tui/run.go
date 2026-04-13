@@ -3,6 +3,7 @@ package tui
 import (
 	"io"
 	"os"
+	"time"
 
 	tea "charm.land/bubbletea/v2"
 	term "github.com/charmbracelet/x/term"
@@ -26,7 +27,49 @@ func runBubbleTea(runID string, ch <-chan engine.ProgressEvent) error {
 		tea.WithInput(nil), // no keyboard input — prevents terminal capability query leaks
 	)
 	_, err := p.Run()
+
+	// Drain any leftover terminal capability responses (CSI ?2026$p,
+	// CSI ?2027$p, Kitty keyboard) that Bubble Tea v2's renderer probes
+	// during startup. These arrive after the TUI exits and would otherwise
+	// leak to stdout as garbage like "2026;2$y2027;1$y1u".
+	drainTerminalResponses()
+
 	return err
+}
+
+// drainTerminalResponses reads and discards any pending terminal response
+// sequences from stdin. Bubble Tea v2 sends DECRQM queries on startup
+// (mode 2026 for synchronized output, mode 2027 for unicode core, and
+// Kitty keyboard protocol). The terminal's responses can arrive after
+// the TUI exits, causing escape sequence garbage on the command line.
+func drainTerminalResponses() {
+	if !term.IsTerminal(os.Stdin.Fd()) {
+		return
+	}
+	// Set stdin to non-blocking raw mode briefly to drain responses.
+	// The DECRQM responses arrive almost instantly from the terminal.
+	oldState, err := term.MakeRaw(os.Stdin.Fd())
+	if err != nil {
+		return
+	}
+	// Set a short read deadline so we don't block if there's nothing to drain.
+	// We use a goroutine with a timeout since os.File doesn't support deadlines
+	// on all platforms.
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		buf := make([]byte, 256)
+		for {
+			if _, err := os.Stdin.Read(buf); err != nil {
+				return
+			}
+		}
+	}()
+	select {
+	case <-done:
+	case <-time.After(50 * time.Millisecond):
+	}
+	_ = term.Restore(os.Stdin.Fd(), oldState)
 }
 
 func isTerminal(w io.Writer) bool {
