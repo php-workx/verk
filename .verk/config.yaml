@@ -1,0 +1,26 @@
+scheduler:
+  max_concurrency: 4
+policy:
+  review_threshold: P2
+  max_implementation_attempts: 3
+  max_repair_cycles: 2
+  allow_dirty_worktree: true
+runtime:
+  default_runtime: claude
+  worker_timeout_minutes: 20
+  reviewer_timeout_minutes: 10
+  auth_env_vars: []
+verification:
+  default_timeout_minutes: 15
+  env_passthrough:
+    - PATH
+    - HOME
+    - CI
+  quality_commands:
+    - path: ""
+      run:
+        - just autofix
+        - just check
+logging:
+  level: ""
+  artifact_retention: 0

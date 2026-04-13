@@ -122,6 +122,11 @@ install:
 format:
     gofumpt --extra -w .
 
+# Auto-fix formatting and lint issues, then verify
+autofix: format
+    @command -v golangci-lint >/dev/null 2>&1 || (echo "golangci-lint not installed (run: just install-dev)" && exit 1)
+    golangci-lint run --fix ./... 2>/dev/null || true
+
 # Set up development environment
 setup: install-dev
     @echo "Development environment ready."
