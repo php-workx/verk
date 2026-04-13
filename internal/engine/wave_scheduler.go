@@ -59,27 +59,32 @@ func CheckScopeViolation(changed, owned []string) error {
 	}
 
 	for _, file := range changed {
-		for _, scope := range owned {
-			if git.PathsOverlap(file, scope) {
-				goto nextFile
-			}
+		if !fileInOwned(file, owned) {
+			return fmt.Errorf("scope violation: changed file %q is outside owned scope", file)
 		}
-		return fmt.Errorf("scope violation: changed file %q is outside owned scope", file)
-	nextFile:
 	}
 
 	return nil
 }
 
+func fileInOwned(file string, owned []string) bool {
+	for _, scope := range owned {
+		if git.PathsOverlap(file, scope) {
+			return true
+		}
+	}
+	return false
+}
+
 // validatePerTicketScope checks that each changed file falls within at least one
 // ticket's declared scope, and that every ticket declares a non-empty scope.
 // This is stricter than checking against the wave-wide union (PlannedScope) because
-// it also catches tickets with no scope declarations (G9: fail closed).
+// it also catches tickets with no scope declarations (G9: scope checks fail closed).
 func validatePerTicketScope(ticketIDs, changedFiles []string, ticketScopes map[string][]string) error {
 	if len(ticketScopes) == 0 {
 		return fmt.Errorf("scope violation: cannot verify scope — no ticket scope declarations provided")
 	}
-	// Every ticket in the wave must declare scope (G9).
+	// Every ticket in the wave must declare scope (G9: missing scope fails closed).
 	for _, id := range ticketIDs {
 		scopes, ok := ticketScopes[id]
 		if !ok || len(scopes) == 0 {

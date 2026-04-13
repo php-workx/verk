@@ -110,13 +110,15 @@ func loadRunArtifacts(repoRoot, runID string) (runArtifacts, error) {
 }
 
 func discoverRunTicketIDs(repoRoot, runID string) ([]string, error) {
-	paths, err := filepath.Glob(filepath.Join(runDir(repoRoot, runID), "tickets", "*", "plan.json"))
+	entries, err := os.ReadDir(filepath.Join(runDir(repoRoot, runID), "tickets"))
 	if err != nil {
 		return nil, err
 	}
-	ids := make([]string, 0, len(paths))
-	for _, path := range paths {
-		ids = append(ids, filepath.Base(filepath.Dir(path)))
+	ids := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		if entry.IsDir() {
+			ids = append(ids, entry.Name())
+		}
 	}
 	sort.Strings(ids)
 	return ids, nil

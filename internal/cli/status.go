@@ -196,8 +196,8 @@ func shortenBlockReason(reason string) string {
 			}
 		}
 	}
-	// Strip "claim renewal lost during worker execution: " prefix
-	if i := strings.Index(reason, "claim renewal failed:"); i >= 0 {
+	// Collapse the claim-renewal sentinel emitted by ticket execution.
+	if strings.HasPrefix(reason, "claim renewal failed:") {
 		reason = "lease expired"
 	}
 	if len(reason) > 72 {

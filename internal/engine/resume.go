@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"path/filepath"
-	"sort"
 	"sync"
 	"time"
 
@@ -58,7 +57,7 @@ func ResumeRun(ctx context.Context, req ResumeRequest) (ResumeReport, error) {
 	for _, ticketID := range artifacts.Run.TicketIDs {
 		snapshot := artifacts.Tickets[ticketID]
 
-		claim, repaired, claimErr := reconcileTicketClaimForResume(artifacts.RepoRoot, req.RunID, ticketID, snapshot)
+		_, repaired, claimErr := reconcileTicketClaimForResume(artifacts.RepoRoot, req.RunID, ticketID, snapshot)
 		if claimErr != nil {
 			artifacts.Run.Status = state.EpicRunStatusBlocked
 			artifacts.Run.CurrentPhase = state.TicketPhaseBlocked
@@ -77,10 +76,6 @@ func ResumeRun(ctx context.Context, req ResumeRequest) (ResumeReport, error) {
 		if repaired {
 			recovered = append(recovered, ticketID)
 		}
-		if claim != nil && snapshot.CurrentPhase == state.TicketPhaseBlocked {
-			_ = claim
-		}
-
 		if snapshot.Closeout == nil && (snapshot.CurrentPhase == state.TicketPhaseCloseout || snapshot.CurrentPhase == state.TicketPhaseClosed) {
 			plan, ok := artifacts.Plans[ticketID]
 			if !ok {
@@ -609,12 +604,3 @@ func appendIfMissing(values []string, value string) []string {
 	}
 	return append(values, value)
 }
-
-// Ensure imports are used.
-var (
-	_ = filepath.Join
-	_ = sort.Strings
-	_ = (*sync.WaitGroup)(nil)
-	_ = time.Now
-	_ = (*repoadapter.Repo)(nil)
-)
