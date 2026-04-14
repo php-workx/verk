@@ -55,14 +55,14 @@ func ReviewFindingBlocks(f any, threshold state.Severity) bool {
 func normalizeReviewFinding(f any) (state.ReviewFinding, bool) {
 	switch v := f.(type) {
 	case state.ReviewFinding:
-		return v, true
+		return applyWaiverExpiry(v), true
 	case *state.ReviewFinding:
 		if v == nil {
 			return state.ReviewFinding{}, false
 		}
-		return *v, true
+		return applyWaiverExpiry(*v), true
 	case runtime.ReviewFinding:
-		return state.ReviewFinding{
+		finding := state.ReviewFinding{
 			ID:              v.ID,
 			Severity:        state.Severity(v.Severity),
 			Title:           v.Title,
@@ -74,7 +74,8 @@ func normalizeReviewFinding(f any) (state.ReviewFinding, bool) {
 			WaivedAt:        v.WaivedAt,
 			WaiverReason:    v.WaiverReason,
 			WaiverExpiresAt: derefTime(v.WaiverExpiresAt),
-		}, true
+		}
+		return applyWaiverExpiry(finding), true
 	case *runtime.ReviewFinding:
 		if v == nil {
 			return state.ReviewFinding{}, false
@@ -83,6 +84,21 @@ func normalizeReviewFinding(f any) (state.ReviewFinding, bool) {
 	default:
 		return state.ReviewFinding{}, false
 	}
+}
+
+// applyWaiverExpiry returns the finding with Disposition reset to "open" and
+// waiver fields cleared when the finding is waived but its WaiverExpiresAt is
+// non-zero and in the past. The original value is never mutated; only the
+// returned copy is adjusted.
+func applyWaiverExpiry(f state.ReviewFinding) state.ReviewFinding {
+	if f.Disposition == "waived" && !f.WaiverExpiresAt.IsZero() && f.WaiverExpiresAt.Before(time.Now()) {
+		f.Disposition = "open"
+		f.WaivedBy = ""
+		f.WaivedAt = time.Time{}
+		f.WaiverReason = ""
+		f.WaiverExpiresAt = time.Time{}
+	}
+	return f
 }
 
 func derefTime(t *time.Time) time.Time {
