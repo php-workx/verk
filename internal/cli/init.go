@@ -132,6 +132,12 @@ var initCmd = &cobra.Command{
 
 		_, _ = fmt.Fprintln(w)
 
+		// Surface any scanner I/O error before persisting config so a partial
+		// read cannot silently produce an incomplete configuration.
+		if err := scanner.Err(); err != nil {
+			return cmdError(cmd, fmt.Errorf("read input: %w", err), 1)
+		}
+
 		// Write config.
 		if err := policy.WriteConfig(repoRoot, cfg); err != nil {
 			return cmdError(cmd, err, 1)
