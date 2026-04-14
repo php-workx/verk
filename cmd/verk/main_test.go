@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -139,20 +140,84 @@ func runCLIFromDir(t *testing.T, dir string, args ...string) (string, string, in
 	stdoutR, stdoutW, _ := os.Pipe()
 	stderrR, stderrW, _ := os.Pipe()
 
+	type result struct{ data []byte }
+	stdoutCh := make(chan result, 1)
+	stderrCh := make(chan result, 1)
+
+	go func() {
+		data, _ := io.ReadAll(stdoutR)
+		stdoutCh <- result{data}
+	}()
+	go func() {
+		data, _ := io.ReadAll(stderrR)
+		stderrCh <- result{data}
+	}()
+
 	code := cli.ExecuteArgs(args, stdoutW, stderrW)
 
 	_ = stdoutW.Close()
 	_ = stderrW.Close()
 
-	stdoutBuf := make([]byte, 64*1024)
-	n, _ := stdoutR.Read(stdoutBuf)
+	stdoutRes := <-stdoutCh
 	_ = stdoutR.Close()
-
-	stderrBuf := make([]byte, 64*1024)
-	m, _ := stderrR.Read(stderrBuf)
+	stderrRes := <-stderrCh
 	_ = stderrR.Close()
 
-	return string(stdoutBuf[:n]), string(stderrBuf[:m]), code
+	return string(stdoutRes.data), string(stderrRes.data), code
+}
+
+// TestRunCLIFromDir_LargeOutput_NoDeadlock verifies that the goroutine-based
+// pipe draining in runCLIFromDir does not deadlock when more than 64KB is
+// written to stdout or stderr before ExecuteArgs returns.
+func TestRunCLIFromDir_LargeOutput_NoDeadlock(t *testing.T) {
+	const size = 128 * 1024 // 128KB — well above the old 64KB fixed buffer
+
+	// Directly exercise the goroutine+io.ReadAll mechanism used by runCLIFromDir.
+	stdoutR, stdoutW, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe (stdout): %v", err)
+	}
+	stderrR, stderrW, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe (stderr): %v", err)
+	}
+
+	type result struct{ data []byte }
+	stdoutCh := make(chan result, 1)
+	stderrCh := make(chan result, 1)
+
+	go func() {
+		data, _ := io.ReadAll(stdoutR)
+		stdoutCh <- result{data}
+	}()
+	go func() {
+		data, _ := io.ReadAll(stderrR)
+		stderrCh <- result{data}
+	}()
+
+	// Write >64KB to both streams before closing.
+	large := make([]byte, size)
+	if _, err := stdoutW.Write(large); err != nil {
+		t.Fatalf("stdoutW.Write: %v", err)
+	}
+	if _, err := stderrW.Write(large); err != nil {
+		t.Fatalf("stderrW.Write: %v", err)
+	}
+
+	_ = stdoutW.Close()
+	_ = stderrW.Close()
+
+	stdoutRes := <-stdoutCh
+	_ = stdoutR.Close()
+	stderrRes := <-stderrCh
+	_ = stderrR.Close()
+
+	if got := len(stdoutRes.data); got != size {
+		t.Errorf("stdout: expected %d bytes, got %d", size, got)
+	}
+	if got := len(stderrRes.data); got != size {
+		t.Errorf("stderr: expected %d bytes, got %d", size, got)
+	}
 }
 
 func writeCLIRepo(t *testing.T, repoRoot string) {

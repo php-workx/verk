@@ -66,6 +66,58 @@ func TestLatestRunID_NoRunsDir(t *testing.T) {
 	}
 }
 
+func TestLatestRunID_CrossTicketIDOrder(t *testing.T) {
+	// run-ticket-z-1000 sorts lex BEFORE run-ticket-a-2000,
+	// but run-ticket-a-2000 has a larger timestamp and must win.
+	repoRoot := t.TempDir()
+	runsDir := filepath.Join(repoRoot, ".verk", "runs")
+	if err := os.MkdirAll(runsDir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	for _, name := range []string{
+		"run-ticket-z-1000",
+		"run-ticket-a-2000",
+	} {
+		if err := os.Mkdir(filepath.Join(runsDir, name), 0o755); err != nil {
+			t.Fatalf("mkdir %s: %v", name, err)
+		}
+	}
+
+	latest, err := latestRunID(repoRoot)
+	if err != nil {
+		t.Fatalf("latestRunID: %v", err)
+	}
+	if latest != "run-ticket-a-2000" {
+		t.Fatalf("expected run-ticket-a-2000, got %q", latest)
+	}
+}
+
+func TestLatestRunID_SkipsUnparseableEntries(t *testing.T) {
+	repoRoot := t.TempDir()
+	runsDir := filepath.Join(repoRoot, ".verk", "runs")
+	if err := os.MkdirAll(runsDir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	// "run-bad-suffix" has a non-numeric suffix; should be skipped.
+	// "run-ticket-a-9999" is valid and should be returned.
+	for _, name := range []string{
+		"run-bad-suffix",
+		"run-ticket-a-9999",
+	} {
+		if err := os.Mkdir(filepath.Join(runsDir, name), 0o755); err != nil {
+			t.Fatalf("mkdir %s: %v", name, err)
+		}
+	}
+
+	latest, err := latestRunID(repoRoot)
+	if err != nil {
+		t.Fatalf("latestRunID: %v", err)
+	}
+	if latest != "run-ticket-a-9999" {
+		t.Fatalf("expected run-ticket-a-9999, got %q", latest)
+	}
+}
+
 func TestLatestRunID_IgnoresNonRunDirs(t *testing.T) {
 	repoRoot := t.TempDir()
 	runsDir := filepath.Join(repoRoot, ".verk", "runs")
