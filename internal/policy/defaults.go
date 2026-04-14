@@ -10,7 +10,8 @@ func DefaultConfig() Config {
 		Policy: PolicyConfig{
 			ReviewThreshold:           state.SeverityP2,
 			MaxImplementationAttempts: 3,
-			MaxRepairCycles:           2,
+			MaxRepairCycles:           5,
+			MaxWaveRepairCycles:       3,
 			AllowDirtyWorktree:        true,
 		},
 		Runtime: RuntimeConfig{

@@ -21,8 +21,11 @@ func TestDefaultConfig(t *testing.T) {
 	if cfg.Policy.MaxImplementationAttempts != 3 {
 		t.Fatalf("expected default implementation attempts 3, got %d", cfg.Policy.MaxImplementationAttempts)
 	}
-	if cfg.Policy.MaxRepairCycles != 2 {
-		t.Fatalf("expected default repair cycles 2, got %d", cfg.Policy.MaxRepairCycles)
+	if cfg.Policy.MaxRepairCycles != 5 {
+		t.Fatalf("expected default repair cycles 5, got %d", cfg.Policy.MaxRepairCycles)
+	}
+	if cfg.Policy.MaxWaveRepairCycles != 3 {
+		t.Fatalf("expected default wave repair cycles 3, got %d", cfg.Policy.MaxWaveRepairCycles)
 	}
 	if cfg.Verification.DefaultTimeoutMinutes != 15 {
 		t.Fatalf("expected default verification timeout 15, got %d", cfg.Verification.DefaultTimeoutMinutes)
@@ -172,6 +175,18 @@ func TestValidate_AcceptsPositiveRuntimeTimeouts(t *testing.T) {
 	cfg.Runtime.ReviewerTimeoutMinutes = 1
 	if err := cfg.Validate(); err != nil {
 		t.Fatalf("expected valid config, got error: %v", err)
+	}
+}
+
+func TestValidate_RejectsNegativeMaxWaveRepairCycles(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.Policy.MaxWaveRepairCycles = -1
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("expected validation error for negative max_wave_repair_cycles, got nil")
+	}
+	if err.Error() != "policy.max_wave_repair_cycles must be zero or greater" {
+		t.Fatalf("unexpected error message: %q", err.Error())
 	}
 }
 

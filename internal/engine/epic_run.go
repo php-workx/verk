@@ -2,7 +2,9 @@ package engine
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io/fs"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -112,6 +114,15 @@ func RunEpic(ctx context.Context, req RunEpicRequest) (RunEpicResult, error) {
 
 	for {
 		if err := ctx.Err(); err != nil {
+			return result, err
+		}
+
+		// If a prior wave is still pending verification (e.g. the process crashed
+		// mid-repair), complete it before scheduling new tickets.
+		if err := resumePendingWaveVerification(ctx, req, cfg, result.Run.ResumeCursor, runPath, &result.Run); err != nil {
+			result.Run.Status = state.EpicRunStatusBlocked
+			result.Run.CurrentPhase = state.TicketPhaseBlocked
+			_ = state.SaveJSONAtomic(runPath, result.Run)
 			return result, err
 		}
 
@@ -305,10 +316,23 @@ func RunEpic(ctx context.Context, req RunEpicRequest) (RunEpicResult, error) {
 			if err := state.SaveJSONAtomic(runPath, result.Run); err != nil {
 				return result, err
 			}
-			if waveFailed {
-				return result, acceptErr
+			return result, acceptErr
+		}
+
+		// Run wave-level verification after all tickets merge. Mark pending in
+		// the cursor first so a crash during repair is detectable on resume.
+		if acceptedWave.Status == state.WaveStatusAccepted {
+			setPendingWaveVerification(result.Run.ResumeCursor, acceptedWave.WaveID)
+			if err := state.SaveJSONAtomic(runPath, result.Run); err != nil {
+				return result, err
 			}
-			return result, nil
+			if verifyErr := runWaveVerificationLoop(ctx, req, cfg, &acceptedWave, wavePath, changedFiles); verifyErr != nil {
+				result.Run.Status = state.EpicRunStatusBlocked
+				result.Run.CurrentPhase = state.TicketPhaseBlocked
+				_ = state.SaveJSONAtomic(runPath, result.Run)
+				return result, verifyErr
+			}
+			clearPendingWaveVerification(result.Run.ResumeCursor)
 		}
 
 		if result.Run.ResumeCursor != nil {
@@ -460,6 +484,9 @@ func waveClaimsReleased(repoRoot, runID string, ticketIDs []string) (bool, error
 		claimPath := filepath.Join(repoRoot, ".verk", "runs", runID, "claims", "claim-"+ticketID+".json")
 		var claim state.ClaimArtifact
 		if err := state.LoadJSON(claimPath, &claim); err != nil {
+			if errors.Is(err, fs.ErrNotExist) {
+				return false, nil
+			}
 			return false, err
 		}
 		if claim.State != "released" {

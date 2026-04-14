@@ -20,6 +20,7 @@ type PolicyConfig struct {
 	ReviewThreshold           state.Severity `yaml:"review_threshold" json:"review_threshold"`
 	MaxImplementationAttempts int            `yaml:"max_implementation_attempts" json:"max_implementation_attempts"`
 	MaxRepairCycles           int            `yaml:"max_repair_cycles" json:"max_repair_cycles"`
+	MaxWaveRepairCycles       int            `yaml:"max_wave_repair_cycles" json:"max_wave_repair_cycles"`
 	AllowDirtyWorktree        bool           `yaml:"allow_dirty_worktree" json:"allow_dirty_worktree"`
 }
 
@@ -105,6 +106,9 @@ func (c Config) Validate() error {
 	}
 	if c.Policy.MaxRepairCycles < 0 {
 		return fmt.Errorf("policy.max_repair_cycles must be zero or greater")
+	}
+	if c.Policy.MaxWaveRepairCycles < 0 {
+		return fmt.Errorf("policy.max_wave_repair_cycles must be zero or greater")
 	}
 	if c.Runtime.WorkerTimeoutMinutes <= 0 {
 		return fmt.Errorf("runtime.worker_timeout_minutes must be greater than zero")

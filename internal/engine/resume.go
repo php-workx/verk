@@ -40,6 +40,9 @@ func ResumeRun(ctx context.Context, req ResumeRequest) (ResumeReport, error) {
 	if req.RunID == "" {
 		return ResumeReport{}, fmt.Errorf("resume requires run id")
 	}
+	if req.RepoRoot == "" {
+		return ResumeReport{}, fmt.Errorf("resume requires repo root")
+	}
 
 	lock, err := AcquireRunLock(req.RepoRoot, req.RunID)
 	if err != nil {
@@ -93,7 +96,8 @@ func ResumeRun(ctx context.Context, req ResumeRequest) (ResumeReport, error) {
 				return ResumeReport{}, err
 			}
 			snapshot.Closeout = &closeout
-			if snapshot.CurrentPhase == state.TicketPhaseCloseout {
+			snapshot.UpdatedAt = stateTime()
+			if snapshot.CurrentPhase == state.TicketPhaseCloseout || snapshot.CurrentPhase == state.TicketPhaseClosed {
 				if closeout.Closable {
 					snapshot.CurrentPhase = state.TicketPhaseClosed
 					snapshot.BlockReason = ""
@@ -102,7 +106,6 @@ func ResumeRun(ctx context.Context, req ResumeRequest) (ResumeReport, error) {
 					snapshot.BlockReason = closeout.FailedGate
 				}
 			}
-			snapshot.UpdatedAt = stateTime()
 			artifacts.Tickets[ticketID] = snapshot
 			recovered = appendIfMissing(recovered, ticketID)
 			if err := state.WriteTransitionCommit(
@@ -327,6 +330,15 @@ func resumeEpicMode(ctx context.Context, req ResumeRequest, artifacts *runArtifa
 			return allResumed, err
 		}
 
+		// If a prior wave is still pending verification (e.g. the process crashed
+		// mid-repair), complete it before scheduling new tickets.
+		if err := resumePendingWaveVerification(ctx, epicReq, cfg, artifacts.Run.ResumeCursor, runPath, &artifacts.Run); err != nil {
+			artifacts.Run.Status = state.EpicRunStatusBlocked
+			artifacts.Run.CurrentPhase = state.TicketPhaseBlocked
+			_ = state.SaveJSONAtomic(runPath, artifacts.Run)
+			return allResumed, err
+		}
+
 		ready, err := tkmd.ListReadyChildren(artifacts.RepoRoot, artifacts.Run.RootTicketID, req.RunID)
 		if err != nil {
 			return allResumed, err
@@ -504,10 +516,23 @@ func resumeEpicMode(ctx context.Context, req ResumeRequest, artifacts *runArtifa
 			if err := state.SaveJSONAtomic(runPath, artifacts.Run); err != nil {
 				return allResumed, err
 			}
-			if waveFailed {
-				return allResumed, acceptErr
+			return allResumed, acceptErr
+		}
+
+		// Run wave-level verification after all tickets merge. Mark pending in
+		// the cursor first so a crash during repair is detectable on resume.
+		if acceptedWave.Status == state.WaveStatusAccepted {
+			setPendingWaveVerification(artifacts.Run.ResumeCursor, acceptedWave.WaveID)
+			if err := state.SaveJSONAtomic(runPath, artifacts.Run); err != nil {
+				return allResumed, err
 			}
-			return allResumed, nil
+			if verifyErr := runWaveVerificationLoop(ctx, epicReq, cfg, &acceptedWave, wavePath, changedFiles); verifyErr != nil {
+				artifacts.Run.Status = state.EpicRunStatusBlocked
+				artifacts.Run.CurrentPhase = state.TicketPhaseBlocked
+				_ = state.SaveJSONAtomic(runPath, artifacts.Run)
+				return allResumed, verifyErr
+			}
+			clearPendingWaveVerification(artifacts.Run.ResumeCursor)
 		}
 
 		if artifacts.Run.ResumeCursor != nil {

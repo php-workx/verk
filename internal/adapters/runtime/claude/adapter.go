@@ -23,8 +23,9 @@ const (
 )
 
 var (
-	runCommand = defaultRunCommand
-	now        = time.Now
+	runCommand          = defaultRunCommand
+	runStreamingCommand = defaultRunStreamingCommand
+	now                 = time.Now
 )
 
 // runtimeEnvPassthrough lists additional env vars from config that should be
@@ -731,9 +732,9 @@ type assistantMessage struct {
 	Content []toolUseContent `json:"content"`
 }
 
-// runStreamingCommand executes a command and processes stdout as stream-json,
+// defaultRunStreamingCommand executes a command and processes stdout as stream-json,
 // calling onProgress for each tool-use event. Returns the collected output.
-func runStreamingCommand(ctx context.Context, binary string, args []string, stdin []byte, env []string, timeout time.Duration, onProgress func(string)) (commandResult, error) {
+func defaultRunStreamingCommand(ctx context.Context, binary string, args []string, stdin []byte, env []string, timeout time.Duration, onProgress func(string)) (commandResult, error) {
 	if timeout > 0 {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, timeout)
@@ -788,6 +789,17 @@ func runStreamingCommand(ctx context.Context, binary string, args []string, stdi
 		case "result":
 			resultEvent = &evt
 		}
+	}
+
+	if scanErr := scanner.Err(); scanErr != nil {
+		if cmd.Process != nil {
+			_ = cmd.Process.Kill()
+		}
+		_ = cmd.Wait() // wait for stderr copy goroutine to finish before reading stderr
+		return commandResult{
+			stdout: allOutput.Bytes(),
+			stderr: stderr.Bytes(),
+		}, fmt.Errorf("scan stream output: %w", scanErr)
 	}
 
 	waitErr := cmd.Wait()

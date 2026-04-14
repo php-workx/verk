@@ -1,8 +1,11 @@
 package claude
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"os"
 	"strings"
 	"testing"
@@ -10,6 +13,18 @@ import (
 
 	"verk/internal/adapters/runtime"
 )
+
+// TestMain allows this test binary to act as a subprocess helper.
+// When _CLAUDE_TEST_WRITE_HUGE_LINE=1, it writes a 2MB line to stdout so that
+// bufio.Scanner (1MB max) returns bufio.ErrTooLong — enabling a real scanner
+// error test without external tooling.
+func TestMain(m *testing.M) {
+	if os.Getenv("_CLAUDE_TEST_WRITE_HUGE_LINE") == "1" {
+		_, _ = fmt.Fprintln(os.Stdout, strings.Repeat("x", 2*1024*1024))
+		os.Exit(0)
+	}
+	os.Exit(m.Run())
+}
 
 // mockCLIOutput builds a JSON response matching `claude -p --output-format json`.
 func mockCLIOutput(resultText string, isError bool) []byte {
@@ -439,4 +454,61 @@ func assertArgValue(t *testing.T, args []string, flag, want string) {
 		}
 	}
 	t.Fatalf("expected flag %s in args: %v", flag, args)
+}
+
+// TestRunStreamingCommand_ScannerError verifies that when the subprocess writes
+// a line exceeding the 1 MB scanner buffer, defaultRunStreamingCommand returns
+// a wrapped bufio.ErrTooLong, kills the subprocess, and does not block in
+// cmd.Wait().  The subprocess is this test binary itself, re-invoked with
+// _CLAUDE_TEST_WRITE_HUGE_LINE=1 (handled by TestMain above).
+func TestRunStreamingCommand_ScannerError(t *testing.T) {
+	env := append(os.Environ(), "_CLAUDE_TEST_WRITE_HUGE_LINE=1")
+	result, err := defaultRunStreamingCommand(
+		context.Background(),
+		os.Args[0],
+		[]string{"-test.run=^$"}, // no tests match; TestMain writes the huge line then exits
+		nil,
+		env,
+		10*time.Second,
+		nil,
+	)
+	if err == nil {
+		t.Fatal("expected scanner error, got nil")
+	}
+	if !errors.Is(err, bufio.ErrTooLong) {
+		t.Fatalf("expected error wrapping bufio.ErrTooLong, got: %v", err)
+	}
+	// Partial output may be empty (the oversized token was never delivered) but
+	// the result must not be nil and stderr is accessible for debugging.
+	_ = result.stdout
+	_ = result.stderr
+}
+
+// TestRunStreamingCommand_NormalCompletion verifies that a subprocess producing
+// valid stream-json output is processed correctly and no error is returned.
+func TestRunStreamingCommand_NormalCompletion(t *testing.T) {
+	resultLine := `{"type":"result","subtype":"success","result":"hello","is_error":false,"duration_ms":100,"num_turns":1}`
+	result, err := defaultRunStreamingCommand(
+		context.Background(),
+		"/bin/sh",
+		[]string{"-c", fmt.Sprintf("printf '%%s\n' '%s'", resultLine)},
+		nil,
+		nil,
+		10*time.Second,
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("expected no error on normal completion, got: %v", err)
+	}
+	if len(result.stdout) == 0 {
+		t.Fatal("expected non-empty stdout in result")
+	}
+	// The result stdout should be the marshalled result event JSON.
+	var out map[string]any
+	if err := json.Unmarshal(result.stdout, &out); err != nil {
+		t.Fatalf("result stdout is not valid JSON: %v — raw: %s", err, result.stdout)
+	}
+	if out["result"] != "hello" {
+		t.Fatalf("expected result field 'hello', got %v", out["result"])
+	}
 }
