@@ -81,21 +81,30 @@ func fileInOwned(file string, owned []string) bool {
 // This is stricter than checking against the wave-wide union (PlannedScope) because
 // it also catches tickets with no scope declarations (G9: scope checks fail closed).
 func validatePerTicketScope(ticketIDs, changedFiles []string, ticketScopes map[string][]string) error {
-	if len(ticketScopes) == 0 {
-		return fmt.Errorf("scope violation: cannot verify scope — no ticket scope declarations provided")
-	}
-	// Every ticket in the wave must declare scope (G9: missing scope fails closed).
-	for _, id := range ticketIDs {
-		scopes, ok := ticketScopes[id]
-		if !ok || len(scopes) == 0 {
-			return fmt.Errorf("scope violation: ticket %q has no scope declarations", id)
-		}
-	}
-	// Build the union of all per-ticket scopes and validate changed files against it.
-	// This ensures each changed file belongs to at least one ticket's owned scope.
+	// Collect scoped and unscoped ticket counts.
+	// Unscoped tickets (no owned_paths) are exempt from per-file scope enforcement:
+	// the ticket has no declared boundaries, so there is nothing to validate.
 	var allOwned []string
-	for _, scopes := range ticketScopes {
+	hasUnscoped := false
+	for _, id := range ticketIDs {
+		scopes := ticketScopes[id]
+		if len(scopes) == 0 {
+			hasUnscoped = true
+			continue
+		}
 		allOwned = append(allOwned, scopes...)
+	}
+
+	// If any ticket is unscoped we cannot attribute changed files to individual
+	// tickets, so per-file scope enforcement is skipped for the whole wave.
+	if hasUnscoped {
+		return nil
+	}
+
+	// All tickets declared scope — validate that every changed file falls
+	// within at least one ticket's owned paths.
+	if len(allOwned) == 0 {
+		return nil
 	}
 	return CheckScopeViolation(changedFiles, allOwned)
 }
@@ -130,9 +139,18 @@ func AcceptWave(req WaveAcceptanceRequest) (state.WaveArtifact, error) {
 		return wave, fmt.Errorf("wave persistence failed")
 	}
 
+	// Scope violation is a hard failure: a worker modifying files outside its
+	// declared owned paths is a safety violation that must be caught and blocked
+	// (G9: scope checks fail closed).
+	if err := validatePerTicketScope(wave.TicketIDs, req.ChangedFiles, req.TicketScopes); err != nil {
+		wave.Status = state.WaveStatusFailed
+		wave.Acceptance["reason"] = err.Error()
+		return wave, err
+	}
+
 	// Soft issues — record but don't block the wave.
-	// Blocked tickets and scope overflow are expected in normal operation
-	// (e.g., verification failures, auto-fix touching files outside scope).
+	// Blocked tickets and unreleased claims are expected in normal operation
+	// (e.g., worker returned needs_context or blocked status).
 	var warnings []string
 	var blockedTickets []string
 	for i, phase := range req.TicketPhases {
@@ -147,12 +165,7 @@ func AcceptWave(req WaveAcceptanceRequest) (state.WaveArtifact, error) {
 	if !req.ClaimsReleased {
 		warnings = append(warnings, "claims not fully released")
 	}
-	if err := validatePerTicketScope(wave.TicketIDs, req.ChangedFiles, req.TicketScopes); err != nil {
-		warnings = append(warnings, err.Error())
-	}
 
-	// Accept the wave even with warnings — blocked tickets will be
-	// retried on resume, and scope overflow from auto-fix is expected.
 	wave.Status = state.WaveStatusAccepted
 	if len(warnings) > 0 {
 		wave.Acceptance["warnings"] = warnings

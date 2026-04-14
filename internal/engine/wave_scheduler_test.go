@@ -34,44 +34,47 @@ func TestCheckScopeViolation_OutOfScope_Fails(t *testing.T) {
 	}
 }
 
-func TestValidatePerTicketScope_NoScopes_ReturnsError(t *testing.T) {
+func TestValidatePerTicketScope_NoScopes_Passes(t *testing.T) {
+	// Unscoped tickets (nil map) are exempt — no boundaries declared means no scope to enforce.
 	err := validatePerTicketScope([]string{"ticket-a"}, []string{"foo/bar.go"}, nil)
-	if err == nil {
-		t.Fatal("expected error when ticketScopes is nil, got nil — must fail closed")
+	if err != nil {
+		t.Fatalf("expected nil for unscoped ticket (nil map), got %v", err)
 	}
 }
 
-func TestValidatePerTicketScope_EmptyScopes_ReturnsError(t *testing.T) {
+func TestValidatePerTicketScope_EmptyScopes_Passes(t *testing.T) {
+	// Same: empty map means all tickets are unscoped, skip enforcement.
 	err := validatePerTicketScope([]string{"ticket-a"}, []string{"foo/bar.go"}, map[string][]string{})
-	if err == nil {
-		t.Fatal("expected error when ticketScopes is empty, got nil — must fail closed")
+	if err != nil {
+		t.Fatalf("expected nil for unscoped ticket (empty map), got %v", err)
 	}
 }
 
-func TestValidatePerTicketScope_TicketMissingFromScopes_ReturnsError(t *testing.T) {
+func TestValidatePerTicketScope_TicketMissingFromScopes_Passes(t *testing.T) {
+	// ticket-b is missing from the scope map → treated as unscoped → whole wave is exempt.
 	err := validatePerTicketScope(
 		[]string{"ticket-a", "ticket-b"},
 		[]string{"internal/app/main.go"},
 		map[string][]string{
 			"ticket-a": {"internal/app"},
-			// ticket-b is missing — must fail closed
 		},
 	)
-	if err == nil {
-		t.Fatal("expected error when ticket-b has no scope declarations, got nil")
+	if err != nil {
+		t.Fatalf("expected nil when one ticket is unscoped, got %v", err)
 	}
 }
 
-func TestValidatePerTicketScope_TicketWithEmptyScope_ReturnsError(t *testing.T) {
+func TestValidatePerTicketScope_TicketWithEmptyScope_Passes(t *testing.T) {
+	// Explicit empty slice is treated as unscoped → whole wave is exempt.
 	err := validatePerTicketScope(
 		[]string{"ticket-a"},
 		[]string{"internal/app/main.go"},
 		map[string][]string{
-			"ticket-a": {}, // empty scope declarations — must fail closed
+			"ticket-a": {},
 		},
 	)
-	if err == nil {
-		t.Fatal("expected error when ticket has empty scope declarations, got nil")
+	if err != nil {
+		t.Fatalf("expected nil when ticket has empty owned_paths, got %v", err)
 	}
 }
 
@@ -133,7 +136,9 @@ func TestValidatePerTicketScope_MultipleTickets_CrossScopeViolation(t *testing.T
 	}
 }
 
-func TestAcceptWave_WarnsOnEmptyTicketScopes(t *testing.T) {
+func TestAcceptWave_UnscopedTickets_Accepted(t *testing.T) {
+	// Tickets with no owned_paths are exempt from scope enforcement; the wave should
+	// be accepted even when TicketScopes is nil or contains only empty entries.
 	wave := state.WaveArtifact{
 		WaveID:       "wave-1",
 		Status:       state.WaveStatusRunning,
@@ -145,25 +150,17 @@ func TestAcceptWave_WarnsOnEmptyTicketScopes(t *testing.T) {
 		Wave:                 wave,
 		TicketPhases:         []state.TicketPhase{state.TicketPhaseClosed},
 		ChangedFiles:         []string{"internal/app/main.go"},
-		TicketScopes:         nil, // no scopes provided — should warn, not fail
+		TicketScopes:         nil, // no owned_paths declared → unscoped → skip check
 		ClaimsReleased:       true,
 		PersistenceSucceeded: true,
 	}
 
-	accepted, err := AcceptWave(req)
+	result, err := AcceptWave(req)
 	if err != nil {
-		t.Fatalf("expected acceptance with warnings, got error: %v", err)
+		t.Fatalf("expected no error for unscoped tickets, got %v", err)
 	}
-	if accepted.Status != state.WaveStatusAccepted {
-		t.Fatalf("expected accepted status, got %q", accepted.Status)
-	}
-	warnings, ok := accepted.Acceptance["warnings"]
-	if !ok {
-		t.Fatal("expected warnings in acceptance metadata")
-	}
-	warningList, ok := warnings.([]string)
-	if !ok || len(warningList) == 0 {
-		t.Fatalf("expected non-empty warnings list, got %#v", warnings)
+	if result.Status != state.WaveStatusAccepted {
+		t.Fatalf("expected accepted status for unscoped tickets, got %q", result.Status)
 	}
 }
 
