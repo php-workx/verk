@@ -18,6 +18,12 @@ import (
 	"verk/internal/state"
 )
 
+// ErrEpicBlocked is returned when RunEpic terminates because the epic cannot
+// make further progress (e.g. remaining children are blocked or waiting on
+// external leases). Callers can use errors.Is(err, ErrEpicBlocked) to
+// distinguish this from hard failures.
+var ErrEpicBlocked = errors.New("epic run blocked")
+
 type RunEpicRequest struct {
 	RepoRoot             string
 	RunID                string
@@ -165,6 +171,9 @@ func RunEpic(ctx context.Context, req RunEpicRequest) (RunEpicResult, error) {
 			result.Run.UpdatedAt = time.Now().UTC()
 			if err := state.SaveJSONAtomic(runPath, result.Run); err != nil {
 				return result, err
+			}
+			if status != state.EpicRunStatusCompleted {
+				return result, fmt.Errorf("%w: %s", ErrEpicBlocked, status)
 			}
 			return result, nil
 		}

@@ -2,6 +2,8 @@ package engine
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -65,7 +67,7 @@ func TestBuildWaveSerializesConflictingOwnedPaths(t *testing.T) {
 	}
 }
 
-func TestAcceptWave_ScopeViolationIsWarning(t *testing.T) {
+func TestAcceptWave_ScopeViolationIsFatal(t *testing.T) {
 	wave := state.WaveArtifact{
 		WaveID: "wave-1",
 		Status: state.WaveStatusRunning,
@@ -86,20 +88,13 @@ func TestAcceptWave_ScopeViolationIsWarning(t *testing.T) {
 		PersistenceSucceeded: true,
 	}
 
-	accepted, err := AcceptWave(req)
-	if err != nil {
-		t.Fatalf("expected acceptance with scope violation as warning, got error: %v", err)
+	// Scope violations must fail-closed (G9: scope checks fail closed).
+	result, err := AcceptWave(req)
+	if err == nil {
+		t.Fatal("expected error for scope violation, got nil")
 	}
-	if accepted.Status != state.WaveStatusAccepted {
-		t.Fatalf("expected accepted status, got %q", accepted.Status)
-	}
-	warnings, ok := accepted.Acceptance["warnings"]
-	if !ok {
-		t.Fatal("expected warnings in acceptance metadata for scope violation")
-	}
-	warningList, ok := warnings.([]string)
-	if !ok || len(warningList) == 0 {
-		t.Fatalf("expected non-empty warnings list, got %#v", warnings)
+	if result.Status != state.WaveStatusFailed {
+		t.Fatalf("expected failed status for scope violation, got %q", result.Status)
 	}
 }
 
@@ -150,22 +145,26 @@ func TestRunEpicSchedulesOpenAndReadyTickets(t *testing.T) {
 		Adapter:      adapter,
 		Config:       cfg,
 	})
-	if err != nil {
-		t.Fatalf("RunEpic returned error: %v", err)
-	}
 
 	// Both open and ready tickets should have been scheduled
 	if adapter.maxConcurrent() < 2 {
 		t.Fatalf("expected both open and ready tickets to run concurrently, max concurrent was %d", adapter.maxConcurrent())
 	}
 
-	// Epic should not be completed because blocked ticket remains
+	// Epic should not be completed because blocked ticket remains, and
+	// the non-completed persisted state must be reflected as a non-nil error.
+	if err == nil {
+		t.Fatal("expected non-nil error when epic has blocked children, got nil")
+	}
+	if !errors.Is(err, ErrEpicBlocked) {
+		t.Fatalf("expected ErrEpicBlocked, got: %v", err)
+	}
 	if result.Run.Status == state.EpicRunStatusCompleted {
 		t.Fatalf("expected epic to stay incomplete while blocked ticket remains")
 	}
 }
 
-func TestRunEpicAcceptsScopeViolationAsWarning(t *testing.T) {
+func TestRunEpicScopeViolationBlocksWave(t *testing.T) {
 	repoRoot := t.TempDir()
 	baseCommit := initEpicRepo(t, repoRoot)
 	cfg := policy.DefaultConfig()
@@ -215,21 +214,24 @@ func TestRunEpicAcceptsScopeViolationAsWarning(t *testing.T) {
 		Config:               cfg,
 		VerificationByTicket: map[string][]string{child.ID: childVerification},
 	})
-	if err != nil {
-		t.Fatalf("RunEpic returned error: %v", err)
+	// Scope violation must surface as a non-nil error so callers are not misled.
+	if err == nil {
+		t.Fatal("expected non-nil error for scope violation, got nil")
 	}
 
 	if _, statErr := os.Stat(touchOutsideScope); statErr != nil {
 		t.Fatalf("expected scope violation fixture file to exist: %v", statErr)
 	}
-	if result.Run.Status != state.EpicRunStatusCompleted {
-		t.Fatalf("expected epic to complete despite scope violation, got %q", result.Run.Status)
-	}
+	// Scope violation must fail closed: the wave should fail and the epic should
+	// not complete (G9: scope checks fail closed).
 	if len(result.Waves) == 0 {
 		t.Fatal("expected at least one wave")
 	}
-	if result.Waves[0].Status != state.WaveStatusAccepted {
-		t.Fatalf("expected accepted wave (with scope warning), got %q", result.Waves[0].Status)
+	if result.Waves[0].Status != state.WaveStatusFailed {
+		t.Fatalf("expected failed wave for scope violation, got %q", result.Waves[0].Status)
+	}
+	if result.Run.Status != state.EpicRunStatusBlocked {
+		t.Fatalf("expected blocked epic status after scope violation, got %q", result.Run.Status)
 	}
 }
 
@@ -280,8 +282,14 @@ func TestRunEpicBlockedTicketPreventsFalseCompletion(t *testing.T) {
 		Adapter:      adapter,
 		Config:       cfg,
 	})
-	if err != nil {
-		t.Fatalf("RunEpic returned error: %v", err)
+
+	// Blocked children must surface as a non-nil error so CLI/API callers
+	// are not misled into treating a blocked epic as successful.
+	if err == nil {
+		t.Fatal("expected non-nil error when epic is blocked, got nil")
+	}
+	if !errors.Is(err, ErrEpicBlocked) {
+		t.Fatalf("expected ErrEpicBlocked, got: %v", err)
 	}
 
 	if result.Run.Status == state.EpicRunStatusCompleted {
@@ -474,6 +482,77 @@ func TestRunEpicSelectsRuntimePerTicket(t *testing.T) {
 	sort.Strings(got)
 	if !reflect.DeepEqual(got, []string{"claude", "codex"}) {
 		t.Fatalf("unexpected requested runtimes: %#v", requestedRuntimes)
+	}
+}
+
+// TestRunEpicFailsOnScopeViolation is a focused regression test for the bug
+// where RunEpic persisted a blocked run state but returned nil, allowing callers
+// to treat acceptance failures as success.  When AcceptWave rejects a wave
+// (here: scope violation) and waveFailed is false (no worker errors), RunEpic
+// must return a non-nil error that matches the persisted blocked state.
+func TestRunEpicFailsOnScopeViolation(t *testing.T) {
+	repoRoot := t.TempDir()
+	baseCommit := initEpicRepo(t, repoRoot)
+	cfg := policy.DefaultConfig()
+
+	epic := epicTicket("epic-failscope")
+	mustSaveTicket(t, repoRoot, epic)
+
+	// Ticket with a narrow scope so that writing an unrelated file triggers a violation.
+	child := epicChildTicket("ticket-failscope", epic.ID, tkmd.StatusReady, nil, []string{"internal/app"})
+	mustSaveTicket(t, repoRoot, child)
+
+	adapter := runtimefake.New(
+		[]runtime.WorkerResult{
+			{
+				Status:             runtime.WorkerStatusDone,
+				RetryClass:         runtime.RetryClassTerminal,
+				LeaseID:            "lease-run-failscope-ticket-failscope",
+				StartedAt:          epicTestStart(),
+				FinishedAt:         epicTestStart().Add(time.Second),
+				ResultArtifactPath: filepath.Join(repoRoot, "worker-failscope.json"),
+			},
+		},
+		[]runtime.ReviewResult{
+			{
+				Status:             runtime.WorkerStatusDone,
+				RetryClass:         runtime.RetryClassTerminal,
+				LeaseID:            "lease-run-failscope-ticket-failscope",
+				StartedAt:          epicTestStart().Add(2 * time.Second),
+				FinishedAt:         epicTestStart().Add(3 * time.Second),
+				ReviewStatus:       runtime.ReviewStatusPassed,
+				Summary:            "clean",
+				ResultArtifactPath: filepath.Join(repoRoot, "review-failscope.json"),
+			},
+		},
+	)
+
+	// The worker succeeds (no outcome.err), but the verification step touches a
+	// file outside the ticket's declared scope.  AcceptWave will detect this
+	// and return a non-nil acceptErr while waveFailed remains false — the exact
+	// condition that caused the original nil-return bug.
+	scopeViolationCmd := []string{"printf 'violation\\n' > failscope-out-of-scope.txt"}
+
+	result, err := RunEpic(context.Background(), RunEpicRequest{
+		RepoRoot:             repoRoot,
+		RunID:                "run-failscope",
+		RootTicketID:         epic.ID,
+		BaseCommit:           baseCommit,
+		Adapter:              adapter,
+		Config:               cfg,
+		VerificationByTicket: map[string][]string{child.ID: scopeViolationCmd},
+	})
+
+	// Core regression assertion: RunEpic must not return nil when the persisted
+	// run state is blocked.
+	if err == nil {
+		t.Fatal("RunEpic returned nil error despite AcceptWave blocking the run; " +
+			"persisted blocked state diverges from returned nil — regression of ver-z6em")
+	}
+
+	// The persisted state and the returned state must agree.
+	if result.Run.Status != state.EpicRunStatusBlocked {
+		t.Fatalf("expected persisted run status %q, got %q", state.EpicRunStatusBlocked, result.Run.Status)
 	}
 }
 
@@ -757,4 +836,78 @@ func TestRunEpicConcurrentLockContention(t *testing.T) {
 	}
 
 	_ = lock.Release()
+}
+
+func writeClaimJSON(t *testing.T, path string, claim state.ClaimArtifact) {
+	t.Helper()
+	data, err := json.Marshal(claim)
+	if err != nil {
+		t.Fatalf("marshal claim: %v", err)
+	}
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		t.Fatalf("write claim file: %v", err)
+	}
+}
+
+func TestWaveClaimsReleased(t *testing.T) {
+	t.Run("missing claim file returns false nil", func(t *testing.T) {
+		dir := t.TempDir()
+		got, err := waveClaimsReleased(dir, "run-1", []string{"ticket-a"})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if got {
+			t.Fatal("expected false for missing claim file")
+		}
+	})
+
+	t.Run("present but unreleased returns false nil", func(t *testing.T) {
+		dir := t.TempDir()
+		claimsDir := filepath.Join(dir, ".verk", "runs", "run-1", "claims")
+		if err := os.MkdirAll(claimsDir, 0o755); err != nil {
+			t.Fatalf("mkdir: %v", err)
+		}
+		writeClaimJSON(t, filepath.Join(claimsDir, "claim-ticket-a.json"), state.ClaimArtifact{State: "active"})
+		got, err := waveClaimsReleased(dir, "run-1", []string{"ticket-a"})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if got {
+			t.Fatal("expected false for unreleased claim")
+		}
+	})
+
+	t.Run("present and released returns true nil", func(t *testing.T) {
+		dir := t.TempDir()
+		claimsDir := filepath.Join(dir, ".verk", "runs", "run-1", "claims")
+		if err := os.MkdirAll(claimsDir, 0o755); err != nil {
+			t.Fatalf("mkdir: %v", err)
+		}
+		writeClaimJSON(t, filepath.Join(claimsDir, "claim-ticket-a.json"), state.ClaimArtifact{State: "released"})
+		got, err := waveClaimsReleased(dir, "run-1", []string{"ticket-a"})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !got {
+			t.Fatal("expected true for released claim")
+		}
+	})
+
+	t.Run("malformed JSON returns false with error", func(t *testing.T) {
+		dir := t.TempDir()
+		claimsDir := filepath.Join(dir, ".verk", "runs", "run-1", "claims")
+		if err := os.MkdirAll(claimsDir, 0o755); err != nil {
+			t.Fatalf("mkdir: %v", err)
+		}
+		if err := os.WriteFile(filepath.Join(claimsDir, "claim-ticket-a.json"), []byte("not json{{{"), 0o644); err != nil {
+			t.Fatalf("write bad claim: %v", err)
+		}
+		got, err := waveClaimsReleased(dir, "run-1", []string{"ticket-a"})
+		if err == nil {
+			t.Fatal("expected error for malformed JSON")
+		}
+		if got {
+			t.Fatal("expected false when error occurs")
+		}
+	})
 }
