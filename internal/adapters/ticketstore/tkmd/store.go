@@ -105,7 +105,10 @@ func ListReadyChildren(rootDir, parentID string, currentRunID ...string) ([]Tick
 	}
 
 	// Load the epic's deps list for alternative child discovery.
-	epicDeps := loadEpicChildren(ticketsDir, parentID)
+	epicDeps, err := loadEpicChildren(ticketsDir, parentID)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return nil, fmt.Errorf("load epic children for %s: %w", parentID, err)
+	}
 
 	var ready []Ticket
 	for _, path := range paths {
@@ -191,11 +194,11 @@ func extractHeadingTitle(body string) string {
 // loadEpicChildren loads an epic ticket's deps and links lists as a set
 // for child discovery. Supports three tk conventions: deps (tk dep),
 // links (tk link), and parent field on children.
-func loadEpicChildren(ticketsDir, epicID string) map[string]struct{} {
+func loadEpicChildren(ticketsDir, epicID string) (map[string]struct{}, error) {
 	path := filepath.Join(ticketsDir, epicID+".md")
 	ticket, err := LoadTicket(path)
 	if err != nil {
-		return nil
+		return nil, err
 	}
 	children := make(map[string]struct{})
 	for _, dep := range ticket.Deps {
@@ -208,7 +211,7 @@ func loadEpicChildren(ticketsDir, epicID string) map[string]struct{} {
 			children[link] = struct{}{}
 		}
 	}
-	return children
+	return children, nil
 }
 
 func depsClosed(ticketsDir string, deps []string) (bool, error) {

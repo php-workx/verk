@@ -180,6 +180,55 @@ func TestUsesCanonicalReadinessPredicate(t *testing.T) {
 	}
 }
 
+func TestLoadEpicChildrenMalformed(t *testing.T) {
+	dir := t.TempDir()
+	// A frontmatter line without a colon causes splitKeyValue to return an error.
+	epicPath := filepath.Join(dir, "epic-bad.md")
+	malformed := "---\nno_colon_here\n---\nbody\n"
+	if err := os.WriteFile(epicPath, []byte(malformed), 0o644); err != nil {
+		t.Fatalf("write malformed epic: %v", err)
+	}
+
+	children, err := loadEpicChildren(dir, "epic-bad")
+	if err == nil {
+		t.Fatal("expected non-nil error for malformed epic, got nil")
+	}
+	// children is nil on error — acceptable per spec
+	_ = children
+}
+
+func TestLoadEpicChildrenValid(t *testing.T) {
+	dir := t.TempDir()
+	epicPath := filepath.Join(dir, "epic-ok.md")
+	content := strings.Join([]string{
+		"---",
+		"id: epic-ok",
+		"title: \"Test Epic\"",
+		"status: open",
+		"deps: [child-1, child-2]",
+		"---",
+		"",
+		"Epic body.",
+		"",
+	}, "\n")
+	if err := os.WriteFile(epicPath, []byte(content), 0o644); err != nil {
+		t.Fatalf("write epic: %v", err)
+	}
+
+	children, err := loadEpicChildren(dir, "epic-ok")
+	if err != nil {
+		t.Fatalf("expected nil error for valid epic, got: %v", err)
+	}
+	if len(children) != 2 {
+		t.Fatalf("expected 2 children, got %d: %v", len(children), children)
+	}
+	for _, id := range []string{"child-1", "child-2"} {
+		if _, ok := children[id]; !ok {
+			t.Fatalf("expected child %q in map, got: %v", id, children)
+		}
+	}
+}
+
 func TestRoundTripNoTitleInFrontmatter(t *testing.T) {
 	// A ticket whose title comes from the # heading (not frontmatter)
 	// must produce identical content after a load-save round-trip.
