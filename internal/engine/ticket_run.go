@@ -67,6 +67,7 @@ type ticketRunState struct {
 	repoRoot               string
 	currentPhase           state.TicketPhase
 	blockReason            string
+	createdAt              time.Time // set once; zero means lazy-init on first snapshot()
 	implementation         *state.ImplementationArtifact
 	verification           *state.VerificationArtifact
 	review                 *state.ReviewFindingsArtifact
@@ -118,6 +119,14 @@ func RunTicket(ctx context.Context, req RunTicketRequest) (result RunTicketResul
 		paths:        buildTicketRunPaths(absRepoRoot, req.RunID, req.Ticket.ID),
 		repoRoot:     absRepoRoot,
 		currentPhase: req.Plan.Phase,
+	}
+
+	// Restore createdAt from any existing snapshot so it is preserved across saves.
+	// Ignore errors: on first run the snapshot does not exist yet, and on resume
+	// any read failure is non-fatal — snapshot() will lazily set createdAt instead.
+	var prevSnapshot TicketRunSnapshot
+	if err := state.LoadJSON(st.paths.snapshotPath, &prevSnapshot); err == nil && !prevSnapshot.CreatedAt.IsZero() {
+		st.createdAt = prevSnapshot.CreatedAt
 	}
 
 	// Release claim on any error return to prevent leaked claims blocking retries.
@@ -1075,11 +1084,14 @@ func isNilArtifactData(data any) bool {
 }
 
 func (st *ticketRunState) snapshot() TicketRunSnapshot {
+	if st.createdAt.IsZero() {
+		st.createdAt = stateTime()
+	}
 	snapshot := TicketRunSnapshot{
 		ArtifactMeta: state.ArtifactMeta{
 			SchemaVersion: artifactSchemaVersion,
 			RunID:         st.req.RunID,
-			CreatedAt:     stateTime(),
+			CreatedAt:     st.createdAt,
 			UpdatedAt:     stateTime(),
 		},
 		TicketID:               st.req.Ticket.ID,

@@ -1069,6 +1069,24 @@ func TestRunTicket_NeedsContextBlocksWorkflow(t *testing.T) {
 	if !strings.Contains(result.Snapshot.BlockReason, "acceptance criteria unclear") {
 		t.Fatalf("expected block reason to contain worker's reason, got %q", result.Snapshot.BlockReason)
 	}
+
+	// Cross-ticket invariant (ver-dmnr × ver-m8d1): the claim must be released
+	// when the workflow blocks via needs_context so that retries are not
+	// permanently locked out.  needs_more_context normalization routes through
+	// WorkerStatusNeedsContext → TicketPhaseBlocked, and the blocked terminal
+	// path must release the live claim just like startup failures do.
+	livePath := filepath.Join(repoRoot, ".tickets", ".claims", ticket.ID+".json")
+	if _, err := os.Stat(livePath); err == nil {
+		t.Fatalf("expected live claim to be released after needs_context block, but file still exists: %s", livePath)
+	}
+	durablePath := filepath.Join(repoRoot, ".verk", "runs", "run-needs-ctx", "claims", "claim-"+ticket.ID+".json")
+	var durable state.ClaimArtifact
+	if err := state.LoadJSON(durablePath, &durable); err != nil {
+		t.Fatalf("load durable claim after needs_context block: %v", err)
+	}
+	if durable.State != "released" {
+		t.Fatalf("expected durable claim state %q after needs_context block, got %q", "released", durable.State)
+	}
 }
 
 // TestRunTicket_ReleasesClaimOnStartupFailure verifies that every startup/setup
@@ -1282,5 +1300,43 @@ func TestRunTicket_RenewsResumedClaimBeforeExpiry(t *testing.T) {
 	if !durableClaim.ExpiresAt.After(claim.ExpiresAt) {
 		t.Fatalf("expected durable claim to be renewed past %s, got %s — resumed near-expiry claim must renew before expiry",
 			claim.ExpiresAt.Format(time.RFC3339Nano), durableClaim.ExpiresAt.Format(time.RFC3339Nano))
+	}
+}
+
+func TestTicketRunState_snapshotPreservesCreatedAt(t *testing.T) {
+	st := &ticketRunState{
+		req: RunTicketRequest{
+			RunID:  "run-snapshot-test",
+			Ticket: tkmd.Ticket{ID: "ver-snapshot-test"},
+		},
+	}
+
+	snap1 := st.snapshot()
+	time.Sleep(2 * time.Millisecond)
+	snap2 := st.snapshot()
+
+	if !snap1.CreatedAt.Equal(snap2.CreatedAt) {
+		t.Errorf("CreatedAt changed between snapshots: %v -> %v", snap1.CreatedAt, snap2.CreatedAt)
+	}
+	if !snap2.UpdatedAt.After(snap1.UpdatedAt) {
+		t.Errorf("expected UpdatedAt to advance between snapshots: first=%v second=%v", snap1.UpdatedAt, snap2.UpdatedAt)
+	}
+}
+
+func TestTicketRunState_snapshotPreservesRestoredCreatedAt(t *testing.T) {
+	fixedCreatedAt := time.Date(2025, 1, 15, 10, 30, 0, 0, time.UTC)
+
+	st := &ticketRunState{
+		req: RunTicketRequest{
+			RunID:  "run-snapshot-restore",
+			Ticket: tkmd.Ticket{ID: "ver-snapshot-restore"},
+		},
+		createdAt: fixedCreatedAt,
+	}
+
+	snap := st.snapshot()
+
+	if !snap.CreatedAt.Equal(fixedCreatedAt) {
+		t.Errorf("expected CreatedAt %v, got %v", fixedCreatedAt, snap.CreatedAt)
 	}
 }
