@@ -106,6 +106,12 @@ func (c Config) Validate() error {
 	if c.Policy.MaxRepairCycles < 0 {
 		return fmt.Errorf("policy.max_repair_cycles must be zero or greater")
 	}
+	if c.Runtime.WorkerTimeoutMinutes <= 0 {
+		return fmt.Errorf("runtime.worker_timeout_minutes must be greater than zero")
+	}
+	if c.Runtime.ReviewerTimeoutMinutes <= 0 {
+		return fmt.Errorf("runtime.reviewer_timeout_minutes must be greater than zero")
+	}
 	if c.Verification.DefaultTimeoutMinutes <= 0 {
 		return fmt.Errorf("verification.default_timeout_minutes must be greater than zero")
 	}

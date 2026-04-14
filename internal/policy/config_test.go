@@ -123,6 +123,58 @@ func TestLoadConfig_RejectsUnknownFields(t *testing.T) {
 	}
 }
 
+func TestValidate_RejectsNonPositiveRuntimeTimeouts(t *testing.T) {
+	cases := []struct {
+		name    string
+		mutate  func(*Config)
+		wantMsg string
+	}{
+		{
+			name:    "worker timeout zero",
+			mutate:  func(c *Config) { c.Runtime.WorkerTimeoutMinutes = 0 },
+			wantMsg: "runtime.worker_timeout_minutes must be greater than zero",
+		},
+		{
+			name:    "worker timeout negative",
+			mutate:  func(c *Config) { c.Runtime.WorkerTimeoutMinutes = -1 },
+			wantMsg: "runtime.worker_timeout_minutes must be greater than zero",
+		},
+		{
+			name:    "reviewer timeout zero",
+			mutate:  func(c *Config) { c.Runtime.ReviewerTimeoutMinutes = 0 },
+			wantMsg: "runtime.reviewer_timeout_minutes must be greater than zero",
+		},
+		{
+			name:    "reviewer timeout negative",
+			mutate:  func(c *Config) { c.Runtime.ReviewerTimeoutMinutes = -5 },
+			wantMsg: "runtime.reviewer_timeout_minutes must be greater than zero",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := DefaultConfig()
+			tc.mutate(&cfg)
+			err := cfg.Validate()
+			if err == nil {
+				t.Fatalf("expected validation error, got nil")
+			}
+			if err.Error() != tc.wantMsg {
+				t.Fatalf("expected error %q, got %q", tc.wantMsg, err.Error())
+			}
+		})
+	}
+}
+
+func TestValidate_AcceptsPositiveRuntimeTimeouts(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.Runtime.WorkerTimeoutMinutes = 1
+	cfg.Runtime.ReviewerTimeoutMinutes = 1
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("expected valid config, got error: %v", err)
+	}
+}
+
 func TestEffectiveReviewThreshold_Precedence(t *testing.T) {
 	cfg := DefaultConfig()
 	ticket := state.SeverityP3
