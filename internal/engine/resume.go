@@ -203,7 +203,7 @@ func resumeTicketMode(ctx context.Context, req ResumeRequest, artifacts *runArti
 			return resumed, err
 		}
 		snapshot := artifacts.Tickets[ticketID]
-		if isTerminalPhase(snapshot.CurrentPhase) {
+		if snapshot.CurrentPhase == state.TicketPhaseClosed {
 			continue
 		}
 
@@ -295,10 +295,12 @@ func resumeEpicMode(ctx context.Context, req ResumeRequest, artifacts *runArtifa
 
 	baseCommit := artifacts.Run.BaseCommit
 
-	// Reset non-terminal tickets to "ready" so ListReadyChildren can pick them up
+	// Reset incomplete tickets (including blocked) to "ready" so ListReadyChildren
+	// can pick them up. Only closed tickets are skipped — blocked tickets must be
+	// reset so callers can resolve the root cause and resume.
 	for _, ticketID := range artifacts.Run.TicketIDs {
 		snapshot := artifacts.Tickets[ticketID]
-		if isTerminalPhase(snapshot.CurrentPhase) {
+		if snapshot.CurrentPhase == state.TicketPhaseClosed {
 			continue
 		}
 		// Release existing claim

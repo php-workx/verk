@@ -3,13 +3,27 @@ package engine
 import (
 	"context"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"verk/internal/adapters/runtime"
+	runtimefake "verk/internal/adapters/runtime/fake"
 	"verk/internal/adapters/ticketstore/tkmd"
+	"verk/internal/policy"
 	"verk/internal/state"
 )
+
+func TestResumeRun_EmptyRepoRoot(t *testing.T) {
+	_, err := ResumeRun(context.Background(), ResumeRequest{RunID: "x", RepoRoot: ""})
+	if err == nil {
+		t.Fatal("expected error for empty RepoRoot, got nil")
+	}
+	if err.Error() != "resume requires repo root" {
+		t.Fatalf("unexpected error message: %q", err.Error())
+	}
+}
 
 func TestResumeRun_BlocksOnClaimDivergence(t *testing.T) {
 	repoRoot := t.TempDir()
@@ -168,6 +182,253 @@ func TestResumeRun_RepairsCommittedTransitionAfterCrash(t *testing.T) {
 	}
 }
 
+func TestResumeRun_ClosedPhase_NonClosable_BecomesBlocked(t *testing.T) {
+	repoRoot := t.TempDir()
+	runID := "run-closed-nonclose"
+	ticketID := "ticket-1"
+
+	writeOpRunFixture(t, repoRoot, runID, state.RunArtifact{
+		ArtifactMeta: state.ArtifactMeta{SchemaVersion: 1, RunID: runID},
+		Mode:         "ticket",
+		RootTicketID: ticketID,
+		Status:       state.EpicRunStatusCompleted,
+		CurrentPhase: state.TicketPhaseClosed,
+		TicketIDs:    []string{ticketID},
+	})
+	writeTicketMarkdownFixture(t, repoRoot, tkmd.Ticket{
+		ID:                 ticketID,
+		Title:              "Non-closable ticket",
+		Status:             tkmd.StatusClosed,
+		OwnedPaths:         []string{"internal/app"},
+		AcceptanceCriteria: []string{"all checks pass"},
+		ValidationCommands: []string{"go test ./..."},
+		UnknownFrontmatter: map[string]any{"type": "task"},
+	})
+	writePlanFixture(t, repoRoot, runID, state.PlanArtifact{
+		ArtifactMeta:             state.ArtifactMeta{SchemaVersion: 1, RunID: runID},
+		TicketID:                 ticketID,
+		AcceptanceCriteria:       []string{"all checks pass"},
+		ValidationCommands:       []string{"go test ./..."},
+		EffectiveReviewThreshold: state.SeverityP2,
+	})
+	writeTicketRunFixture(t, repoRoot, runID, TicketRunSnapshot{
+		ArtifactMeta: state.ArtifactMeta{SchemaVersion: 1, RunID: runID},
+		TicketID:     ticketID,
+		CurrentPhase: state.TicketPhaseClosed,
+		Verification: &state.VerificationArtifact{
+			ArtifactMeta: state.ArtifactMeta{SchemaVersion: 1, RunID: runID},
+			TicketID:     ticketID,
+			Attempt:      1,
+			Commands:     []string{"go test ./..."},
+			Results: []state.VerificationResult{
+				{
+					Command:    "go test ./...",
+					ExitCode:   1,
+					Passed:     false,
+					StartedAt:  time.Date(2026, 4, 2, 12, 0, 0, 0, time.UTC),
+					FinishedAt: time.Date(2026, 4, 2, 12, 0, 1, 0, time.UTC),
+				},
+			},
+			Passed: false,
+		},
+		Review: &state.ReviewFindingsArtifact{
+			ArtifactMeta:             state.ArtifactMeta{SchemaVersion: 1, RunID: runID},
+			TicketID:                 ticketID,
+			Attempt:                  1,
+			ReviewerRuntime:          "codex",
+			Summary:                  "clean",
+			EffectiveReviewThreshold: state.SeverityP2,
+			Passed:                   true,
+		},
+	})
+
+	report, err := ResumeRun(context.Background(), ResumeRequest{RepoRoot: repoRoot, RunID: runID})
+	if err != nil {
+		t.Fatalf("ResumeRun returned error: %v", err)
+	}
+	if len(report.RecoveredTickets) != 1 || report.RecoveredTickets[0] != ticketID {
+		t.Fatalf("expected ticket recovery, got %#v", report.RecoveredTickets)
+	}
+
+	var snapshot TicketRunSnapshot
+	if err := state.LoadJSON(ticketSnapshotPath(repoRoot, runID, ticketID), &snapshot); err != nil {
+		t.Fatalf("load ticket snapshot: %v", err)
+	}
+	if snapshot.CurrentPhase != state.TicketPhaseBlocked {
+		t.Fatalf("expected Blocked phase, got %q", snapshot.CurrentPhase)
+	}
+	if snapshot.BlockReason == "" {
+		t.Fatal("expected BlockReason to be set, got empty string")
+	}
+	if snapshot.Closeout == nil || snapshot.Closeout.Closable {
+		t.Fatalf("expected non-closable closeout, got %#v", snapshot.Closeout)
+	}
+}
+
+func TestResumeRun_ClosedPhase_Closable_StaysClosed(t *testing.T) {
+	repoRoot := t.TempDir()
+	runID := "run-closed-closable"
+	ticketID := "ticket-1"
+
+	writeOpRunFixture(t, repoRoot, runID, state.RunArtifact{
+		ArtifactMeta: state.ArtifactMeta{SchemaVersion: 1, RunID: runID},
+		Mode:         "ticket",
+		RootTicketID: ticketID,
+		Status:       state.EpicRunStatusCompleted,
+		CurrentPhase: state.TicketPhaseClosed,
+		TicketIDs:    []string{ticketID},
+	})
+	writeTicketMarkdownFixture(t, repoRoot, tkmd.Ticket{
+		ID:                 ticketID,
+		Title:              "Closable ticket",
+		Status:             tkmd.StatusClosed,
+		OwnedPaths:         []string{"internal/app"},
+		AcceptanceCriteria: []string{"all checks pass"},
+		ValidationCommands: []string{"go test ./..."},
+		UnknownFrontmatter: map[string]any{"type": "task"},
+	})
+	writePlanFixture(t, repoRoot, runID, state.PlanArtifact{
+		ArtifactMeta:             state.ArtifactMeta{SchemaVersion: 1, RunID: runID},
+		TicketID:                 ticketID,
+		AcceptanceCriteria:       []string{"all checks pass"},
+		ValidationCommands:       []string{"go test ./..."},
+		EffectiveReviewThreshold: state.SeverityP2,
+	})
+	writeTicketRunFixture(t, repoRoot, runID, TicketRunSnapshot{
+		ArtifactMeta: state.ArtifactMeta{SchemaVersion: 1, RunID: runID},
+		TicketID:     ticketID,
+		CurrentPhase: state.TicketPhaseClosed,
+		BlockReason:  "stale-block-reason",
+		Verification: &state.VerificationArtifact{
+			ArtifactMeta: state.ArtifactMeta{SchemaVersion: 1, RunID: runID},
+			TicketID:     ticketID,
+			Attempt:      1,
+			Commands:     []string{"go test ./..."},
+			Results: []state.VerificationResult{
+				{
+					Command:    "go test ./...",
+					ExitCode:   0,
+					Passed:     true,
+					StartedAt:  time.Date(2026, 4, 2, 12, 0, 0, 0, time.UTC),
+					FinishedAt: time.Date(2026, 4, 2, 12, 0, 1, 0, time.UTC),
+				},
+			},
+			Passed: true,
+		},
+		Review: &state.ReviewFindingsArtifact{
+			ArtifactMeta:             state.ArtifactMeta{SchemaVersion: 1, RunID: runID},
+			TicketID:                 ticketID,
+			Attempt:                  1,
+			ReviewerRuntime:          "codex",
+			Summary:                  "clean",
+			EffectiveReviewThreshold: state.SeverityP2,
+			Passed:                   true,
+		},
+	})
+
+	report, err := ResumeRun(context.Background(), ResumeRequest{RepoRoot: repoRoot, RunID: runID})
+	if err != nil {
+		t.Fatalf("ResumeRun returned error: %v", err)
+	}
+	if len(report.RecoveredTickets) != 1 || report.RecoveredTickets[0] != ticketID {
+		t.Fatalf("expected ticket recovery, got %#v", report.RecoveredTickets)
+	}
+
+	var snapshot TicketRunSnapshot
+	if err := state.LoadJSON(ticketSnapshotPath(repoRoot, runID, ticketID), &snapshot); err != nil {
+		t.Fatalf("load ticket snapshot: %v", err)
+	}
+	if snapshot.CurrentPhase != state.TicketPhaseClosed {
+		t.Fatalf("expected Closed phase, got %q", snapshot.CurrentPhase)
+	}
+	if snapshot.BlockReason != "" {
+		t.Fatalf("expected BlockReason cleared, got %q", snapshot.BlockReason)
+	}
+	if snapshot.Closeout == nil || !snapshot.Closeout.Closable {
+		t.Fatalf("expected closable closeout, got %#v", snapshot.Closeout)
+	}
+}
+
+func TestResumeRun_CloseoutPhase_Closable_BecomesClosed(t *testing.T) {
+	repoRoot := t.TempDir()
+	runID := "run-closeout-closable"
+	ticketID := "ticket-1"
+
+	writeOpRunFixture(t, repoRoot, runID, state.RunArtifact{
+		ArtifactMeta: state.ArtifactMeta{SchemaVersion: 1, RunID: runID},
+		Mode:         "ticket",
+		RootTicketID: ticketID,
+		Status:       state.EpicRunStatusRunning,
+		CurrentPhase: state.TicketPhaseCloseout,
+		TicketIDs:    []string{ticketID},
+	})
+	writeTicketMarkdownFixture(t, repoRoot, tkmd.Ticket{
+		ID:                 ticketID,
+		Title:              "Closeout phase ticket",
+		Status:             tkmd.StatusInProgress,
+		OwnedPaths:         []string{"internal/app"},
+		AcceptanceCriteria: []string{"all checks pass"},
+		ValidationCommands: []string{"go test ./..."},
+		UnknownFrontmatter: map[string]any{"type": "task"},
+	})
+	writePlanFixture(t, repoRoot, runID, state.PlanArtifact{
+		ArtifactMeta:             state.ArtifactMeta{SchemaVersion: 1, RunID: runID},
+		TicketID:                 ticketID,
+		AcceptanceCriteria:       []string{"all checks pass"},
+		ValidationCommands:       []string{"go test ./..."},
+		EffectiveReviewThreshold: state.SeverityP2,
+	})
+	writeTicketRunFixture(t, repoRoot, runID, TicketRunSnapshot{
+		ArtifactMeta: state.ArtifactMeta{SchemaVersion: 1, RunID: runID},
+		TicketID:     ticketID,
+		CurrentPhase: state.TicketPhaseCloseout,
+		Verification: &state.VerificationArtifact{
+			ArtifactMeta: state.ArtifactMeta{SchemaVersion: 1, RunID: runID},
+			TicketID:     ticketID,
+			Attempt:      1,
+			Commands:     []string{"go test ./..."},
+			Results: []state.VerificationResult{
+				{
+					Command:    "go test ./...",
+					ExitCode:   0,
+					Passed:     true,
+					StartedAt:  time.Date(2026, 4, 2, 12, 0, 0, 0, time.UTC),
+					FinishedAt: time.Date(2026, 4, 2, 12, 0, 1, 0, time.UTC),
+				},
+			},
+			Passed: true,
+		},
+		Review: &state.ReviewFindingsArtifact{
+			ArtifactMeta:             state.ArtifactMeta{SchemaVersion: 1, RunID: runID},
+			TicketID:                 ticketID,
+			Attempt:                  1,
+			ReviewerRuntime:          "codex",
+			Summary:                  "clean",
+			EffectiveReviewThreshold: state.SeverityP2,
+			Passed:                   true,
+		},
+	})
+
+	report, err := ResumeRun(context.Background(), ResumeRequest{RepoRoot: repoRoot, RunID: runID})
+	if err != nil {
+		t.Fatalf("ResumeRun returned error: %v", err)
+	}
+	if len(report.RecoveredTickets) != 1 || report.RecoveredTickets[0] != ticketID {
+		t.Fatalf("expected ticket recovery, got %#v", report.RecoveredTickets)
+	}
+
+	var snapshot TicketRunSnapshot
+	if err := state.LoadJSON(ticketSnapshotPath(repoRoot, runID, ticketID), &snapshot); err != nil {
+		t.Fatalf("load ticket snapshot: %v", err)
+	}
+	if snapshot.CurrentPhase != state.TicketPhaseClosed {
+		t.Fatalf("expected Closed phase, got %q", snapshot.CurrentPhase)
+	}
+	if snapshot.Closeout == nil || !snapshot.Closeout.Closable {
+		t.Fatalf("expected closable closeout, got %#v", snapshot.Closeout)
+	}
+}
+
 func TestReloadTicketSnapshots_UpdatesStalePhases(t *testing.T) {
 	repoRoot := t.TempDir()
 	runID := "run-reload"
@@ -237,5 +498,107 @@ func TestReloadTicketSnapshots_UpdatesStalePhases(t *testing.T) {
 	updateRunStatusFromTickets(&run, artifacts.Tickets)
 	if run.Status != state.EpicRunStatusCompleted {
 		t.Fatalf("expected completed run after reload, got %q", run.Status)
+	}
+}
+
+// TestResumeRun_BlockedTicketIsReset verifies that a ticket in the blocked phase
+// is reset to ready and included in re-execution when a blocked epic run is resumed.
+// Regression test: isTerminalPhase used to treat blocked as terminal, causing the
+// reset loop to skip blocked tickets and resume to exit immediately as blocked.
+func TestResumeRun_BlockedTicketIsReset_EpicMode(t *testing.T) {
+	repoRoot := t.TempDir()
+	baseCommit := initEpicRepo(t, repoRoot)
+	runID := "run-blocked-reset"
+
+	epic := epicTicket("epic-reset")
+	mustSaveTicket(t, repoRoot, epic)
+
+	// blocked child: should be reset and re-run
+	blocked := epicChildTicket("ticket-blocked", epic.ID, tkmd.StatusBlocked, nil, []string{"internal/app"})
+	mustSaveTicket(t, repoRoot, blocked)
+
+	// closed child: should not be reset or re-run
+	closed := epicChildTicket("ticket-closed", epic.ID, tkmd.StatusClosed, nil, []string{"docs"})
+	mustSaveTicket(t, repoRoot, closed)
+
+	writeOpRunFixture(t, repoRoot, runID, state.RunArtifact{
+		ArtifactMeta: state.ArtifactMeta{SchemaVersion: 1, RunID: runID},
+		Mode:         "epic",
+		RootTicketID: epic.ID,
+		Status:       state.EpicRunStatusBlocked,
+		CurrentPhase: state.TicketPhaseBlocked,
+		BaseCommit:   baseCommit,
+		TicketIDs:    []string{blocked.ID, closed.ID},
+		ResumeCursor: map[string]any{},
+	})
+	writeTicketRunFixture(t, repoRoot, runID, TicketRunSnapshot{
+		ArtifactMeta: state.ArtifactMeta{SchemaVersion: 1, RunID: runID},
+		TicketID:     blocked.ID,
+		CurrentPhase: state.TicketPhaseBlocked,
+		BlockReason:  "non_convergent_verification: failed after 3 attempt(s)",
+	})
+	writeTicketRunFixture(t, repoRoot, runID, TicketRunSnapshot{
+		ArtifactMeta: state.ArtifactMeta{SchemaVersion: 1, RunID: runID},
+		TicketID:     closed.ID,
+		CurrentPhase: state.TicketPhaseClosed,
+		Closeout:     &state.CloseoutArtifact{Closable: true},
+	})
+	writePlanFixture(t, repoRoot, runID, state.PlanArtifact{
+		ArtifactMeta:             state.ArtifactMeta{SchemaVersion: 1, RunID: runID},
+		TicketID:                 blocked.ID,
+		EffectiveReviewThreshold: state.SeverityP2,
+	})
+	writePlanFixture(t, repoRoot, runID, state.PlanArtifact{
+		ArtifactMeta:             state.ArtifactMeta{SchemaVersion: 1, RunID: runID},
+		TicketID:                 closed.ID,
+		EffectiveReviewThreshold: state.SeverityP2,
+	})
+
+	// Adapter returns a blocked result so we can verify re-execution happened
+	// without needing a successful full ticket run.
+	artifactPath := filepath.Join(repoRoot, "worker-result.json")
+	if err := os.WriteFile(artifactPath, []byte("{}"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	adapter := runtimefake.New([]runtime.WorkerResult{
+		validWorkerResult("lease-run-blocked-reset-ticket-blocked", artifactPath),
+	}, nil)
+
+	cfg := policy.DefaultConfig()
+	cfg.Verification.QualityCommands = nil // skip wave verification
+
+	report, err := ResumeRun(context.Background(), ResumeRequest{
+		RepoRoot: repoRoot,
+		RunID:    runID,
+		Adapter:  adapter,
+		Config:   cfg,
+	})
+	if err != nil {
+		t.Fatalf("ResumeRun returned error: %v", err)
+	}
+
+	// The blocked ticket must appear in ResumedTickets — it was reset and re-executed.
+	found := false
+	for _, tid := range report.ResumedTickets {
+		if tid == blocked.ID {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("expected %q in ResumedTickets, got %v", blocked.ID, report.ResumedTickets)
+	}
+
+	// The closed ticket must NOT appear in ResumedTickets.
+	for _, tid := range report.ResumedTickets {
+		if tid == closed.ID {
+			t.Errorf("closed ticket %q should not appear in ResumedTickets", closed.ID)
+		}
+	}
+
+	// Verify the adapter was actually called for the blocked ticket.
+	reqs := adapter.WorkerRequests()
+	if len(reqs) == 0 {
+		t.Error("expected adapter to be called for the re-executed blocked ticket, got 0 calls")
 	}
 }
