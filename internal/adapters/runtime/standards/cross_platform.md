@@ -76,7 +76,7 @@ Always injected unconditionally by standards.go.
 
 - [ ] **`physicalRoot` vs `displayRoot`**: The symlink-resolved physical path and the
   git-canonical display path (`git rev-parse --show-toplevel`) differ on systems
-  with symlinked worktrees. Path relativisation must use the display root so that
+  with symlinked worktrees. Path relativization must use the display root so that
   relative paths computed from it match what the user sees.
 
 - [ ] **Run directory ordering by mtime**: Filesystem mtime is unreliable for ordering

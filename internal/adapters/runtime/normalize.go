@@ -22,7 +22,7 @@ func NormalizeWorkerStatusString(raw string) (WorkerStatus, bool) {
 		return WorkerStatusDone, true
 	case "done_with_concerns", "donewithconcerns", "concerns":
 		return WorkerStatusDoneWithConcerns, true
-	case "needs_context", "needscontext", "context_needed", "needs_more_context":
+	case "needs_context", "needscontext", "context_needed", "needs_more_context", "needsmorecontext":
 		return WorkerStatusNeedsContext, true
 	case "blocked", "blocked_by_operator_input", "blockedbyoperatorinput":
 		return WorkerStatusBlocked, true

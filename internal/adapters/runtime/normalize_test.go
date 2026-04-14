@@ -39,11 +39,13 @@ func TestNormalizeWorkerStatusString_NeedsContextVariants(t *testing.T) {
 		"context-needed",
 		"needs_more_context",
 		"needs-more-context",
+		"needs more context",
 		"NEEDS-MORE-CONTEXT",
 		"Needs More Context",
 		"  needs_context  ",
 		"NEEDS_CONTEXT",
 		"needs-more_context",
+		"needsMoreContext",
 	}
 	for _, raw := range variants {
 		t.Run(raw, func(t *testing.T) {
@@ -86,6 +88,8 @@ func TestNormalizeWorkerStatusString_AllStatuses(t *testing.T) {
 		{"needs-more-context", runtime.WorkerStatusNeedsContext, true},
 		{"needscontext", runtime.WorkerStatusNeedsContext, true},
 		{"context_needed", runtime.WorkerStatusNeedsContext, true},
+		{"needsMoreContext", runtime.WorkerStatusNeedsContext, true},
+		{"needsmorecontext", runtime.WorkerStatusNeedsContext, true},
 
 		// Blocked variants
 		{"blocked", runtime.WorkerStatusBlocked, true},

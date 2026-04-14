@@ -323,6 +323,7 @@ Claim release operation:
   - successful closeout
   - terminal block
   - wave cleanup after failure
+  - startup or setup failure before engine ownership is established (prevents tickets from being blocked until lease expiry after transient startup errors)
 - release must:
   - persist `released_at`, `release_reason`, and `state=released` to the durable claim snapshot
   - remove or tombstone the live claim record only after the durable snapshot update succeeds
@@ -378,6 +379,13 @@ Implementer adapter output enum:
 - `done_with_concerns`
 - `needs_context`
 - `blocked`
+
+Completion code normalization rules:
+
+- adapters must normalize raw runtime output to the canonical enum before returning to the engine
+- hyphenated and underscored variants of the same code must both map to the same canonical value (e.g., `needs-more-context` and `needs_more_context` must both normalize to `needs_context`)
+- the engine must never receive a raw un-normalized completion code; any unknown value after normalization is a terminal adapter error
+- Codex and Claude adapters must apply the same normalization logic to produce identical canonical outputs for identical raw inputs
 
 Reviewer adapter output fields:
 

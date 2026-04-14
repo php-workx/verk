@@ -3,6 +3,7 @@ package runtime
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"verk/internal/state"
@@ -218,13 +219,13 @@ func (r ReviewFinding) Validate() error {
 	if err := ValidateSeverity(r.Severity); err != nil {
 		return err
 	}
-	if r.Title == "" {
+	if strings.TrimSpace(r.Title) == "" {
 		return fmt.Errorf("review finding missing title")
 	}
-	if r.Body == "" {
+	if strings.TrimSpace(r.Body) == "" {
 		return fmt.Errorf("review finding missing body")
 	}
-	if r.File == "" {
+	if strings.TrimSpace(r.File) == "" {
 		return fmt.Errorf("review finding missing file")
 	}
 	if r.Line <= 0 {
@@ -236,13 +237,13 @@ func (r ReviewFinding) Validate() error {
 	if r.Disposition != ReviewDispositionWaived {
 		return nil
 	}
-	if r.WaivedBy == "" {
+	if strings.TrimSpace(r.WaivedBy) == "" {
 		return fmt.Errorf("waived review finding missing waived_by")
 	}
 	if r.WaivedAt.IsZero() {
 		return fmt.Errorf("waived review finding missing waived_at")
 	}
-	if r.WaiverReason == "" {
+	if strings.TrimSpace(r.WaiverReason) == "" {
 		return fmt.Errorf("waived review finding missing waiver_reason")
 	}
 	return nil

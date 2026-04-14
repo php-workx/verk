@@ -319,6 +319,64 @@ func TestIsBlockingFinding_ExpiredWaiverRespectsSeverityThreshold(t *testing.T) 
 	}
 }
 
+func TestReviewFindingValidate_RejectsWhitespaceOnlyFields(t *testing.T) {
+	startedAt, _ := fixedRuntimeTimes()
+
+	base := runtime.ReviewFinding{
+		ID:          "f-1",
+		Severity:    runtime.SeverityP2,
+		Title:       "real title",
+		Body:        "real body",
+		File:        "internal/example.go",
+		Line:        1,
+		Disposition: runtime.ReviewDispositionOpen,
+	}
+
+	for _, tc := range []struct {
+		name   string
+		mutate func(f *runtime.ReviewFinding)
+	}{
+		{
+			name:   "whitespace-only title",
+			mutate: func(f *runtime.ReviewFinding) { f.Title = "   " },
+		},
+		{
+			name:   "newline-tab body",
+			mutate: func(f *runtime.ReviewFinding) { f.Body = "\n\t" },
+		},
+		{
+			name:   "space-only file",
+			mutate: func(f *runtime.ReviewFinding) { f.File = " " },
+		},
+		{
+			name: "tab-only waived_by on waived finding",
+			mutate: func(f *runtime.ReviewFinding) {
+				f.Disposition = runtime.ReviewDispositionWaived
+				f.WaivedBy = "\t"
+				f.WaivedAt = startedAt
+				f.WaiverReason = "accepted risk"
+			},
+		},
+		{
+			name: "space-only waiver_reason on waived finding",
+			mutate: func(f *runtime.ReviewFinding) {
+				f.Disposition = runtime.ReviewDispositionWaived
+				f.WaivedBy = "reviewer"
+				f.WaivedAt = startedAt
+				f.WaiverReason = " "
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := base
+			tc.mutate(&f)
+			if err := f.Validate(); err == nil {
+				t.Fatalf("expected whitespace-only %s to be rejected", tc.name)
+			}
+		})
+	}
+}
+
 func TestFakeAdapter_ReturnsScriptedResults(t *testing.T) {
 	startedAt, finishedAt := fixedRuntimeTimes()
 	adapter := runtimefake.New([]runtime.WorkerResult{
