@@ -54,12 +54,21 @@ func drainTerminalResponses() {
 	}
 	// Set a short read deadline so we don't block if there's nothing to drain.
 	// We use a goroutine with a timeout since os.File doesn't support deadlines
-	// on all platforms.
+	// on all platforms. A cancel channel is closed before restoring the terminal
+	// so the goroutine stops looping as soon as its current Read unblocks.
+	cancel := make(chan struct{})
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
 		buf := make([]byte, 256)
 		for {
+			// Check for cancellation before attempting another read so the
+			// goroutine terminates promptly once the timeout fires.
+			select {
+			case <-cancel:
+				return
+			default:
+			}
 			if _, err := os.Stdin.Read(buf); err != nil {
 				return
 			}
@@ -69,6 +78,7 @@ func drainTerminalResponses() {
 	case <-done:
 	case <-time.After(50 * time.Millisecond):
 	}
+	close(cancel) // Signal goroutine to stop on its next iteration
 	_ = term.Restore(os.Stdin.Fd(), oldState)
 }
 

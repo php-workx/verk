@@ -4,8 +4,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -111,19 +113,37 @@ func latestRunID(repoRoot string) (string, error) {
 		}
 		return "", err
 	}
-	var latest string
+	var latestName string
+	var latestTS int64 = -1
 	for _, entry := range entries {
 		if !entry.IsDir() || !strings.HasPrefix(entry.Name(), "run-") {
 			continue
 		}
-		// Run IDs contain timestamps in the format run-<ticketID>-<unixNano>,
-		// so lexicographic comparison of directory names gives correct
-		// chronological order without relying on filesystem mtime.
-		if latest == "" || entry.Name() > latest {
-			latest = entry.Name()
+		name := entry.Name()
+		// Run IDs are formatted run-<ticketID>-<unixNano>.
+		// Parse the unixNano suffix so that runs across different ticket IDs
+		// are ordered correctly by time, not lexicographically by ticket name.
+		idx := strings.LastIndex(name, "-")
+		if idx < 0 {
+			// Non-conforming entry in the runs directory; log unconditionally
+			// because the project has no debug-level log facility and these
+			// entries indicate an unexpected filesystem state worth surfacing.
+			log.Printf("debug: latestRunID: skipping %q (no '-' separator)", name)
+			continue
+		}
+		ts, err := strconv.ParseInt(name[idx+1:], 10, 64)
+		if err != nil {
+			// Same rationale: unparseable timestamp suffix is unexpected;
+			// emit via log.Printf so the operator can diagnose stale entries.
+			log.Printf("debug: latestRunID: skipping %q (unparseable timestamp: %v)", name, err)
+			continue
+		}
+		if ts > latestTS {
+			latestTS = ts
+			latestName = name
 		}
 	}
-	return latest, nil
+	return latestName, nil
 }
 
 func resolveRunID(args []string) (string, error) {

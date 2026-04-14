@@ -23,11 +23,11 @@ var groupCommandOrder = map[string][]string{
 
 var shouldColorizeFunc = shouldColorize
 
-func initHelp() {
+func initHelp(root *cobra.Command) {
 	cobra.AddTemplateFuncs(template.FuncMap{
 		"groupedHelp": groupedHelp,
 	})
-	rootCmd.SetUsageTemplate(usageTemplate)
+	root.SetUsageTemplate(usageTemplate)
 }
 
 func shouldColorize() bool {

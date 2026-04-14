@@ -11,110 +11,110 @@ import (
 	"github.com/spf13/cobra"
 )
 
-var statusJSONFlag bool
+func initStatusCmd(root *cobra.Command) {
+	var statusJSONFlag bool
 
-var statusCmd = &cobra.Command{
-	Use:          "status [run-id]",
-	Short:        "Show run status",
-	GroupID:      groupObserve,
-	SilenceUsage: true,
-	Args:         cobra.MaximumNArgs(1),
-	RunE: func(cmd *cobra.Command, args []string) error {
-		runID, err := resolveRunID(args)
-		if err != nil {
-			return cmdError(cmd, err, 1)
-		}
-		repoRoot, err := resolveRepoRoot()
-		if err != nil {
-			return cmdError(cmd, fmt.Errorf("resolve repo root: %w", err), 1)
-		}
-
-		report, err := engine.DeriveStatus(engine.StatusRequest{RepoRoot: repoRoot, RunID: runID})
-		if err != nil {
-			return cmdError(cmd, err, 1)
-		}
-		if statusJSONFlag {
-			return printJSON(cmd.OutOrStdout(), report)
-		}
-
-		w := cmd.OutOrStdout()
-		color := shouldColorizeFunc()
-		r := doctorRenderer{color: color}
-
-		_, _ = fmt.Fprintln(w, r.bold("verk status"))
-		_, _ = fmt.Fprintln(w, r.dim(strings.Repeat("─", 40)))
-		_, _ = fmt.Fprintln(w)
-
-		_, _ = fmt.Fprintf(w, "  Run:    %s\n", report.RunID)
-		runStatus := formatRunStatus(r, report.RunStatus)
-		if report.RunStatus == state.EpicRunStatusRunning {
-			if repoRoot != "" && !engine.IsRunLockHeld(repoRoot, report.RunID) {
-				runStatus = r.fail("stale") + r.dim(" (process died — use 'verk run' to resume)")
+	statusCmd := &cobra.Command{
+		Use:          "status [run-id]",
+		Short:        "Show run status",
+		GroupID:      groupObserve,
+		SilenceUsage: true,
+		Args:         cobra.MaximumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			runID, err := resolveRunID(args)
+			if err != nil {
+				return cmdError(cmd, err, 1)
 			}
-		}
-		_, _ = fmt.Fprintf(w, "  Status: %s\n", runStatus)
-		if report.CurrentWave != "" {
-			_, _ = fmt.Fprintf(w, "  Wave:   %s\n", report.CurrentWave)
-		}
-		if report.LastFailedGate != "" {
-			_, _ = fmt.Fprintf(w, "  Gate:   %s\n", r.fail(report.LastFailedGate))
-		}
-
-		_, _ = fmt.Fprintf(w, "\n  %s\n\n", r.bold("Tickets:"))
-
-		tickets := sortTicketsByPhase(report.Tickets)
-		closed, blocked, active, pending := 0, 0, 0, 0
-		for _, ticket := range tickets {
-			tag, tagFn := statusTag(ticket.Phase)
-			title := ticket.TicketID
-			if ticket.Title != "" {
-				title = fmt.Sprintf("%-10s %s", ticket.TicketID, ticket.Title)
+			repoRoot, err := resolveRepoRoot()
+			if err != nil {
+				return cmdError(cmd, fmt.Errorf("resolve repo root: %w", err), 1)
 			}
 
-			_, _ = fmt.Fprintf(w, "  %s %s\n", tagFn(r, tag), title)
-
-			if ticket.BlockReason != "" {
-				reason := shortenBlockReason(ticket.BlockReason)
-				_, _ = fmt.Fprintf(w, "  %s %s\n", strings.Repeat(" ", len(tag)), r.dim(reason))
+			report, err := engine.DeriveStatus(engine.StatusRequest{RepoRoot: repoRoot, RunID: runID})
+			if err != nil {
+				return cmdError(cmd, err, 1)
+			}
+			if statusJSONFlag {
+				return printJSON(cmd.OutOrStdout(), report)
 			}
 
-			switch ticket.Phase {
-			case state.TicketPhaseClosed:
-				closed++
-			case state.TicketPhaseBlocked:
-				blocked++
-			case state.TicketPhaseImplement, state.TicketPhaseVerify, state.TicketPhaseReview, state.TicketPhaseRepair, state.TicketPhaseCloseout:
-				active++
-			default:
-				pending++
+			w := cmd.OutOrStdout()
+			color := shouldColorizeFunc()
+			r := doctorRenderer{color: color}
+
+			_, _ = fmt.Fprintln(w, r.bold("verk status"))
+			_, _ = fmt.Fprintln(w, r.dim(strings.Repeat("─", 40)))
+			_, _ = fmt.Fprintln(w)
+
+			_, _ = fmt.Fprintf(w, "  Run:    %s\n", report.RunID)
+			runStatus := formatRunStatus(r, report.RunStatus)
+			if report.RunStatus == state.EpicRunStatusRunning {
+				if repoRoot != "" && !engine.IsRunLockHeld(repoRoot, report.RunID) {
+					runStatus = r.fail("stale") + r.dim(" (process died — use 'verk run' to resume)")
+				}
 			}
-		}
+			_, _ = fmt.Fprintf(w, "  Status: %s\n", runStatus)
+			if report.CurrentWave != "" {
+				_, _ = fmt.Fprintf(w, "  Wave:   %s\n", report.CurrentWave)
+			}
+			if report.LastFailedGate != "" {
+				_, _ = fmt.Fprintf(w, "  Gate:   %s\n", r.fail(report.LastFailedGate))
+			}
 
-		_, _ = fmt.Fprintln(w)
-		parts := make([]string, 0, 4)
-		if closed > 0 {
-			parts = append(parts, fmt.Sprintf("%d closed", closed))
-		}
-		if active > 0 {
-			parts = append(parts, fmt.Sprintf("%d active", active))
-		}
-		if blocked > 0 {
-			parts = append(parts, fmt.Sprintf("%d blocked", blocked))
-		}
-		if pending > 0 {
-			parts = append(parts, fmt.Sprintf("%d pending", pending))
-		}
-		if len(parts) > 0 {
-			_, _ = fmt.Fprintf(w, "  %s\n", strings.Join(parts, ", "))
-		}
+			_, _ = fmt.Fprintf(w, "\n  %s\n\n", r.bold("Tickets:"))
 
-		return nil
-	},
-}
+			tickets := sortTicketsByPhase(report.Tickets)
+			closed, blocked, active, pending := 0, 0, 0, 0
+			for _, ticket := range tickets {
+				tag, tagFn := statusTag(ticket.Phase)
+				title := ticket.TicketID
+				if ticket.Title != "" {
+					title = fmt.Sprintf("%-10s %s", ticket.TicketID, ticket.Title)
+				}
 
-func initStatusCmd() {
+				_, _ = fmt.Fprintf(w, "  %s %s\n", tagFn(r, tag), title)
+
+				if ticket.BlockReason != "" {
+					reason := shortenBlockReason(ticket.BlockReason)
+					_, _ = fmt.Fprintf(w, "  %s %s\n", strings.Repeat(" ", len(tag)), r.dim(reason))
+				}
+
+				switch ticket.Phase {
+				case state.TicketPhaseClosed:
+					closed++
+				case state.TicketPhaseBlocked:
+					blocked++
+				case state.TicketPhaseImplement, state.TicketPhaseVerify, state.TicketPhaseReview, state.TicketPhaseRepair, state.TicketPhaseCloseout:
+					active++
+				default:
+					pending++
+				}
+			}
+
+			_, _ = fmt.Fprintln(w)
+			parts := make([]string, 0, 4)
+			if closed > 0 {
+				parts = append(parts, fmt.Sprintf("%d closed", closed))
+			}
+			if active > 0 {
+				parts = append(parts, fmt.Sprintf("%d active", active))
+			}
+			if blocked > 0 {
+				parts = append(parts, fmt.Sprintf("%d blocked", blocked))
+			}
+			if pending > 0 {
+				parts = append(parts, fmt.Sprintf("%d pending", pending))
+			}
+			if len(parts) > 0 {
+				_, _ = fmt.Fprintf(w, "  %s\n", strings.Join(parts, ", "))
+			}
+
+			return nil
+		},
+	}
+
 	statusCmd.Flags().BoolVar(&statusJSONFlag, "json", false, "Output as JSON")
-	rootCmd.AddCommand(statusCmd)
+	root.AddCommand(statusCmd)
 }
 
 type tagFormatter func(r doctorRenderer, tag string) string
