@@ -1,8 +1,10 @@
 package tkmd
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -301,5 +303,198 @@ func TestClaimPaths_PreservesValidIdentifiers(t *testing.T) {
 func TestValidateLeaseFence_RejectsLateResult(t *testing.T) {
 	if err := ValidateLeaseFence("lease-current", "lease-old"); err == nil {
 		t.Fatal("expected mismatched lease fence to fail")
+	}
+}
+
+// TestRenewClaim_DurableWriteFailure_LiveRestored verifies that when the
+// durable write fails, RenewClaim restores the live claim to its pre-renewal
+// state so that live and durable remain in sync.
+func TestRenewClaim_DurableWriteFailure_LiveRestored(t *testing.T) {
+	if os.Getuid() == 0 {
+		t.Skip("permission-based test cannot run as root")
+	}
+
+	dir := t.TempDir()
+
+	acquired, err := AcquireClaim(dir, "run-a", "ticket-1", "lease-a", 10*time.Minute)
+	if err != nil {
+		t.Fatalf("AcquireClaim: %v", err)
+	}
+
+	livePath, durablePath, err := claimPaths(dir, "run-a", "ticket-1")
+	if err != nil {
+		t.Fatalf("claimPaths: %v", err)
+	}
+
+	// Make the durable parent directory read-only so writes fail but reads
+	// (and the pre-existing durable file) are still accessible.
+	durableParent := filepath.Dir(durablePath)
+	if err := os.Chmod(durableParent, 0o555); err != nil {
+		t.Fatalf("chmod durable parent: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = os.Chmod(durableParent, 0o755) // restore so t.TempDir cleanup can remove files
+	})
+
+	_, renewErr := RenewClaim(dir, "run-a", "ticket-1", acquired.LeaseID, 20*time.Minute)
+	if renewErr == nil {
+		t.Fatal("expected RenewClaim to return an error")
+	}
+	if !strings.Contains(renewErr.Error(), "live restored") {
+		t.Errorf("expected error to mention 'live restored', got: %v", renewErr)
+	}
+
+	// Live claim on disk must equal the pre-renewal (acquired) state.
+	restoredLive, err := loadClaimArtifact(livePath)
+	if err != nil {
+		t.Fatalf("loadClaimArtifact after failed renewal: %v", err)
+	}
+	if restoredLive == nil {
+		t.Fatal("expected live claim file to exist after restore")
+	}
+	if !restoredLive.ExpiresAt.Equal(acquired.ExpiresAt) {
+		t.Errorf("live claim ExpiresAt mismatch: got %v, want %v (pre-renewal)", restoredLive.ExpiresAt, acquired.ExpiresAt)
+	}
+	if restoredLive.LeaseID != acquired.LeaseID {
+		t.Errorf("live claim LeaseID mismatch: got %q, want %q", restoredLive.LeaseID, acquired.LeaseID)
+	}
+}
+
+// TestConcurrent_AcquireAndRenew_NoRace verifies that a concurrent AcquireClaim
+// and RenewClaim on the same ticket produce a consistent outcome (one serialises
+// before the other) and do not trigger the race detector.
+func TestConcurrent_AcquireAndRenew_NoRace(t *testing.T) {
+	dir := t.TempDir()
+
+	acquired, err := AcquireClaim(dir, "run-a", "ticket-1", "lease-a", 30*time.Minute)
+	if err != nil {
+		t.Fatalf("AcquireClaim setup: %v", err)
+	}
+
+	start := make(chan struct{})
+	renewErr := make(chan error, 1)
+	acquireErr := make(chan error, 1)
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	// Goroutine 1: renew the existing claim held by run-a.
+	go func() {
+		defer wg.Done()
+		<-start
+		_, err := RenewClaim(dir, "run-a", "ticket-1", acquired.LeaseID, 30*time.Minute)
+		renewErr <- err
+	}()
+
+	// Goroutine 2: attempt to acquire the same ticket for run-b.
+	// run-a still holds an active claim, so this must fail.
+	go func() {
+		defer wg.Done()
+		<-start
+		_, err := AcquireClaim(dir, "run-b", "ticket-1", "lease-b", 30*time.Minute)
+		acquireErr <- err
+	}()
+
+	close(start)
+	wg.Wait()
+
+	// Renew must succeed; acquire must fail because run-a still holds the claim.
+	if err := <-renewErr; err != nil {
+		t.Errorf("RenewClaim failed unexpectedly: %v", err)
+	}
+	if err := <-acquireErr; err == nil {
+		t.Error("AcquireClaim by run-b succeeded while run-a still holds claim")
+	}
+}
+
+// TestConcurrent_AcquireAndRelease_NoRace verifies that a concurrent
+// AcquireClaim and ReleaseClaim on the same ticket produce a consistent outcome
+// and do not trigger the race detector.
+func TestConcurrent_AcquireAndRelease_NoRace(t *testing.T) {
+	dir := t.TempDir()
+
+	acquired, err := AcquireClaim(dir, "run-a", "ticket-1", "lease-a", 30*time.Minute)
+	if err != nil {
+		t.Fatalf("AcquireClaim setup: %v", err)
+	}
+
+	start := make(chan struct{})
+	releaseErr := make(chan error, 1)
+	acquireErr := make(chan error, 1)
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	// Goroutine 1: release the claim held by run-a.
+	go func() {
+		defer wg.Done()
+		<-start
+		releaseErr <- ReleaseClaim(dir, "run-a", "ticket-1", acquired.LeaseID, "completed")
+	}()
+
+	// Goroutine 2: attempt to acquire the same ticket for run-b.
+	go func() {
+		defer wg.Done()
+		<-start
+		_, err := AcquireClaim(dir, "run-b", "ticket-1", "lease-b", 30*time.Minute)
+		acquireErr <- err
+	}()
+
+	close(start)
+	wg.Wait()
+
+	rErr := <-releaseErr
+	aErr := <-acquireErr
+
+	// Valid outcomes (one serialises before the other):
+	//   - Release wins: rErr==nil; acquire sees a free slot: aErr==nil.
+	//   - Acquire-check wins: aErr!=nil (active claim blocks it); release still succeeds: rErr==nil.
+	// The only invalid outcome is both failing simultaneously.
+	if rErr != nil {
+		t.Errorf("ReleaseClaim failed unexpectedly: %v", rErr)
+	}
+	// aErr is allowed to be non-nil when the lock ordering puts the acquire
+	// check before the release completes.
+	_ = aErr
+}
+
+// TestRenewClaim_DurableAndRestoreFailure_ErrorMentionsBoth verifies that when
+// both the durable write and the compensating live-restore fail, the returned
+// error mentions both failure causes so operators know the state is fully
+// wedged.
+func TestRenewClaim_DurableAndRestoreFailure_ErrorMentionsBoth(t *testing.T) {
+	dir := t.TempDir()
+
+	acquired, err := AcquireClaim(dir, "run-a", "ticket-1", "lease-a", 10*time.Minute)
+	if err != nil {
+		t.Fatalf("AcquireClaim: %v", err)
+	}
+
+	origSave := saveAtomic
+	t.Cleanup(func() { saveAtomic = origSave })
+
+	callN := 0
+	saveAtomic = func(path string, v any) error {
+		callN++
+		switch callN {
+		case 1: // initial live write: succeed
+			return state.SaveJSONAtomic(path, v)
+		case 2: // durable write: fail
+			return errors.New("simulated durable write failure")
+		default: // restore attempt: fail
+			return errors.New("simulated restore failure")
+		}
+	}
+
+	_, renewErr := RenewClaim(dir, "run-a", "ticket-1", acquired.LeaseID, 20*time.Minute)
+	if renewErr == nil {
+		t.Fatal("expected RenewClaim to return an error")
+	}
+	msg := renewErr.Error()
+	if !strings.Contains(msg, "durable") {
+		t.Errorf("expected error to mention durable failure, got: %s", msg)
+	}
+	if !strings.Contains(msg, "restore") {
+		t.Errorf("expected error to mention restore failure, got: %s", msg)
 	}
 }

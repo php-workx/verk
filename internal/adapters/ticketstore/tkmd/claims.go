@@ -7,7 +7,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"syscall"
 	"time"
 
 	"verk/internal/state"
@@ -17,6 +16,10 @@ const (
 	claimSchemaVersion = 1
 	defaultClaimTTL    = 30 * time.Minute
 )
+
+// saveAtomic is the atomic JSON save function used by RenewClaim.
+// Package-internal; overridable in tests.
+var saveAtomic = state.SaveJSONAtomic
 
 func AcquireClaim(rootDir string, args ...any) (state.ClaimArtifact, error) {
 	req, err := parseAcquireClaimRequest(rootDir, args...)
@@ -103,54 +106,66 @@ func RenewClaim(rootDir string, args ...any) (state.ClaimArtifact, error) {
 		return state.ClaimArtifact{}, err
 	}
 
-	live, err := loadClaimArtifact(livePath)
-	if err != nil {
-		return state.ClaimArtifact{}, err
-	}
-	if live == nil {
-		return state.ClaimArtifact{}, fmt.Errorf("claim %s not found for renewal", req.ticketID)
-	}
-	if claimReleased(live) {
-		return state.ClaimArtifact{}, fmt.Errorf("claim %s has already been released", req.ticketID)
-	}
-	if live.OwnerRunID != req.runID {
-		return state.ClaimArtifact{}, fmt.Errorf("claim %s belongs to run %s", req.ticketID, live.OwnerRunID)
-	}
-	if err := ValidateLeaseFence(live.LeaseID, req.leaseID); err != nil {
-		return state.ClaimArtifact{}, err
-	}
-	if claimExpired(*live, req.now) {
-		return state.ClaimArtifact{}, fmt.Errorf("claim %s lease expired at %s", req.ticketID, live.ExpiresAt.UTC().Format(time.RFC3339Nano))
-	}
-
-	durable, err := loadClaimArtifact(durablePath)
-	if err != nil {
-		return state.ClaimArtifact{}, err
-	}
-	if durable != nil && !claimReleased(durable) {
-		if durable.OwnerRunID != live.OwnerRunID || durable.LeaseID != live.LeaseID {
-			return state.ClaimArtifact{}, fmt.Errorf("claim %s diverged between live and durable state", req.ticketID)
+	var renewed state.ClaimArtifact
+	if err := withClaimAcquisitionLock(livePath, func() error {
+		live, err := loadClaimArtifact(livePath)
+		if err != nil {
+			return err
 		}
-	}
+		if live == nil {
+			return fmt.Errorf("claim %s not found for renewal", req.ticketID)
+		}
+		if claimReleased(live) {
+			return fmt.Errorf("claim %s has already been released", req.ticketID)
+		}
+		if live.OwnerRunID != req.runID {
+			return fmt.Errorf("claim %s belongs to run %s", req.ticketID, live.OwnerRunID)
+		}
+		if err := ValidateLeaseFence(live.LeaseID, req.leaseID); err != nil {
+			return err
+		}
+		if claimExpired(*live, req.now) {
+			return fmt.Errorf("claim %s lease expired at %s", req.ticketID, live.ExpiresAt.UTC().Format(time.RFC3339Nano))
+		}
 
-	renewed := *live
-	normalizeClaimArtifact(&renewed, req.now)
-	renewed.RunID = req.runID
-	renewed.OwnerRunID = req.runID
-	if req.ownerWaveID != "" {
-		renewed.OwnerWaveID = req.ownerWaveID
-	}
-	renewed.LeaseID = live.LeaseID
-	renewed.LeasedAt = live.LeasedAt
-	renewed.ExpiresAt = req.now.Add(req.ttl)
-	renewed.State = "active"
-	renewed.LastSeenLiveClaimPath = liveClaimRelativePath(req.ticketID)
+		durable, err := loadClaimArtifact(durablePath)
+		if err != nil {
+			return err
+		}
+		if durable != nil && !claimReleased(durable) {
+			if durable.OwnerRunID != live.OwnerRunID || durable.LeaseID != live.LeaseID {
+				return fmt.Errorf("claim %s diverged between live and durable state", req.ticketID)
+			}
+		}
 
-	if err := state.SaveJSONAtomic(livePath, renewed); err != nil {
-		return state.ClaimArtifact{}, fmt.Errorf("write live claim: %w", err)
-	}
-	if err := state.SaveJSONAtomic(durablePath, renewed); err != nil {
-		return state.ClaimArtifact{}, fmt.Errorf("write durable claim: %w", err)
+		r := *live
+		normalizeClaimArtifact(&r, req.now)
+		r.RunID = req.runID
+		r.OwnerRunID = req.runID
+		if req.ownerWaveID != "" {
+			r.OwnerWaveID = req.ownerWaveID
+		}
+		r.LeaseID = live.LeaseID
+		r.LeasedAt = live.LeasedAt
+		r.ExpiresAt = req.now.Add(req.ttl)
+		r.State = "active"
+		r.LastSeenLiveClaimPath = liveClaimRelativePath(req.ticketID)
+
+		originalLive := *live
+
+		if err := saveAtomic(livePath, r); err != nil {
+			return fmt.Errorf("write live claim: %w", err)
+		}
+		if durableErr := saveAtomic(durablePath, r); durableErr != nil {
+			if restoreErr := saveAtomic(livePath, originalLive); restoreErr != nil {
+				return fmt.Errorf("write durable claim: %w; restore live claim: %w", durableErr, restoreErr)
+			}
+			return fmt.Errorf("write durable claim, live restored: %w", durableErr)
+		}
+		renewed = r
+		return nil
+	}); err != nil {
+		return state.ClaimArtifact{}, err
 	}
 	return renewed, nil
 }
@@ -166,54 +181,56 @@ func ReleaseClaim(rootDir string, args ...any) error {
 		return err
 	}
 
-	live, err := loadClaimArtifact(livePath)
-	if err != nil {
-		return err
-	}
-	durable, err := loadClaimArtifact(durablePath)
-	if err != nil {
-		return err
-	}
+	return withClaimAcquisitionLock(livePath, func() error {
+		live, err := loadClaimArtifact(livePath)
+		if err != nil {
+			return err
+		}
+		durable, err := loadClaimArtifact(durablePath)
+		if err != nil {
+			return err
+		}
 
-	current := live
-	if current == nil {
-		current = durable
-	}
-	if current == nil {
-		return fmt.Errorf("claim %s not found for release", req.ticketID)
-	}
-	if current.OwnerRunID != req.runID {
-		return fmt.Errorf("claim %s belongs to run %s", req.ticketID, current.OwnerRunID)
-	}
+		current := live
+		if current == nil {
+			current = durable
+		}
+		if current == nil {
+			return fmt.Errorf("claim %s not found for release", req.ticketID)
+		}
+		if current.OwnerRunID != req.runID {
+			return fmt.Errorf("claim %s belongs to run %s", req.ticketID, current.OwnerRunID)
+		}
 
-	leaseID := req.leaseID
-	if leaseID == "" {
-		leaseID = current.LeaseID
-	}
-	if err := ValidateLeaseFence(current.LeaseID, leaseID); err != nil {
-		return err
-	}
+		leaseID := req.leaseID
+		if leaseID == "" {
+			leaseID = current.LeaseID
+		}
+		if err := ValidateLeaseFence(current.LeaseID, leaseID); err != nil {
+			return err
+		}
 
-	released := *current
-	normalizeClaimArtifact(&released, req.now)
-	released.RunID = req.runID
-	released.OwnerRunID = req.runID
-	released.LeaseID = current.LeaseID
-	released.State = "released"
-	released.ReleasedAt = req.now
-	if req.releaseReason == "" {
-		req.releaseReason = "released"
-	}
-	released.ReleaseReason = req.releaseReason
-	released.LastSeenLiveClaimPath = liveClaimRelativePath(req.ticketID)
+		released := *current
+		normalizeClaimArtifact(&released, req.now)
+		released.RunID = req.runID
+		released.OwnerRunID = req.runID
+		released.LeaseID = current.LeaseID
+		released.State = "released"
+		released.ReleasedAt = req.now
+		if req.releaseReason == "" {
+			req.releaseReason = "released"
+		}
+		released.ReleaseReason = req.releaseReason
+		released.LastSeenLiveClaimPath = liveClaimRelativePath(req.ticketID)
 
-	if err := state.SaveJSONAtomic(durablePath, released); err != nil {
-		return fmt.Errorf("write durable claim: %w", err)
-	}
-	if err := os.Remove(livePath); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf("remove live claim: %w", err)
-	}
-	return nil
+		if err := state.SaveJSONAtomic(durablePath, released); err != nil {
+			return fmt.Errorf("write durable claim: %w", err)
+		}
+		if err := os.Remove(livePath); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("remove live claim: %w", err)
+		}
+		return nil
+	})
 }
 
 func ReconcileClaim(live, durable *state.ClaimArtifact, runID string, terminal bool) (state.ClaimArtifact, error) {
@@ -286,23 +303,6 @@ func ValidateLeaseFence(expected, actual string) error {
 		return fmt.Errorf("lease fence mismatch: expected %q, got %q", expected, actual)
 	}
 	return nil
-}
-
-func withClaimAcquisitionLock(path string, fn func() error) error {
-	lockFile, err := os.OpenFile(path+".lock", os.O_CREATE|os.O_RDWR, 0o644)
-	if err != nil {
-		return fmt.Errorf("open claim lock: %w", err)
-	}
-	defer func() {
-		_ = syscall.Flock(int(lockFile.Fd()), syscall.LOCK_UN)
-		_ = lockFile.Close()
-		_ = os.Remove(path + ".lock")
-	}()
-
-	if err := syscall.Flock(int(lockFile.Fd()), syscall.LOCK_EX); err != nil {
-		return fmt.Errorf("lock claim: %w", err)
-	}
-	return fn()
 }
 
 type acquireClaimRequest struct {
