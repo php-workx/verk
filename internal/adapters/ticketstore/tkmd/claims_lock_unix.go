@@ -9,8 +9,11 @@ import (
 )
 
 // withClaimAcquisitionLock acquires an exclusive advisory lock on the lock file
-// at path+".lock", calls fn under the lock, then releases the lock and removes
-// the lock file. Uses syscall.Flock (POSIX) for Unix platforms.
+// at path+".lock", calls fn under the lock, then releases the lock. The lock
+// file is left on disk after release so that racing openers always contend on
+// the same inode; removing it between unlock and re-open would cause the next
+// waiter to get a lock on a new, unrelated inode. Uses syscall.Flock (POSIX)
+// for Unix platforms.
 func withClaimAcquisitionLock(path string, fn func() error) error {
 	lockFile, err := os.OpenFile(path+".lock", os.O_CREATE|os.O_RDWR, 0o644)
 	if err != nil {
@@ -19,7 +22,6 @@ func withClaimAcquisitionLock(path string, fn func() error) error {
 	defer func() {
 		_ = syscall.Flock(int(lockFile.Fd()), syscall.LOCK_UN)
 		_ = lockFile.Close()
-		_ = os.Remove(path + ".lock")
 	}()
 
 	if err := syscall.Flock(int(lockFile.Fd()), syscall.LOCK_EX); err != nil {
