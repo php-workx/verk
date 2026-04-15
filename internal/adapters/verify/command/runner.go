@@ -205,6 +205,9 @@ func RunQualityCommands(ctx context.Context, repoRoot string, cmds []policy.Qual
 		workDir := absRepoRoot
 		if qc.Path != "" {
 			workDir = filepath.Join(absRepoRoot, filepath.Clean(qc.Path))
+			if !strings.HasPrefix(workDir+string(filepath.Separator), absRepoRoot+string(filepath.Separator)) {
+				return results, fmt.Errorf("quality command path %q escapes repo root", qc.Path)
+			}
 		}
 
 		for _, rawCmd := range qc.Run {
