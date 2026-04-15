@@ -179,6 +179,8 @@ func promptSeverity(w io.Writer, scanner *bufio.Scanner, label string, defaultVa
 		switch state.Severity(input) {
 		case state.SeverityP0, state.SeverityP1, state.SeverityP2, state.SeverityP3, state.SeverityP4:
 			return state.Severity(input)
+		default:
+			_, _ = fmt.Fprintf(w, "  Invalid severity %q, using default: %s\n", input, defaultVal)
 		}
 	}
 	return defaultVal
@@ -194,6 +196,7 @@ func promptInt(w io.Writer, scanner *bufio.Scanner, label string, defaultVal, mi
 		if n, err := strconv.Atoi(input); err == nil && n >= min && n <= max {
 			return n
 		}
+		_, _ = fmt.Fprintf(w, "  Invalid input %q, using default: %d\n", input, defaultVal)
 	}
 	return defaultVal
 }
