@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -48,8 +49,11 @@ func runWaveVerificationLoop(
 	if cfg.Policy.MaxWaveRepairCycles == 0 {
 		wave.Acceptance["wave_verification_passed"] = false
 		wave.Acceptance["wave_verification_cycles"] = 0
-		_ = state.SaveJSONAtomic(wavePath, wave)
-		return fmt.Errorf("wave %s: quality commands failed (wave repair disabled)", wave.WaveID)
+		primary := fmt.Errorf("wave %s: quality commands failed (wave repair disabled)", wave.WaveID)
+		if saveErr := state.SaveJSONAtomic(wavePath, wave); saveErr != nil {
+			return errors.Join(primary, fmt.Errorf("persist wave state: %w", saveErr))
+		}
+		return primary
 	}
 
 	adapter, err := resolveWaveAdapter(req)
@@ -58,7 +62,7 @@ func runWaveVerificationLoop(
 	}
 
 	for cycle := 1; cycle <= cfg.Policy.MaxWaveRepairCycles; cycle++ {
-		SendProgress(req.Progress, ProgressEvent{
+		SendProgress(ctx, req.Progress, ProgressEvent{
 			Type:     EventTicketDetail,
 			TicketID: wave.WaveID,
 			Detail:   fmt.Sprintf("wave repair cycle %d/%d", cycle, cfg.Policy.MaxWaveRepairCycles),
@@ -77,7 +81,7 @@ func runWaveVerificationLoop(
 			Instructions:    instructions,
 			ExecutionConfig: executionConfigFromPolicy(cfg),
 			OnProgress: func(detail string) {
-				SendProgress(req.Progress, ProgressEvent{
+				SendProgress(ctx, req.Progress, ProgressEvent{
 					Type:     EventTicketDetail,
 					TicketID: wave.WaveID,
 					Detail:   detail,
@@ -87,8 +91,11 @@ func runWaveVerificationLoop(
 		if err != nil {
 			wave.Acceptance["wave_verification_passed"] = false
 			wave.Acceptance["wave_verification_cycles"] = cycle
-			_ = state.SaveJSONAtomic(wavePath, wave)
-			return fmt.Errorf("wave %s: repair worker cycle %d: %w", wave.WaveID, cycle, err)
+			primary := fmt.Errorf("wave %s: repair worker cycle %d: %w", wave.WaveID, cycle, err)
+			if saveErr := state.SaveJSONAtomic(wavePath, wave); saveErr != nil {
+				return errors.Join(primary, fmt.Errorf("persist wave state: %w", saveErr))
+			}
+			return primary
 		}
 
 		results, err = verifycommand.RunQualityCommands(ctx, req.RepoRoot, cfg.Verification.QualityCommands, cfg.Verification)
@@ -104,8 +111,11 @@ func runWaveVerificationLoop(
 
 	wave.Acceptance["wave_verification_passed"] = false
 	wave.Acceptance["wave_verification_cycles"] = cfg.Policy.MaxWaveRepairCycles
-	_ = state.SaveJSONAtomic(wavePath, wave)
-	return fmt.Errorf("wave %s: quality commands still failing after %d repair cycle(s)", wave.WaveID, cfg.Policy.MaxWaveRepairCycles)
+	primary := fmt.Errorf("wave %s: quality commands still failing after %d repair cycle(s)", wave.WaveID, cfg.Policy.MaxWaveRepairCycles)
+	if saveErr := state.SaveJSONAtomic(wavePath, wave); saveErr != nil {
+		return errors.Join(primary, fmt.Errorf("persist wave state: %w", saveErr))
+	}
+	return primary
 }
 
 // resolveWaveAdapter returns the runtime adapter for wave-level repair workers.
@@ -235,7 +245,7 @@ func resumePendingWaveVerification(
 		return fmt.Errorf("load pending wave %s for re-verification: %w", pendingWaveID, err)
 	}
 
-	SendProgress(req.Progress, ProgressEvent{
+	SendProgress(ctx, req.Progress, ProgressEvent{
 		Type:     EventTicketDetail,
 		TicketID: pendingWaveID,
 		Detail:   fmt.Sprintf("re-running wave verification for %s", pendingWaveID),

@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"context"
 	"time"
 
 	"verk/internal/state"
@@ -34,12 +35,15 @@ type ProgressEvent struct {
 }
 
 // SendProgress sends an event on the channel if it's not nil.
-func SendProgress(ch chan<- ProgressEvent, evt ProgressEvent) {
+func SendProgress(ctx context.Context, ch chan<- ProgressEvent, evt ProgressEvent) {
 	if ch == nil {
 		return
 	}
 	if evt.Time.IsZero() {
 		evt.Time = time.Now().UTC()
 	}
-	ch <- evt
+	select {
+	case ch <- evt:
+	case <-ctx.Done():
+	}
 }

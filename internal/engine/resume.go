@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"sync"
@@ -337,7 +338,9 @@ func resumeEpicMode(ctx context.Context, req ResumeRequest, artifacts *runArtifa
 		if err := resumePendingWaveVerification(ctx, epicReq, cfg, artifacts.Run.ResumeCursor, runPath, &artifacts.Run); err != nil {
 			artifacts.Run.Status = state.EpicRunStatusBlocked
 			artifacts.Run.CurrentPhase = state.TicketPhaseBlocked
-			_ = state.SaveJSONAtomic(runPath, artifacts.Run)
+			if saveErr := state.SaveJSONAtomic(runPath, artifacts.Run); saveErr != nil {
+				return allResumed, errors.Join(err, fmt.Errorf("persist run state: %w", saveErr))
+			}
 			return allResumed, err
 		}
 
@@ -374,7 +377,9 @@ func resumeEpicMode(ctx context.Context, req ResumeRequest, artifacts *runArtifa
 			artifacts.Run.Status = state.EpicRunStatusBlocked
 			artifacts.Run.CurrentPhase = state.TicketPhaseBlocked
 			artifacts.Run.UpdatedAt = time.Now().UTC()
-			_ = state.SaveJSONAtomic(runPath, artifacts.Run)
+			if saveErr := state.SaveJSONAtomic(runPath, artifacts.Run); saveErr != nil {
+				return allResumed, errors.Join(err, fmt.Errorf("persist run state: %w", saveErr))
+			}
 			return allResumed, err
 		}
 
@@ -389,7 +394,7 @@ func resumeEpicMode(ctx context.Context, req ResumeRequest, artifacts *runArtifa
 		if err := state.SaveJSONAtomic(wavePath, wave); err != nil {
 			return allResumed, err
 		}
-		SendProgress(req.Progress, ProgressEvent{
+		SendProgress(ctx, req.Progress, ProgressEvent{
 			Type:    EventWaveStarted,
 			WaveID:  waveOrdinal,
 			Tickets: append([]string(nil), wave.TicketIDs...),
@@ -421,7 +426,7 @@ func resumeEpicMode(ctx context.Context, req ResumeRequest, artifacts *runArtifa
 						outcomes[i] = outcome
 						return
 					}
-					SendProgress(req.Progress, ProgressEvent{
+					SendProgress(ctx, req.Progress, ProgressEvent{
 						Type:     EventTicketDetail,
 						TicketID: ticketID,
 						Detail:   fmt.Sprintf("worker crashed (attempt %d/%d), retrying: %v", attempt+1, maxCrashRetries+1, outcome.err),
@@ -492,7 +497,7 @@ func resumeEpicMode(ctx context.Context, req ResumeRequest, artifacts *runArtifa
 			return allResumed, err
 		}
 		closedCount := countClosedTickets(outcomes)
-		SendProgress(req.Progress, ProgressEvent{
+		SendProgress(ctx, req.Progress, ProgressEvent{
 			Type:    EventWaveCompleted,
 			WaveID:  waveOrdinal,
 			Closed:  closedCount,
@@ -531,7 +536,9 @@ func resumeEpicMode(ctx context.Context, req ResumeRequest, artifacts *runArtifa
 			if verifyErr := runWaveVerificationLoop(ctx, epicReq, cfg, &acceptedWave, wavePath, changedFiles); verifyErr != nil {
 				artifacts.Run.Status = state.EpicRunStatusBlocked
 				artifacts.Run.CurrentPhase = state.TicketPhaseBlocked
-				_ = state.SaveJSONAtomic(runPath, artifacts.Run)
+				if saveErr := state.SaveJSONAtomic(runPath, artifacts.Run); saveErr != nil {
+					return allResumed, errors.Join(verifyErr, fmt.Errorf("persist run state: %w", saveErr))
+				}
 				return allResumed, verifyErr
 			}
 			clearPendingWaveVerification(artifacts.Run.ResumeCursor)

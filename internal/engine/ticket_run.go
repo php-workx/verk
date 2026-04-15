@@ -61,6 +61,7 @@ type TicketRunSnapshot struct {
 }
 
 type ticketRunState struct {
+	ctx                    context.Context
 	req                    RunTicketRequest
 	cfg                    policy.Config
 	paths                  ticketRunPaths
@@ -114,6 +115,7 @@ func RunTicket(ctx context.Context, req RunTicketRequest) (result RunTicketResul
 	req.Plan = plan
 
 	st := &ticketRunState{
+		ctx:          ctx,
 		req:          req,
 		cfg:          cfg,
 		paths:        buildTicketRunPaths(absRepoRoot, req.RunID, req.Ticket.ID),
@@ -1024,7 +1026,7 @@ func (st *ticketRunState) emitProgress(phase state.TicketPhase) {
 			detail = detail[:57] + "..."
 		}
 	}
-	SendProgress(st.req.Progress, ProgressEvent{
+	SendProgress(st.ctx, st.req.Progress, ProgressEvent{
 		Type:     EventTicketPhaseChanged,
 		TicketID: st.req.Ticket.ID,
 		Title:    st.req.Plan.Title,
@@ -1034,7 +1036,7 @@ func (st *ticketRunState) emitProgress(phase state.TicketPhase) {
 }
 
 func (st *ticketRunState) progressDetail(detail string) {
-	SendProgress(st.req.Progress, ProgressEvent{
+	SendProgress(st.ctx, st.req.Progress, ProgressEvent{
 		Type:     EventTicketDetail,
 		TicketID: st.req.Ticket.ID,
 		Title:    st.req.Plan.Title,

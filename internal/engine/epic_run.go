@@ -82,7 +82,7 @@ func RunEpic(ctx context.Context, req RunEpicRequest) (RunEpicResult, error) {
 			if err := updateTicketStoreStatus(req.RepoRoot, child.ID, tkmd.StatusOpen); err != nil {
 				return RunEpicResult{}, fmt.Errorf("reset orphaned ticket %s: %w", child.ID, err)
 			}
-			SendProgress(req.Progress, ProgressEvent{
+			SendProgress(ctx, req.Progress, ProgressEvent{
 				Type:     EventTicketDetail,
 				TicketID: child.ID,
 				Detail:   "reset to ready (was in_progress from prior run)",
@@ -128,7 +128,9 @@ func RunEpic(ctx context.Context, req RunEpicRequest) (RunEpicResult, error) {
 		if err := resumePendingWaveVerification(ctx, req, cfg, result.Run.ResumeCursor, runPath, &result.Run); err != nil {
 			result.Run.Status = state.EpicRunStatusBlocked
 			result.Run.CurrentPhase = state.TicketPhaseBlocked
-			_ = state.SaveJSONAtomic(runPath, result.Run)
+			if saveErr := state.SaveJSONAtomic(runPath, result.Run); saveErr != nil {
+				return result, errors.Join(err, fmt.Errorf("persist run state: %w", saveErr))
+			}
 			return result, err
 		}
 
@@ -143,14 +145,14 @@ func RunEpic(ctx context.Context, req RunEpicRequest) (RunEpicResult, error) {
 				return result, err
 			}
 			if len(currentChildren) == 0 {
-				SendProgress(req.Progress, ProgressEvent{
+				SendProgress(ctx, req.Progress, ProgressEvent{
 					Type:   EventTicketDetail,
 					Detail: fmt.Sprintf("no child tickets found for epic %s", req.RootTicketID),
 				})
 			} else {
 				for _, child := range currentChildren {
 					reason := describeNotReady(child)
-					SendProgress(req.Progress, ProgressEvent{
+					SendProgress(ctx, req.Progress, ProgressEvent{
 						Type:     EventTicketDetail,
 						TicketID: child.ID,
 						Title:    child.Title,
@@ -183,7 +185,9 @@ func RunEpic(ctx context.Context, req RunEpicRequest) (RunEpicResult, error) {
 			result.Run.Status = state.EpicRunStatusBlocked
 			result.Run.CurrentPhase = state.TicketPhaseBlocked
 			result.Run.UpdatedAt = time.Now().UTC()
-			_ = state.SaveJSONAtomic(runPath, result.Run)
+			if saveErr := state.SaveJSONAtomic(runPath, result.Run); saveErr != nil {
+				return result, errors.Join(err, fmt.Errorf("persist run state: %w", saveErr))
+			}
 			return result, err
 		}
 
@@ -198,7 +202,7 @@ func RunEpic(ctx context.Context, req RunEpicRequest) (RunEpicResult, error) {
 		if err := state.SaveJSONAtomic(wavePath, wave); err != nil {
 			return result, err
 		}
-		SendProgress(req.Progress, ProgressEvent{
+		SendProgress(ctx, req.Progress, ProgressEvent{
 			Type:    EventWaveStarted,
 			WaveID:  waveOrdinal,
 			Tickets: append([]string(nil), wave.TicketIDs...),
@@ -229,7 +233,7 @@ func RunEpic(ctx context.Context, req RunEpicRequest) (RunEpicResult, error) {
 						outcomes[i] = outcome
 						return
 					}
-					SendProgress(req.Progress, ProgressEvent{
+					SendProgress(ctx, req.Progress, ProgressEvent{
 						Type:     EventTicketDetail,
 						TicketID: ticketID,
 						Detail:   fmt.Sprintf("worker crashed (attempt %d/%d), retrying: %v", attempt+1, maxCrashRetries+1, outcome.err),
@@ -299,7 +303,7 @@ func RunEpic(ctx context.Context, req RunEpicRequest) (RunEpicResult, error) {
 			return result, err
 		}
 		closedCount := countClosedTickets(outcomes)
-		SendProgress(req.Progress, ProgressEvent{
+		SendProgress(ctx, req.Progress, ProgressEvent{
 			Type:    EventWaveCompleted,
 			WaveID:  waveOrdinal,
 			Closed:  closedCount,
@@ -337,7 +341,9 @@ func RunEpic(ctx context.Context, req RunEpicRequest) (RunEpicResult, error) {
 			if verifyErr := runWaveVerificationLoop(ctx, req, cfg, &acceptedWave, wavePath, changedFiles); verifyErr != nil {
 				result.Run.Status = state.EpicRunStatusBlocked
 				result.Run.CurrentPhase = state.TicketPhaseBlocked
-				_ = state.SaveJSONAtomic(runPath, result.Run)
+				if saveErr := state.SaveJSONAtomic(runPath, result.Run); saveErr != nil {
+					return result, errors.Join(verifyErr, fmt.Errorf("persist run state: %w", saveErr))
+				}
 				return result, verifyErr
 			}
 			clearPendingWaveVerification(result.Run.ResumeCursor)

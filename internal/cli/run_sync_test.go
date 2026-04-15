@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -164,7 +165,7 @@ func TestDrainGoroutine_PreventsDeadlockOnEarlyTUIReturn(t *testing.T) {
 		// Send twice the buffer capacity to guarantee the goroutine would
 		// deadlock if nobody drains ch after the TUI returns early.
 		for i := 0; i < eventCount; i++ {
-			engine.SendProgress(ch, engine.ProgressEvent{
+			engine.SendProgress(context.Background(), ch, engine.ProgressEvent{
 				Type:   engine.EventTicketDetail,
 				Detail: fmt.Sprintf("event-%d", i),
 			})
