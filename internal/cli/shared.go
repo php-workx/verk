@@ -2,6 +2,7 @@ package cli
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -66,11 +67,11 @@ func newRunID(ticketID string) string {
 func mustJSONMap(v any) map[string]any {
 	data, err := json.Marshal(v)
 	if err != nil {
-		return map[string]any{}
+		panic(fmt.Errorf("mustJSONMap: marshal %T: %w", v, err))
 	}
 	var out map[string]any
 	if err := json.Unmarshal(data, &out); err != nil {
-		return map[string]any{}
+		panic(fmt.Errorf("mustJSONMap: unmarshal %T: %w", v, err))
 	}
 	return out
 }
@@ -89,6 +90,14 @@ func writeCurrentRunID(repoRoot, runID string) error {
 		return err
 	}
 	return os.WriteFile(filepath.Join(dir, "current"), []byte(runID+"\n"), 0o644)
+}
+
+func clearCurrentRunID(repoRoot string) error {
+	path := filepath.Join(repoRoot, ".verk", "current")
+	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return nil
 }
 
 func readCurrentRunID(repoRoot string) (string, error) {

@@ -2,8 +2,10 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
+	"os"
 	"path/filepath"
 	"sync"
 	"time"
@@ -362,6 +364,12 @@ func doAutoResume(w, errw io.Writer) error {
 	var run state.RunArtifact
 	runPath := filepath.Join(repoRoot, ".verk", "runs", runID, "run.json")
 	if loadErr := state.LoadJSON(runPath, &run); loadErr != nil {
+		if errors.Is(loadErr, os.ErrNotExist) {
+			_ = clearCurrentRunID(repoRoot)
+			msg := fmt.Errorf("run %s no longer exists (stale pointer cleared) — start a new run with: verk run ticket <id>", runID)
+			_, _ = fmt.Fprintf(w, "Error: %s\n", msg)
+			return withExitCode(msg, 1)
+		}
 		msg := fmt.Errorf("could not load run %s: %w", runID, loadErr)
 		_, _ = fmt.Fprintf(w, "Error: %s\n", msg)
 		return withExitCode(msg, 1)
