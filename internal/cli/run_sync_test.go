@@ -54,12 +54,10 @@ func TestEngineGoroutineSync_NoRaceOnEarlyTUIReturn(t *testing.T) {
 		runErr = errors.New("engine finished")
 	}()
 
-	// Fake TUI: drain the channel until it closes (simulates RunProgress in
-	// non-terminal mode), then return — potentially before the goroutine above
-	// has written result/runErr.
+	// Fake TUI: consume exactly one event then return early — simulating a TUI
+	// that exits before the goroutine has written result/runErr.
 	fakeTUI := func() {
-		for range ch {
-		}
+		<-ch // consume exactly one event, then return — simulating a TUI that exits early
 	}
 	fakeTUI()
 

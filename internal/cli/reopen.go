@@ -25,7 +25,7 @@ Examples:
 		SilenceUsage: true,
 		Args: func(cmd *cobra.Command, args []string) error {
 			if len(args) != 2 {
-				return fmt.Errorf("requires <run-id> and <ticket-id>\n\nUsage:\n  verk reopen <run-id> <ticket-id> --to <phase>")
+				return withExitCode(fmt.Errorf("requires <run-id> and <ticket-id>\n\nUsage:\n  verk reopen <run-id> <ticket-id> --to <phase>"), 2)
 			}
 			return nil
 		},

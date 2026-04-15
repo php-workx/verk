@@ -25,9 +25,10 @@ func TestFinalizeRun_SaveJSONAtomicFailure(t *testing.T) {
 		saveTicket = originalSaveTicket
 	}()
 
+	errDiskFull := errors.New("disk full")
 	saveTicket = func(_ string, _ tkmd.Ticket) error { return nil }
 	saveJSONAtomic = func(_ string, _ any) error {
-		return errors.New("disk full")
+		return errDiskFull
 	}
 
 	var stdout, stderr bytes.Buffer
@@ -45,14 +46,8 @@ func TestFinalizeRun_SaveJSONAtomicFailure(t *testing.T) {
 	if !strings.Contains(err.Error(), "persist run state") {
 		t.Errorf("expected error to contain %q, got %q", "persist run state", err.Error())
 	}
-	if !errors.Is(err, errors.New("disk full")) {
-		// errors.Is won't match a plain New; check wrapping via Unwrap.
-		var wrapped interface{ Unwrap() error }
-		if errors.As(err, &wrapped) {
-			if wrapped.Unwrap() == nil || wrapped.Unwrap().Error() != "disk full" {
-				t.Errorf("expected wrapped cause %q, got %v", "disk full", wrapped.Unwrap())
-			}
-		}
+	if !errors.Is(err, errDiskFull) {
+		t.Errorf("expected wrapped cause %q, got %v", "disk full", err)
 	}
 
 	// Assert: no success status line printed.
