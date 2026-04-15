@@ -234,8 +234,7 @@ func RunEpic(ctx context.Context, req RunEpicRequest) (RunEpicResult, error) {
 						TicketID: ticketID,
 						Detail:   fmt.Sprintf("worker crashed (attempt %d/%d), retrying: %v", attempt+1, maxCrashRetries+1, outcome.err),
 					})
-					_ = tkmd.ReleaseClaim(req.RepoRoot, req.RunID, ticketID,
-						fmt.Sprintf("lease-%s-%s", req.RunID, ticketID), "crash recovery")
+					_ = tkmd.ReleaseClaim(req.RepoRoot, req.RunID, ticketID, "crash recovery")
 					if attempt == maxCrashRetries {
 						outcome.phase = state.TicketPhaseBlocked
 						outcomes[i] = outcome
@@ -342,6 +341,7 @@ func RunEpic(ctx context.Context, req RunEpicRequest) (RunEpicResult, error) {
 				return result, verifyErr
 			}
 			clearPendingWaveVerification(result.Run.ResumeCursor)
+			result.Waves[len(result.Waves)-1] = acceptedWave
 		}
 
 		if result.Run.ResumeCursor != nil {
@@ -567,7 +567,7 @@ func executeEpicTicket(ctx context.Context, req RunEpicRequest, cfg policy.Confi
 		outcome.err = err
 		return outcome
 	}
-	claim, err := tkmd.AcquireClaim(req.RepoRoot, req.RunID, ticket.ID, fmt.Sprintf("lease-%s-%s", req.RunID, ticket.ID), wave.WaveID, 10*time.Minute, time.Now().UTC())
+	claim, err := tkmd.AcquireClaim(req.RepoRoot, req.RunID, ticket.ID, fmt.Sprintf("lease-%s-%s-%s", req.RunID, ticket.ID, wave.WaveID), wave.WaveID, 10*time.Minute, time.Now().UTC())
 	if err != nil {
 		outcome.err = err
 		return outcome

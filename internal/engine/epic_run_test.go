@@ -180,7 +180,7 @@ func TestRunEpicScopeViolationBlocksWave(t *testing.T) {
 			{
 				Status:             runtime.WorkerStatusDone,
 				RetryClass:         runtime.RetryClassTerminal,
-				LeaseID:            "lease-run-scope-ticket-scope",
+				LeaseID:            "lease-run-scope-ticket-scope-wave-1",
 				StartedAt:          epicTestStart(),
 				FinishedAt:         epicTestStart().Add(time.Second),
 				ResultArtifactPath: filepath.Join(repoRoot, "worker.json"),
@@ -190,7 +190,7 @@ func TestRunEpicScopeViolationBlocksWave(t *testing.T) {
 			{
 				Status:             runtime.WorkerStatusDone,
 				RetryClass:         runtime.RetryClassTerminal,
-				LeaseID:            "lease-run-scope-ticket-scope",
+				LeaseID:            "lease-run-scope-ticket-scope-wave-1",
 				StartedAt:          epicTestStart().Add(2 * time.Second),
 				FinishedAt:         epicTestStart().Add(3 * time.Second),
 				ReviewStatus:       runtime.ReviewStatusPassed,
@@ -254,7 +254,7 @@ func TestRunEpicBlockedTicketPreventsFalseCompletion(t *testing.T) {
 			{
 				Status:             runtime.WorkerStatusDone,
 				RetryClass:         runtime.RetryClassTerminal,
-				LeaseID:            "lease-run-blocked-ticket-ready",
+				LeaseID:            "lease-run-blocked-ticket-ready-wave-1",
 				StartedAt:          epicTestStart(),
 				FinishedAt:         epicTestStart().Add(time.Second),
 				ResultArtifactPath: filepath.Join(repoRoot, "worker.json"),
@@ -264,7 +264,7 @@ func TestRunEpicBlockedTicketPreventsFalseCompletion(t *testing.T) {
 			{
 				Status:             runtime.WorkerStatusDone,
 				RetryClass:         runtime.RetryClassTerminal,
-				LeaseID:            "lease-run-blocked-ticket-ready",
+				LeaseID:            "lease-run-blocked-ticket-ready-wave-1",
 				StartedAt:          epicTestStart().Add(2 * time.Second),
 				FinishedAt:         epicTestStart().Add(3 * time.Second),
 				ReviewStatus:       runtime.ReviewStatusPassed,
@@ -371,7 +371,7 @@ func TestRunEpicSelectsRuntimePerTicket(t *testing.T) {
 				{
 					Status:             runtime.WorkerStatusDone,
 					RetryClass:         runtime.RetryClassTerminal,
-					LeaseID:            "lease-run-runtime-ticket-codex",
+					LeaseID:            "lease-run-runtime-ticket-codex-wave-1",
 					StartedAt:          epicTestStart(),
 					FinishedAt:         epicTestStart().Add(time.Second),
 					ResultArtifactPath: filepath.Join(repoRoot, "codex-worker.json"),
@@ -379,7 +379,7 @@ func TestRunEpicSelectsRuntimePerTicket(t *testing.T) {
 				{
 					Status:             runtime.WorkerStatusDone,
 					RetryClass:         runtime.RetryClassTerminal,
-					LeaseID:            "lease-run-runtime-ticket-codex",
+					LeaseID:            "lease-run-runtime-ticket-codex-wave-1",
 					StartedAt:          epicTestStart().Add(4 * time.Second),
 					FinishedAt:         epicTestStart().Add(5 * time.Second),
 					ResultArtifactPath: filepath.Join(repoRoot, "codex-worker-2.json"),
@@ -389,7 +389,7 @@ func TestRunEpicSelectsRuntimePerTicket(t *testing.T) {
 				{
 					Status:             runtime.WorkerStatusDone,
 					RetryClass:         runtime.RetryClassTerminal,
-					LeaseID:            "lease-run-runtime-ticket-codex",
+					LeaseID:            "lease-run-runtime-ticket-codex-wave-1",
 					StartedAt:          epicTestStart().Add(2 * time.Second),
 					FinishedAt:         epicTestStart().Add(3 * time.Second),
 					ReviewStatus:       runtime.ReviewStatusPassed,
@@ -399,7 +399,7 @@ func TestRunEpicSelectsRuntimePerTicket(t *testing.T) {
 				{
 					Status:             runtime.WorkerStatusDone,
 					RetryClass:         runtime.RetryClassTerminal,
-					LeaseID:            "lease-run-runtime-ticket-codex",
+					LeaseID:            "lease-run-runtime-ticket-codex-wave-1",
 					StartedAt:          epicTestStart().Add(6 * time.Second),
 					FinishedAt:         epicTestStart().Add(7 * time.Second),
 					ReviewStatus:       runtime.ReviewStatusPassed,
@@ -413,7 +413,7 @@ func TestRunEpicSelectsRuntimePerTicket(t *testing.T) {
 				{
 					Status:             runtime.WorkerStatusDone,
 					RetryClass:         runtime.RetryClassTerminal,
-					LeaseID:            "lease-run-runtime-ticket-claude",
+					LeaseID:            "lease-run-runtime-ticket-claude-wave-1",
 					StartedAt:          epicTestStart().Add(8 * time.Second),
 					FinishedAt:         epicTestStart().Add(9 * time.Second),
 					ResultArtifactPath: filepath.Join(repoRoot, "claude-worker.json"),
@@ -421,7 +421,7 @@ func TestRunEpicSelectsRuntimePerTicket(t *testing.T) {
 				{
 					Status:             runtime.WorkerStatusDone,
 					RetryClass:         runtime.RetryClassTerminal,
-					LeaseID:            "lease-run-runtime-ticket-claude",
+					LeaseID:            "lease-run-runtime-ticket-claude-wave-1",
 					StartedAt:          epicTestStart().Add(12 * time.Second),
 					FinishedAt:         epicTestStart().Add(13 * time.Second),
 					ResultArtifactPath: filepath.Join(repoRoot, "claude-worker-2.json"),
@@ -431,7 +431,7 @@ func TestRunEpicSelectsRuntimePerTicket(t *testing.T) {
 				{
 					Status:             runtime.WorkerStatusDone,
 					RetryClass:         runtime.RetryClassTerminal,
-					LeaseID:            "lease-run-runtime-ticket-claude",
+					LeaseID:            "lease-run-runtime-ticket-claude-wave-1",
 					StartedAt:          epicTestStart().Add(10 * time.Second),
 					FinishedAt:         epicTestStart().Add(11 * time.Second),
 					ReviewStatus:       runtime.ReviewStatusPassed,
@@ -441,7 +441,7 @@ func TestRunEpicSelectsRuntimePerTicket(t *testing.T) {
 				{
 					Status:             runtime.WorkerStatusDone,
 					RetryClass:         runtime.RetryClassTerminal,
-					LeaseID:            "lease-run-runtime-ticket-claude",
+					LeaseID:            "lease-run-runtime-ticket-claude-wave-1",
 					StartedAt:          epicTestStart().Add(14 * time.Second),
 					FinishedAt:         epicTestStart().Add(15 * time.Second),
 					ReviewStatus:       runtime.ReviewStatusPassed,
@@ -507,7 +507,7 @@ func TestRunEpicFailsOnScopeViolation(t *testing.T) {
 			{
 				Status:             runtime.WorkerStatusDone,
 				RetryClass:         runtime.RetryClassTerminal,
-				LeaseID:            "lease-run-failscope-ticket-failscope",
+				LeaseID:            "lease-run-failscope-ticket-failscope-wave-1",
 				StartedAt:          epicTestStart(),
 				FinishedAt:         epicTestStart().Add(time.Second),
 				ResultArtifactPath: filepath.Join(repoRoot, "worker-failscope.json"),
@@ -517,7 +517,7 @@ func TestRunEpicFailsOnScopeViolation(t *testing.T) {
 			{
 				Status:             runtime.WorkerStatusDone,
 				RetryClass:         runtime.RetryClassTerminal,
-				LeaseID:            "lease-run-failscope-ticket-failscope",
+				LeaseID:            "lease-run-failscope-ticket-failscope-wave-1",
 				StartedAt:          epicTestStart().Add(2 * time.Second),
 				FinishedAt:         epicTestStart().Add(3 * time.Second),
 				ReviewStatus:       runtime.ReviewStatusPassed,
@@ -575,7 +575,7 @@ func TestRunEpicIgnoresBaselineDirtyFilesInScopeChecks(t *testing.T) {
 			{
 				Status:             runtime.WorkerStatusDone,
 				RetryClass:         runtime.RetryClassTerminal,
-				LeaseID:            "lease-run-baseline-ticket-baseline",
+				LeaseID:            "lease-run-baseline-ticket-baseline-wave-1",
 				StartedAt:          epicTestStart(),
 				FinishedAt:         epicTestStart().Add(time.Second),
 				ResultArtifactPath: filepath.Join(repoRoot, "worker-baseline.json"),
@@ -585,7 +585,7 @@ func TestRunEpicIgnoresBaselineDirtyFilesInScopeChecks(t *testing.T) {
 			{
 				Status:             runtime.WorkerStatusDone,
 				RetryClass:         runtime.RetryClassTerminal,
-				LeaseID:            "lease-run-baseline-ticket-baseline",
+				LeaseID:            "lease-run-baseline-ticket-baseline-wave-1",
 				StartedAt:          epicTestStart().Add(2 * time.Second),
 				FinishedAt:         epicTestStart().Add(3 * time.Second),
 				ReviewStatus:       runtime.ReviewStatusPassed,
