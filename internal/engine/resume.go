@@ -431,8 +431,7 @@ func resumeEpicMode(ctx context.Context, req ResumeRequest, artifacts *runArtifa
 						TicketID: ticketID,
 						Detail:   fmt.Sprintf("worker crashed (attempt %d/%d), retrying: %v", attempt+1, maxCrashRetries+1, outcome.err),
 					})
-					_ = tkmd.ReleaseClaim(artifacts.RepoRoot, req.RunID, ticketID,
-						fmt.Sprintf("lease-%s-%s", req.RunID, ticketID), "crash recovery")
+					_ = tkmd.ReleaseClaim(artifacts.RepoRoot, req.RunID, ticketID, "crash recovery")
 					if attempt == maxCrashRetries {
 						outcome.phase = state.TicketPhaseBlocked
 						outcomes[i] = outcome
