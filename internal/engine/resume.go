@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"path/filepath"
 	"sync"
 	"time"
@@ -623,7 +624,10 @@ func reconcileTicketClaimForResume(repoRoot, runID, ticketID string, snapshot Ti
 func reloadTicketSnapshots(repoRoot, runID string, tickets map[string]TicketRunSnapshot) {
 	for ticketID := range tickets {
 		var snapshot TicketRunSnapshot
-		if err := loadTicketSnapshot(repoRoot, runID, ticketID, &snapshot); err == nil {
+		if err := loadTicketSnapshot(repoRoot, runID, ticketID, &snapshot); err != nil {
+			log.Printf("reloadTicketSnapshots: %s/%s: %v (removing stale entry)", runID, ticketID, err)
+			delete(tickets, ticketID)
+		} else {
 			tickets[ticketID] = snapshot
 		}
 	}

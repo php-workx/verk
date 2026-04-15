@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"crypto/sha256"
 	"fmt"
 	"sort"
 	"strings"
@@ -815,5 +816,7 @@ func criterionEvidenceID(criterion string) string {
 	if trimmed == "" {
 		return defaultCriteriaPrefix + "empty"
 	}
-	return defaultCriteriaPrefix + strings.NewReplacer(" ", "-", "\t", "-", "/", "-", "_", "-", ":", "-", ".", "-", ",", "-", "(", "", ")", "", "[", "", "]", "").Replace(strings.ToLower(trimmed))
+	slug := strings.NewReplacer(" ", "-", "\t", "-", "/", "-", "_", "-", ":", "-", ".", "-", ",", "-", "(", "", ")", "", "[", "", "]", "").Replace(strings.ToLower(trimmed))
+	sum := sha256.Sum256([]byte(trimmed))
+	return defaultCriteriaPrefix + slug + "-" + fmt.Sprintf("%x", sum[:4])
 }
