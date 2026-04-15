@@ -322,13 +322,17 @@ func RunEpic(ctx context.Context, req RunEpicRequest) (RunEpicResult, error) {
 			}
 		}
 
-		if acceptErr != nil {
+		if acceptErr != nil || waveFailed {
 			result.Run.Status = state.EpicRunStatusBlocked
 			result.Run.CurrentPhase = state.TicketPhaseBlocked
-			if err := state.SaveJSONAtomic(runPath, result.Run); err != nil {
-				return result, err
+			blockErr := acceptErr
+			if waveFailed && blockErr == nil {
+				blockErr = fmt.Errorf("%w: wave %s had ticket failures", ErrEpicBlocked, waveID)
 			}
-			return result, acceptErr
+			if err := state.SaveJSONAtomic(runPath, result.Run); err != nil {
+				return result, errors.Join(blockErr, fmt.Errorf("persist run state: %w", err))
+			}
+			return result, blockErr
 		}
 
 		// Run wave-level verification after all tickets merge. Mark pending in
