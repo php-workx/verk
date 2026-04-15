@@ -595,7 +595,13 @@ func looksLikeTransientFailure(stderr []byte) bool {
 
 func looksLikeMissingContext(stderr []byte) bool {
 	blob := strings.ToLower(string(stderr))
-	return strings.Contains(blob, "context") || strings.Contains(blob, "input") || strings.Contains(blob, "operator") || strings.Contains(blob, "lease")
+	return strings.Contains(blob, "missing context") ||
+		strings.Contains(blob, "no context") ||
+		strings.Contains(blob, "insufficient context") ||
+		strings.Contains(blob, "lease expired") ||
+		strings.Contains(blob, "lease not found") ||
+		strings.Contains(blob, "operator not found") ||
+		strings.Contains(blob, "operator permission")
 }
 
 func ensureRuntime(value, fallback string) string {
