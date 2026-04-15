@@ -132,7 +132,10 @@ func RenewClaim(rootDir string, args ...any) (state.ClaimArtifact, error) {
 		if err != nil {
 			return err
 		}
-		if durable != nil && !claimReleased(durable) {
+		if durable != nil {
+			if claimReleased(durable) {
+				return fmt.Errorf("claim %s has already been released (durable state)", req.ticketID)
+			}
 			if durable.OwnerRunID != live.OwnerRunID || durable.LeaseID != live.LeaseID {
 				return fmt.Errorf("claim %s diverged between live and durable state", req.ticketID)
 			}
@@ -140,6 +143,7 @@ func RenewClaim(rootDir string, args ...any) (state.ClaimArtifact, error) {
 
 		r := *live
 		normalizeClaimArtifact(&r, req.now)
+		r.UpdatedAt = req.now
 		r.RunID = req.runID
 		r.OwnerRunID = req.runID
 		if req.ownerWaveID != "" {
@@ -212,6 +216,7 @@ func ReleaseClaim(rootDir string, args ...any) error {
 
 		released := *current
 		normalizeClaimArtifact(&released, req.now)
+		released.UpdatedAt = req.now
 		released.RunID = req.runID
 		released.OwnerRunID = req.runID
 		released.LeaseID = current.LeaseID
