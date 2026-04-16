@@ -1,0 +1,13 @@
+title = "verk gitleaks config"
+
+[[rules]]
+id = "test-fixture-generic-secret"
+description = "Allow generic secret patterns in test fixtures"
+path = '''internal/engine/testdata/'''
+tags = ["test-fixture"]
+
+[[rules]]
+id = "test-fixture-generic-secret-2"
+description = "Allow generic secret patterns in e2e test fixtures"
+path = '''internal/e2e/testdata/'''
+tags = ["test-fixture"]

@@ -1,0 +1,119 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+# Each job appears as a separate check on the PR.
+# Go module cache is shared via actions/setup-go's built-in caching.
+
+jobs:
+  actionlint:
+    name: Workflow Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: go tool -modfile=tools.mod actionlint .github/workflows/*.yml
+
+  vet:
+    name: Vet
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: go vet ./...
+
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: go tool -modfile=tools.mod golangci-lint run
+
+  fmt:
+    name: Format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Check formatting
+        run: |
+          test -z "$(go tool -modfile=tools.mod golangci-lint fmt --diff 2>&1)" || (echo "gofumpt: unformatted files" && go tool -modfile=tools.mod golangci-lint fmt --diff 2>&1 && exit 1)
+
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: go test -race -count=1 ./...
+
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # needed for git describe in ldflags
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: go build -ldflags "-X verk/internal/cli.Version=$(git describe --tags --always --dirty) -X verk/internal/cli.GitCommit=$(git rev-parse --short HEAD) -X verk/internal/cli.BuildDate=$(date -u +%Y-%m-%dT%H:%M:%SZ)" -o /dev/null ./cmd/verk
+
+  mod-tidy:
+    name: Mod Tidy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Check go.mod and go.sum are tidy
+        run: |
+          go mod tidy
+          git diff --exit-code go.mod || (echo "go.mod not tidy — run 'go mod tidy'" && exit 1)
+          if [ -f go.sum ]; then git diff --exit-code go.sum || (echo "go.sum not tidy — run 'go mod tidy'" && exit 1); fi
+
+  vuln:
+    name: Vulnerability Scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: go tool -modfile=tools.mod govulncheck ./...
+
+  gitleaks:
+    name: Secret Scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: gitleaks/gitleaks-action@v2
+        env:
+          GITLEAKS_LICENSE: ${{ secrets.GITLEAKS_LICENSE }}
+
+  semgrep:
+    name: Semantic Scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: semgrep/action@v1
+        with:
+          config: auto
