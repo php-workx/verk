@@ -6,11 +6,11 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
-
 	"verk/internal/adapters/runtime"
-	runtimefake "verk/internal/adapters/runtime/fake"
 	"verk/internal/policy"
 	"verk/internal/state"
+
+	runtimefake "verk/internal/adapters/runtime/fake"
 )
 
 var waveTestStart = time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)

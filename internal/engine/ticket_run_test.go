@@ -7,12 +7,12 @@ import (
 	"strings"
 	"testing"
 	"time"
-
 	"verk/internal/adapters/runtime"
-	runtimefake "verk/internal/adapters/runtime/fake"
 	"verk/internal/adapters/ticketstore/tkmd"
 	"verk/internal/policy"
 	"verk/internal/state"
+
+	runtimefake "verk/internal/adapters/runtime/fake"
 )
 
 func TestRunTicket_HappyPath(t *testing.T) {

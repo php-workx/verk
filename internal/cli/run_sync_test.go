@@ -8,7 +8,6 @@ import (
 	"sync"
 	"testing"
 	"time"
-
 	"verk/internal/engine"
 )
 

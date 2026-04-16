@@ -5,12 +5,12 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
-
 	"verk/internal/adapters/runtime"
-	runtimefake "verk/internal/adapters/runtime/fake"
 	"verk/internal/engine"
 	"verk/internal/policy"
 	"verk/internal/state"
+
+	runtimefake "verk/internal/adapters/runtime/fake"
 )
 
 func TestTicketHappyPath(t *testing.T) {

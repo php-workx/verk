@@ -5,7 +5,6 @@ import (
 	"sort"
 	"strings"
 	"time"
-
 	"verk/internal/adapters/repo/git"
 	"verk/internal/adapters/ticketstore/tkmd"
 	"verk/internal/state"

@@ -3,7 +3,6 @@ package engine
 import (
 	"context"
 	"fmt"
-
 	"verk/internal/state"
 )
 

@@ -7,7 +7,6 @@ import (
 	"os"
 	"strconv"
 	"strings"
-
 	"verk/internal/policy"
 	"verk/internal/state"
 

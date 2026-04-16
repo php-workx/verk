@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"io"
 	"strings"
-
 	"verk/internal/engine"
 	"verk/internal/state"
 )

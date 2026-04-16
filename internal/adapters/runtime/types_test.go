@@ -4,8 +4,8 @@ import (
 	"context"
 	"testing"
 	"time"
-
 	"verk/internal/adapters/runtime"
+
 	runtimefake "verk/internal/adapters/runtime/fake"
 )
 

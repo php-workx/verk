@@ -2,7 +2,6 @@ package engine
 
 import (
 	"testing"
-
 	"verk/internal/adapters/ticketstore/tkmd"
 	"verk/internal/state"
 )
