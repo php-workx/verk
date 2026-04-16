@@ -1,0 +1,16 @@
+{
+  "goal": "specs/initial_v1.md",
+  "epic_id": null,
+  "phase": "validation",
+  "auto": true,
+  "test_first": true,
+  "complexity": "standard",
+  "cycle": 1,
+  "parent_epic": null,
+  "mode": "document",
+  "verdicts": {
+    "pre_mortem": "WARN",
+    "vibe": "PASS",
+    "post_mortem": "PASS"
+  }
+}

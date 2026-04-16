@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "wave": 2,
+  "timestamp": "2026-04-12T13:54:59+02:00",
+  "tasks_completed": ["ver-inwj","ver-0rch"],
+  "tasks_failed": [],
+  "files_changed": [
+  "internal/engine/epic_run.go",
+  "internal/engine/epic_run_test.go",
+  "internal/engine/reopen.go",
+  "internal/engine/reopen_test.go",
+  "internal/engine/resume.go",
+  "internal/engine/ticket_run.go",
+  "internal/engine/ticket_run_test.go",
+  "internal/engine/wave_scheduler.go",
+  "internal/engine/wave_scheduler_test.go"
+],
+  "git_sha": "41cf2a3badc2a70edc8ebf7d440d132a6fe35858",
+  "acceptance_verdict": "PASS",
+  "commit_strategy": "wave-batch"
+}
