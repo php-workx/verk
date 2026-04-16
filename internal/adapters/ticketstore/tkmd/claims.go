@@ -8,7 +8,6 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
-
 	"verk/internal/state"
 )
 
@@ -574,7 +573,7 @@ func loadClaimArtifact(path string) (*state.ClaimArtifact, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			return nil, nil
+			return nil, nil //nolint:nilnil // not-found: nil value + nil error = "no data, no problem"
 		}
 		return nil, fmt.Errorf("read claim: %w", err)
 	}

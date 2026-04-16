@@ -6,7 +6,6 @@ import (
 	"sort"
 	"strings"
 	"time"
-
 	"verk/internal/adapters/runtime"
 	"verk/internal/adapters/ticketstore/tkmd"
 	"verk/internal/state"
@@ -65,7 +64,7 @@ func normalizeReviewFinding(f any) (state.ReviewFinding, bool) {
 	case runtime.ReviewFinding:
 		finding := state.ReviewFinding{
 			ID:              v.ID,
-			Severity:        state.Severity(v.Severity),
+			Severity:        v.Severity,
 			Title:           v.Title,
 			Body:            v.Body,
 			File:            v.File,
@@ -252,7 +251,7 @@ func deriveGateResults(req closeoutRequest) (map[string]state.GateResult, error)
 			Status: gateFailed,
 			Reason: err.Error(),
 		}
-		return gates, nil
+		return gates, nil //nolint:nilerr // gate failure encoded in gates map, not Go error
 	}
 
 	if err := validateCriteriaEvidence(req, currentRunID); err != nil {
@@ -261,7 +260,7 @@ func deriveGateResults(req closeoutRequest) (map[string]state.GateResult, error)
 			Reason:        err.Error(),
 			ArtifactPaths: evidenceArtifactRefs(req.criteriaEvidence),
 		}
-		return gates, nil
+		return gates, nil //nolint:nilerr // gate failure encoded in gates map, not Go error
 	}
 
 	if err := validateVerification(req); err != nil {
@@ -270,7 +269,7 @@ func deriveGateResults(req closeoutRequest) (map[string]state.GateResult, error)
 			Reason:        err.Error(),
 			ArtifactPaths: verificationArtifactPaths(req.verification),
 		}
-		return gates, nil
+		return gates, nil //nolint:nilerr // gate failure encoded in gates map, not Go error
 	}
 
 	if err := validateRequiredArtifacts(req); err != nil {
@@ -279,27 +278,27 @@ func deriveGateResults(req closeoutRequest) (map[string]state.GateResult, error)
 			Reason:        err.Error(),
 			ArtifactPaths: append([]string(nil), req.requiredArtifacts...),
 		}
-		return gates, nil
+		return gates, nil //nolint:nilerr // gate failure encoded in gates map, not Go error
 	}
 
-	if result, err := validateReview(req); err != nil {
+	result, err := validateReview(req)
+	if err != nil {
 		gates[gateReview] = state.GateResult{
 			Status:        gateFailed,
 			Reason:        err.Error(),
 			FindingIDs:    reviewFindingIDs(req.review),
 			ArtifactPaths: reviewArtifactPaths(req.review),
 		}
-		return gates, nil
-	} else {
-		gates[gateReview] = result
+		return gates, nil //nolint:nilerr // gate failure encoded in gates map, not Go error
 	}
+	gates[gateReview] = result
 
 	if err := validateDeclaredChecks(req); err != nil {
 		gates[gateDeclaredChecks] = state.GateResult{
 			Status: gateFailed,
 			Reason: err.Error(),
 		}
-		return gates, nil
+		return gates, nil //nolint:nilerr // gate failure encoded in gates map, not Go error
 	}
 
 	return gates, nil

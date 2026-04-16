@@ -12,7 +12,6 @@ import (
 	"os/exec"
 	"strings"
 	"time"
-
 	"verk/internal/adapters/runtime"
 )
 
@@ -271,11 +270,12 @@ func buildWorkerArgs(req runtime.WorkerRequest, prompt string) []string {
 
 // buildReviewArgs constructs CLI args for `codex exec` in review mode.
 func buildReviewArgs(req runtime.ReviewRequest, prompt string) []string {
-	args := []string{
+	args := make([]string, 0, 4)
+	args = append(args,
 		"exec",
 		"--json",
 		"--full-auto",
-	}
+	)
 	args = append(args, prompt)
 	return args
 }

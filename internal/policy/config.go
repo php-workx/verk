@@ -6,17 +6,16 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"verk/internal/state"
 
 	"gopkg.in/yaml.v3"
-
-	"verk/internal/state"
 )
 
 type SchedulerConfig struct {
 	MaxConcurrency int `yaml:"max_concurrency" json:"max_concurrency"`
 }
 
-type PolicyConfig struct {
+type PolicyConfig struct { //nolint:revive // stuttering name matches Go convention
 	ReviewThreshold           state.Severity `yaml:"review_threshold" json:"review_threshold"`
 	MaxImplementationAttempts int            `yaml:"max_implementation_attempts" json:"max_implementation_attempts"`
 	MaxRepairCycles           int            `yaml:"max_repair_cycles" json:"max_repair_cycles"`

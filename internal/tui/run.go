@@ -4,11 +4,10 @@ import (
 	"io"
 	"os"
 	"time"
+	"verk/internal/engine"
 
 	tea "charm.land/bubbletea/v2"
 	term "github.com/charmbracelet/x/term"
-
-	"verk/internal/engine"
 )
 
 // RunProgress starts the appropriate progress display for a verk run.

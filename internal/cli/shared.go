@@ -11,12 +11,12 @@ import (
 	"strconv"
 	"strings"
 	"time"
-
-	repoadapter "verk/internal/adapters/repo/git"
 	"verk/internal/adapters/runtime"
 	"verk/internal/adapters/runtime/claude"
 	"verk/internal/adapters/runtime/codex"
 	"verk/internal/policy"
+
+	repoadapter "verk/internal/adapters/repo/git"
 
 	"github.com/spf13/cobra"
 )

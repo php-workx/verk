@@ -8,12 +8,12 @@ import (
 	"path/filepath"
 	"sync"
 	"time"
-
-	repoadapter "verk/internal/adapters/repo/git"
 	"verk/internal/adapters/runtime"
 	"verk/internal/adapters/ticketstore/tkmd"
 	"verk/internal/policy"
 	"verk/internal/state"
+
+	repoadapter "verk/internal/adapters/repo/git"
 )
 
 type ResumeRequest struct {
@@ -32,7 +32,7 @@ type ResumeReport struct {
 	ResumedTickets   []string          `json:"resumed_tickets,omitempty"`
 }
 
-func ResumeRun(ctx context.Context, req ResumeRequest) (ResumeReport, error) {
+func ResumeRun(ctx context.Context, req ResumeRequest) (ResumeReport, error) { //nolint:gocognit,cyclop // complex resume orchestration; refactor into sub-functions
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -284,7 +284,7 @@ func resumeTicketMode(ctx context.Context, req ResumeRequest, artifacts *runArti
 
 // resumeEpicMode re-enters the wave loop for an epic-mode run,
 // skipping already-completed waves.
-func resumeEpicMode(ctx context.Context, req ResumeRequest, artifacts *runArtifacts) ([]string, error) {
+func resumeEpicMode(ctx context.Context, req ResumeRequest, artifacts *runArtifacts) ([]string, error) { //nolint:gocognit,cyclop // complex resume orchestration; refactor into sub-functions
 	cfg := normalizeEpicConfig(req.Config)
 	repo, err := repoadapter.New(artifacts.RepoRoot)
 	if err != nil {

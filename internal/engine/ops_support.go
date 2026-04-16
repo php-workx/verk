@@ -7,7 +7,6 @@ import (
 	"path/filepath"
 	"sort"
 	"time"
-
 	"verk/internal/adapters/repo/git"
 	"verk/internal/adapters/ticketstore/tkmd"
 	"verk/internal/state"
@@ -197,7 +196,7 @@ func loadOptionalClaim(path string) (*state.ClaimArtifact, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return nil, nil
+			return nil, nil //nolint:nilnil // not-found: nil value + nil error = "no data, no problem"
 		}
 		return nil, err
 	}

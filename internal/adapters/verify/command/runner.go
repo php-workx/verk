@@ -11,7 +11,6 @@ import (
 	"sort"
 	"strings"
 	"time"
-
 	"verk/internal/policy"
 )
 
@@ -32,7 +31,7 @@ var createArtifactFile = func(name string) (artifactFile, error) {
 	return os.Create(name)
 }
 
-type CommandResult struct {
+type CommandResult struct { //nolint:revive // stuttering name is intentional for clarity
 	Command    string    `json:"command"`
 	Cwd        string    `json:"cwd"`
 	ExitCode   int       `json:"exit_code"`

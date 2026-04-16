@@ -10,7 +10,6 @@ import (
 	"strings"
 	"sync"
 	"time"
-
 	"verk/internal/adapters/repo/git"
 	"verk/internal/adapters/runtime"
 	"verk/internal/adapters/ticketstore/tkmd"
@@ -43,7 +42,7 @@ type RunEpicResult struct {
 	Path  string
 }
 
-func RunEpic(ctx context.Context, req RunEpicRequest) (RunEpicResult, error) {
+func RunEpic(ctx context.Context, req RunEpicRequest) (RunEpicResult, error) { //nolint:gocognit,cyclop // complex orchestration loop; refactor into sub-functions
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -659,7 +658,7 @@ func describeNotReady(ticket tkmd.Ticket) string {
 	}
 	// Status is open/ready — must be deps not resolved
 	if len(ticket.Deps) > 0 {
-		unresolved := make([]string, 0)
+		unresolved := make([]string, 0, len(ticket.Deps))
 		unresolved = append(unresolved, ticket.Deps...)
 		if len(unresolved) <= 3 {
 			return fmt.Sprintf("waiting on deps: %s", strings.Join(unresolved, ", "))

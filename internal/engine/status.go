@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"path/filepath"
 	"sort"
-
 	"verk/internal/adapters/ticketstore/tkmd"
 	"verk/internal/state"
 )
@@ -140,7 +139,7 @@ func deriveTicketClaim(repoRoot, runID, ticketID string, snapshot TicketRunSnaps
 		return nil, err
 	}
 	if live == nil && durable == nil {
-		return nil, nil
+		return nil, nil //nolint:nilnil // not-found: nil value + nil error = "no data, no problem"
 	}
 	claim, err := tkmd.ReconcileClaim(live, durable, runID, isTerminalPhase(snapshot.CurrentPhase))
 	if err != nil {

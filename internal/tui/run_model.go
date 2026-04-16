@@ -4,12 +4,11 @@ import (
 	"fmt"
 	"strings"
 	"time"
+	"verk/internal/engine"
+	"verk/internal/state"
 
 	"charm.land/bubbles/v2/spinner"
 	tea "charm.land/bubbletea/v2"
-
-	"verk/internal/engine"
-	"verk/internal/state"
 )
 
 // doneMsg signals the progress channel has been closed.

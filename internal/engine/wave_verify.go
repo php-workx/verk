@@ -7,11 +7,11 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-
 	"verk/internal/adapters/runtime"
-	verifycommand "verk/internal/adapters/verify/command"
 	"verk/internal/policy"
 	"verk/internal/state"
+
+	verifycommand "verk/internal/adapters/verify/command"
 )
 
 const waveVerificationOutputLimit = 4 * 1024 // 4 KB

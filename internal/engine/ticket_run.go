@@ -10,13 +10,13 @@ import (
 	"sort"
 	"strings"
 	"time"
-
 	"verk/internal/adapters/repo/git"
 	"verk/internal/adapters/runtime"
 	"verk/internal/adapters/ticketstore/tkmd"
-	verifycommand "verk/internal/adapters/verify/command"
 	"verk/internal/policy"
 	"verk/internal/state"
+
+	verifycommand "verk/internal/adapters/verify/command"
 )
 
 const maxRuntimeRetryAttempts = 2
@@ -88,7 +88,7 @@ type ticketRunPaths struct {
 	runDir             string
 }
 
-func RunTicket(ctx context.Context, req RunTicketRequest) (result RunTicketResult, retErr error) {
+func RunTicket(ctx context.Context, req RunTicketRequest) (result RunTicketResult, retErr error) { //nolint:gocognit,cyclop // complex ticket state machine; refactor into sub-functions
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -480,7 +480,7 @@ func handleImplementResult(st *ticketRunState, result runtime.WorkerResult, atte
 		Runtime:           chosenRuntime(st.req.Plan, st.cfg),
 		Status:            string(result.Status),
 		CompletionCode:    result.CompletionCode,
-		RetryClass:        state.RetryClass(result.RetryClass),
+		RetryClass:        result.RetryClass,
 		Concerns:          result.Concerns,
 		LeaseID:           result.LeaseID,
 		InputArtifactPath: inputArtifactPath,
@@ -1440,7 +1440,7 @@ func convertReviewFindings(findings []runtime.ReviewFinding) []state.ReviewFindi
 	for _, finding := range findings {
 		converted = append(converted, state.ReviewFinding{
 			ID:              finding.ID,
-			Severity:        state.Severity(finding.Severity),
+			Severity:        finding.Severity,
 			Title:           finding.Title,
 			Body:            finding.Body,
 			File:            finding.File,

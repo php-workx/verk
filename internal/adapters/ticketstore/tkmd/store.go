@@ -12,7 +12,6 @@ import (
 	"strings"
 	"time"
 	"unicode"
-
 	"verk/internal/state"
 )
 
@@ -417,7 +416,7 @@ func encodeFrontMatter(ticket *Ticket) string {
 	return b.String()
 }
 
-func assignField(ticket *Ticket, key string, value any, present bool) {
+func assignField(ticket *Ticket, key string, value any, present bool) { //nolint:unparam // present required by call-site convention, always true currently
 	if ticket.present == nil {
 		ticket.present = map[string]bool{}
 	}

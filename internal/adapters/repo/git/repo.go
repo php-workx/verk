@@ -109,7 +109,7 @@ func (r *Repo) MainWorktreeRoot() (string, error) {
 	commonDir, err := gitOutput(r.root, "rev-parse", "--path-format=absolute", "--git-common-dir")
 	if err != nil {
 		// Fallback: if git doesn't support --path-format, use the current root
-		return r.root, nil
+		return r.root, nil //nolint:nilerr // intentional fallback — error handled by returning root
 	}
 	commonDir = filepath.Clean(strings.TrimRight(commonDir, "\r\n"))
 	// The main worktree root is the parent of the .git directory

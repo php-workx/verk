@@ -9,7 +9,6 @@ import (
 	"path/filepath"
 	"sync"
 	"time"
-
 	"verk/internal/adapters/runtime"
 	"verk/internal/adapters/ticketstore/tkmd"
 	"verk/internal/engine"
@@ -226,7 +225,7 @@ func doRunTicket(w, errw io.Writer, ticketID string) (string, error) {
 		// sends and call close(ch). Without this, a full buffer causes the
 		// engine goroutine to block on SendProgress, and wg.Wait() hangs.
 		go func() {
-			for range ch {
+			for range ch { //nolint:revive // intentional drain loop to prevent goroutine leak
 			}
 		}()
 	}
@@ -322,7 +321,7 @@ func doRunEpic(w, errw io.Writer, ticketID string) (string, error) {
 		// sends and call close(ch). Without this, a full buffer causes the
 		// engine goroutine to block on SendProgress, and wg.Wait() hangs.
 		go func() {
-			for range ch {
+			for range ch { //nolint:revive // intentional drain loop to prevent goroutine leak
 			}
 		}()
 	}
@@ -413,7 +412,7 @@ func doAutoResume(w, errw io.Writer) error {
 		// sends and call close(ch). Without this, a full buffer causes the
 		// engine goroutine to block on SendProgress, and wg.Wait() hangs.
 		go func() {
-			for range ch {
+			for range ch { //nolint:revive // intentional drain loop to prevent goroutine leak
 			}
 		}()
 	}
