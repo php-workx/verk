@@ -8,3 +8,14 @@ bin/
 
 # Crank checkpoint files may contain unrendered shell substitutions
 .agents/crank/*.json
+
+# Coverage
+coverage.out
+coverage.html
+
+# Secrets
+.env
+
+# SonarQube working directory
+.sonarqube/
+.scannerwork/
