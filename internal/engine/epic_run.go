@@ -34,6 +34,7 @@ type RunEpicRequest struct {
 	Config               policy.Config
 	VerificationByTicket map[string][]string
 	Progress             chan<- ProgressEvent
+	MaxDepth             int
 }
 
 type RunEpicResult struct {
@@ -227,7 +228,7 @@ func RunEpic(ctx context.Context, req RunEpicRequest) (RunEpicResult, error) { /
 				defer wg.Done()
 				const maxCrashRetries = 2
 				for attempt := 0; attempt <= maxCrashRetries; attempt++ {
-					outcome, crashed := executeWithRecovery(ctx, req, cfg, wave, ticketID)
+					outcome, crashed := executeWithRecovery(ctx, req, cfg, wave, ticketID, 1)
 					if !crashed {
 						outcomes[i] = outcome
 						return
@@ -383,59 +384,14 @@ func normalizeEpicConfig(cfg policy.Config) policy.Config {
 	if cfg.Scheduler.MaxConcurrency <= 0 {
 		cfg.Scheduler.MaxConcurrency = policy.DefaultConfig().Scheduler.MaxConcurrency
 	}
+	if cfg.Scheduler.MaxDepth <= 0 {
+		cfg.Scheduler.MaxDepth = policy.DefaultConfig().Scheduler.MaxDepth
+	}
 	return cfg
 }
 
 func listEpicChildren(repoRoot, parentID string) ([]tkmd.Ticket, error) {
-	// Load the epic ticket to get its deps/links list for child discovery.
-	epicPath := filepath.Join(repoRoot, ".tickets", parentID+".md")
-	epicTicket, err := tkmd.LoadTicket(epicPath)
-	if err != nil {
-		return nil, fmt.Errorf("load epic %s: %w", parentID, err)
-	}
-	epicChildren := make(map[string]struct{})
-	for _, dep := range epicTicket.Deps {
-		epicChildren[dep] = struct{}{}
-	}
-	if epicTicket.UnknownFrontmatter != nil {
-		if links, ok := epicTicket.UnknownFrontmatter["links"]; ok {
-			for _, link := range toStringSlice(links) {
-				epicChildren[link] = struct{}{}
-			}
-		}
-	}
-
-	paths, err := filepath.Glob(filepath.Join(repoRoot, ".tickets", "*.md"))
-	if err != nil {
-		return nil, err
-	}
-	sort.Strings(paths)
-
-	children := make([]tkmd.Ticket, 0, len(paths))
-	seen := make(map[string]struct{})
-	for _, path := range paths {
-		ticket, err := tkmd.LoadTicket(path)
-		if err != nil {
-			return nil, err
-		}
-		if ticket.ID == parentID {
-			continue
-		}
-		// Child if: has parent field, OR is in epic's deps list, OR is in epic's links list
-		isChild := ticketParent(&ticket) == parentID
-		if !isChild {
-			_, isChild = epicChildren[ticket.ID]
-		}
-		if !isChild {
-			continue
-		}
-		if _, ok := seen[ticket.ID]; ok {
-			continue
-		}
-		seen[ticket.ID] = struct{}{}
-		children = append(children, ticket)
-	}
-	return children, nil
+	return tkmd.ListAllChildren(repoRoot, parentID)
 }
 
 func ticketIDs(tickets []tkmd.Ticket) []string {
@@ -549,7 +505,7 @@ func buildTicketScopes(tickets []tkmd.Ticket) map[string][]string {
 	return scopes
 }
 
-func executeWithRecovery(ctx context.Context, req RunEpicRequest, cfg policy.Config, wave state.WaveArtifact, ticketID string) (outcome waveTicketOutcome, crashed bool) {
+func executeWithRecovery(ctx context.Context, req RunEpicRequest, cfg policy.Config, wave state.WaveArtifact, ticketID string, depth int) (outcome waveTicketOutcome, crashed bool) {
 	defer func() {
 		if r := recover(); r != nil {
 			outcome = waveTicketOutcome{
@@ -560,10 +516,148 @@ func executeWithRecovery(ctx context.Context, req RunEpicRequest, cfg policy.Con
 			crashed = true
 		}
 	}()
-	return executeEpicTicket(ctx, req, cfg, wave, ticketID), false
+	return executeEpicTicket(ctx, req, cfg, wave, ticketID, depth), false
 }
 
-func executeEpicTicket(ctx context.Context, req RunEpicRequest, cfg policy.Config, wave state.WaveArtifact, ticketID string) waveTicketOutcome {
+// runSubEpic executes a mini epic loop for the children of a ticket.
+// It discovers children, runs them in waves (up to the configured concurrency),
+// and returns a waveTicketOutcome reflecting the aggregate result.
+// The parent ticket is not run here — the caller runs it after sub-tickets complete.
+func runSubEpic(ctx context.Context, req RunEpicRequest, cfg policy.Config, parentTicketID string, parentWave state.WaveArtifact, depth int) waveTicketOutcome {
+	outcome := waveTicketOutcome{ticketID: parentTicketID, phase: state.TicketPhaseBlocked}
+
+	SendProgress(ctx, req.Progress, ProgressEvent{
+		Type:     EventTicketDetail,
+		TicketID: parentTicketID,
+		Detail:   fmt.Sprintf("running sub-tickets at depth %d", depth+1),
+	})
+
+	children, err := tkmd.ListAllChildren(req.RepoRoot, parentTicketID)
+	if err != nil {
+		outcome.err = fmt.Errorf("list children of %s: %w", parentTicketID, err)
+		return outcome
+	}
+	if len(children) == 0 {
+		// No children — nothing to do, let the parent run as a flat ticket.
+		outcome.phase = state.TicketPhaseClosed
+		return outcome
+	}
+
+	// Reset orphaned in_progress children from crashed prior runs.
+	for _, child := range children {
+		if child.Status == tkmd.StatusInProgress {
+			if err := updateTicketStoreStatus(req.RepoRoot, child.ID, tkmd.StatusOpen); err != nil {
+				outcome.err = fmt.Errorf("reset orphaned child %s: %w", child.ID, err)
+				return outcome
+			}
+		}
+	}
+
+	// Run the mini wave loop until all children are closed or the sub-epic is blocked.
+	subWaveOrdinal := 0
+	for {
+		if err := ctx.Err(); err != nil {
+			outcome.err = err
+			return outcome
+		}
+
+		ready, err := tkmd.ListReadyChildren(req.RepoRoot, parentTicketID, req.RunID)
+		if err != nil {
+			outcome.err = fmt.Errorf("list ready children of %s: %w", parentTicketID, err)
+			return outcome
+		}
+		if len(ready) == 0 {
+			// Check completion status of all children.
+			currentChildren, err := tkmd.ListAllChildren(req.RepoRoot, parentTicketID)
+			if err != nil {
+				outcome.err = err
+				return outcome
+			}
+			status := epicCompletionStatus(currentChildren)
+			switch status {
+			case state.EpicRunStatusCompleted:
+				outcome.phase = state.TicketPhaseClosed
+			default:
+				outcome.phase = state.TicketPhaseBlocked
+			}
+			return outcome
+		}
+
+		subWave, err := BuildWave(ready, cfg.Scheduler.MaxConcurrency)
+		if err != nil {
+			outcome.err = fmt.Errorf("build sub-wave for %s: %w", parentTicketID, err)
+			return outcome
+		}
+		subWaveOrdinal++
+		subWaveID := fmt.Sprintf("sub-%s-wave-%d", parentTicketID, subWaveOrdinal)
+		subWave.WaveID = subWaveID
+		subWave.Ordinal = subWaveOrdinal
+		subWave.Status = state.WaveStatusRunning
+		subWave.WaveBaseCommit = parentWave.WaveBaseCommit
+		subWave.StartedAt = time.Now().UTC()
+
+		SendProgress(ctx, req.Progress, ProgressEvent{
+			Type:    EventWaveStarted,
+			WaveID:  subWaveOrdinal,
+			Tickets: append([]string(nil), subWave.TicketIDs...),
+		})
+
+		outcomes := make([]waveTicketOutcome, len(subWave.TicketIDs))
+		var wg sync.WaitGroup
+		for i, childID := range subWave.TicketIDs {
+			wg.Add(1)
+			i := i
+			childID := childID
+			go func() {
+				defer wg.Done()
+				const maxCrashRetries = 2
+				for attempt := 0; attempt <= maxCrashRetries; attempt++ {
+					childOutcome, crashed := executeWithRecovery(ctx, req, cfg, subWave, childID, depth+1)
+					if !crashed {
+						outcomes[i] = childOutcome
+						return
+					}
+					SendProgress(ctx, req.Progress, ProgressEvent{
+						Type:     EventTicketDetail,
+						TicketID: childID,
+						Detail:   fmt.Sprintf("sub-ticket worker crashed (attempt %d/%d), retrying: %v", attempt+1, maxCrashRetries+1, childOutcome.err),
+					})
+					_ = tkmd.ReleaseClaim(req.RepoRoot, req.RunID, childID, "crash recovery")
+					if attempt == maxCrashRetries {
+						outcomes[i] = waveTicketOutcome{ticketID: childID, phase: state.TicketPhaseBlocked}
+						return
+					}
+				}
+			}()
+		}
+		wg.Wait()
+
+		allClosed := true
+		for _, o := range outcomes {
+			if o.phase != state.TicketPhaseClosed {
+				allClosed = false
+			}
+			if o.err != nil {
+				outcome.err = o.err
+			}
+		}
+
+		SendProgress(ctx, req.Progress, ProgressEvent{
+			Type:    EventWaveCompleted,
+			WaveID:  subWaveOrdinal,
+			Closed:  countClosedTickets(outcomes),
+			Total:   len(outcomes),
+			Success: allClosed,
+		})
+
+		if !allClosed {
+			outcome.phase = state.TicketPhaseBlocked
+			return outcome
+		}
+	}
+}
+
+func executeEpicTicket(ctx context.Context, req RunEpicRequest, cfg policy.Config, wave state.WaveArtifact, ticketID string, depth int) waveTicketOutcome {
 	outcome := waveTicketOutcome{ticketID: ticketID, phase: state.TicketPhaseBlocked}
 
 	ticket, err := loadEpicTicket(req.RepoRoot, ticketID)
@@ -571,6 +665,34 @@ func executeEpicTicket(ctx context.Context, req RunEpicRequest, cfg policy.Confi
 		outcome.err = err
 		return outcome
 	}
+
+	// If this ticket has children and we haven't exceeded max depth, run the
+	// sub-tickets first (recursive mini-epic loop), then run the parent ticket.
+	maxDepth := cfg.Scheduler.MaxDepth
+	if maxDepth <= 0 {
+		maxDepth = 3
+	}
+	hasChildren, err := tkmd.HasChildren(req.RepoRoot, ticketID)
+	if err != nil {
+		outcome.err = fmt.Errorf("check children of %s: %w", ticketID, err)
+		return outcome
+	}
+	if hasChildren && depth < maxDepth {
+		subOutcome := runSubEpic(ctx, req, cfg, ticketID, wave, depth)
+		if subOutcome.err != nil {
+			return subOutcome
+		}
+		// If sub-tickets didn't all close, the parent can't proceed.
+		if subOutcome.phase != state.TicketPhaseClosed {
+			return subOutcome
+		}
+		SendProgress(ctx, req.Progress, ProgressEvent{
+			Type:     EventTicketDetail,
+			TicketID: ticketID,
+			Detail:   fmt.Sprintf("sub-tickets completed at depth %d, running parent", depth+1),
+		})
+	}
+
 	plan, err := BuildPlanArtifact(ticket, cfg)
 	if err != nil {
 		outcome.err = err
@@ -639,14 +761,6 @@ func subtractFiles(changed, baseline []string) []string {
 	return out
 }
 
-func ticketParent(ticket *tkmd.Ticket) string {
-	if ticket == nil || ticket.UnknownFrontmatter == nil {
-		return ""
-	}
-	parent, _ := ticket.UnknownFrontmatter["parent"].(string)
-	return parent
-}
-
 func describeNotReady(ticket tkmd.Ticket) string {
 	switch ticket.Status {
 	case tkmd.StatusClosed:
@@ -666,23 +780,6 @@ func describeNotReady(ticket tkmd.Ticket) string {
 		return fmt.Sprintf("waiting on %d deps", len(unresolved))
 	}
 	return fmt.Sprintf("status=%s", string(ticket.Status))
-}
-
-func toStringSlice(value any) []string {
-	switch v := value.(type) {
-	case []string:
-		return v
-	case []any:
-		out := make([]string, 0, len(v))
-		for _, item := range v {
-			if s, ok := item.(string); ok {
-				out = append(out, s)
-			}
-		}
-		return out
-	default:
-		return nil
-	}
 }
 
 func countClosedTickets(outcomes []waveTicketOutcome) int {

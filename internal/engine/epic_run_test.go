@@ -22,6 +22,98 @@ import (
 	runtimefake "verk/internal/adapters/runtime/fake"
 )
 
+
+
+// reflectingAdapter wraps a fake.Adapter and reflects the request LeaseID
+// into the response, avoiding the need to predict dynamic lease IDs.
+// It bypasses the inner adapter validation by returning results directly
+// with the LeaseID set from the request.
+type reflectingAdapter struct {
+	inner         *runtimefake.Adapter
+	workerIndex   int
+	reviewIndex   int
+	workerResults []runtime.WorkerResult
+	reviewResults []runtime.ReviewResult
+	mu            sync.Mutex
+	workerReqs    []runtime.WorkerRequest
+	reviewReqs    []runtime.ReviewRequest
+}
+
+func (a *reflectingAdapter) RunWorker(ctx context.Context, req runtime.WorkerRequest) (runtime.WorkerResult, error) {
+	if err := ctx.Err(); err != nil {
+		return runtime.WorkerResult{}, err
+	}
+	a.mu.Lock()
+	a.workerReqs = append(a.workerReqs, req)
+	a.mu.Unlock()
+	if a.workerIndex >= len(a.workerResults) {
+		return runtime.WorkerResult{}, fmt.Errorf("reflectingAdapter: no more scripted worker results (index %d)", a.workerIndex)
+	}
+	result := a.workerResults[a.workerIndex]
+	result.LeaseID = req.LeaseID
+	a.workerIndex++
+	return result, nil
+}
+
+func (a *reflectingAdapter) RunReviewer(ctx context.Context, req runtime.ReviewRequest) (runtime.ReviewResult, error) {
+	if err := ctx.Err(); err != nil {
+		return runtime.ReviewResult{}, err
+	}
+	a.mu.Lock()
+	a.reviewReqs = append(a.reviewReqs, req)
+	a.mu.Unlock()
+	if a.reviewIndex >= len(a.reviewResults) {
+		return runtime.ReviewResult{}, fmt.Errorf("reflectingAdapter: no more scripted review results (index %d)", a.reviewIndex)
+	}
+	result := a.reviewResults[a.reviewIndex]
+	result.LeaseID = req.LeaseID
+	a.reviewIndex++
+	return result, nil
+}
+
+func (a *reflectingAdapter) WorkerRequests() []runtime.WorkerRequest {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return append([]runtime.WorkerRequest(nil), a.workerReqs...)
+}
+
+func (a *reflectingAdapter) ReviewRequests() []runtime.ReviewRequest {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return append([]runtime.ReviewRequest(nil), a.reviewReqs...)
+}
+
+func newReflectingAdapter(numTickets int) *reflectingAdapter {
+	start := epicTestStart()
+	workerResults := make([]runtime.WorkerResult, numTickets)
+	reviewResults := make([]runtime.ReviewResult, numTickets)
+	for i := 0; i < numTickets; i++ {
+		workerResults[i] = runtime.WorkerResult{
+			Status:             runtime.WorkerStatusDone,
+			RetryClass:         runtime.RetryClassTerminal,
+			LeaseID:            "placeholder", // will be overwritten by reflectingAdapter
+			StartedAt:          start.Add(time.Duration(i) * time.Second),
+			FinishedAt:         start.Add(time.Duration(i) * time.Second).Add(time.Second),
+			ResultArtifactPath: "artifact.json",
+		}
+		reviewResults[i] = runtime.ReviewResult{
+			Status:             runtime.WorkerStatusDone,
+			RetryClass:         runtime.RetryClassTerminal,
+			LeaseID:            "placeholder", // will be overwritten by reflectingAdapter
+			StartedAt:          start.Add(time.Duration(i) * time.Second).Add(2 * time.Second),
+			FinishedAt:         start.Add(time.Duration(i) * time.Second).Add(3 * time.Second),
+			ReviewStatus:       runtime.ReviewStatusPassed,
+			Summary:            "clean",
+			ResultArtifactPath: "review.json",
+		}
+	}
+	return &reflectingAdapter{
+		inner:         runtimefake.New(workerResults, reviewResults),
+		workerResults: workerResults,
+		reviewResults: reviewResults,
+	}
+}
+
 func TestBuildWaveSerializesConflictingOwnedPaths(t *testing.T) {
 	ready := []tkmd.Ticket{
 		{
@@ -910,4 +1002,170 @@ func TestWaveClaimsReleased(t *testing.T) {
 			t.Fatal("expected false when error occurs")
 		}
 	})
+}
+
+
+func TestRunEpicRecursesIntoSubTickets(t *testing.T) {
+	repoRoot := t.TempDir()
+	baseCommit := initEpicRepo(t, repoRoot)
+	cfg := policy.DefaultConfig()
+	cfg.Scheduler.MaxDepth = 3
+
+	// Epic -> ticket-1 (has children) -> sub-1, sub-2
+	// Epic -> ticket-2 (leaf)
+	epic := epicTicket("epic-sub")
+	mustSaveTicket(t, repoRoot, epic)
+
+	ticket1 := epicChildTicket("ticket-1", epic.ID, tkmd.StatusOpen, nil, []string{"internal/app"})
+	mustSaveTicket(t, repoRoot, ticket1)
+
+	ticket2 := epicChildTicket("ticket-2", epic.ID, tkmd.StatusOpen, nil, []string{"docs"})
+	mustSaveTicket(t, repoRoot, ticket2)
+
+	sub1 := epicChildTicket("sub-1", ticket1.ID, tkmd.StatusOpen, nil, []string{"internal/app/sub1"})
+	mustSaveTicket(t, repoRoot, sub1)
+
+	sub2 := epicChildTicket("sub-2", ticket1.ID, tkmd.StatusOpen, nil, []string{"internal/app/sub2"})
+	mustSaveTicket(t, repoRoot, sub2)
+
+	adapter := newReflectingAdapter(4)
+
+	result, err := RunEpic(context.Background(), RunEpicRequest{
+		RepoRoot:     repoRoot,
+		RunID:        "run-sub",
+		RootTicketID: epic.ID,
+		BaseCommit:   baseCommit,
+		Adapter:      adapter,
+		Config:       cfg,
+	})
+
+	// All tickets including sub-tickets should have been dispatched
+	workerReqs := adapter.WorkerRequests()
+	startedSet := make(map[string]bool)
+	for _, req := range workerReqs {
+		startedSet[req.TicketID] = true
+	}
+	for _, id := range []string{"sub-1", "sub-2", "ticket-1", "ticket-2"} {
+		if !startedSet[id] {
+			t.Errorf("expected ticket %q to be started, got started: %v", id, keys(startedSet))
+		}
+	}
+
+	// Epic should complete since all tickets pass
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.Run.Status != state.EpicRunStatusCompleted {
+		t.Fatalf("expected completed epic, got status %s", result.Run.Status)
+	}
+}
+
+func keys(m map[string]bool) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func TestRunEpicRespectsMaxDepth(t *testing.T) {
+	repoRoot := t.TempDir()
+	baseCommit := initEpicRepo(t, repoRoot)
+	cfg := policy.DefaultConfig()
+	cfg.Scheduler.MaxDepth = 1 // Only 1 level: epic's direct children
+
+	// Epic -> ticket-1 -> sub-1
+	// With MaxDepth=1, sub-1 should NOT be run as a sub-epic;
+	// ticket-1 runs as a flat ticket (no recursion into its children).
+	epic := epicTicket("epic-depth")
+	mustSaveTicket(t, repoRoot, epic)
+
+	ticket1 := epicChildTicket("ticket-1", epic.ID, tkmd.StatusOpen, nil, []string{"internal/app"})
+	mustSaveTicket(t, repoRoot, ticket1)
+
+	sub1 := epicChildTicket("sub-1", ticket1.ID, tkmd.StatusOpen, nil, []string{"internal/app/sub"})
+	mustSaveTicket(t, repoRoot, sub1)
+
+	// Only 1 worker + 1 review needed: just ticket-1 (sub-1 is skipped by MaxDepth=1)
+	adapter := newReflectingAdapter(1)
+
+	_, err := RunEpic(context.Background(), RunEpicRequest{
+		RepoRoot:     repoRoot,
+		RunID:        "run-depth",
+		RootTicketID: epic.ID,
+		BaseCommit:   baseCommit,
+		Adapter:      adapter,
+		Config:       cfg,
+	})
+
+	// sub-1 should NOT have been started because MaxDepth=1 prevents recursion
+	workerReqs := adapter.WorkerRequests()
+	for _, req := range workerReqs {
+		if req.TicketID == "sub-1" {
+			t.Error("sub-1 should not have been started with MaxDepth=1")
+		}
+	}
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+
+func TestRunSubEpicBasic(t *testing.T) {
+	repoRoot := t.TempDir()
+	baseCommit := initEpicRepo(t, repoRoot)
+	cfg := policy.DefaultConfig()
+	cfg.Scheduler.MaxDepth = 3
+
+	// ticket-1 has children: sub-1, sub-2
+	ticket1 := epicChildTicket("ticket-1", "epic-parent", tkmd.StatusOpen, nil, []string{"internal/app"})
+	mustSaveTicket(t, repoRoot, ticket1)
+
+	sub1 := epicChildTicket("sub-1", ticket1.ID, tkmd.StatusOpen, nil, []string{"internal/app/sub1"})
+	mustSaveTicket(t, repoRoot, sub1)
+
+	sub2 := epicChildTicket("sub-2", ticket1.ID, tkmd.StatusOpen, nil, []string{"internal/app/sub2"})
+	mustSaveTicket(t, repoRoot, sub2)
+
+	adapter := newReflectingAdapter(2)
+
+	wave := state.WaveArtifact{
+		WaveID:         "wave-1",
+		Ordinal:        1,
+		Status:         state.WaveStatusRunning,
+		WaveBaseCommit: baseCommit,
+		StartedAt:      epicTestStart(),
+	}
+
+	req := RunEpicRequest{
+		RepoRoot:     repoRoot,
+		RunID:        "run-sub-epic",
+		RootTicketID: "epic-parent",
+		BaseCommit:   baseCommit,
+		Adapter:      adapter,
+		Config:       cfg,
+	}
+
+	outcome := runSubEpic(context.Background(), req, cfg, ticket1.ID, wave, 1)
+
+	t.Logf("outcome: ticketID=%s phase=%s err=%v", outcome.ticketID, outcome.phase, outcome.err)
+	if outcome.err != nil {
+		t.Fatalf("runSubEpic failed: %v", outcome.err)
+	}
+	if outcome.phase != state.TicketPhaseClosed {
+		t.Fatalf("expected closed, got %s", outcome.phase)
+	}
+
+	// Both sub-tickets should have been dispatched
+	workerReqs := adapter.WorkerRequests()
+	startedSet := make(map[string]bool)
+	for _, req := range workerReqs {
+		startedSet[req.TicketID] = true
+	}
+	for _, id := range []string{"sub-1", "sub-2"} {
+		if !startedSet[id] {
+			t.Errorf("expected ticket %q to be started, got %v", id, keys(startedSet))
+		}
+	}
 }

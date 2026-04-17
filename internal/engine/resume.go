@@ -422,7 +422,7 @@ func resumeEpicMode(ctx context.Context, req ResumeRequest, artifacts *runArtifa
 				defer wg.Done()
 				const maxCrashRetries = 2
 				for attempt := 0; attempt <= maxCrashRetries; attempt++ {
-					outcome, crashed := executeWithRecovery(ctx, epicReq, cfg, wave, ticketID)
+					outcome, crashed := executeWithRecovery(ctx, epicReq, cfg, wave, ticketID, 1)
 					if !crashed {
 						outcomes[i] = outcome
 						return
