@@ -13,6 +13,7 @@ import (
 
 type SchedulerConfig struct {
 	MaxConcurrency int `yaml:"max_concurrency" json:"max_concurrency"`
+	MaxDepth       int `yaml:"max_depth" json:"max_depth"`
 }
 
 type PolicyConfig struct { //nolint:revive // stuttering name matches Go convention
@@ -96,6 +97,9 @@ func LoadConfig(repoRoot string) (Config, error) {
 func (c Config) Validate() error {
 	if c.Scheduler.MaxConcurrency <= 0 {
 		return fmt.Errorf("scheduler.max_concurrency must be greater than zero")
+	}
+	if c.Scheduler.MaxDepth <= 0 {
+		return fmt.Errorf("scheduler.max_depth must be greater than zero")
 	}
 	if err := validateSeverity(c.Policy.ReviewThreshold, "policy.review_threshold"); err != nil {
 		return err
