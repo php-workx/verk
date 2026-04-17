@@ -179,6 +179,80 @@ func parentOf(ticket *Ticket) string {
 	return parent
 }
 
+// HasChildren reports whether the ticket with the given ID has any children.
+// A child is a ticket whose parent field, deps, or links reference the given ID.
+func HasChildren(rootDir, ticketID string) (bool, error) {
+	ticketsDir := resolveTicketsDir(rootDir)
+	paths, err := filepath.Glob(filepath.Join(ticketsDir, "*.md"))
+	if err != nil {
+		return false, fmt.Errorf("glob tickets: %w", err)
+	}
+	epicDeps, err := loadEpicChildren(ticketsDir, ticketID)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return false, fmt.Errorf("load children of %s: %w", ticketID, err)
+	}
+	for _, path := range paths {
+		ticket, err := LoadTicket(path)
+		if err != nil {
+			return false, err
+		}
+		if ticket.ID == ticketID {
+			continue
+		}
+		if parentOf(&ticket) == ticketID {
+			return true, nil
+		}
+		if _, ok := epicDeps[ticket.ID]; ok {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// ListAllChildren returns all direct children of the ticket with the given ID,
+// regardless of their status. Used by the engine to discover the full hierarchy.
+// Returns an error if the parent ticket does not exist.
+func ListAllChildren(rootDir, parentID string) ([]Ticket, error) {
+	ticketsDir := resolveTicketsDir(rootDir)
+	parentPath := filepath.Join(ticketsDir, parentID+".md")
+	if _, err := os.Stat(parentPath); err != nil {
+		return nil, fmt.Errorf("load %s: %w", parentID, err)
+	}
+	epicDeps, err := loadEpicChildren(ticketsDir, parentID)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return nil, fmt.Errorf("load epic children for %s: %w", parentID, err)
+	}
+	paths, err := filepath.Glob(filepath.Join(ticketsDir, "*.md"))
+	if err != nil {
+		return nil, fmt.Errorf("glob tickets: %w", err)
+	}
+	sort.Strings(paths)
+	var children []Ticket
+	seen := make(map[string]struct{})
+	for _, path := range paths {
+		ticket, err := LoadTicket(path)
+		if err != nil {
+			return nil, err
+		}
+		if ticket.ID == parentID {
+			continue
+		}
+		isChild := parentOf(&ticket) == parentID
+		if !isChild {
+			_, isChild = epicDeps[ticket.ID]
+		}
+		if !isChild {
+			continue
+		}
+		if _, ok := seen[ticket.ID]; ok {
+			continue
+		}
+		seen[ticket.ID] = struct{}{}
+		children = append(children, ticket)
+	}
+	return children, nil
+}
+
 // extractHeadingTitle extracts the title from the first # heading in the body.
 func extractHeadingTitle(body string) string {
 	for _, line := range strings.Split(body, "\n") {

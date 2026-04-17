@@ -263,3 +263,114 @@ func TestRoundTripNoTitleInFrontmatter(t *testing.T) {
 		t.Fatalf("round-trip mismatch\nwant:\n%s\ngot:\n%s", original, string(saved))
 	}
 }
+
+
+func writeTicketToRepo(t *testing.T, repoRoot, id, parent string, status Status, deps ...string) {
+	t.Helper()
+	ticketsDir := filepath.Join(repoRoot, ".tickets")
+	parts := []string{"---"}
+	parts = append(parts, "id: "+id)
+	if parent != "" {
+		parts = append(parts, "parent: "+parent)
+	}
+	parts = append(parts, "status: "+string(status))
+	if len(deps) > 0 {
+		parts = append(parts, "deps: ["+strings.Join(deps, ", ")+"]")
+	}
+	parts = append(parts, "---", "", "Body for "+id+".", "")
+	path := filepath.Join(ticketsDir, id+".md")
+	if err := os.MkdirAll(ticketsDir, 0o755); err != nil {
+		t.Fatalf("mkdir .tickets: %v", err)
+	}
+	if err := os.WriteFile(path, []byte(strings.Join(parts, "\n")), 0o644); err != nil {
+		t.Fatalf("write ticket %s: %v", id, err)
+	}
+}
+
+func TestHasChildren(t *testing.T) {
+	dir := t.TempDir()
+
+	writeTicketToRepo(t, dir, "epic-1", "", StatusOpen)
+	writeTicketToRepo(t, dir, "child-1", "epic-1", StatusOpen)
+	writeTicketToRepo(t, dir, "child-2", "epic-1", StatusOpen)
+	writeTicketToRepo(t, dir, "orphan-1", "", StatusOpen)
+
+	has, err := HasChildren(dir, "epic-1")
+	if err != nil {
+		t.Fatalf("HasChildren: %v", err)
+	}
+	if !has {
+		t.Fatal("expected epic-1 to have children")
+	}
+
+	has, err = HasChildren(dir, "orphan-1")
+	if err != nil {
+		t.Fatalf("HasChildren: %v", err)
+	}
+	if has {
+		t.Fatal("expected orphan-1 to have no children")
+	}
+}
+
+func TestListAllChildren(t *testing.T) {
+	dir := t.TempDir()
+
+	writeTicketToRepo(t, dir, "epic-1", "", StatusOpen)
+	writeTicketToRepo(t, dir, "child-1", "epic-1", StatusOpen)
+	writeTicketToRepo(t, dir, "child-2", "epic-1", StatusClosed)
+	writeTicketToRepo(t, dir, "child-3", "epic-1", StatusBlocked)
+	writeTicketToRepo(t, dir, "other-1", "other-epic", StatusOpen)
+
+	children, err := ListAllChildren(dir, "epic-1")
+	if err != nil {
+		t.Fatalf("ListAllChildren: %v", err)
+	}
+	if len(children) != 3 {
+		t.Fatalf("expected 3 children, got %d", len(children))
+	}
+
+	// ListAllChildren returns all statuses unlike ListReadyChildren
+	ids := make(map[string]bool)
+	for _, c := range children {
+		ids[c.ID] = true
+	}
+	for _, id := range []string{"child-1", "child-2", "child-3"} {
+		if !ids[id] {
+			t.Errorf("expected child %q in results", id)
+		}
+	}
+}
+
+func TestHasChildrenViaDeps(t *testing.T) {
+	dir := t.TempDir()
+
+	// Epic with deps that reference other tickets
+	ticketsDir := filepath.Join(dir, ".tickets")
+	if err := os.MkdirAll(ticketsDir, 0o755); err != nil {
+		t.Fatalf("mkdir .tickets: %v", err)
+	}
+	epicPath := filepath.Join(ticketsDir, "epic-2.md")
+	content := strings.Join([]string{
+		"---",
+		"id: epic-2",
+		"status: open",
+		"deps: [dep-child-1, dep-child-2]",
+		"---",
+		"",
+		"Epic body.",
+		"",
+	}, "\n")
+	if err := os.WriteFile(epicPath, []byte(content), 0o644); err != nil {
+		t.Fatalf("write epic: %v", err)
+	}
+	writeTicketToRepo(t, dir, "dep-child-1", "", StatusOpen)
+	writeTicketToRepo(t, dir, "dep-child-2", "", StatusOpen)
+
+	has, err := HasChildren(dir, "epic-2")
+	if err != nil {
+		t.Fatalf("HasChildren: %v", err)
+	}
+	if !has {
+		t.Fatal("expected epic-2 to have children via deps")
+	}
+}
