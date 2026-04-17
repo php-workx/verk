@@ -255,6 +255,20 @@ func TestBuildWorkerPrompt_ContainsTicketInfo(t *testing.T) {
 	}
 }
 
+func TestBuildWorkerPrompt_AsksWorkerToInspectExistingImplementation(t *testing.T) {
+	prompt := BuildWorkerPrompt(WorkerRequest{
+		TicketID:     "VER-001",
+		LeaseID:      "lease-1",
+		WorktreePath: "/workspace",
+		Instructions: "Implement the feature",
+	})
+
+	expected := "Before editing, inspect the current working tree to determine whether any required implementation already exists, then continue from the actual state."
+	if !strings.Contains(prompt, expected) {
+		t.Fatalf("expected existing-implementation instruction in prompt:\n%s", prompt)
+	}
+}
+
 func TestBuildReviewPrompt_ContainsThreshold(t *testing.T) {
 	prompt := BuildReviewPrompt(ReviewRequest{
 		TicketID:                 "VER-002",

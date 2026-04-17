@@ -97,6 +97,8 @@ func BuildWorkerPrompt(req WorkerRequest) string {
 		fmt.Fprintf(&b, "Working directory: %s\n", req.WorktreePath)
 	}
 
+	b.WriteString("Before editing, inspect the current working tree to determine whether any required implementation already exists, then continue from the actual state.\n")
+
 	if req.Instructions != "" {
 		b.WriteString("\n")
 		b.WriteString(req.Instructions)
