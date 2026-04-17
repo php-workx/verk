@@ -174,7 +174,6 @@ func (a *routingAdapter) RunReviewer(ctx context.Context, req runtime.ReviewRequ
 	return result, nil
 }
 
-
 func TestEpicThreeLevelHierarchy(t *testing.T) {
 	repoRoot := t.TempDir()
 	baseCommit := initRepo(t, repoRoot)
@@ -206,7 +205,6 @@ func TestEpicThreeLevelHierarchy(t *testing.T) {
 		Adapter:      adapter,
 		Config:       cfg,
 	})
-
 	if err != nil {
 		t.Fatalf("RunEpic returned error: %v", err)
 	}
@@ -244,13 +242,14 @@ func (a *e2eReflectingAdapter) RunWorker(ctx context.Context, req runtime.Worker
 	}
 	a.mu.Lock()
 	a.workerReqs = append(a.workerReqs, req)
-	a.mu.Unlock()
 	if a.workerIndex >= len(a.workerResults) {
+		a.mu.Unlock()
 		return runtime.WorkerResult{}, fmt.Errorf("e2eReflectingAdapter: no more worker results (index %d)", a.workerIndex)
 	}
 	result := a.workerResults[a.workerIndex]
 	result.LeaseID = req.LeaseID
 	a.workerIndex++
+	a.mu.Unlock()
 	return result, nil
 }
 
@@ -260,13 +259,14 @@ func (a *e2eReflectingAdapter) RunReviewer(ctx context.Context, req runtime.Revi
 	}
 	a.mu.Lock()
 	a.reviewReqs = append(a.reviewReqs, req)
-	a.mu.Unlock()
 	if a.reviewIndex >= len(a.reviewResults) {
+		a.mu.Unlock()
 		return runtime.ReviewResult{}, fmt.Errorf("e2eReflectingAdapter: no more review results (index %d)", a.reviewIndex)
 	}
 	result := a.reviewResults[a.reviewIndex]
 	result.LeaseID = req.LeaseID
 	a.reviewIndex++
+	a.mu.Unlock()
 	return result, nil
 }
 
