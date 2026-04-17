@@ -5,9 +5,9 @@ import "verk/internal/state"
 func DefaultConfig() Config {
 	return Config{
 		Scheduler: SchedulerConfig{
-		MaxConcurrency: 4,
-		MaxDepth:       3,
-	},
+			MaxConcurrency: 4,
+			MaxDepth:       3,
+		},
 		Policy: PolicyConfig{
 			ReviewThreshold:           state.SeverityP2,
 			MaxImplementationAttempts: 3,

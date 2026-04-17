@@ -264,7 +264,6 @@ func TestRoundTripNoTitleInFrontmatter(t *testing.T) {
 	}
 }
 
-
 func writeTicketToRepo(t *testing.T, repoRoot, id, parent string, status Status, deps ...string) {
 	t.Helper()
 	ticketsDir := filepath.Join(repoRoot, ".tickets")
