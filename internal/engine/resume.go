@@ -328,6 +328,7 @@ func resumeEpicMode(ctx context.Context, req ResumeRequest, artifacts *runArtifa
 
 	var allResumed []string
 	runPath := runJSONPath(artifacts.RepoRoot, req.RunID)
+	registrar := &subEpicRegistrar{run: &artifacts.Run, runPath: runPath}
 
 	for {
 		if err := ctx.Err(); err != nil {
@@ -422,7 +423,7 @@ func resumeEpicMode(ctx context.Context, req ResumeRequest, artifacts *runArtifa
 				defer wg.Done()
 				const maxCrashRetries = 2
 				for attempt := 0; attempt <= maxCrashRetries; attempt++ {
-					outcome, crashed := executeWithRecovery(ctx, epicReq, cfg, wave, ticketID, 1)
+					outcome, crashed := executeWithRecovery(ctx, epicReq, cfg, wave, ticketID, 1, registrar)
 					if !crashed {
 						outcomes[i] = outcome
 						return

@@ -14,14 +14,14 @@ func RunPlainProgress(w io.Writer, ch <-chan engine.ProgressEvent) {
 	for evt := range ch {
 		switch evt.Type {
 		case engine.EventWaveStarted:
-			_, _ = fmt.Fprintf(w, "[wave %d] %s\n", evt.WaveID, strings.Join(evt.Tickets, ", "))
+			_, _ = fmt.Fprintf(w, "[%s] %s\n", plainWaveLabel(evt), strings.Join(evt.Tickets, ", "))
 
 		case engine.EventWaveCompleted:
 			mark := "✓"
 			if !evt.Success {
 				mark = "✗"
 			}
-			_, _ = fmt.Fprintf(w, "[wave %d] %d/%d closed %s\n", evt.WaveID, evt.Closed, evt.Total, mark)
+			_, _ = fmt.Fprintf(w, "[%s] %d/%d closed %s\n", plainWaveLabel(evt), evt.Closed, evt.Total, mark)
 
 		case engine.EventTicketPhaseChanged:
 			label := evt.TicketID
@@ -53,4 +53,11 @@ func RunPlainProgress(w io.Writer, ch <-chan engine.ProgressEvent) {
 			// nothing to print — the caller handles final status
 		}
 	}
+}
+
+func plainWaveLabel(evt engine.ProgressEvent) string {
+	if evt.ParentTicketID != "" {
+		return fmt.Sprintf("sub-wave %d for %s", evt.WaveID, evt.ParentTicketID)
+	}
+	return fmt.Sprintf("wave %d", evt.WaveID)
 }

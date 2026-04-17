@@ -22,8 +22,6 @@ import (
 	runtimefake "verk/internal/adapters/runtime/fake"
 )
 
-
-
 // reflectingAdapter wraps a fake.Adapter and reflects the request LeaseID
 // into the response, avoiding the need to predict dynamic lease IDs.
 // It bypasses the inner adapter validation by returning results directly
@@ -1004,7 +1002,6 @@ func TestWaveClaimsReleased(t *testing.T) {
 	})
 }
 
-
 func TestRunEpicRecursesIntoSubTickets(t *testing.T) {
 	repoRoot := t.TempDir()
 	baseCommit := initEpicRepo(t, repoRoot)
@@ -1111,7 +1108,6 @@ func TestRunEpicRespectsMaxDepth(t *testing.T) {
 	}
 }
 
-
 func TestRunSubEpicBasic(t *testing.T) {
 	repoRoot := t.TempDir()
 	baseCommit := initEpicRepo(t, repoRoot)
@@ -1147,7 +1143,7 @@ func TestRunSubEpicBasic(t *testing.T) {
 		Config:       cfg,
 	}
 
-	outcome := runSubEpic(context.Background(), req, cfg, ticket1.ID, wave, 1)
+	outcome := runSubEpic(context.Background(), req, cfg, ticket1.ID, wave, 1, nil)
 
 	t.Logf("outcome: ticketID=%s phase=%s err=%v", outcome.ticketID, outcome.phase, outcome.err)
 	if outcome.err != nil {
@@ -1167,5 +1163,84 @@ func TestRunSubEpicBasic(t *testing.T) {
 		if !startedSet[id] {
 			t.Errorf("expected ticket %q to be started, got %v", id, keys(startedSet))
 		}
+	}
+}
+
+// TestRunEpicBlockedGrandchildTerminatesRun is a regression test for the bug
+// where a blocked descendant left the parent sub-epic ticket in open/ready state,
+// causing the outer RunEpic loop to reschedule the same parent repeatedly and
+// create accepted waves forever without making progress.
+//
+// Topology: epic -> parent-task (has children) -> grandchild
+// The grandchild's worker returns needs_context, which becomes TicketPhaseBlocked.
+// The fix: executeEpicTicket persists blocked state on the parent ticket so the
+// outer loop cannot reschedule it.
+func TestRunEpicBlockedGrandchildTerminatesRun(t *testing.T) {
+	repoRoot := t.TempDir()
+	baseCommit := initEpicRepo(t, repoRoot)
+	cfg := policy.DefaultConfig()
+	cfg.Scheduler.MaxDepth = 3
+
+	epic := epicTicket("epic-gc-blocked")
+	mustSaveTicket(t, repoRoot, epic)
+
+	// parent-task has children, so it triggers the sub-epic path in executeEpicTicket.
+	parentTask := epicChildTicket("parent-task", epic.ID, tkmd.StatusOpen, nil, []string{"internal/app"})
+	mustSaveTicket(t, repoRoot, parentTask)
+
+	// grandchild is a leaf; its worker will return needs_context (blocked).
+	grandchild := epicChildTicket("grandchild", parentTask.ID, tkmd.StatusOpen, nil, []string{"internal/app/sub"})
+	mustSaveTicket(t, repoRoot, grandchild)
+
+	// Script the grandchild worker to return needs_context. The reflectingAdapter
+	// overrides LeaseID from the request, so no pre-computed lease ID is needed.
+	adapter := &reflectingAdapter{
+		workerResults: []runtime.WorkerResult{
+			{
+				Status:             runtime.WorkerStatusNeedsContext,
+				RetryClass:         runtime.RetryClassBlockedByOperatorInput,
+				LeaseID:            "placeholder", // overwritten by reflectingAdapter.RunWorker
+				StartedAt:          epicTestStart(),
+				FinishedAt:         epicTestStart().Add(time.Second),
+				ResultArtifactPath: "artifact.json",
+			},
+		},
+		reviewResults: []runtime.ReviewResult{}, // no review: grandchild blocked at implement
+	}
+
+	result, err := RunEpic(context.Background(), RunEpicRequest{
+		RepoRoot:     repoRoot,
+		RunID:        "run-gc-blocked",
+		RootTicketID: epic.ID,
+		BaseCommit:   baseCommit,
+		Adapter:      adapter,
+		Config:       cfg,
+	})
+
+	// RunEpic must terminate with ErrEpicBlocked, not loop forever.
+	if err == nil {
+		t.Fatal("expected ErrEpicBlocked, got nil error — regression: blocked grandchild did not stop the run")
+	}
+	if !errors.Is(err, ErrEpicBlocked) {
+		t.Fatalf("expected ErrEpicBlocked, got: %v", err)
+	}
+
+	// The parent sub-epic ticket must be persisted as blocked so it cannot be
+	// rescheduled in a future wave for the same run.
+	parentTicket, loadErr := loadEpicTicket(repoRoot, parentTask.ID)
+	if loadErr != nil {
+		t.Fatalf("load parent-task ticket: %v", loadErr)
+	}
+	if parentTicket.Status != tkmd.StatusBlocked {
+		t.Fatalf("expected parent-task to be blocked in ticket store, got %q — "+
+			"parent will be rescheduled until it is explicitly marked blocked", parentTicket.Status)
+	}
+
+	// Only one wave must have been created: parent-task must not be rescheduled
+	// after its grandchild blocked. Repeated accepted waves for the same parent
+	// indicate the looping regression is still present.
+	if len(result.Waves) != 1 {
+		t.Fatalf("expected exactly 1 wave (parent not rescheduled after grandchild blocked), "+
+			"got %d waves — regression: same blocked parent accepted into multiple waves", len(result.Waves))
 	}
 }

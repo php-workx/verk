@@ -34,7 +34,6 @@ type RunEpicRequest struct {
 	Config               policy.Config
 	VerificationByTicket map[string][]string
 	Progress             chan<- ProgressEvent
-	MaxDepth             int
 }
 
 type RunEpicResult struct {
@@ -116,6 +115,7 @@ func RunEpic(ctx context.Context, req RunEpicRequest) (RunEpicResult, error) { /
 	}
 
 	result := RunEpicResult{Run: run, Path: runPath}
+	registrar := &subEpicRegistrar{run: &result.Run, runPath: runPath}
 	waveOrdinal := 0
 
 	for {
@@ -228,7 +228,7 @@ func RunEpic(ctx context.Context, req RunEpicRequest) (RunEpicResult, error) { /
 				defer wg.Done()
 				const maxCrashRetries = 2
 				for attempt := 0; attempt <= maxCrashRetries; attempt++ {
-					outcome, crashed := executeWithRecovery(ctx, req, cfg, wave, ticketID, 1)
+					outcome, crashed := executeWithRecovery(ctx, req, cfg, wave, ticketID, 1, registrar)
 					if !crashed {
 						outcomes[i] = outcome
 						return
@@ -495,6 +495,31 @@ type waveTicketOutcome struct {
 	err      error
 }
 
+// subEpicRegistrar serializes run-metadata updates from concurrent sub-epic
+// goroutines. Multiple tickets in the same wave may have children and therefore
+// run their own mini-epic loops in parallel; this registrar coordinates their
+// writes to Run.WaveIDs, Run.TicketIDs, and the persisted run.json.
+type subEpicRegistrar struct {
+	mu      sync.Mutex
+	run     *state.RunArtifact
+	runPath string
+}
+
+// registerSubWave atomically appends subWaveID and descendantIDs to the shared
+// run artifact and persists it. This makes sub-wave and descendant-ticket
+// metadata durable before sub-wave execution begins, so resume can reconstruct
+// state after a crash mid-sub-wave.
+func (r *subEpicRegistrar) registerSubWave(subWaveID string, descendantIDs []string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.run.WaveIDs = appendIfMissing(r.run.WaveIDs, subWaveID)
+	for _, id := range descendantIDs {
+		r.run.TicketIDs = appendIfMissing(r.run.TicketIDs, id)
+	}
+	r.run.UpdatedAt = time.Now().UTC()
+	return state.SaveJSONAtomic(r.runPath, *r.run)
+}
+
 // buildTicketScopes creates a map of ticket ID -> owned paths from a ticket list.
 // This is used for per-ticket scope validation during wave acceptance.
 func buildTicketScopes(tickets []tkmd.Ticket) map[string][]string {
@@ -505,7 +530,7 @@ func buildTicketScopes(tickets []tkmd.Ticket) map[string][]string {
 	return scopes
 }
 
-func executeWithRecovery(ctx context.Context, req RunEpicRequest, cfg policy.Config, wave state.WaveArtifact, ticketID string, depth int) (outcome waveTicketOutcome, crashed bool) {
+func executeWithRecovery(ctx context.Context, req RunEpicRequest, cfg policy.Config, wave state.WaveArtifact, ticketID string, depth int, reg *subEpicRegistrar) (outcome waveTicketOutcome, crashed bool) {
 	defer func() {
 		if r := recover(); r != nil {
 			outcome = waveTicketOutcome{
@@ -516,14 +541,14 @@ func executeWithRecovery(ctx context.Context, req RunEpicRequest, cfg policy.Con
 			crashed = true
 		}
 	}()
-	return executeEpicTicket(ctx, req, cfg, wave, ticketID, depth), false
+	return executeEpicTicket(ctx, req, cfg, wave, ticketID, depth, reg), false
 }
 
 // runSubEpic executes a mini epic loop for the children of a ticket.
 // It discovers children, runs them in waves (up to the configured concurrency),
 // and returns a waveTicketOutcome reflecting the aggregate result.
 // The parent ticket is not run here — the caller runs it after sub-tickets complete.
-func runSubEpic(ctx context.Context, req RunEpicRequest, cfg policy.Config, parentTicketID string, parentWave state.WaveArtifact, depth int) waveTicketOutcome {
+func runSubEpic(ctx context.Context, req RunEpicRequest, cfg policy.Config, parentTicketID string, parentWave state.WaveArtifact, depth int, reg *subEpicRegistrar) waveTicketOutcome {
 	outcome := waveTicketOutcome{ticketID: parentTicketID, phase: state.TicketPhaseBlocked}
 
 	SendProgress(ctx, req.Progress, ProgressEvent{
@@ -597,9 +622,10 @@ func runSubEpic(ctx context.Context, req RunEpicRequest, cfg policy.Config, pare
 		subWave.StartedAt = time.Now().UTC()
 
 		SendProgress(ctx, req.Progress, ProgressEvent{
-			Type:    EventWaveStarted,
-			WaveID:  subWaveOrdinal,
-			Tickets: append([]string(nil), subWave.TicketIDs...),
+			Type:           EventWaveStarted,
+			WaveID:         subWaveOrdinal,
+			ParentTicketID: parentTicketID,
+			Tickets:        append([]string(nil), subWave.TicketIDs...),
 		})
 
 		outcomes := make([]waveTicketOutcome, len(subWave.TicketIDs))
@@ -612,7 +638,7 @@ func runSubEpic(ctx context.Context, req RunEpicRequest, cfg policy.Config, pare
 				defer wg.Done()
 				const maxCrashRetries = 2
 				for attempt := 0; attempt <= maxCrashRetries; attempt++ {
-					childOutcome, crashed := executeWithRecovery(ctx, req, cfg, subWave, childID, depth+1)
+					childOutcome, crashed := executeWithRecovery(ctx, req, cfg, subWave, childID, depth+1, reg)
 					if !crashed {
 						outcomes[i] = childOutcome
 						return
@@ -643,11 +669,12 @@ func runSubEpic(ctx context.Context, req RunEpicRequest, cfg policy.Config, pare
 		}
 
 		SendProgress(ctx, req.Progress, ProgressEvent{
-			Type:    EventWaveCompleted,
-			WaveID:  subWaveOrdinal,
-			Closed:  countClosedTickets(outcomes),
-			Total:   len(outcomes),
-			Success: allClosed,
+			Type:           EventWaveCompleted,
+			WaveID:         subWaveOrdinal,
+			ParentTicketID: parentTicketID,
+			Closed:         countClosedTickets(outcomes),
+			Total:          len(outcomes),
+			Success:        allClosed,
 		})
 
 		if !allClosed {
@@ -657,7 +684,7 @@ func runSubEpic(ctx context.Context, req RunEpicRequest, cfg policy.Config, pare
 	}
 }
 
-func executeEpicTicket(ctx context.Context, req RunEpicRequest, cfg policy.Config, wave state.WaveArtifact, ticketID string, depth int) waveTicketOutcome {
+func executeEpicTicket(ctx context.Context, req RunEpicRequest, cfg policy.Config, wave state.WaveArtifact, ticketID string, depth int, reg *subEpicRegistrar) waveTicketOutcome {
 	outcome := waveTicketOutcome{ticketID: ticketID, phase: state.TicketPhaseBlocked}
 
 	ticket, err := loadEpicTicket(req.RepoRoot, ticketID)
@@ -678,12 +705,19 @@ func executeEpicTicket(ctx context.Context, req RunEpicRequest, cfg policy.Confi
 		return outcome
 	}
 	if hasChildren && depth < maxDepth {
-		subOutcome := runSubEpic(ctx, req, cfg, ticketID, wave, depth)
+		subOutcome := runSubEpic(ctx, req, cfg, ticketID, wave, depth, reg)
 		if subOutcome.err != nil {
 			return subOutcome
 		}
 		// If sub-tickets didn't all close, the parent can't proceed.
+		// Persist the blocked state durably so the parent ticket is not eligible
+		// for rescheduling in a subsequent wave while the descendant remains
+		// unresolved. Without this, the outer run loop would find the parent
+		// still open/ready and schedule it again, creating a repeated-wave loop.
 		if subOutcome.phase != state.TicketPhaseClosed {
+			if updateErr := updateTicketStoreStatus(req.RepoRoot, ticketID, tkmd.StatusBlocked); updateErr != nil {
+				subOutcome.err = fmt.Errorf("persist blocked status for %s: %w", ticketID, updateErr)
+			}
 			return subOutcome
 		}
 		SendProgress(ctx, req.Progress, ProgressEvent{

@@ -31,12 +31,13 @@ type ticketLine struct {
 
 // waveState tracks a wave.
 type waveState struct {
-	id      int
-	tickets []string
-	closed  int
-	total   int
-	done    bool
-	ok      bool
+	id             int
+	parentTicketID string
+	tickets        []string
+	closed         int
+	total          int
+	done           bool
+	ok             bool
 }
 
 // Model is the Bubble Tea model for verk run progress.
@@ -104,9 +105,10 @@ func (m *Model) handleEvent(evt engine.ProgressEvent) tea.Cmd {
 	switch evt.Type {
 	case engine.EventWaveStarted:
 		m.waves = append(m.waves, waveState{
-			id:      evt.WaveID,
-			tickets: evt.Tickets,
-			total:   len(evt.Tickets),
+			id:             evt.WaveID,
+			parentTicketID: evt.ParentTicketID,
+			tickets:        evt.Tickets,
+			total:          len(evt.Tickets),
 		})
 		for _, id := range evt.Tickets {
 			if _, exists := m.tickets[id]; !exists {
@@ -209,14 +211,14 @@ func (m Model) renderWave(b *strings.Builder, w *waveState, isCurrent bool) {
 		if !w.ok {
 			mark = styleWaveSummaryFail.Render("✗")
 		}
-		summary := fmt.Sprintf("  Wave %d  %d/%d closed %s", w.id, w.closed, w.total, mark)
+		summary := fmt.Sprintf("  %s  %d/%d closed %s", waveLabel(w), w.closed, w.total, mark)
 		if !isCurrent {
 			b.WriteString(styleDivider.Render(summary) + "\n")
 			return // Collapsed — don't show ticket lines for past waves
 		}
 		b.WriteString(styleWaveTitle.Render(summary) + "\n")
 	} else {
-		b.WriteString(styleWaveTitle.Render(fmt.Sprintf("  Wave %d", w.id)) + "\n")
+		b.WriteString(styleWaveTitle.Render(fmt.Sprintf("  %s", waveLabel(w))) + "\n")
 	}
 	divider := strings.Repeat("─", 62)
 	b.WriteString("  " + styleDivider.Render(divider) + "\n")
@@ -230,6 +232,13 @@ func (m Model) renderWave(b *strings.Builder, w *waveState, isCurrent bool) {
 		m.renderTicket(b, tl)
 	}
 	b.WriteString("\n")
+}
+
+func waveLabel(w *waveState) string {
+	if w.parentTicketID != "" {
+		return fmt.Sprintf("Sub-wave %d for %s", w.id, w.parentTicketID)
+	}
+	return fmt.Sprintf("Wave %d", w.id)
 }
 
 func (m Model) renderTicket(b *strings.Builder, tl *ticketLine) {
