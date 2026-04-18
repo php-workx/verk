@@ -98,18 +98,16 @@ jobs:
           go-version-file: go.mod
       - run: go tool -modfile=tools.mod govulncheck ./...
 
-  betterleaks:
+  trufflehog:
     name: Secret Scan
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - uses: dortort/betterleaks-action@v1
+      - uses: trufflesecurity/trufflehog@main
         with:
-          scan-mode: git
-          report-format: sarif
-          fail-on-leak: true
+          extra_args: --results=verified,unknown
 
   semgrep:
     name: Semantic Scan
