@@ -15,7 +15,7 @@ default:
 # --- Quality gates ---
 
 # Pre-commit: fast local checks + fresh non-race tests
-pre-commit: fmt vet lint build-check mod-tidy actionlint gitleaks test-fast
+pre-commit: fmt vet lint build-check mod-tidy actionlint betterleaks test-fast
 
 # Pre-push: pre-commit + race tests + vulnerability scan + semgrep
 pre-push: pre-commit test-race vuln semgrep
@@ -50,11 +50,11 @@ actionlint:
 # --- Security ---
 
 # Scan for leaked secrets
-gitleaks:
-    @if command -v gitleaks >/dev/null 2>&1; then \
-        gitleaks git --no-banner; \
+betterleaks:
+    @if command -v betterleaks >/dev/null 2>&1; then \
+        betterleaks git --no-banner; \
     else \
-        echo "warning: gitleaks not installed, skipping secret scan"; \
+        echo "warning: betterleaks not installed, skipping secret scan"; \
     fi
 
 # Semantic code scan (optional, skip if not installed)

@@ -1,4 +1,4 @@
-title = "verk gitleaks config"
+title = "verk betterleaks config"
 
 [[rules]]
 id = "test-fixture-generic-secret"
