@@ -619,6 +619,9 @@ func defaultRunCommand(ctx context.Context, binary string, args []string, stdin 
 	cmd := exec.CommandContext(ctx, binary, args...)
 	cmd.Stdin = bytes.NewReader(stdin)
 	cmd.Env = env
+	// Put the subprocess in its own process group so that MCP helper processes
+	// spawned by the worker are also killed when the context is cancelled.
+	setupProcessGroup(cmd)
 
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
@@ -748,6 +751,9 @@ func defaultRunStreamingCommand(ctx context.Context, binary string, args []strin
 	cmd := exec.CommandContext(ctx, binary, args...)
 	cmd.Stdin = bytes.NewReader(stdin)
 	cmd.Env = env
+	// Put the subprocess in its own process group so that MCP helper processes
+	// spawned by the worker are also killed when the context is cancelled.
+	setupProcessGroup(cmd)
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {

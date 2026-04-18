@@ -115,6 +115,9 @@ func RunCommands(ctx context.Context, repoRoot string, cmds []string, cfg policy
 			cmd.Env = env
 			cmd.Stdout = stdoutFile
 			cmd.Stderr = stderrFile
+			// Put the subprocess in its own process group so that any processes
+			// spawned by the shell command are also killed on context cancellation.
+			setupProcessGroup(cmd)
 
 			execErr := cmd.Run()
 			finishedAt := time.Now().UTC()
@@ -248,6 +251,9 @@ func RunQualityCommands(ctx context.Context, repoRoot string, cmds []policy.Qual
 				cmd.Env = env
 				cmd.Stdout = stdoutFile
 				cmd.Stderr = stderrFile
+				// Put the subprocess in its own process group so that any processes
+				// spawned by the shell command are also killed on context cancellation.
+				setupProcessGroup(cmd)
 
 				execErr := cmd.Run()
 				finishedAt := time.Now().UTC()

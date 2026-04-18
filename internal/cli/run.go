@@ -6,8 +6,10 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"sync"
+	"syscall"
 	"time"
 	"verk/internal/adapters/runtime"
 	"verk/internal/adapters/ticketstore/tkmd"
@@ -104,6 +106,13 @@ func initRunCmd(root *cobra.Command) {
 }
 
 func doRunTicket(w, errw io.Writer, ticketID string) (string, error) {
+	// Cancel engine execution on SIGINT (Ctrl-C) or SIGTERM so that worker
+	// processes and MCP helpers are terminated and claims are released before
+	// the process exits.  stop() removes the signal handler when the function
+	// returns so that subsequent commands get the default signal behaviour.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
 	repoRoot, cfg, repo, err := loadExecutionContext()
 	if err != nil {
 		return "", err
@@ -206,7 +215,7 @@ func doRunTicket(w, errw io.Writer, ticketID string) (string, error) {
 	go func() {
 		defer wg.Done()
 		defer close(ch)
-		result, runErr = engine.RunTicket(context.Background(), engine.RunTicketRequest{
+		result, runErr = engine.RunTicket(ctx, engine.RunTicketRequest{
 			RepoRoot:   repoRoot,
 			RunID:      runID,
 			Ticket:     ticket,
@@ -263,6 +272,12 @@ func doRunTicket(w, errw io.Writer, ticketID string) (string, error) {
 }
 
 func doRunEpic(w, errw io.Writer, ticketID string) (string, error) {
+	// Cancel engine execution on SIGINT (Ctrl-C) or SIGTERM so that worker
+	// processes and MCP helpers are terminated and claims are released before
+	// the process exits.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
 	repoRoot, cfg, repo, err := loadExecutionContext()
 	if err != nil {
 		return "", err
@@ -300,7 +315,7 @@ func doRunEpic(w, errw io.Writer, ticketID string) (string, error) {
 	go func() {
 		defer wg.Done()
 		defer close(ch)
-		result, runErr = engine.RunEpic(context.Background(), engine.RunEpicRequest{
+		result, runErr = engine.RunEpic(ctx, engine.RunEpicRequest{
 			RepoRoot:     repoRoot,
 			RunID:        runID,
 			RootTicketID: ticketID,
@@ -342,6 +357,12 @@ func doRunEpic(w, errw io.Writer, ticketID string) (string, error) {
 }
 
 func doAutoResume(w, errw io.Writer) error {
+	// Cancel engine execution on SIGINT (Ctrl-C) or SIGTERM so that worker
+	// processes and MCP helpers are terminated and claims are released before
+	// the process exits.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
 	repoRoot, cfg, _, err := loadExecutionContext()
 	if err != nil {
 		_, _ = fmt.Fprintf(w, "Error: %s\n", err)
@@ -395,7 +416,7 @@ func doAutoResume(w, errw io.Writer) error {
 	go func() {
 		defer wg.Done()
 		defer close(ch)
-		report, resumeErr = engine.ResumeRun(context.Background(), engine.ResumeRequest{
+		report, resumeErr = engine.ResumeRun(ctx, engine.ResumeRequest{
 			RepoRoot: repoRoot,
 			RunID:    runID,
 			AdapterFactory: func(ticketPreference string) (runtime.Adapter, error) {
