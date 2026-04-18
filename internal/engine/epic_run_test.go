@@ -42,8 +42,8 @@ func (a *reflectingAdapter) RunWorker(ctx context.Context, req runtime.WorkerReq
 		return runtime.WorkerResult{}, err
 	}
 	a.mu.Lock()
+	defer a.mu.Unlock()
 	a.workerReqs = append(a.workerReqs, req)
-	a.mu.Unlock()
 	if a.workerIndex >= len(a.workerResults) {
 		return runtime.WorkerResult{}, fmt.Errorf("reflectingAdapter: no more scripted worker results (index %d)", a.workerIndex)
 	}
@@ -58,8 +58,8 @@ func (a *reflectingAdapter) RunReviewer(ctx context.Context, req runtime.ReviewR
 		return runtime.ReviewResult{}, err
 	}
 	a.mu.Lock()
+	defer a.mu.Unlock()
 	a.reviewReqs = append(a.reviewReqs, req)
-	a.mu.Unlock()
 	if a.reviewIndex >= len(a.reviewResults) {
 		return runtime.ReviewResult{}, fmt.Errorf("reflectingAdapter: no more scripted review results (index %d)", a.reviewIndex)
 	}
@@ -1143,7 +1143,7 @@ func TestRunSubEpicBasic(t *testing.T) {
 		Config:       cfg,
 	}
 
-	outcome := runSubEpic(context.Background(), req, cfg, ticket1.ID, wave, 1, nil)
+	outcome := runSubEpic(context.Background(), req, cfg, ticket1.ID, wave, 1, nil, nil)
 
 	t.Logf("outcome: ticketID=%s phase=%s err=%v", outcome.ticketID, outcome.phase, outcome.err)
 	if outcome.err != nil {
@@ -1242,5 +1242,471 @@ func TestRunEpicBlockedGrandchildTerminatesRun(t *testing.T) {
 	if len(result.Waves) != 1 {
 		t.Fatalf("expected exactly 1 wave (parent not rescheduled after grandchild blocked), "+
 			"got %d waves — regression: same blocked parent accepted into multiple waves", len(result.Waves))
+	}
+}
+
+// TestRunEpicLinkedSiblingsNotEachOthersChildren is an engine-level regression
+// test for the bug where peer tk links between siblings were treated as child
+// edges by recursive epic execution. When sib-a links to sib-b and sib-b links
+// to sib-a, neither should be discovered as a child of the other. The parent
+// epic must complete in a single wave with both siblings dispatched as flat
+// (non-sub-epic) tickets.
+// TestRunEpicContextCancellation verifies that cancelling the context passed to
+// RunEpic causes the run to terminate promptly rather than hanging until workers
+// finish normally. This mirrors the behaviour triggered by Ctrl-C / SIGINT at
+// the CLI layer (which calls signal.NotifyContext → cancel).
+func TestRunEpicContextCancellation(t *testing.T) {
+	repoRoot := t.TempDir()
+	baseCommit := initEpicRepo(t, repoRoot)
+	cfg := policy.DefaultConfig()
+
+	epic := epicTicket("epic-ctx-cancel")
+	mustSaveTicket(t, repoRoot, epic)
+	child := epicChildTicket("ticket-ctx-cancel", epic.ID, tkmd.StatusReady, nil, []string{"internal/app"})
+	mustSaveTicket(t, repoRoot, child)
+
+	// blockingEpicAdapter blocks inside RunWorker until the context is cancelled
+	// or adapter.release is closed, so it faithfully simulates a long-running
+	// worker process (e.g. a Claude worker waiting for MCP calls to complete).
+	adapter := newBlockingEpicAdapter(t)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	type epicResult struct {
+		r   RunEpicResult
+		err error
+	}
+	done := make(chan epicResult, 1)
+	go func() {
+		r, err := RunEpic(ctx, RunEpicRequest{
+			RepoRoot:     repoRoot,
+			RunID:        "run-ctx-cancel",
+			RootTicketID: epic.ID,
+			BaseCommit:   baseCommit,
+			Adapter:      adapter,
+			Config:       cfg,
+		})
+		done <- epicResult{r, err}
+	}()
+
+	// Wait until the blocking worker has actually started before cancelling so
+	// the test exercises the in-flight cancellation path, not a pre-start check.
+	waitForStarted(t, adapter.started, 1)
+
+	// Cancel the context — RunWorker should unblock immediately and RunEpic
+	// should propagate the cancellation and return.
+	cancel()
+
+	// RunEpic must return within a short deadline. A hang here indicates that
+	// context cancellation does not propagate to in-flight workers.
+	select {
+	case res := <-done:
+		if res.err == nil {
+			t.Fatal("expected error after context cancellation, got nil")
+		}
+		t.Logf("RunEpic returned on cancellation (expected): %v", res.err)
+	case <-time.After(10 * time.Second):
+		t.Fatal("RunEpic did not return after context cancellation — workers may be ignoring ctx.Done()")
+	}
+}
+
+func TestRunEpicLinkedSiblingsNotEachOthersChildren(t *testing.T) {
+	repoRoot := t.TempDir()
+	baseCommit := initEpicRepo(t, repoRoot)
+	cfg := policy.DefaultConfig()
+	cfg.Scheduler.MaxDepth = 3
+
+	epic := epicTicket("epic-linked-sibs")
+	mustSaveTicket(t, repoRoot, epic)
+
+	// Two siblings that cross-link each other via the tk links field.
+	// Links are stored in UnknownFrontmatter since Ticket has no native Links field.
+	sibA := tkmd.Ticket{
+		ID:         "sib-linked-a",
+		Title:      "Sibling A",
+		Status:     tkmd.StatusOpen,
+		OwnedPaths: []string{"internal/app/sib-a"},
+		UnknownFrontmatter: map[string]any{
+			"parent": epic.ID,
+			"type":   "task",
+			"links":  []any{"sib-linked-b"},
+		},
+	}
+	mustSaveTicket(t, repoRoot, sibA)
+
+	sibB := tkmd.Ticket{
+		ID:         "sib-linked-b",
+		Title:      "Sibling B",
+		Status:     tkmd.StatusOpen,
+		OwnedPaths: []string{"internal/app/sib-b"},
+		UnknownFrontmatter: map[string]any{
+			"parent": epic.ID,
+			"type":   "task",
+			"links":  []any{"sib-linked-a"},
+		},
+	}
+	mustSaveTicket(t, repoRoot, sibB)
+
+	// Two workers: one for each sibling. No review results needed to keep the
+	// test simple — both return WorkerStatusDone so the epic completes.
+	adapter := newReflectingAdapter(2)
+
+	result, err := RunEpic(context.Background(), RunEpicRequest{
+		RepoRoot:     repoRoot,
+		RunID:        "run-linked-sibs",
+		RootTicketID: epic.ID,
+		BaseCommit:   baseCommit,
+		Adapter:      adapter,
+		Config:       cfg,
+	})
+	if err != nil {
+		t.Fatalf("RunEpic failed: %v — regression: linked siblings caused repeated waves or cycle", err)
+	}
+	if result.Run.Status != state.EpicRunStatusCompleted {
+		t.Fatalf("expected epic to complete, got status %q", result.Run.Status)
+	}
+
+	// Both siblings must have been dispatched exactly once.
+	workerReqs := adapter.WorkerRequests()
+	dispatched := make(map[string]int)
+	for _, req := range workerReqs {
+		dispatched[req.TicketID]++
+	}
+	for _, id := range []string{"sib-linked-a", "sib-linked-b"} {
+		if dispatched[id] != 1 {
+			t.Errorf("expected %s dispatched exactly once, got %d — linked sibling treated as sub-epic child", id, dispatched[id])
+		}
+	}
+
+	// Exactly one wave: no repeated waves from sibling-as-child recursion.
+	if len(result.Waves) != 1 {
+		t.Fatalf("expected exactly 1 wave, got %d — regression: linked siblings caused repeated wave execution", len(result.Waves))
+	}
+}
+
+// workerTicketIDs extracts the TicketID from each WorkerRequest for readable assertions.
+func workerTicketIDs(reqs []runtime.WorkerRequest) []string {
+	ids := make([]string, len(reqs))
+	for i, req := range reqs {
+		ids[i] = req.TicketID
+	}
+	return ids
+}
+
+// TestResumeRun_InProgressDescendantIsResumed verifies that a descendant ticket
+// which was in_progress when the prior run crashed is reset to ready and re-executed
+// by the resume path. The sub-wave artifact persisted by runSubEpic lets
+// loadRunArtifacts find the wave; the descendant's presence in run.TicketIDs
+// ensures the reset loop resets it before the wave loop re-enters the sub-epic.
+func TestResumeRun_InProgressDescendantIsResumed(t *testing.T) {
+	repoRoot := t.TempDir()
+	baseCommit := initEpicRepo(t, repoRoot)
+	runID := "run-desc-inprog"
+
+	// Hierarchy: epic -> parent-task -> grandchild
+	epic := epicTicket("epic-desc-inprog")
+	mustSaveTicket(t, repoRoot, epic)
+
+	parentTask := epicChildTicket("parent-task-inprog", epic.ID, tkmd.StatusInProgress, nil, []string{"internal/app"})
+	mustSaveTicket(t, repoRoot, parentTask)
+
+	grandchild := epicChildTicket("grandchild-inprog", parentTask.ID, tkmd.StatusInProgress, nil, []string{"internal/app/sub"})
+	mustSaveTicket(t, repoRoot, grandchild)
+
+	// Simulate crash mid-sub-wave: grandchild added to TicketIDs by registerSubWave,
+	// sub-wave persisted to WaveIDs, but the top-level wave-1 not yet accepted.
+	subWaveID := fmt.Sprintf("sub-%s-wave-1", parentTask.ID)
+	writeOpRunFixture(t, repoRoot, runID, state.RunArtifact{
+		ArtifactMeta: state.ArtifactMeta{SchemaVersion: 1, RunID: runID},
+		Mode:         "epic",
+		RootTicketID: epic.ID,
+		Status:       state.EpicRunStatusRunning,
+		CurrentPhase: state.TicketPhaseImplement,
+		BaseCommit:   baseCommit,
+		TicketIDs:    []string{parentTask.ID, grandchild.ID},
+		WaveIDs:      []string{subWaveID},
+		ResumeCursor: map[string]any{"wave_ordinal": 0},
+	})
+	writeTicketRunFixture(t, repoRoot, runID, TicketRunSnapshot{
+		ArtifactMeta: state.ArtifactMeta{SchemaVersion: 1, RunID: runID},
+		TicketID:     parentTask.ID,
+		CurrentPhase: state.TicketPhaseImplement,
+	})
+	writeTicketRunFixture(t, repoRoot, runID, TicketRunSnapshot{
+		ArtifactMeta: state.ArtifactMeta{SchemaVersion: 1, RunID: runID},
+		TicketID:     grandchild.ID,
+		CurrentPhase: state.TicketPhaseImplement,
+	})
+	writePlanFixture(t, repoRoot, runID, state.PlanArtifact{
+		ArtifactMeta:             state.ArtifactMeta{SchemaVersion: 1, RunID: runID},
+		TicketID:                 parentTask.ID,
+		EffectiveReviewThreshold: state.SeverityP2,
+	})
+	writePlanFixture(t, repoRoot, runID, state.PlanArtifact{
+		ArtifactMeta:             state.ArtifactMeta{SchemaVersion: 1, RunID: runID},
+		TicketID:                 grandchild.ID,
+		EffectiveReviewThreshold: state.SeverityP2,
+	})
+	// Sub-wave artifact persisted by runSubEpic before crash.
+	writeWaveFixture(t, repoRoot, runID, state.WaveArtifact{
+		WaveID:         subWaveID,
+		ParentTicketID: parentTask.ID,
+		Status:         state.WaveStatusRunning,
+		TicketIDs:      []string{grandchild.ID},
+	})
+
+	// Adapter returns needs_context for grandchild so execution terminates
+	// predictably without requiring full review/verification machinery.
+	adapter := &reflectingAdapter{
+		workerResults: []runtime.WorkerResult{
+			{
+				Status:             runtime.WorkerStatusNeedsContext,
+				RetryClass:         runtime.RetryClassBlockedByOperatorInput,
+				LeaseID:            "placeholder",
+				StartedAt:          epicTestStart(),
+				FinishedAt:         epicTestStart().Add(time.Second),
+				ResultArtifactPath: "artifact.json",
+			},
+		},
+		reviewResults: []runtime.ReviewResult{},
+	}
+
+	cfg := policy.DefaultConfig()
+	cfg.Verification.QualityCommands = nil
+
+	report, err := ResumeRun(context.Background(), ResumeRequest{
+		RepoRoot: repoRoot,
+		RunID:    runID,
+		Adapter:  adapter,
+		Config:   cfg,
+	})
+	if err != nil {
+		t.Fatalf("ResumeRun returned error: %v", err)
+	}
+
+	// Grandchild must have been dispatched: the resume path must have re-entered
+	// the sub-epic loop for parent-task and scheduled the in-progress grandchild.
+	reqs := adapter.WorkerRequests()
+	dispatched := false
+	for _, req := range reqs {
+		if req.TicketID == grandchild.ID {
+			dispatched = true
+			break
+		}
+	}
+	if !dispatched {
+		t.Errorf("expected in-progress grandchild %q to be dispatched on resume, got dispatched: %v",
+			grandchild.ID, workerTicketIDs(reqs))
+	}
+
+	// Run ends blocked because grandchild returned needs_context.
+	if report.Run.Status != state.EpicRunStatusBlocked {
+		t.Errorf("expected blocked run after grandchild needs_context, got %q", report.Run.Status)
+	}
+}
+
+// TestResumeRun_BlockedDescendantIsResumed verifies that a descendant ticket
+// that was blocked when the prior run stopped is reset to ready and re-executed
+// by the resume path. Blocked is not a terminal phase for resume purposes — the
+// engine treats it as "needs another attempt" and resets the ticket to open.
+func TestResumeRun_BlockedDescendantIsResumed(t *testing.T) {
+	repoRoot := t.TempDir()
+	baseCommit := initEpicRepo(t, repoRoot)
+	runID := "run-desc-blocked"
+
+	// Hierarchy: epic -> parent-task -> grandchild (blocked)
+	epic := epicTicket("epic-desc-blocked")
+	mustSaveTicket(t, repoRoot, epic)
+
+	parentTask := epicChildTicket("parent-task-blocked", epic.ID, tkmd.StatusBlocked, nil, []string{"internal/app"})
+	mustSaveTicket(t, repoRoot, parentTask)
+
+	grandchild := epicChildTicket("grandchild-blocked", parentTask.ID, tkmd.StatusBlocked, nil, []string{"internal/app/sub"})
+	mustSaveTicket(t, repoRoot, grandchild)
+
+	subWaveID := fmt.Sprintf("sub-%s-wave-1", parentTask.ID)
+	writeOpRunFixture(t, repoRoot, runID, state.RunArtifact{
+		ArtifactMeta: state.ArtifactMeta{SchemaVersion: 1, RunID: runID},
+		Mode:         "epic",
+		RootTicketID: epic.ID,
+		Status:       state.EpicRunStatusBlocked,
+		CurrentPhase: state.TicketPhaseBlocked,
+		BaseCommit:   baseCommit,
+		TicketIDs:    []string{parentTask.ID, grandchild.ID},
+		WaveIDs:      []string{subWaveID},
+		ResumeCursor: map[string]any{"wave_ordinal": 0},
+	})
+	writeTicketRunFixture(t, repoRoot, runID, TicketRunSnapshot{
+		ArtifactMeta: state.ArtifactMeta{SchemaVersion: 1, RunID: runID},
+		TicketID:     parentTask.ID,
+		CurrentPhase: state.TicketPhaseBlocked,
+		BlockReason:  "sub-epic blocked: grandchild needs_context",
+	})
+	writeTicketRunFixture(t, repoRoot, runID, TicketRunSnapshot{
+		ArtifactMeta: state.ArtifactMeta{SchemaVersion: 1, RunID: runID},
+		TicketID:     grandchild.ID,
+		CurrentPhase: state.TicketPhaseBlocked,
+		BlockReason:  "needs_context",
+	})
+	writePlanFixture(t, repoRoot, runID, state.PlanArtifact{
+		ArtifactMeta:             state.ArtifactMeta{SchemaVersion: 1, RunID: runID},
+		TicketID:                 parentTask.ID,
+		EffectiveReviewThreshold: state.SeverityP2,
+	})
+	writePlanFixture(t, repoRoot, runID, state.PlanArtifact{
+		ArtifactMeta:             state.ArtifactMeta{SchemaVersion: 1, RunID: runID},
+		TicketID:                 grandchild.ID,
+		EffectiveReviewThreshold: state.SeverityP2,
+	})
+	writeWaveFixture(t, repoRoot, runID, state.WaveArtifact{
+		WaveID:         subWaveID,
+		ParentTicketID: parentTask.ID,
+		Status:         state.WaveStatusFailed,
+		TicketIDs:      []string{grandchild.ID},
+	})
+
+	// On resume, grandchild is reset to open and gets another chance.
+	// The adapter blocks it again (needs_context) to keep the test deterministic.
+	adapter := &reflectingAdapter{
+		workerResults: []runtime.WorkerResult{
+			{
+				Status:             runtime.WorkerStatusNeedsContext,
+				RetryClass:         runtime.RetryClassBlockedByOperatorInput,
+				LeaseID:            "placeholder",
+				StartedAt:          epicTestStart(),
+				FinishedAt:         epicTestStart().Add(time.Second),
+				ResultArtifactPath: "artifact.json",
+			},
+		},
+		reviewResults: []runtime.ReviewResult{},
+	}
+
+	cfg := policy.DefaultConfig()
+	cfg.Verification.QualityCommands = nil
+
+	report, err := ResumeRun(context.Background(), ResumeRequest{
+		RepoRoot: repoRoot,
+		RunID:    runID,
+		Adapter:  adapter,
+		Config:   cfg,
+	})
+	if err != nil {
+		t.Fatalf("ResumeRun returned error: %v", err)
+	}
+
+	// Blocked grandchild must be re-executed on resume.
+	reqs := adapter.WorkerRequests()
+	dispatched := false
+	for _, req := range reqs {
+		if req.TicketID == grandchild.ID {
+			dispatched = true
+			break
+		}
+	}
+	if !dispatched {
+		t.Errorf("expected blocked grandchild %q to be dispatched on resume, got dispatched: %v",
+			grandchild.ID, workerTicketIDs(reqs))
+	}
+
+	// Epic ends blocked because grandchild is still stuck on needs_context.
+	if report.Run.Status != state.EpicRunStatusBlocked {
+		t.Errorf("expected blocked run after grandchild still needs_context, got %q", report.Run.Status)
+	}
+}
+
+func TestResumeRun_PendingVerificationSubWaveIsCompleted(t *testing.T) {
+	repoRoot := t.TempDir()
+	baseCommit := initEpicRepo(t, repoRoot)
+	runID := "run-subwave-pending-verification"
+
+	epic := epicTicket("epic-subwave-pending")
+	mustSaveTicket(t, repoRoot, epic)
+
+	parentTask := epicChildTicket("parent-subwave-pending", epic.ID, tkmd.StatusClosed, nil, []string{"internal/app"})
+	mustSaveTicket(t, repoRoot, parentTask)
+
+	grandchild := epicChildTicket("grandchild-subwave-pending", parentTask.ID, tkmd.StatusClosed, nil, []string{"internal/app/sub"})
+	mustSaveTicket(t, repoRoot, grandchild)
+
+	subWaveID := fmt.Sprintf("sub-%s-wave-1", parentTask.ID)
+	writeOpRunFixture(t, repoRoot, runID, state.RunArtifact{
+		ArtifactMeta: state.ArtifactMeta{SchemaVersion: 1, RunID: runID},
+		Mode:         "epic",
+		RootTicketID: epic.ID,
+		Status:       state.EpicRunStatusRunning,
+		CurrentPhase: state.TicketPhaseImplement,
+		BaseCommit:   baseCommit,
+		TicketIDs:    []string{parentTask.ID, grandchild.ID},
+		WaveIDs:      []string{subWaveID},
+		ResumeCursor: map[string]any{
+			"wave_ordinal":              0,
+			"pending_wave_verification": subWaveID,
+		},
+	})
+	writeTicketRunFixture(t, repoRoot, runID, TicketRunSnapshot{
+		ArtifactMeta: state.ArtifactMeta{SchemaVersion: 1, RunID: runID},
+		TicketID:     parentTask.ID,
+		CurrentPhase: state.TicketPhaseClosed,
+		Closeout:     &state.CloseoutArtifact{Closable: true},
+	})
+	writeTicketRunFixture(t, repoRoot, runID, TicketRunSnapshot{
+		ArtifactMeta: state.ArtifactMeta{SchemaVersion: 1, RunID: runID},
+		TicketID:     grandchild.ID,
+		CurrentPhase: state.TicketPhaseClosed,
+		Closeout:     &state.CloseoutArtifact{Closable: true},
+	})
+	writePlanFixture(t, repoRoot, runID, state.PlanArtifact{
+		ArtifactMeta:             state.ArtifactMeta{SchemaVersion: 1, RunID: runID},
+		TicketID:                 parentTask.ID,
+		EffectiveReviewThreshold: state.SeverityP2,
+	})
+	writePlanFixture(t, repoRoot, runID, state.PlanArtifact{
+		ArtifactMeta:             state.ArtifactMeta{SchemaVersion: 1, RunID: runID},
+		TicketID:                 grandchild.ID,
+		EffectiveReviewThreshold: state.SeverityP2,
+	})
+	writeWaveFixture(t, repoRoot, runID, state.WaveArtifact{
+		ArtifactMeta:   state.ArtifactMeta{SchemaVersion: 1, RunID: runID},
+		WaveID:         subWaveID,
+		ParentTicketID: parentTask.ID,
+		Status:         state.WaveStatusAccepted,
+		TicketIDs:      []string{grandchild.ID},
+		ActualScope:    []string{"internal/app/sub"},
+		Acceptance:     map[string]any{},
+		WaveBaseCommit: baseCommit,
+		StartedAt:      epicTestStart(),
+		FinishedAt:     epicTestStart().Add(time.Second),
+	})
+
+	cfg := policy.DefaultConfig()
+	cfg.Verification.QualityCommands = []policy.QualityCommand{{Path: ".", Run: []string{"true"}}}
+
+	report, err := ResumeRun(context.Background(), ResumeRequest{
+		RepoRoot: repoRoot,
+		RunID:    runID,
+		Adapter:  newReflectingAdapter(0),
+		Config:   cfg,
+	})
+	if err != nil {
+		t.Fatalf("ResumeRun returned error: %v", err)
+	}
+
+	if _, ok := pendingWaveVerificationID(report.Run.ResumeCursor); ok {
+		t.Fatalf("expected pending sub-wave verification marker to be cleared, cursor=%v", report.Run.ResumeCursor)
+	}
+	if report.Run.Status != state.EpicRunStatusCompleted {
+		t.Fatalf("expected run to complete after pending sub-wave verification, got %q", report.Run.Status)
+	}
+
+	var subWave state.WaveArtifact
+	if err := state.LoadJSON(waveArtifactPath(repoRoot, runID, subWaveID), &subWave); err != nil {
+		t.Fatalf("load sub-wave artifact: %v", err)
+	}
+	if subWave.ParentTicketID != parentTask.ID {
+		t.Fatalf("expected sub-wave parent %q, got %q", parentTask.ID, subWave.ParentTicketID)
+	}
+	if got, ok := subWave.Acceptance["wave_verification_passed"].(bool); !ok || !got {
+		t.Fatalf("expected sub-wave verification to pass, acceptance=%v", subWave.Acceptance)
 	}
 }

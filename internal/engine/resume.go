@@ -194,6 +194,9 @@ func resumeExecutionAllowed(run state.RunArtifact, req ResumeRequest) bool {
 	if req.Adapter == nil && req.AdapterFactory == nil {
 		return false
 	}
+	if _, ok := pendingWaveVerificationID(run.ResumeCursor); ok {
+		return true
+	}
 	return run.Status == state.EpicRunStatusRunning || run.Status == state.EpicRunStatusBlocked
 }
 
@@ -423,7 +426,7 @@ func resumeEpicMode(ctx context.Context, req ResumeRequest, artifacts *runArtifa
 				defer wg.Done()
 				const maxCrashRetries = 2
 				for attempt := 0; attempt <= maxCrashRetries; attempt++ {
-					outcome, crashed := executeWithRecovery(ctx, epicReq, cfg, wave, ticketID, 1, registrar)
+					outcome, crashed := executeWithRecovery(ctx, epicReq, cfg, wave, ticketID, 1, nil, registrar)
 					if !crashed {
 						outcomes[i] = outcome
 						return

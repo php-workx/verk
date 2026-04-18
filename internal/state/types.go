@@ -90,6 +90,7 @@ type RunArtifact struct {
 type WaveArtifact struct {
 	ArtifactMeta
 	WaveID         string         `json:"wave_id"`
+	ParentTicketID string         `json:"parent_ticket_id,omitempty"` // non-empty for sub-epic waves
 	Ordinal        int            `json:"ordinal"`
 	Status         WaveStatus     `json:"status"`
 	TicketIDs      []string       `json:"ticket_ids"`
