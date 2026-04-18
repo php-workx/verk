@@ -179,8 +179,22 @@ func parentOf(ticket *Ticket) string {
 	return parent
 }
 
+// ErrEpicCycle is returned when a cycle is detected in the epic child graph
+// (e.g. ticket A is both an ancestor and a descendant of itself).
+var ErrEpicCycle = errors.New("epic cycle detected")
+
+// DetectEpicCycle returns ErrEpicCycle if epicID already appears in ancestors,
+// indicating a circular epic-child relationship. Callers building the ancestors
+// set should add each epic they recurse into before calling sub-levels.
+func DetectEpicCycle(epicID string, ancestors map[string]struct{}) error {
+	if _, cycle := ancestors[epicID]; cycle {
+		return fmt.Errorf("%w: %q appears in its own descendant chain", ErrEpicCycle, epicID)
+	}
+	return nil
+}
+
 // HasChildren reports whether the ticket with the given ID has any children.
-// A child is a ticket whose parent field, deps, or links reference the given ID.
+// A child is a ticket whose parent field or deps reference the given ID.
 func HasChildren(rootDir, ticketID string) (bool, error) {
 	ticketsDir := resolveTicketsDir(rootDir)
 	paths, err := filepath.Glob(filepath.Join(ticketsDir, "*.md"))
@@ -264,9 +278,9 @@ func extractHeadingTitle(body string) string {
 	return ""
 }
 
-// loadEpicChildren loads an epic ticket's deps and links lists as a set
-// for child discovery. Supports three tk conventions: deps (tk dep),
-// links (tk link), and parent field on children.
+// loadEpicChildren loads an epic ticket's deps list as a set for child
+// discovery. Only deps are considered as child edges; tk links are navigation
+// aids and must not be treated as child relationships.
 func loadEpicChildren(ticketsDir, epicID string) (map[string]struct{}, error) {
 	path := filepath.Join(ticketsDir, epicID+".md")
 	ticket, err := LoadTicket(path)
@@ -276,13 +290,6 @@ func loadEpicChildren(ticketsDir, epicID string) (map[string]struct{}, error) {
 	children := make(map[string]struct{})
 	for _, dep := range ticket.Deps {
 		children[dep] = struct{}{}
-	}
-	// Also check links — some projects use tk link instead of tk dep
-	if ticket.UnknownFrontmatter != nil {
-		links := asStringSlice(ticket.UnknownFrontmatter["links"])
-		for _, link := range links {
-			children[link] = struct{}{}
-		}
 	}
 	return children, nil
 }

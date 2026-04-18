@@ -2,6 +2,7 @@ package tkmd
 
 import (
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -371,5 +372,102 @@ func TestHasChildrenViaDeps(t *testing.T) {
 	}
 	if !has {
 		t.Fatal("expected epic-2 to have children via deps")
+	}
+}
+
+// Regression: peer tk links between siblings must not be treated as child edges.
+// Running the parent epic must not see either sibling as a child of the other.
+func TestLinkedSiblingsNotChildrenOfEachOther(t *testing.T) {
+	dir := t.TempDir()
+	ticketsDir := filepath.Join(dir, ".tickets")
+	if err := os.MkdirAll(ticketsDir, 0o755); err != nil {
+		t.Fatalf("mkdir .tickets: %v", err)
+	}
+
+	// Parent epic
+	writeTicketToRepo(t, dir, "par-1", "", StatusOpen)
+
+	// Two sibling tickets that reference each other via links
+	writeLinkedTicket := func(id, parent, linkedTo string) {
+		t.Helper()
+		content := strings.Join([]string{
+			"---",
+			"id: " + id,
+			"parent: " + parent,
+			"status: open",
+			"links: [" + linkedTo + "]",
+			"---",
+			"",
+			"Body for " + id + ".",
+			"",
+		}, "\n")
+		path := filepath.Join(ticketsDir, id+".md")
+		if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+			t.Fatalf("write ticket %s: %v", id, err)
+		}
+	}
+	writeLinkedTicket("sib-a", "par-1", "sib-b")
+	writeLinkedTicket("sib-b", "par-1", "sib-a")
+
+	// Both siblings should be children of par-1 (via parent field).
+	children, err := ListAllChildren(dir, "par-1")
+	if err != nil {
+		t.Fatalf("ListAllChildren par-1: %v", err)
+	}
+	if len(children) != 2 {
+		t.Fatalf("expected 2 children of par-1, got %d", len(children))
+	}
+
+	// Neither sibling should see the other as its child.
+	for _, sib := range []string{"sib-a", "sib-b"} {
+		sibChildren, err := ListAllChildren(dir, sib)
+		if err != nil {
+			t.Fatalf("ListAllChildren %s: %v", sib, err)
+		}
+		if len(sibChildren) != 0 {
+			ids := make([]string, 0, len(sibChildren))
+			for _, c := range sibChildren {
+				ids = append(ids, c.ID)
+			}
+			t.Errorf("sibling %s should have no children, got: %v", sib, ids)
+		}
+		has, err := HasChildren(dir, sib)
+		if err != nil {
+			t.Fatalf("HasChildren %s: %v", sib, err)
+		}
+		if has {
+			t.Errorf("HasChildren(%s) should be false; linked siblings must not be epic children", sib)
+		}
+	}
+}
+
+func TestDetectEpicCycleNoCycle(t *testing.T) {
+	ancestors := map[string]struct{}{
+		"epic-root":   {},
+		"epic-parent": {},
+	}
+	if err := DetectEpicCycle("epic-child", ancestors); err != nil {
+		t.Fatalf("expected no cycle, got: %v", err)
+	}
+}
+
+func TestDetectEpicCycleDetected(t *testing.T) {
+	ancestors := map[string]struct{}{
+		"epic-root": {},
+		"epic-mid":  {},
+	}
+	err := DetectEpicCycle("epic-root", ancestors)
+	if err == nil {
+		t.Fatal("expected ErrEpicCycle, got nil")
+	}
+	if !errors.Is(err, ErrEpicCycle) {
+		t.Fatalf("expected errors.Is(err, ErrEpicCycle), got: %v", err)
+	}
+}
+
+func TestDetectEpicCycleNilAncestors(t *testing.T) {
+	// nil ancestors map means no ancestors; any epicID is safe.
+	if err := DetectEpicCycle("any-epic", nil); err != nil {
+		t.Fatalf("expected no cycle with nil ancestors, got: %v", err)
 	}
 }
