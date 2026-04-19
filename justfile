@@ -75,7 +75,7 @@ vuln:
 build-check:
     go build ./...
 
-# Verify go.mod and go.sum are tidy (detect-only)
+# Verify go.mod/go.sum and tools.mod/tools.sum are tidy (detect-only)
 mod-tidy:
     @cp go.mod go.mod.bak
     @if [ -f go.sum ]; then cp go.sum go.sum.bak; fi
@@ -86,7 +86,17 @@ mod-tidy:
         elif [ -f go.sum ]; then DIRTY=1; fi; \
         mv go.mod.bak go.mod; \
         if [ -f go.sum.bak ]; then mv go.sum.bak go.sum; elif [ -f go.sum ]; then rm go.sum; fi; \
-        if [ "$$DIRTY" = "1" ]; then echo "go.mod/go.sum not tidy — run 'go mod tidy'" && exit 1; fi
+        if [ "$DIRTY" = "1" ]; then echo "go.mod/go.sum not tidy — run 'go mod tidy'" && exit 1; fi
+    @cp tools.mod tools.mod.bak
+    @if [ -f tools.sum ]; then cp tools.sum tools.sum.bak; fi
+    @go mod tidy -modfile=tools.mod
+    @DIRTY=0; \
+        diff -q tools.mod tools.mod.bak >/dev/null 2>&1 || DIRTY=1; \
+        if [ -f tools.sum.bak ]; then diff -q tools.sum tools.sum.bak >/dev/null 2>&1 || DIRTY=1; \
+        elif [ -f tools.sum ]; then DIRTY=1; fi; \
+        mv tools.mod.bak tools.mod; \
+        if [ -f tools.sum.bak ]; then mv tools.sum.bak tools.sum; elif [ -f tools.sum ]; then rm tools.sum; fi; \
+        if [ "$DIRTY" = "1" ]; then echo "tools.mod/tools.sum not tidy — run 'go mod tidy -modfile=tools.mod'" && exit 1; fi
 
 # Run all tests without race detector (fresh)
 test: test-fast

@@ -2,6 +2,15 @@ module verk/tools
 
 go 1.26
 
+// Keep `go mod tidy -modfile=tools.mod` scoped to the tool directives below.
+// Without these ignores, tidy walks the main module's source tree and pollutes
+// tools.mod with the application's runtime dependencies.
+ignore (
+	./cmd
+	./internal
+	./pkg
+)
+
 tool (
 	github.com/golangci/golangci-lint/v2/cmd/golangci-lint
 	github.com/rhysd/actionlint/cmd/actionlint

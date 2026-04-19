@@ -87,6 +87,11 @@ jobs:
           go mod tidy
           git diff --exit-code go.mod || (echo "go.mod not tidy — run 'go mod tidy'" && exit 1)
           if [ -f go.sum ]; then git diff --exit-code go.sum || (echo "go.sum not tidy — run 'go mod tidy'" && exit 1); fi
+      - name: Check tools.mod and tools.sum are tidy
+        run: |
+          go mod tidy -modfile=tools.mod
+          git diff --exit-code tools.mod || (echo "tools.mod not tidy — run 'go mod tidy -modfile=tools.mod'" && exit 1)
+          if [ -f tools.sum ]; then git diff --exit-code tools.sum || (echo "tools.sum not tidy — run 'go mod tidy -modfile=tools.mod'" && exit 1); fi
 
   vuln:
     name: Vulnerability Scan
@@ -105,7 +110,8 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - uses: trufflesecurity/trufflehog@main
+      # Pinned to trufflesecurity/trufflehog v3.94.3 (commit SHA, not mutable tag/branch).
+      - uses: trufflesecurity/trufflehog@47e7b7cd74f578e1e3145d48f669f22fd1330ca6 # v3.94.3
         with:
           extra_args: --results=verified,unknown
 
@@ -114,6 +120,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: semgrep/action@v1
+      # Pinned to semgrep/semgrep-action v1 (commit SHA, not mutable tag/branch).
+      # Note: the previous reference `semgrep/action@v1` is not a real upstream
+      # repository (workflow failed to resolve it). `semgrep/semgrep-action` is the
+      # canonical Semgrep GitHub Action repo (archived but still functional for v1,
+      # which accepts `config: auto` as documented). If this action is retired, swap
+      # to the container-based approach: `container: { image: semgrep/semgrep }` +
+      # `run: semgrep scan --config auto`.
+      - uses: semgrep/semgrep-action@713efdd345f3035192eaa63f56867b88e63e4e5d # v1
         with:
           config: auto

@@ -1,13 +1,21 @@
 title = "verk betterleaks config"
 
-[[rules]]
-id = "test-fixture-generic-secret"
-description = "Allow generic secret patterns in test fixtures"
-path = '''internal/engine/testdata/'''
-tags = ["test-fixture"]
+# Extend the default Betterleaks rule set so every stock detector stays enabled.
+# Without this block, a custom config replaces the built-in detectors entirely,
+# which would silently weaken local secret scanning.
+# Reference: /opt/homebrew/Cellar/betterleaks/1.1.2/README.md "Configuration".
+[extend]
+useDefault = true
 
-[[rules]]
-id = "test-fixture-generic-secret-2"
-description = "Allow generic secret patterns in e2e test fixtures"
-path = '''internal/e2e/testdata/'''
-tags = ["test-fixture"]
+# Global allowlist: ignore findings whose file path lives under a test-fixture
+# directory. Paths are Go regular expressions matched against the finding's
+# file path, so we anchor with `.*` to match anything beneath the directory.
+# This replaces the prior `[[rules]]` entries, which required a `regex` field
+# to be treated as valid detection rules and therefore did not actually exclude
+# the fixture directories.
+[[allowlists]]
+description = "Allow intentional secret-like fixtures in engine and e2e testdata"
+paths = [
+    '''internal/engine/testdata/.*''',
+    '''internal/e2e/testdata/.*''',
+]
