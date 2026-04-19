@@ -157,6 +157,15 @@ func BuildCloseoutArtifact(args ...any) (state.CloseoutArtifact, error) {
 		return state.CloseoutArtifact{}, err
 	}
 
+	coverage := closeoutValidationCoverage(req, gates, failedGate)
+	blockReason := ""
+	unresolvedCheckID := ""
+	if !closable {
+		blockReason = closeoutBlockReason(gates, failedGate, coverage)
+		if coverage != nil && len(coverage.UnresolvedBlockers) > 0 {
+			unresolvedCheckID = coverage.UnresolvedBlockers[0].CheckID
+		}
+	}
 	return state.CloseoutArtifact{
 		ArtifactMeta: state.ArtifactMeta{
 			SchemaVersion: artifactSchemaVersion,
@@ -164,13 +173,100 @@ func BuildCloseoutArtifact(args ...any) (state.CloseoutArtifact, error) {
 			CreatedAt:     stateTime(),
 			UpdatedAt:     stateTime(),
 		},
-		TicketID:          req.ticket.ID,
-		CriteriaEvidence:  criteriaEvidence,
-		RequiredArtifacts: append([]string(nil), req.requiredArtifacts...),
-		GateResults:       gates,
-		Closable:          closable,
-		FailedGate:        failedGate,
+		TicketID:           req.ticket.ID,
+		CriteriaEvidence:   criteriaEvidence,
+		RequiredArtifacts:  append([]string(nil), req.requiredArtifacts...),
+		GateResults:        gates,
+		Closable:           closable,
+		FailedGate:         failedGate,
+		ValidationCoverage: coverage,
+		UnresolvedCheckID:  unresolvedCheckID,
+		BlockReason:        blockReason,
 	}, nil
+}
+
+// closeoutValidationCoverage extracts the ValidationCoverageArtifact that
+// best describes the ticket's closure state. It prefers the coverage
+// already attached to the verification artifact so the history of
+// declared + derived + quality executions is preserved; if verification
+// did not record coverage (older artifact or never ran) it synthesises a
+// placeholder from plan + review + no executions so closeout still
+// reports *something* about the gates that ran.
+func closeoutValidationCoverage(req closeoutRequest, gates map[string]state.GateResult, failedGate string) *state.ValidationCoverageArtifact {
+	if req.verification != nil && req.verification.ValidationCoverage != nil {
+		copy := *req.verification.ValidationCoverage
+		// Reflect closeout-level closure decision in the returned coverage
+		// so downstream consumers don't need to reconcile the two.
+		if failedGate == "" {
+			copy.Closable = true
+			if copy.ClosureReason == "" {
+				copy.ClosureReason = "closeout gates all passed"
+			}
+		} else {
+			copy.Closable = false
+			if copy.BlockReason == "" {
+				if gate, ok := gates[failedGate]; ok && gate.Reason != "" {
+					copy.BlockReason = gate.Reason
+				} else {
+					copy.BlockReason = "closeout gate " + failedGate + " failed"
+				}
+			}
+		}
+		return &copy
+	}
+	// Fallback placeholder so the closeout artifact still exposes a
+	// coverage slot for UI/resume code. This keeps the shape predictable
+	// for downstream consumers that always expect coverage to be present.
+	placeholder := state.ValidationCoverageArtifact{
+		ArtifactMeta: state.ArtifactMeta{
+			SchemaVersion: artifactSchemaVersion,
+			RunID:         req.plan.RunID,
+			CreatedAt:     stateTime(),
+			UpdatedAt:     stateTime(),
+		},
+		Scope:    state.ValidationScopeTicket,
+		TicketID: req.ticket.ID,
+	}
+	placeholder.DeclaredChecks = buildDeclaredChecks(req.plan)
+	if req.review != nil {
+		addReviewBlockers(&placeholder, req.review, req.plan.EffectiveReviewThreshold)
+	}
+	if failedGate == "" {
+		placeholder.Closable = true
+		placeholder.ClosureReason = "closeout gates all passed"
+	} else {
+		placeholder.Closable = false
+		if gate, ok := gates[failedGate]; ok {
+			placeholder.BlockReason = gate.Reason
+		} else {
+			placeholder.BlockReason = "closeout gate " + failedGate + " failed"
+		}
+	}
+	return &placeholder
+}
+
+// closeoutBlockReason picks a human-readable block reason for a
+// non-closable closeout artifact. Preference order: explicit
+// coverage.BlockReason -> first unresolved blocker -> gate.Reason ->
+// generic fallback based on failedGate.
+func closeoutBlockReason(gates map[string]state.GateResult, failedGate string, coverage *state.ValidationCoverageArtifact) string {
+	if coverage != nil {
+		if strings.TrimSpace(coverage.BlockReason) != "" {
+			return coverage.BlockReason
+		}
+		if len(coverage.UnresolvedBlockers) > 0 {
+			if reason := strings.TrimSpace(coverage.UnresolvedBlockers[0].Reason); reason != "" {
+				return reason
+			}
+		}
+	}
+	if failedGate != "" {
+		if gate, ok := gates[failedGate]; ok && strings.TrimSpace(gate.Reason) != "" {
+			return gate.Reason
+		}
+		return "closeout gate " + failedGate + " failed"
+	}
+	return "closeout could not confirm closure"
 }
 
 func parseCloseoutRequest(args ...any) (closeoutRequest, error) {

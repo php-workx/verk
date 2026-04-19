@@ -19,6 +19,16 @@ func DefaultConfig() Config {
 			DefaultRuntime:         "claude",
 			WorkerTimeoutMinutes:   30,
 			ReviewerTimeoutMinutes: 15,
+			Worker: RoleProfile{
+				Runtime:   "claude",
+				Model:     "sonnet",
+				Reasoning: "high",
+			},
+			Reviewer: RoleProfile{
+				Runtime:   "claude",
+				Model:     "opus",
+				Reasoning: "xhigh",
+			},
 		},
 		Verification: VerificationConfig{
 			DefaultTimeoutMinutes: 15,

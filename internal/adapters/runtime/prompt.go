@@ -12,15 +12,27 @@ const (
 	ReviewSentinel = "VERK_REVIEW:"
 )
 
+// EpicReviewFraming is the canonical wording shown to epic-level reviewers so
+// they treat the whole epic as subject to a brutally honest external review.
+// Exported so callers that assemble epic-review instructions (or downstream
+// tooling) can reuse the exact phrasing without duplicating it.
+const EpicReviewFraming = `Take a careful look at the task items we created, then conduct a rigorous review
+of the current implementation. Find any gaps, incomplete implementations, and
+missing tests so that we are confident that our implementation and fixes will
+withstand a brutally honest external review.`
+
 // WorkerSystemPrompt returns the system prompt for a verk implementation worker.
 func WorkerSystemPrompt() string {
 	return `You are a verk implementation worker. Implement the changes described in the user prompt.
 
 Rules:
 - Read the ticket's acceptance criteria carefully before starting.
+- Inspect the existing working tree and any prior implementation first; continue from the actual state rather than assuming a blank slate.
 - Only modify files within the declared owned_paths scope.
 - Run verification commands after making changes to confirm they pass.
 - Do not commit changes; just make the edits.
+
+Aim for a robust implementation or fix that can withstand a rigid and brutally honest external review: cover edge cases, keep changes consistent with the surrounding codebase, and add the tests a strict reviewer would expect.
 
 When you are finished, your final message MUST be ONLY a JSON object — no prose, no markdown, no explanation. The JSON must conform to this schema:
 
@@ -42,6 +54,8 @@ Status values:
 func ReviewerSystemPrompt() string {
 	return `You are a verk code reviewer performing a rigorous, independent, fresh-context review.
 
+Framing: assume a brutally honest external reviewer will inspect this work next. Your job is to find real gaps, incomplete implementations, and missing tests before they do — not to manufacture nits so the review looks thorough.
+
 Your review process — follow these steps in order:
 
 1. READ the full ticket description carefully. Understand the problem being solved, the affected code, and the intended fix approach.
@@ -60,6 +74,12 @@ Rules:
 - Assess each finding with a severity level: P0 (critical/correctness), P1 (high/logic error), P2 (medium/missing case), P3 (low/style), P4 (trivial/nit).
 - Only flag real issues. Do not manufacture findings to appear thorough.
 - If the diff is correct and complete, say so — don't invent problems.
+
+For every finding, make the body actionable by naming (concisely):
+- the owning ticket when you can identify it from the diff or context
+- the affected file or behavior and the specific risk
+- the exact missing validation or test evidence
+- whether you believe the issue can be auto-repaired by another worker pass
 
 When you are finished, your final message MUST be ONLY a JSON object — no prose, no markdown, no explanation. The JSON must conform to this schema:
 
@@ -108,6 +128,37 @@ func BuildWorkerPrompt(req WorkerRequest) string {
 		fmt.Fprintf(&b, "\nPrior artifact: %s\n", req.InputArtifactPath)
 	}
 
+	return b.String()
+}
+
+// BuildEpicReviewInstructions renders the instructions block shown to the
+// epic reviewer so every epic-level review opens with the canonical
+// rigorous-review wording (EpicReviewFraming) and then lists the child
+// ticket context the reviewer should weigh.
+//
+// childIDs should contain the epic's closed child ticket ids in a stable
+// order so reviewers can cross-reference per-ticket artifacts without
+// having to re-scan the diff for ownership. The caller is expected to
+// assemble the Diff, Standards, and Instructions fields of the
+// ReviewRequest; this helper only emits the textual instructions and is
+// intentionally deterministic so test assertions can pin the wording.
+func BuildEpicReviewInstructions(epicID string, childIDs []string, extra string) string {
+	var b strings.Builder
+	b.WriteString(EpicReviewFraming)
+	b.WriteString("\n\n")
+	if strings.TrimSpace(epicID) != "" {
+		fmt.Fprintf(&b, "**Epic:** %s\n", epicID)
+	}
+	if len(childIDs) > 0 {
+		b.WriteString("**Child tickets:**\n")
+		for _, id := range childIDs {
+			fmt.Fprintf(&b, "- %s\n", id)
+		}
+	}
+	if strings.TrimSpace(extra) != "" {
+		b.WriteString("\n")
+		b.WriteString(extra)
+	}
 	return b.String()
 }
 

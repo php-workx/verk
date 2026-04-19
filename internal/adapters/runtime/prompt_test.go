@@ -300,6 +300,26 @@ func TestWorkerSystemPrompt_JSONOnly(t *testing.T) {
 	}
 }
 
+func TestWorkerSystemPrompt_InspectExistingImplementation(t *testing.T) {
+	prompt := WorkerSystemPrompt()
+	if !strings.Contains(prompt, "Inspect the existing working tree") {
+		t.Fatalf("expected existing-implementation inspection guidance in worker system prompt:\n%s", prompt)
+	}
+	if !strings.Contains(prompt, "continue from the actual state") {
+		t.Fatalf("expected continue-from-actual-state guidance in worker system prompt:\n%s", prompt)
+	}
+}
+
+func TestWorkerSystemPrompt_ExternalReviewReadiness(t *testing.T) {
+	prompt := WorkerSystemPrompt()
+	if !strings.Contains(prompt, "brutally honest external review") {
+		t.Fatalf("expected brutally honest external review goal in worker system prompt:\n%s", prompt)
+	}
+	if !strings.Contains(prompt, "robust") {
+		t.Fatalf("expected robust-implementation language in worker system prompt:\n%s", prompt)
+	}
+}
+
 func TestReviewerSystemPrompt_JSONOnly(t *testing.T) {
 	prompt := ReviewerSystemPrompt()
 	if !strings.Contains(prompt, "ONLY a JSON object") {
@@ -316,6 +336,43 @@ func TestReviewerSystemPrompt_JSONOnly(t *testing.T) {
 	}
 	if !strings.Contains(prompt, "ticket description") {
 		t.Fatal("expected instruction to read ticket description")
+	}
+}
+
+func TestReviewerSystemPrompt_RigorousGapFinding(t *testing.T) {
+	prompt := ReviewerSystemPrompt()
+	if !strings.Contains(prompt, "brutally honest external reviewer") {
+		t.Fatalf("expected brutally-honest framing in reviewer system prompt:\n%s", prompt)
+	}
+	if !strings.Contains(prompt, "real gaps, incomplete implementations, and missing tests") {
+		t.Fatalf("expected rigorous gap-finding instruction in reviewer system prompt:\n%s", prompt)
+	}
+	if !strings.Contains(prompt, "not to manufacture nits") {
+		t.Fatalf("expected anti-performative-findings guidance in reviewer system prompt:\n%s", prompt)
+	}
+}
+
+func TestReviewerSystemPrompt_ActionableFindings(t *testing.T) {
+	prompt := ReviewerSystemPrompt()
+	for _, phrase := range []string{
+		"owning ticket",
+		"affected file or behavior",
+		"missing validation",
+		"auto-repaired",
+	} {
+		if !strings.Contains(prompt, phrase) {
+			t.Fatalf("expected reviewer system prompt to request %q:\n%s", phrase, prompt)
+		}
+	}
+}
+
+func TestEpicReviewFraming_MatchesRequestedWording(t *testing.T) {
+	expected := "Take a careful look at the task items we created, then conduct a rigorous review\n" +
+		"of the current implementation. Find any gaps, incomplete implementations, and\n" +
+		"missing tests so that we are confident that our implementation and fixes will\n" +
+		"withstand a brutally honest external review."
+	if EpicReviewFraming != expected {
+		t.Fatalf("EpicReviewFraming does not match the requested wording.\n--- want ---\n%s\n--- got ---\n%s", expected, EpicReviewFraming)
 	}
 }
 

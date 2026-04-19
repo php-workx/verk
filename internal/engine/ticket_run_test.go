@@ -1340,3 +1340,436 @@ func TestTicketRunState_snapshotPreservesRestoredCreatedAt(t *testing.T) {
 		t.Errorf("expected CreatedAt %v, got %v", fixedCreatedAt, snap.CreatedAt)
 	}
 }
+
+func TestRenderReviewInstructions_RequestsOwnerRiskAndValidationEvidence(t *testing.T) {
+	plan := state.PlanArtifact{
+		TicketID:                 "VER-42",
+		Title:                    "Sample ticket",
+		Description:              "Some description.",
+		AcceptanceCriteria:       []string{"does the right thing"},
+		EffectiveReviewThreshold: "P2",
+	}
+
+	out := renderReviewInstructions(plan, 1)
+
+	for _, phrase := range []string{
+		"brutally honest external review",
+		"owning ticket",
+		"`VER-42`",
+		"concrete risk",
+		"missing validation or test evidence",
+		"auto-repaired",
+	} {
+		if !strings.Contains(out, phrase) {
+			t.Fatalf("expected review instructions to contain %q:\n%s", phrase, out)
+		}
+	}
+}
+
+// TestRenderRepairInstructions_IncludesFindingAndContext verifies the repair
+// worker prompt carries the specific review finding plus enough surrounding
+// context (acceptance criteria, changed files, prior verification summary) for
+// the worker to address the finding without rerunning the whole ticket blindly
+// (ver-amsh AC3).
+func TestRenderRepairInstructions_IncludesFindingAndContext(t *testing.T) {
+	st := &ticketRunState{
+		req: RunTicketRequest{
+			Plan: state.PlanArtifact{
+				TicketID:                 "ver-repair-ctx",
+				Title:                    "repair context",
+				Description:              "Original ticket description about docs.",
+				AcceptanceCriteria:       []string{"docs read correctly"},
+				TestCases:                []string{"docs do not contradict each other"},
+				OwnedPaths:               []string{"docs"},
+				EffectiveReviewThreshold: state.SeverityP2,
+			},
+		},
+		repairCycles: []state.RepairCycleArtifact{{
+			TicketID:          "ver-repair-ctx",
+			Cycle:             1,
+			TriggerFindingIDs: []string{"finding-42"},
+			Status:            "repair_pending",
+			Scope:             state.ValidationScopeTicket,
+		}},
+		review: &state.ReviewFindingsArtifact{
+			TicketID: "ver-repair-ctx",
+			Findings: []state.ReviewFinding{{
+				ID:          "finding-42",
+				Severity:    state.SeverityP2,
+				Title:       "docs contradiction",
+				Body:        "README claims X but CONTRIBUTING claims Y.",
+				File:        "docs/README.md",
+				Line:        12,
+				Disposition: "open",
+			}},
+			EffectiveReviewThreshold: state.SeverityP2,
+		},
+		implementation: &state.ImplementationArtifact{
+			TicketID:     "ver-repair-ctx",
+			ChangedFiles: []string{"docs/README.md", "docs/CONTRIBUTING.md"},
+		},
+		verification: &state.VerificationArtifact{
+			TicketID: "ver-repair-ctx",
+			Attempt:  2,
+			Passed:   true,
+			Results: []state.VerificationResult{
+				{Command: "markdownlint docs", Passed: true},
+			},
+		},
+	}
+
+	out := renderRepairInstructions(st)
+
+	for _, phrase := range []string{
+		"**Ticket ID:** ver-repair-ctx",
+		"**Repair Cycle:** 1",
+		"finding-42",
+		"docs contradiction",
+		"docs/README.md:12",
+		"Original Ticket Description",
+		"Original ticket description about docs.",
+		"Acceptance Criteria",
+		"docs read correctly",
+		"Test Cases",
+		"docs do not contradict each other",
+		"Changed Files So Far",
+		"docs/README.md",
+		"docs/CONTRIBUTING.md",
+		"Prior Verification",
+		"Do not regress",
+	} {
+		if !strings.Contains(out, phrase) {
+			t.Fatalf("expected repair instructions to contain %q:\n%s", phrase, out)
+		}
+	}
+}
+
+// TestRunTicket_ReviewFindingRepairedClosesTicket exercises ver-amsh AC1+AC2:
+// a medium-severity review finding must trigger a repair cycle, and once the
+// repair worker addresses it and the follow-up review passes, the ticket
+// closes with a repair artifact that references the triggering finding id.
+func TestRunTicket_ReviewFindingRepairedClosesTicket(t *testing.T) {
+	repoRoot := t.TempDir()
+	cfg := policy.DefaultConfig()
+	ticket := testTicket("ver-review-repair")
+	plan, claim := testPlanAndClaim(t, repoRoot, ticket, cfg, "run-review-repair", "lease-review-repair", []string{`true`})
+
+	started, finished := testRunTimes()
+	blockingFinding := runtime.ReviewFinding{
+		ID:          "finding-77",
+		Severity:    runtime.SeverityP2,
+		Title:       "docs contradict each other",
+		Body:        "README and CONTRIBUTING disagree about bootstrap command.",
+		File:        "docs/README.md",
+		Line:        22,
+		Disposition: runtime.ReviewDispositionOpen,
+	}
+	adapter := runtimefake.New(
+		[]runtime.WorkerResult{
+			{
+				Status:             runtime.WorkerStatusDone,
+				RetryClass:         runtime.RetryClassTerminal,
+				LeaseID:            claim.LeaseID,
+				StartedAt:          started,
+				FinishedAt:         finished,
+				ResultArtifactPath: filepath.Join(repoRoot, "worker-1.json"),
+			},
+			// Repair worker run after the blocking finding lands.
+			{
+				Status:             runtime.WorkerStatusDone,
+				RetryClass:         runtime.RetryClassTerminal,
+				LeaseID:            claim.LeaseID,
+				StartedAt:          finished.Add(5 * time.Second),
+				FinishedAt:         finished.Add(6 * time.Second),
+				ResultArtifactPath: filepath.Join(repoRoot, "worker-repair.json"),
+			},
+		},
+		[]runtime.ReviewResult{
+			{
+				Status:             runtime.WorkerStatusDone,
+				RetryClass:         runtime.RetryClassTerminal,
+				LeaseID:            claim.LeaseID,
+				StartedAt:          finished.Add(2 * time.Second),
+				FinishedAt:         finished.Add(3 * time.Second),
+				ReviewStatus:       runtime.ReviewStatusFindings,
+				Summary:            "needs docs repair",
+				Findings:           []runtime.ReviewFinding{blockingFinding},
+				ResultArtifactPath: filepath.Join(repoRoot, "review-1.json"),
+			},
+			// After repair, review passes cleanly.
+			{
+				Status:             runtime.WorkerStatusDone,
+				RetryClass:         runtime.RetryClassTerminal,
+				LeaseID:            claim.LeaseID,
+				StartedAt:          finished.Add(7 * time.Second),
+				FinishedAt:         finished.Add(8 * time.Second),
+				ReviewStatus:       runtime.ReviewStatusPassed,
+				Summary:            "clean after repair",
+				ResultArtifactPath: filepath.Join(repoRoot, "review-2.json"),
+			},
+		},
+	)
+
+	result, err := RunTicket(context.Background(), RunTicketRequest{
+		RepoRoot: repoRoot,
+		RunID:    "run-review-repair",
+		Ticket:   ticket,
+		Plan:     plan,
+		Claim:    claim,
+		Adapter:  adapter,
+		Config:   cfg,
+	})
+	if err != nil {
+		t.Fatalf("RunTicket returned error: %v", err)
+	}
+	if result.Snapshot.CurrentPhase != state.TicketPhaseClosed {
+		t.Fatalf("expected closed phase after successful repair, got %q (block=%q)",
+			result.Snapshot.CurrentPhase, result.Snapshot.BlockReason)
+	}
+	if len(result.Snapshot.RepairCycles) != 1 {
+		t.Fatalf("expected 1 repair cycle, got %d", len(result.Snapshot.RepairCycles))
+	}
+	cycle := result.Snapshot.RepairCycles[0]
+	if len(cycle.TriggerFindingIDs) != 1 || cycle.TriggerFindingIDs[0] != "finding-77" {
+		t.Fatalf("expected repair cycle to reference finding-77, got %#v", cycle.TriggerFindingIDs)
+	}
+	if cycle.Status != "completed" {
+		t.Fatalf("expected completed repair cycle after passing review, got %q", cycle.Status)
+	}
+	if result.Snapshot.ReviewAttempts != 2 {
+		t.Fatalf("expected 2 review attempts (initial + post-repair), got %d", result.Snapshot.ReviewAttempts)
+	}
+	if len(adapter.WorkerRequests()) != 2 {
+		t.Fatalf("expected 2 worker requests (implement + repair), got %d", len(adapter.WorkerRequests()))
+	}
+	// The repair worker's prompt must include the triggering finding id so
+	// the worker can act on it without rerunning the whole ticket.
+	repairPrompt := adapter.WorkerRequests()[1].Instructions
+	if !strings.Contains(repairPrompt, "finding-77") {
+		t.Fatalf("expected repair worker prompt to reference finding id, got:\n%s", repairPrompt)
+	}
+	if !strings.Contains(repairPrompt, "docs contradict each other") {
+		t.Fatalf("expected repair worker prompt to include the finding title, got:\n%s", repairPrompt)
+	}
+}
+
+// TestRunTicket_ExhaustedReviewRepairBlocksWithActionableReason exercises
+// ver-amsh AC1+AC5: when a finding survives repair cycles past the policy
+// budget, the ticket must transition to blocked with a reason that cites the
+// canonical non-convergent prefix, the unresolved finding id, and a suggested
+// next action (operator input) so the blocker is actionable.
+func TestRunTicket_ExhaustedReviewRepairBlocksWithActionableReason(t *testing.T) {
+	repoRoot := t.TempDir()
+	cfg := policy.DefaultConfig()
+	cfg.Policy.MaxRepairCycles = 1
+	ticket := testTicket("ver-review-exhaust")
+	plan, claim := testPlanAndClaim(t, repoRoot, ticket, cfg, "run-review-exhaust", "lease-review-exhaust", []string{`true`})
+
+	started, finished := testRunTimes()
+	persistent := runtime.ReviewFinding{
+		ID:          "finding-stuck",
+		Severity:    runtime.SeverityP1,
+		Title:       "high severity cannot be repaired",
+		Body:        "requires operator decision about schema migration.",
+		File:        "internal/engine/example.go",
+		Line:        10,
+		Disposition: runtime.ReviewDispositionOpen,
+	}
+	adapter := runtimefake.New(
+		[]runtime.WorkerResult{
+			{
+				Status:             runtime.WorkerStatusDone,
+				RetryClass:         runtime.RetryClassTerminal,
+				LeaseID:            claim.LeaseID,
+				StartedAt:          started,
+				FinishedAt:         finished,
+				ResultArtifactPath: filepath.Join(repoRoot, "worker-1.json"),
+			},
+			{
+				Status:             runtime.WorkerStatusDone,
+				RetryClass:         runtime.RetryClassTerminal,
+				LeaseID:            claim.LeaseID,
+				StartedAt:          finished.Add(3 * time.Second),
+				FinishedAt:         finished.Add(4 * time.Second),
+				ResultArtifactPath: filepath.Join(repoRoot, "worker-2.json"),
+			},
+		},
+		[]runtime.ReviewResult{
+			{
+				Status:             runtime.WorkerStatusDone,
+				RetryClass:         runtime.RetryClassTerminal,
+				LeaseID:            claim.LeaseID,
+				StartedAt:          finished.Add(5 * time.Second),
+				FinishedAt:         finished.Add(6 * time.Second),
+				ReviewStatus:       runtime.ReviewStatusFindings,
+				Summary:            "needs repair",
+				Findings:           []runtime.ReviewFinding{persistent},
+				ResultArtifactPath: filepath.Join(repoRoot, "review-1.json"),
+			},
+			{
+				Status:             runtime.WorkerStatusDone,
+				RetryClass:         runtime.RetryClassTerminal,
+				LeaseID:            claim.LeaseID,
+				StartedAt:          finished.Add(7 * time.Second),
+				FinishedAt:         finished.Add(8 * time.Second),
+				ReviewStatus:       runtime.ReviewStatusFindings,
+				Summary:            "still blocked",
+				Findings:           []runtime.ReviewFinding{persistent},
+				ResultArtifactPath: filepath.Join(repoRoot, "review-2.json"),
+			},
+		},
+	)
+
+	result, err := RunTicket(context.Background(), RunTicketRequest{
+		RepoRoot: repoRoot,
+		RunID:    "run-review-exhaust",
+		Ticket:   ticket,
+		Plan:     plan,
+		Claim:    claim,
+		Adapter:  adapter,
+		Config:   cfg,
+	})
+	if err != nil {
+		t.Fatalf("RunTicket returned error: %v", err)
+	}
+	if result.Snapshot.CurrentPhase != state.TicketPhaseBlocked {
+		t.Fatalf("expected blocked phase after repair budget exhausted, got %q", result.Snapshot.CurrentPhase)
+	}
+	for _, phrase := range []string{
+		string(state.EscalationNonConvergentReview),
+		"repair limit reached",
+		"finding-stuck",
+		"operator input required",
+	} {
+		if !strings.Contains(result.Snapshot.BlockReason, phrase) {
+			t.Fatalf("expected block reason to contain %q, got %q", phrase, result.Snapshot.BlockReason)
+		}
+	}
+	if len(result.Snapshot.RepairCycles) != 2 {
+		t.Fatalf("expected 2 repair cycles, got %d", len(result.Snapshot.RepairCycles))
+	}
+	last := result.Snapshot.RepairCycles[len(result.Snapshot.RepairCycles)-1]
+	if last.Status != "blocked" {
+		t.Fatalf("expected last repair cycle to be blocked, got %q", last.Status)
+	}
+	if last.PolicyLimitReached == nil {
+		t.Fatalf("expected PolicyLimitReached to be set on exhausted repair cycle")
+	}
+	if last.PolicyLimitReached.Name != "max_repair_cycles" {
+		t.Fatalf("expected max_repair_cycles limit name, got %q", last.PolicyLimitReached.Name)
+	}
+	if len(last.TriggerFindingIDs) != 1 || last.TriggerFindingIDs[0] != "finding-stuck" {
+		t.Fatalf("expected last cycle to reference finding-stuck, got %#v", last.TriggerFindingIDs)
+	}
+}
+
+// TestRunTicket_LowSeverityFindingDoesNotBlock exercises ver-amsh AC1+AC4:
+// a reviewer finding whose severity is below the configured threshold must
+// not trigger a repair cycle and must not prevent closure. The finding still
+// round-trips through the review artifact so it stays visible to operators.
+func TestRunTicket_LowSeverityFindingDoesNotBlock(t *testing.T) {
+	repoRoot := t.TempDir()
+	cfg := policy.DefaultConfig() // default threshold is P2
+	ticket := testTicket("ver-low-sev")
+	plan, claim := testPlanAndClaim(t, repoRoot, ticket, cfg, "run-low-sev", "lease-low-sev", []string{`true`})
+
+	started, finished := testRunTimes()
+	lowFinding := runtime.ReviewFinding{
+		ID:          "finding-nit",
+		Severity:    runtime.SeverityP3,
+		Title:       "minor style nit",
+		Body:        "consider renaming `foo` to something more descriptive.",
+		File:        "internal/example.go",
+		Line:        5,
+		Disposition: runtime.ReviewDispositionOpen,
+	}
+	adapter := runtimefake.New(
+		[]runtime.WorkerResult{
+			{
+				Status:             runtime.WorkerStatusDone,
+				RetryClass:         runtime.RetryClassTerminal,
+				LeaseID:            claim.LeaseID,
+				StartedAt:          started,
+				FinishedAt:         finished,
+				ResultArtifactPath: filepath.Join(repoRoot, "worker.json"),
+			},
+		},
+		[]runtime.ReviewResult{
+			{
+				Status:             runtime.WorkerStatusDone,
+				RetryClass:         runtime.RetryClassTerminal,
+				LeaseID:            claim.LeaseID,
+				StartedAt:          finished.Add(time.Second),
+				FinishedAt:         finished.Add(2 * time.Second),
+				ReviewStatus:       runtime.ReviewStatusPassed, // below-threshold → derived status is passed
+				Summary:            "only style nits remain",
+				Findings:           []runtime.ReviewFinding{lowFinding},
+				ResultArtifactPath: filepath.Join(repoRoot, "review.json"),
+			},
+		},
+	)
+
+	result, err := RunTicket(context.Background(), RunTicketRequest{
+		RepoRoot: repoRoot,
+		RunID:    "run-low-sev",
+		Ticket:   ticket,
+		Plan:     plan,
+		Claim:    claim,
+		Adapter:  adapter,
+		Config:   cfg,
+	})
+	if err != nil {
+		t.Fatalf("RunTicket returned error: %v", err)
+	}
+	if result.Snapshot.CurrentPhase != state.TicketPhaseClosed {
+		t.Fatalf("expected closed phase with below-threshold finding, got %q (block=%q)",
+			result.Snapshot.CurrentPhase, result.Snapshot.BlockReason)
+	}
+	if len(result.Snapshot.RepairCycles) != 0 {
+		t.Fatalf("expected no repair cycles for below-threshold finding, got %d", len(result.Snapshot.RepairCycles))
+	}
+	if result.Snapshot.Review == nil {
+		t.Fatalf("expected review artifact on snapshot")
+	}
+	if len(result.Snapshot.Review.Findings) != 1 || result.Snapshot.Review.Findings[0].ID != "finding-nit" {
+		t.Fatalf("expected finding-nit recorded on review artifact, got %#v", result.Snapshot.Review.Findings)
+	}
+	if !result.Snapshot.Review.Passed {
+		t.Fatalf("expected review.Passed=true for below-threshold finding, got false")
+	}
+	if len(result.Snapshot.Review.BlockingFindings) != 0 {
+		t.Fatalf("expected no blocking findings, got %#v", result.Snapshot.Review.BlockingFindings)
+	}
+}
+
+// TestBuildReviewRepairBlockReason_IncludesFindingIDsAndNextAction guards the
+// canonical shape of the review-repair exhaustion block reason. Operators rely
+// on this string to know which findings stalled the ticket and what to do next
+// (ver-amsh AC2+AC5).
+func TestBuildReviewRepairBlockReason_IncludesFindingIDsAndNextAction(t *testing.T) {
+	reason := buildReviewRepairBlockReason(3, []string{"finding-1", "finding-2"})
+	for _, phrase := range []string{
+		string(state.EscalationNonConvergentReview),
+		"repair limit reached after 3 cycle(s)",
+		"finding-1",
+		"finding-2",
+		"operator input required",
+	} {
+		if !strings.Contains(reason, phrase) {
+			t.Fatalf("expected reason to contain %q, got %q", phrase, reason)
+		}
+	}
+}
+
+// TestBuildReviewRepairBlockReason_EmptyFindingIDs verifies the helper still
+// emits an actionable suggestion when the engine could not attribute the
+// exhaustion to specific finding ids (AC5).
+func TestBuildReviewRepairBlockReason_EmptyFindingIDs(t *testing.T) {
+	reason := buildReviewRepairBlockReason(2, nil)
+	if !strings.Contains(reason, "operator input required") {
+		t.Fatalf("expected operator-input next-action even without finding ids, got %q", reason)
+	}
+	if strings.Contains(reason, "unresolved findings:") {
+		t.Fatalf("expected no unresolved-findings tail when list is empty, got %q", reason)
+	}
+}

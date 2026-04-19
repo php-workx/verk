@@ -24,6 +24,9 @@ func BuildPlanArtifact(t tkmd.Ticket, cfg policy.Config) (state.PlanArtifact, er
 
 	effective := cfg.EffectiveReviewThreshold(nil, &plannedThreshold)
 
+	workerProfile := cfg.EffectiveWorkerProfile()
+	reviewerProfile := cfg.EffectiveReviewerProfile()
+
 	return state.PlanArtifact{
 		ArtifactMeta: state.ArtifactMeta{
 			SchemaVersion: artifactSchemaVersion,
@@ -43,8 +46,33 @@ func BuildPlanArtifact(t tkmd.Ticket, cfg policy.Config) (state.PlanArtifact, er
 		OwnedPaths:               append([]string(nil), t.OwnedPaths...),
 		ReviewThreshold:          plannedThreshold,
 		EffectiveReviewThreshold: effective,
-		RuntimePreference:        t.Runtime,
+		// RuntimePreference is ticket-level routing only — it can swap the
+		// runtime identifier (e.g. force codex for a ticket) but MUST NOT
+		// influence model or reasoning selection. Ticket frontmatter `model`
+		// is intentionally never copied into the plan; see ver-laq2.
+		RuntimePreference: t.Runtime,
+		WorkerProfile:     profileSnapshotFor(workerProfile, t.Runtime),
+		ReviewerProfile:   profileSnapshotFor(reviewerProfile, t.Runtime),
 	}, nil
+}
+
+// profileSnapshotFor captures the effective role profile (runtime/model/
+// reasoning) that intake resolved for this ticket. The ticket-level
+// RuntimePreference, when set, overrides the runtime field so the snapshot
+// mirrors what workers and reviewers will actually execute against.
+func profileSnapshotFor(profile policy.RoleProfile, runtimePreference string) *state.RoleProfileSnapshot {
+	snapshot := state.RoleProfileSnapshot{
+		Runtime:   strings.TrimSpace(profile.Runtime),
+		Model:     strings.TrimSpace(profile.Model),
+		Reasoning: strings.TrimSpace(profile.Reasoning),
+	}
+	if pref := strings.TrimSpace(runtimePreference); pref != "" {
+		snapshot.Runtime = pref
+	}
+	if snapshot.Runtime == "" && snapshot.Model == "" && snapshot.Reasoning == "" {
+		return nil
+	}
+	return &snapshot
 }
 
 func parseTicketThreshold(raw string, fallback state.Severity) (state.Severity, error) {

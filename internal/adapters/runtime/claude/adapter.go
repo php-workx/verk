@@ -273,6 +273,12 @@ func validateReviewRequest(req runtime.ReviewRequest) error {
 
 // buildWorkerArgs constructs CLI args for `claude -p --output-format json`.
 // The user prompt is passed via stdin.
+//
+// Role profile mapping: Claude Code CLI supports `--model <name>` (e.g.
+// "sonnet", "opus") which we pass through when req.Model is set. Claude's
+// CLI does not currently expose a reasoning-effort flag, so req.Reasoning
+// is intentionally not mapped here — it remains informational on the
+// attempt artifact and is not propagated to the subprocess.
 func buildWorkerArgs(req runtime.WorkerRequest) []string {
 	outputFormat := "json"
 	args := []string{"-p"}
@@ -284,6 +290,7 @@ func buildWorkerArgs(req runtime.WorkerRequest) []string {
 		"--output-format", outputFormat,
 		"--system-prompt", runtime.WorkerSystemPrompt(),
 	)
+	args = appendModelArg(args, req.Model)
 	if req.ExecutionConfig.WorkerTimeoutMinutes > 0 {
 		args = append(args, "--max-turns", "50")
 	}
@@ -301,10 +308,24 @@ func buildReviewArgs(req runtime.ReviewRequest) []string {
 		"--output-format", outputFormat,
 		"--system-prompt", runtime.ReviewerSystemPrompt(),
 	)
+	args = appendModelArg(args, req.Model)
 	if req.ExecutionConfig.ReviewerTimeoutMinutes > 0 {
 		args = append(args, "--max-turns", "30")
 	}
 	return args
+}
+
+// appendModelArg appends a `--model <name>` option when the role profile
+// selected a model. The Claude Code CLI rejects unknown aliases itself, so
+// callers do not need to validate the value here — but the adapter gives the
+// operator a clear block reason by preserving stderr via the standard
+// derivation path when the subprocess exits non-zero.
+func appendModelArg(args []string, model string) []string {
+	model = strings.TrimSpace(model)
+	if model == "" {
+		return args
+	}
+	return append(args, "--model", model)
 }
 
 // --- Status derivation from verk protocol blocks ---

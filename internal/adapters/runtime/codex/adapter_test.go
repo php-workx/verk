@@ -406,3 +406,66 @@ func hasArg(args []string, value string) bool {
 	}
 	return false
 }
+
+// assertArgValue asserts that args contains `flag` followed by `want`.
+func assertArgValue(t *testing.T, args []string, flag, want string) {
+	t.Helper()
+	for i := 0; i+1 < len(args); i++ {
+		if args[i] == flag {
+			if args[i+1] != want {
+				t.Fatalf("expected %s %q, got %q (full args: %v)", flag, want, args[i+1], args)
+			}
+			return
+		}
+	}
+	t.Fatalf("expected flag %s in args: %v", flag, args)
+}
+
+// TestBuildWorkerArgs_IncludesModelAndReasoning covers ver-laq2 test case 7:
+// Codex supports both `--model` and `-c model_reasoning_effort=<level>`, and
+// the adapter must translate role profile fields into these flags so the
+// run is reproducible without relying on CLI defaults.
+func TestBuildWorkerArgs_IncludesModelAndReasoning(t *testing.T) {
+	req := runtime.WorkerRequest{
+		LeaseID:   "lease-1",
+		Model:     "gpt-5-mini",
+		Reasoning: "medium",
+	}
+	args := buildWorkerArgs(req, "prompt-body")
+	assertArgValue(t, args, "--model", "gpt-5-mini")
+	assertArgValue(t, args, "-c", "model_reasoning_effort=medium")
+	// The prompt is always the final positional argument.
+	if last := args[len(args)-1]; last != "prompt-body" {
+		t.Fatalf("expected prompt as final arg, got %q", last)
+	}
+}
+
+// TestBuildWorkerArgs_OmitsModelAndReasoningWhenEmpty verifies that an empty
+// role profile leaves both `--model` and `-c model_reasoning_effort=...` off
+// the command line so Codex's own defaults apply. Passing empty flags would
+// cause the CLI to reject the invocation.
+func TestBuildWorkerArgs_OmitsModelAndReasoningWhenEmpty(t *testing.T) {
+	args := buildWorkerArgs(runtime.WorkerRequest{LeaseID: "lease-1"}, "prompt-body")
+	if hasArg(args, "--model") {
+		t.Fatalf("expected no --model flag when Model is unset, got %v", args)
+	}
+	for i := 0; i+1 < len(args); i++ {
+		if args[i] == "-c" && strings.HasPrefix(args[i+1], "model_reasoning_effort=") {
+			t.Fatalf("expected no reasoning override when Reasoning is unset, got %v", args)
+		}
+	}
+}
+
+// TestBuildReviewArgs_IncludesModelAndReasoning is the reviewer counterpart
+// for Codex role profile translation.
+func TestBuildReviewArgs_IncludesModelAndReasoning(t *testing.T) {
+	req := runtime.ReviewRequest{
+		LeaseID:                  "lease-1",
+		Model:                    "gpt-5",
+		Reasoning:                "high",
+		EffectiveReviewThreshold: runtime.SeverityP2,
+	}
+	args := buildReviewArgs(req, "prompt-body")
+	assertArgValue(t, args, "--model", "gpt-5")
+	assertArgValue(t, args, "-c", "model_reasoning_effort=high")
+}

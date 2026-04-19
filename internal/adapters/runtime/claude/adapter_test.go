@@ -455,6 +455,45 @@ func assertArgValue(t *testing.T, args []string, flag, want string) {
 	t.Fatalf("expected flag %s in args: %v", flag, args)
 }
 
+// TestBuildWorkerArgs_IncludesModelWhenSet covers ver-laq2 test case 6:
+// when the role profile selects a model, the Claude adapter must translate
+// it into the `--model <name>` CLI flag so the installed CLI runs the
+// configured model rather than its built-in default. Reasoning is
+// intentionally not asserted here — Claude's CLI does not currently expose
+// a reasoning-effort flag, so reasoning stays informational on the attempt
+// artifact (see adapter.go doc for buildWorkerArgs).
+func TestBuildWorkerArgs_IncludesModelWhenSet(t *testing.T) {
+	req := runtime.WorkerRequest{
+		LeaseID: "lease-1",
+		Model:   "sonnet",
+	}
+	args := buildWorkerArgs(req)
+	assertArgValue(t, args, "--model", "sonnet")
+}
+
+// TestBuildWorkerArgs_OmitsModelWhenEmpty guarantees that a missing model
+// profile does NOT pass an empty `--model` argument to the CLI (which would
+// fail), and instead falls back to the CLI's own default.
+func TestBuildWorkerArgs_OmitsModelWhenEmpty(t *testing.T) {
+	args := buildWorkerArgs(runtime.WorkerRequest{LeaseID: "lease-1"})
+	if hasArg(args, "--model") {
+		t.Fatalf("expected no --model flag when Model is unset, got %v", args)
+	}
+}
+
+// TestBuildReviewArgs_IncludesModelWhenSet is the reviewer-side counterpart
+// to TestBuildWorkerArgs_IncludesModelWhenSet and locks in the role-based
+// reviewer model routing.
+func TestBuildReviewArgs_IncludesModelWhenSet(t *testing.T) {
+	req := runtime.ReviewRequest{
+		LeaseID:                  "lease-1",
+		Model:                    "opus",
+		EffectiveReviewThreshold: runtime.SeverityP2,
+	}
+	args := buildReviewArgs(req)
+	assertArgValue(t, args, "--model", "opus")
+}
+
 // TestRunStreamingCommand_ScannerError verifies that when the subprocess writes
 // a line exceeding the 1 MB scanner buffer, defaultRunStreamingCommand returns
 // a wrapped bufio.ErrTooLong, kills the subprocess, and does not block in

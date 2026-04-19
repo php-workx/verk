@@ -21,14 +21,56 @@ type PolicyConfig struct { //nolint:revive // stuttering name matches Go convent
 	MaxImplementationAttempts int            `yaml:"max_implementation_attempts" json:"max_implementation_attempts"`
 	MaxRepairCycles           int            `yaml:"max_repair_cycles" json:"max_repair_cycles"`
 	MaxWaveRepairCycles       int            `yaml:"max_wave_repair_cycles" json:"max_wave_repair_cycles"`
-	AllowDirtyWorktree        bool           `yaml:"allow_dirty_worktree" json:"allow_dirty_worktree"`
+	// MaxEpicRepairCycles bounds the epic closure gate's repair/review loop.
+	// A value of 0 disables epic-level repair entirely (the gate still runs
+	// broad checks and an epic review, but any blocking finding marks the
+	// epic blocked without dispatching a repair worker).
+	MaxEpicRepairCycles int  `yaml:"max_epic_repair_cycles" json:"max_epic_repair_cycles"`
+	AllowDirtyWorktree  bool `yaml:"allow_dirty_worktree" json:"allow_dirty_worktree"`
+}
+
+// RoleProfile describes the runtime, model, and reasoning level that should be
+// used to execute a given role (worker or reviewer). Runtime selects the CLI
+// adapter (e.g. "claude", "codex"); Model selects the model identifier passed
+// to that adapter (e.g. "sonnet", "opus"); Reasoning selects the reasoning
+// effort level (e.g. "low", "medium", "high", "xhigh") when the runtime
+// supports one.
+//
+// Role profiles are owned by policy/config; they are intentionally NOT
+// derived from ticket frontmatter so that workers cannot silently change
+// the execution model by editing ticket metadata.
+type RoleProfile struct {
+	Runtime   string `yaml:"runtime" json:"runtime"`
+	Model     string `yaml:"model" json:"model"`
+	Reasoning string `yaml:"reasoning" json:"reasoning"`
+}
+
+// IsZero reports whether the profile is entirely unpopulated.
+func (p RoleProfile) IsZero() bool {
+	return strings.TrimSpace(p.Runtime) == "" &&
+		strings.TrimSpace(p.Model) == "" &&
+		strings.TrimSpace(p.Reasoning) == ""
 }
 
 type RuntimeConfig struct {
+	// DefaultRuntime is retained as a backward-compatibility fallback for
+	// configs that predate role-specific profiles. When a role profile has
+	// no Runtime set, DefaultRuntime is used. Role profiles take precedence.
 	DefaultRuntime         string   `yaml:"default_runtime" json:"default_runtime"`
 	WorkerTimeoutMinutes   int      `yaml:"worker_timeout_minutes" json:"worker_timeout_minutes"`
 	ReviewerTimeoutMinutes int      `yaml:"reviewer_timeout_minutes" json:"reviewer_timeout_minutes"`
 	AuthEnvVars            []string `yaml:"auth_env_vars" json:"auth_env_vars"`
+
+	// Worker is the role profile used for worker (implement/repair) attempts.
+	Worker RoleProfile `yaml:"worker" json:"worker"`
+	// Reviewer is the role profile used for reviewer attempts.
+	Reviewer RoleProfile `yaml:"reviewer" json:"reviewer"`
+	// WorkerFallback, if set, is used by retry/resume logic when the primary
+	// Worker profile's model is unavailable, rate-limited, or repeatedly
+	// failing. Optional.
+	WorkerFallback RoleProfile `yaml:"worker_fallback" json:"worker_fallback"`
+	// ReviewerFallback is the equivalent fallback for the reviewer role.
+	ReviewerFallback RoleProfile `yaml:"reviewer_fallback" json:"reviewer_fallback"`
 }
 
 // QualityCommand describes a set of shell commands to run from an optional
@@ -54,6 +96,22 @@ type VerificationConfig struct {
 	DefaultTimeoutMinutes int              `yaml:"default_timeout_minutes" json:"default_timeout_minutes"`
 	EnvPassthrough        []string         `yaml:"env_passthrough" json:"env_passthrough"`
 	QualityCommands       []QualityCommand `yaml:"quality_commands" json:"quality_commands"`
+	// EpicClosureCommands are broad gates that run only at epic closure —
+	// e.g. `go test ./internal/e2e/...` or repo-wide integration suites
+	// that would be too expensive to repeat on every ticket and wave. They
+	// execute after per-ticket and per-wave verification have already passed
+	// and are subject to the same timeout and env_passthrough settings.
+	EpicClosureCommands []QualityCommand `yaml:"epic_closure_commands" json:"epic_closure_commands"`
+	// EpicStaleWordingTerms are literal strings the epic closure gate
+	// should sweep across epic-scoped documentation for. When empty, no
+	// stale-wording sweep runs at epic closure. Used to catch
+	// cross-ticket inconsistencies (e.g. one ticket renamed "Gitleaks"
+	// to "Betterleaks" but another doc still says "Gitleaks").
+	EpicStaleWordingTerms []string `yaml:"epic_stale_wording_terms" json:"epic_stale_wording_terms"`
+	// EpicClosureDocs lists doc paths the epic closure gate may scan for
+	// stale wording and cross-ticket consistency. When empty, a built-in
+	// default set (README.md, CONTRIBUTING.md, docs/**/*.md) is used.
+	EpicClosureDocs []string `yaml:"epic_closure_docs" json:"epic_closure_docs"`
 }
 
 type LoggingConfig struct {
@@ -113,6 +171,9 @@ func (c Config) Validate() error {
 	if c.Policy.MaxWaveRepairCycles < 0 {
 		return fmt.Errorf("policy.max_wave_repair_cycles must be zero or greater")
 	}
+	if c.Policy.MaxEpicRepairCycles < 0 {
+		return fmt.Errorf("policy.max_epic_repair_cycles must be zero or greater")
+	}
 	if c.Runtime.WorkerTimeoutMinutes <= 0 {
 		return fmt.Errorf("runtime.worker_timeout_minutes must be greater than zero")
 	}
@@ -125,10 +186,25 @@ func (c Config) Validate() error {
 	if err := validateStringList(c.Runtime.AuthEnvVars, "runtime.auth_env_vars"); err != nil {
 		return err
 	}
+	if err := validateRoleProfile(c.Runtime.Worker, "runtime.worker"); err != nil {
+		return err
+	}
+	if err := validateRoleProfile(c.Runtime.Reviewer, "runtime.reviewer"); err != nil {
+		return err
+	}
+	if err := validateOptionalRoleProfile(c.Runtime.WorkerFallback, "runtime.worker_fallback"); err != nil {
+		return err
+	}
+	if err := validateOptionalRoleProfile(c.Runtime.ReviewerFallback, "runtime.reviewer_fallback"); err != nil {
+		return err
+	}
 	if err := validateStringList(c.Verification.EnvPassthrough, "verification.env_passthrough"); err != nil {
 		return err
 	}
 	if err := validateQualityCommands(c.Verification.QualityCommands); err != nil {
+		return err
+	}
+	if err := validateEpicClosureCommands(c.Verification.EpicClosureCommands); err != nil {
 		return err
 	}
 	if c.Logging.ArtifactRetention < 0 {
@@ -180,6 +256,83 @@ func validateQualityCommands(cmds []QualityCommand) error {
 		}
 	}
 	return nil
+}
+
+// validateEpicClosureCommands mirrors validateQualityCommands but reports
+// errors under the epic_closure_commands key so operators can locate a
+// malformed entry without having to guess which list produced the error.
+// Epic closure commands are broad gates that run once at epic closure (for
+// example `go test ./internal/e2e/...`), so the same safety rules apply:
+// non-empty runs, relative paths, and no traversal outside the repo root.
+func validateEpicClosureCommands(cmds []QualityCommand) error {
+	for i, qc := range cmds {
+		if len(qc.Run) == 0 {
+			return fmt.Errorf("verification.epic_closure_commands[%d] must have at least one command in run", i)
+		}
+		for j, cmd := range qc.Run {
+			if strings.TrimSpace(cmd) == "" {
+				return fmt.Errorf("verification.epic_closure_commands[%d].run[%d] must not be empty", i, j)
+			}
+		}
+		if qc.Path != "" {
+			if filepath.IsAbs(qc.Path) {
+				return fmt.Errorf("verification.epic_closure_commands[%d].path must be relative, got %q", i, qc.Path)
+			}
+			if strings.HasPrefix(filepath.Clean(qc.Path), "..") {
+				return fmt.Errorf("verification.epic_closure_commands[%d].path must not traverse outside repo root, got %q", i, qc.Path)
+			}
+		}
+	}
+	return nil
+}
+
+// validateRoleProfile enforces that a primary (required) role profile has
+// Runtime, Model, and Reasoning populated. Empty role profiles are rejected
+// with a clear field-qualified message so operators can correct the config.
+func validateRoleProfile(profile RoleProfile, field string) error {
+	if strings.TrimSpace(profile.Runtime) == "" {
+		return fmt.Errorf("%s.runtime must not be empty", field)
+	}
+	if strings.TrimSpace(profile.Model) == "" {
+		return fmt.Errorf("%s.model must not be empty", field)
+	}
+	if strings.TrimSpace(profile.Reasoning) == "" {
+		return fmt.Errorf("%s.reasoning must not be empty", field)
+	}
+	return nil
+}
+
+// validateOptionalRoleProfile permits an entirely empty profile (treated as
+// "no fallback configured") but requires all three fields when any one is set
+// so partially configured fallbacks surface at load time instead of at retry.
+func validateOptionalRoleProfile(profile RoleProfile, field string) error {
+	if profile.IsZero() {
+		return nil
+	}
+	return validateRoleProfile(profile, field)
+}
+
+// EffectiveRoleProfile resolves the final role profile used at execution time.
+// DefaultRuntime fills in as a backward-compatibility fallback when the role
+// profile has no Runtime explicitly set.
+func (c Config) EffectiveRoleProfile(profile RoleProfile) RoleProfile {
+	out := profile
+	if strings.TrimSpace(out.Runtime) == "" {
+		out.Runtime = strings.TrimSpace(c.Runtime.DefaultRuntime)
+	}
+	return out
+}
+
+// EffectiveWorkerProfile returns the worker role profile with fallbacks
+// applied. See EffectiveRoleProfile for rules.
+func (c Config) EffectiveWorkerProfile() RoleProfile {
+	return c.EffectiveRoleProfile(c.Runtime.Worker)
+}
+
+// EffectiveReviewerProfile returns the reviewer role profile with fallbacks
+// applied. See EffectiveRoleProfile for rules.
+func (c Config) EffectiveReviewerProfile() RoleProfile {
+	return c.EffectiveRoleProfile(c.Runtime.Reviewer)
 }
 
 func validateStringList(values []string, field string) error {

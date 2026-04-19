@@ -182,18 +182,21 @@ func RunTicket(ctx context.Context, req RunTicketRequest) (result RunTicketResul
 
 		switch st.currentPhase {
 		case state.TicketPhaseImplement:
+			workerProfile := workerProfileForPlan(req.Plan, cfg)
 			workerReq := runtime.WorkerRequest{
 				RunID:           req.RunID,
 				TicketID:        req.Ticket.ID,
 				LeaseID:         req.Claim.LeaseID,
 				Attempt:         st.implementationAttempts + 1,
-				Runtime:         chosenRuntime(req.Plan, cfg),
+				Runtime:         workerProfile.Runtime,
+				Model:           workerProfile.Model,
+				Reasoning:       workerProfile.Reasoning,
 				WorktreePath:    absRepoRoot,
 				Instructions:    renderImplementInstructions(req.Plan, st.currentPhase, st.implementationAttempts+1),
 				ExecutionConfig: executionConfigFromPolicy(cfg),
 				OnProgress:      func(detail string) { st.progressDetail(detail) },
 			}
-			st.progressDetail(fmt.Sprintf("%s worker running", chosenRuntime(req.Plan, cfg)))
+			st.progressDetail(fmt.Sprintf("%s worker running", workerProfile.Runtime))
 			result, err := st.runWorkerWithRuntimeControls(ctx, workerReq)
 			if err != nil {
 				if errors.Is(err, errRuntimeExecutionBlocked) {
@@ -207,7 +210,7 @@ func RunTicket(ctx context.Context, req RunTicketRequest) (result RunTicketResul
 				}
 				return RunTicketResult{}, err
 			}
-			if err := handleImplementResult(st, result, workerReq.Attempt, workerReq.InputArtifactPath); err != nil {
+			if err := handleImplementResult(st, result, workerReq); err != nil {
 				return RunTicketResult{}, err
 			}
 			st.progressDetail(fmt.Sprintf("worker %s (%s)", result.Status, result.CompletionCode))
@@ -274,12 +277,15 @@ func RunTicket(ctx context.Context, req RunTicketRequest) (result RunTicketResul
 			if err != nil {
 				return RunTicketResult{}, fmt.Errorf("collect diff for review: %w", err)
 			}
+			reviewerProfile := reviewerProfileForPlan(req.Plan, cfg)
 			reviewReq := runtime.ReviewRequest{
 				RunID:                    req.RunID,
 				TicketID:                 req.Ticket.ID,
 				LeaseID:                  req.Claim.LeaseID,
 				Attempt:                  st.reviewAttempts + 1,
-				Runtime:                  chosenRuntime(req.Plan, cfg),
+				Runtime:                  reviewerProfile.Runtime,
+				Model:                    reviewerProfile.Model,
+				Reasoning:                reviewerProfile.Reasoning,
 				InputArtifactPath:        st.paths.verificationPath,
 				Instructions:             renderReviewInstructions(req.Plan, st.reviewAttempts+1),
 				Diff:                     diffForReview,
@@ -288,7 +294,7 @@ func RunTicket(ctx context.Context, req RunTicketRequest) (result RunTicketResul
 				ExecutionConfig:          executionConfigFromPolicy(cfg),
 				OnProgress:               func(detail string) { st.progressDetail(detail) },
 			}
-			st.progressDetail(fmt.Sprintf("%s reviewer running", chosenRuntime(req.Plan, cfg)))
+			st.progressDetail(fmt.Sprintf("%s reviewer running", reviewerProfile.Runtime))
 			result, err := st.runReviewerWithRuntimeControls(ctx, reviewReq)
 			if err != nil {
 				if errors.Is(err, errRuntimeExecutionBlocked) {
@@ -302,7 +308,7 @@ func RunTicket(ctx context.Context, req RunTicketRequest) (result RunTicketResul
 				}
 				return RunTicketResult{}, err
 			}
-			if err := handleReviewOutcome(st, result, reviewReq.Attempt); err != nil {
+			if err := handleReviewOutcome(st, result, reviewReq); err != nil {
 				return RunTicketResult{}, err
 			}
 			if result.ReviewStatus == runtime.ReviewStatusPassed {
@@ -359,18 +365,21 @@ func RunTicket(ctx context.Context, req RunTicketRequest) (result RunTicketResul
 			continue
 
 		case state.TicketPhaseRepair:
+			workerProfile := workerProfileForPlan(req.Plan, cfg)
 			workerReq := runtime.WorkerRequest{
 				RunID:           req.RunID,
 				TicketID:        req.Ticket.ID,
 				LeaseID:         req.Claim.LeaseID,
 				Attempt:         st.implementationAttempts + 1,
-				Runtime:         chosenRuntime(req.Plan, cfg),
+				Runtime:         workerProfile.Runtime,
+				Model:           workerProfile.Model,
+				Reasoning:       workerProfile.Reasoning,
 				WorktreePath:    absRepoRoot,
 				Instructions:    renderRepairInstructions(st),
 				ExecutionConfig: executionConfigFromPolicy(cfg),
 				OnProgress:      func(detail string) { st.progressDetail(detail) },
 			}
-			st.progressDetail(fmt.Sprintf("%s repair worker running", chosenRuntime(req.Plan, cfg)))
+			st.progressDetail(fmt.Sprintf("%s repair worker running", workerProfile.Runtime))
 			result, err := st.runWorkerWithRuntimeControls(ctx, workerReq)
 			if err != nil {
 				if errors.Is(err, errRuntimeExecutionBlocked) {
@@ -384,7 +393,7 @@ func RunTicket(ctx context.Context, req RunTicketRequest) (result RunTicketResul
 				}
 				return RunTicketResult{}, err
 			}
-			if err := handleImplementResult(st, result, workerReq.Attempt, workerReq.InputArtifactPath); err != nil {
+			if err := handleImplementResult(st, result, workerReq); err != nil {
 				return RunTicketResult{}, err
 			}
 			if st.currentPhase == state.TicketPhaseVerify {
@@ -459,7 +468,7 @@ func RunTicket(ctx context.Context, req RunTicketRequest) (result RunTicketResul
 	}
 }
 
-func handleImplementResult(st *ticketRunState, result runtime.WorkerResult, attempt int, inputArtifactPath string) error {
+func handleImplementResult(st *ticketRunState, result runtime.WorkerResult, req runtime.WorkerRequest) error {
 	if err := result.Validate(); err != nil {
 		return err
 	}
@@ -467,7 +476,15 @@ func handleImplementResult(st *ticketRunState, result runtime.WorkerResult, atte
 		return err
 	}
 
-	st.implementationAttempts = attempt
+	st.implementationAttempts = req.Attempt
+	// Record the attempt profile actually used (runtime/model/reasoning)
+	// from the request so benchmark and audit consumers can reproduce
+	// or evaluate runs. This is attempt metadata, not an execution lock:
+	// retries and resumes are free to use the current or fallback profile.
+	attemptRuntime := strings.TrimSpace(req.Runtime)
+	if attemptRuntime == "" {
+		attemptRuntime = chosenRuntime(st.req.Plan, st.cfg)
+	}
 	st.implementation = &state.ImplementationArtifact{
 		ArtifactMeta: state.ArtifactMeta{
 			SchemaVersion: artifactSchemaVersion,
@@ -477,13 +494,16 @@ func handleImplementResult(st *ticketRunState, result runtime.WorkerResult, atte
 		},
 		TicketID:          st.req.Ticket.ID,
 		Attempt:           st.implementationAttempts,
-		Runtime:           chosenRuntime(st.req.Plan, st.cfg),
+		Runtime:           attemptRuntime,
+		Model:             strings.TrimSpace(req.Model),
+		Reasoning:         strings.TrimSpace(req.Reasoning),
+		FallbackReason:    strings.TrimSpace(req.FallbackReason),
 		Status:            string(result.Status),
 		CompletionCode:    result.CompletionCode,
 		RetryClass:        result.RetryClass,
 		Concerns:          result.Concerns,
 		LeaseID:           result.LeaseID,
-		InputArtifactPath: inputArtifactPath,
+		InputArtifactPath: req.InputArtifactPath,
 		StartedAt:         result.StartedAt,
 		FinishedAt:        result.FinishedAt,
 		Artifacts:         compactStrings([]string{result.StdoutPath, result.StderrPath, result.ResultArtifactPath}),
@@ -579,15 +599,24 @@ func handleVerificationFailure(st *ticketRunState, verification state.Verificati
 	if !verification.Passed {
 		st.verification = &verification
 	}
+	failingIDs := verificationFailingCheckIDs(st.verification)
 	if st.implementationAttempts >= st.cfg.Policy.MaxImplementationAttempts {
-		st.blockReason = fmt.Sprintf("%s: failed after %d attempt(s)", state.EscalationNonConvergentVerification, st.implementationAttempts)
+		st.blockReason = buildVerificationBlockReason(st.implementationAttempts, failingIDs)
 		if err := st.transitionTo(state.TicketPhaseBlocked); err != nil {
 			return err
 		}
 		if st.verification != nil {
 			st.verification.Passed = false
+			recordVerificationRepairLimit(st.verification, st.implementationAttempts, st.cfg.Policy.MaxImplementationAttempts, failingIDs)
 		}
 		return nil
+	}
+
+	if st.verification != nil && len(failingIDs) > 0 {
+		// Record a repair trigger cycle so validation coverage carries
+		// the referenced check ids. The cycle is marked repair_pending
+		// until the next verification run resolves it.
+		appendVerificationRepairCycle(st, failingIDs)
 	}
 
 	if err := st.transitionTo(state.TicketPhaseImplement); err != nil {
@@ -596,7 +625,91 @@ func handleVerificationFailure(st *ticketRunState, verification state.Verificati
 	return nil
 }
 
-func handleReviewOutcome(st *ticketRunState, result runtime.ReviewResult, attempt int) error {
+// verificationFailingCheckIDs returns the ids of failed executions in
+// the verification artifact's coverage. Empty when coverage is missing
+// or all checks passed.
+func verificationFailingCheckIDs(verification *state.VerificationArtifact) []string {
+	if verification == nil || verification.ValidationCoverage == nil {
+		return nil
+	}
+	return failingCheckIDs(*verification.ValidationCoverage)
+}
+
+// buildVerificationBlockReason composes a clear block reason for a
+// ticket that exhausted its verify-loop budget. When the coverage
+// artifact recorded specific failing check ids, they are included so
+// operators can see exactly which commands could not be repaired.
+func buildVerificationBlockReason(attempts int, failingIDs []string) string {
+	base := fmt.Sprintf("%s: failed after %d attempt(s)", state.EscalationNonConvergentVerification, attempts)
+	if len(failingIDs) == 0 {
+		return base
+	}
+	return fmt.Sprintf("%s; unresolved checks: %s", base, strings.Join(failingIDs, ", "))
+}
+
+// buildReviewRepairBlockReason composes a block reason for a ticket that
+// exhausted its review-repair budget. The reason keeps the canonical
+// non-convergent prefix so downstream parsers continue to work, cites the
+// unresolved finding ids (when known), and names operator input as the
+// suggested next action so the ticket becomes a user-needed blocker with
+// a concrete recovery path.
+func buildReviewRepairBlockReason(cycles int, findingIDs []string) string {
+	base := fmt.Sprintf("%s: repair limit reached after %d cycle(s)", state.EscalationNonConvergentReview, cycles)
+	if len(findingIDs) == 0 {
+		return fmt.Sprintf("%s; operator input required to resolve unresolved review findings", base)
+	}
+	return fmt.Sprintf("%s; unresolved findings: %s; operator input required", base, strings.Join(findingIDs, ", "))
+}
+
+// recordVerificationRepairLimit attaches a ValidationRepairLimit marker
+// to the verification artifact's coverage so the bounded-loop stopping
+// condition is auditable in closeout artifacts and resume reports.
+func recordVerificationRepairLimit(verification *state.VerificationArtifact, reached, limit int, failingIDs []string) {
+	if verification == nil || verification.ValidationCoverage == nil {
+		return
+	}
+	verification.ValidationCoverage.RepairLimit = &state.ValidationRepairLimit{
+		Name:      "max_implementation_attempts",
+		Limit:     limit,
+		Reached:   reached,
+		Reason:    buildVerificationBlockReason(reached, failingIDs),
+		PolicyRef: "policy.max_implementation_attempts",
+	}
+	verification.ValidationCoverage.Closable = false
+	if verification.ValidationCoverage.BlockReason == "" {
+		verification.ValidationCoverage.BlockReason = verification.ValidationCoverage.RepairLimit.Reason
+	}
+}
+
+// appendVerificationRepairCycle records a repair cycle in the ticket
+// state whose trigger check ids reference the failing verification
+// checks. The cycle's Status stays repair_pending until the next
+// verification run settles it.
+func appendVerificationRepairCycle(st *ticketRunState, failingCheckIDs []string) {
+	if len(failingCheckIDs) == 0 {
+		return
+	}
+	cycle := state.RepairCycleArtifact{
+		ArtifactMeta: state.ArtifactMeta{
+			SchemaVersion: artifactSchemaVersion,
+			RunID:         st.req.RunID,
+			CreatedAt:     stateTime(),
+			UpdatedAt:     stateTime(),
+		},
+		TicketID:             st.req.Ticket.ID,
+		Cycle:                len(st.repairCycles) + 1,
+		TriggerCheckIDs:      append([]string(nil), failingCheckIDs...),
+		InputReviewArtifact:  "",
+		VerificationArtifact: st.paths.verificationPath,
+		Status:               "repair_pending",
+		StartedAt:            time.Now().UTC(),
+		Scope:                state.ValidationScopeTicket,
+		RepairNotes:          fmt.Sprintf("repair cycle %d triggered by failing checks: %s", len(st.repairCycles)+1, strings.Join(failingCheckIDs, ", ")),
+	}
+	st.repairCycles = append(st.repairCycles, cycle)
+}
+
+func handleReviewOutcome(st *ticketRunState, result runtime.ReviewResult, req runtime.ReviewRequest) error {
 	if err := result.Validate(st.req.Plan.EffectiveReviewThreshold); err != nil {
 		return err
 	}
@@ -612,7 +725,12 @@ func handleReviewOutcome(st *ticketRunState, result runtime.ReviewResult, attemp
 	}
 	sort.Strings(blockingIDs)
 
-	st.reviewAttempts = attempt
+	st.reviewAttempts = req.Attempt
+	// Record attempt profile actually used so each review attempt is auditable.
+	reviewerRuntime := strings.TrimSpace(req.Runtime)
+	if reviewerRuntime == "" {
+		reviewerRuntime = reviewerProfileForPlan(st.req.Plan, st.cfg).Runtime
+	}
 	st.review = &state.ReviewFindingsArtifact{
 		ArtifactMeta: state.ArtifactMeta{
 			SchemaVersion: artifactSchemaVersion,
@@ -622,7 +740,10 @@ func handleReviewOutcome(st *ticketRunState, result runtime.ReviewResult, attemp
 		},
 		TicketID:                 st.req.Ticket.ID,
 		Attempt:                  st.reviewAttempts,
-		ReviewerRuntime:          chosenRuntime(st.req.Plan, st.cfg),
+		ReviewerRuntime:          reviewerRuntime,
+		ReviewerModel:            strings.TrimSpace(req.Model),
+		ReviewerReasoning:        strings.TrimSpace(req.Reasoning),
+		FallbackReason:           strings.TrimSpace(req.FallbackReason),
 		Summary:                  result.Summary,
 		Findings:                 convertReviewFindings(result.Findings),
 		BlockingFindings:         append([]string(nil), blockingIDs...),
@@ -668,14 +789,29 @@ func handleReviewOutcome(st *ticketRunState, result runtime.ReviewResult, attemp
 		ReviewArtifact:      st.paths.reviewPath,
 		Status:              "repair_pending",
 		StartedAt:           time.Now().UTC(),
+		Scope:               state.ValidationScopeTicket,
 	}
 	st.repairCycles = append(st.repairCycles, cycle)
 
 	if len(st.repairCycles) > st.cfg.Policy.MaxRepairCycles {
-		st.blockReason = fmt.Sprintf("%s: repair limit reached after %d cycle(s)", state.EscalationNonConvergentReview, len(st.repairCycles)-1)
+		// Compose an actionable block reason that names the unresolved
+		// finding ids, because operators rely on this string to decide
+		// whether to escalate, waive, or rework the ticket. Keeping the
+		// non-convergent prefix preserves downstream parsers that key off
+		// the canonical escalation reason.
+		st.blockReason = buildReviewRepairBlockReason(len(st.repairCycles)-1, blockingIDs)
 		last := &st.repairCycles[len(st.repairCycles)-1]
 		last.Status = "blocked"
 		last.FinishedAt = time.Now().UTC()
+		// Persist a ValidationRepairLimit marker on the cycle so the
+		// limiting reason survives in artifacts for audit and resume.
+		last.PolicyLimitReached = &state.ValidationRepairLimit{
+			Name:      "max_repair_cycles",
+			Limit:     st.cfg.Policy.MaxRepairCycles,
+			Reached:   len(st.repairCycles) - 1,
+			Reason:    st.blockReason,
+			PolicyRef: "policy.max_repair_cycles",
+		}
 		if err := st.transitionTo(state.TicketPhaseBlocked); err != nil {
 			return err
 		}
@@ -696,13 +832,13 @@ func (st *ticketRunState) runVerification(ctx context.Context, repoRoot string) 
 
 	// Quality commands run first (from global config) and gate validation commands.
 	// They are prepended to the combined result set so the artifact records all runs.
-	var allResults []verifycommand.CommandResult
+	var declaredResults []verifycommand.CommandResult
 	if len(st.cfg.Verification.QualityCommands) > 0 {
 		qualityResults, err := verifycommand.RunQualityCommands(ctx, repoRoot, st.cfg.Verification.QualityCommands, st.cfg.Verification)
 		if err != nil {
 			return nil, false, fmt.Errorf("run quality commands: %w", err)
 		}
-		allResults = append(allResults, qualityResults...)
+		declaredResults = append(declaredResults, qualityResults...)
 	}
 
 	// Only run per-ticket validation commands when there are any declared.
@@ -711,8 +847,25 @@ func (st *ticketRunState) runVerification(ctx context.Context, repoRoot string) 
 		if err != nil {
 			return nil, false, fmt.Errorf("run validation commands: %w", err)
 		}
-		allResults = append(allResults, validationResults...)
+		declaredResults = append(declaredResults, validationResults...)
 	}
+
+	// Derive focused checks from the implementation's changed files and
+	// ticket scope. Running derived commands here (after declared/quality)
+	// gives closeout a chance to catch file-scoped regressions that the
+	// ticket forgot to declare — a failed ruff check after a Python edit,
+	// for example. Derived checks are advisory by default: their results
+	// feed ValidationCoverage and can trigger repair routing, but they do
+	// not flip the legacy `Passed` flag unless promoted to required.
+	derivation := deriveTicketChecks(st)
+	derivedCommandResults, derivedOrdered, err := runDerivedChecks(ctx, repoRoot, derivation.Checks, st.cfg.Verification)
+	if err != nil {
+		return nil, false, err
+	}
+
+	allResults := make([]verifycommand.CommandResult, 0, len(declaredResults)+len(derivedOrdered))
+	allResults = append(allResults, declaredResults...)
+	allResults = append(allResults, derivedOrdered...)
 
 	// Build flat command list for the artifact (CommandResult.Command is canonical).
 	allCommands := make([]string, 0, len(allResults))
@@ -721,6 +874,30 @@ func (st *ticketRunState) runVerification(ctx context.Context, repoRoot string) 
 	}
 
 	converted := convertVerificationResults(nil, allResults)
+	// `Passed` is keyed on declared/quality commands AND non-advisory
+	// derived checks. Advisory derived checks (the default) are captured
+	// in ValidationCoverage for auditing and repair routing but do not
+	// block the verify loop on their own. Failing required derived
+	// checks, once repair policy promotes them, participate in this
+	// gating flag so the verify → implement loop retries them.
+	declaredPassed := true
+	if len(declaredResults) > 0 {
+		declaredPassed = verifycommand.DeriveVerificationPassed(declaredResults)
+	}
+	requiredDerivedPassed := requiredDerivedChecksPassed(derivation.Checks, derivedCommandResults)
+	attempt := st.verificationAttempts + 1
+	coverage := assembleTicketValidationCoverage(
+		st.req.Plan,
+		st.req.RunID,
+		attempt,
+		declaredResults,
+		derivation,
+		derivedCommandResults,
+		st.review,
+		st.repairCycles,
+		nil,
+	)
+
 	artifact := &state.VerificationArtifact{
 		ArtifactMeta: state.ArtifactMeta{
 			SchemaVersion: artifactSchemaVersion,
@@ -728,14 +905,15 @@ func (st *ticketRunState) runVerification(ctx context.Context, repoRoot string) 
 			CreatedAt:     stateTime(),
 			UpdatedAt:     stateTime(),
 		},
-		TicketID:   st.req.Ticket.ID,
-		Attempt:    st.verificationAttempts + 1,
-		Commands:   allCommands,
-		Results:    converted,
-		Passed:     verifycommand.DeriveVerificationPassed(allResults),
-		RepoRoot:   repoRoot,
-		StartedAt:  verificationStartedAt(converted),
-		FinishedAt: verificationFinishedAt(converted),
+		TicketID:           st.req.Ticket.ID,
+		Attempt:            attempt,
+		Commands:           allCommands,
+		Results:            converted,
+		Passed:             declaredPassed && requiredDerivedPassed,
+		RepoRoot:           repoRoot,
+		StartedAt:          verificationStartedAt(converted),
+		FinishedAt:         verificationFinishedAt(converted),
+		ValidationCoverage: &coverage,
 	}
 	for _, vr := range converted {
 		mark := "✓"
@@ -1188,6 +1366,16 @@ func normalizeRunTicketConfig(cfg policy.Config) policy.Config {
 	if cfg.Runtime.DefaultRuntime == "" {
 		cfg.Runtime.DefaultRuntime = defaults.Runtime.DefaultRuntime
 	}
+	// Fill in the role profiles from defaults when an embedded caller passes a
+	// bare Config that skipped LoadConfig/Validate. This keeps worker/reviewer
+	// selection deterministic (claude/sonnet/high and claude/opus/xhigh) even
+	// in tests that construct Config manually without role profiles.
+	if cfg.Runtime.Worker.IsZero() {
+		cfg.Runtime.Worker = defaults.Runtime.Worker
+	}
+	if cfg.Runtime.Reviewer.IsZero() {
+		cfg.Runtime.Reviewer = defaults.Runtime.Reviewer
+	}
 	if len(cfg.Verification.EnvPassthrough) == 0 {
 		cfg.Verification.EnvPassthrough = append([]string(nil), defaults.Verification.EnvPassthrough...)
 	}
@@ -1202,11 +1390,50 @@ func executionConfigFromPolicy(cfg policy.Config) runtime.ExecutionConfig {
 	}
 }
 
+// chosenRuntime resolves the runtime identifier used for a ticket's
+// execution. Role-specific profiles (worker/reviewer) now own model and
+// reasoning selection; the ticket-level RuntimePreference is retained as an
+// explicit routing hint only, taking precedence over the worker profile's
+// runtime. This is the ONLY ticket-frontmatter field permitted to influence
+// runtime selection. Model selection is intentionally policy-owned and must
+// not be derived from ticket frontmatter (see ver-laq2).
 func chosenRuntime(plan state.PlanArtifact, cfg policy.Config) string {
 	if strings.TrimSpace(plan.RuntimePreference) != "" {
 		return strings.TrimSpace(plan.RuntimePreference)
 	}
+	if rt := strings.TrimSpace(cfg.Runtime.Worker.Runtime); rt != "" {
+		return rt
+	}
 	return strings.TrimSpace(cfg.Runtime.DefaultRuntime)
+}
+
+// workerProfileForPlan resolves the effective worker role profile for a
+// ticket run. The plan's RuntimePreference (from ticket frontmatter) can
+// override the runtime identifier, but model and reasoning come strictly
+// from config. Ticket frontmatter `model` is intentionally ignored.
+func workerProfileForPlan(plan state.PlanArtifact, cfg policy.Config) policy.RoleProfile {
+	profile := cfg.EffectiveWorkerProfile()
+	if pref := strings.TrimSpace(plan.RuntimePreference); pref != "" {
+		profile.Runtime = pref
+	}
+	if strings.TrimSpace(profile.Runtime) == "" {
+		profile.Runtime = strings.TrimSpace(cfg.Runtime.DefaultRuntime)
+	}
+	return profile
+}
+
+// reviewerProfileForPlan resolves the effective reviewer role profile.
+// The ticket's RuntimePreference is an explicit routing hint for the
+// runtime only; model and reasoning come from config.
+func reviewerProfileForPlan(plan state.PlanArtifact, cfg policy.Config) policy.RoleProfile {
+	profile := cfg.EffectiveReviewerProfile()
+	if pref := strings.TrimSpace(plan.RuntimePreference); pref != "" {
+		profile.Runtime = pref
+	}
+	if strings.TrimSpace(profile.Runtime) == "" {
+		profile.Runtime = strings.TrimSpace(cfg.Runtime.DefaultRuntime)
+	}
+	return profile
 }
 
 func renderImplementInstructions(plan state.PlanArtifact, phase state.TicketPhase, attempt int) string {
@@ -1294,21 +1521,54 @@ func renderRepairInstructions(st *ticketRunState) string {
 		b.WriteString("**Repair Cycle:** 1\n\n")
 	}
 
+	// Ticket description keeps the repair worker anchored to the original
+	// problem so it doesn't over-rotate on the single finding.
+	if strings.TrimSpace(st.req.Plan.Description) != "" {
+		b.WriteString("### Original Ticket Description\n\n")
+		b.WriteString(st.req.Plan.Description)
+		b.WriteString("\n\n")
+	}
+
+	// Surface per-finding detail so the repair worker can act on exactly
+	// the issues the reviewer flagged without re-reading the review
+	// artifact. Open findings are listed first; waived/resolved findings
+	// are omitted — their state already says no repair is required.
 	if st.review != nil && len(st.review.Findings) > 0 {
-		b.WriteString("### Review Findings Detail\n\n")
-		for _, finding := range st.review.Findings {
-			if finding.Disposition == "open" {
-				fmt.Fprintf(&b, "- **[%s] %s** (%s:%d): %s\n",
-					finding.Severity, finding.Title, finding.File, finding.Line, finding.Body)
+		openFindings := make([]state.ReviewFinding, 0, len(st.review.Findings))
+		for _, f := range st.review.Findings {
+			if f.Disposition == "open" {
+				openFindings = append(openFindings, f)
 			}
 		}
-		b.WriteString("\n")
+		if len(openFindings) > 0 {
+			b.WriteString("### Review Findings Detail\n\n")
+			for _, finding := range openFindings {
+				location := finding.File
+				if finding.Line > 0 {
+					location = fmt.Sprintf("%s:%d", finding.File, finding.Line)
+				}
+				fmt.Fprintf(&b, "- **[%s] %s** (id=`%s`", finding.Severity, finding.Title, finding.ID)
+				if location != "" {
+					fmt.Fprintf(&b, ", %s", location)
+				}
+				fmt.Fprintf(&b, "): %s\n", finding.Body)
+			}
+			b.WriteString("\n")
+		}
 	}
 
 	if len(st.req.Plan.AcceptanceCriteria) > 0 {
 		b.WriteString("### Acceptance Criteria\n\n")
 		for i, criterion := range st.req.Plan.AcceptanceCriteria {
 			fmt.Fprintf(&b, "%d. %s\n", i+1, criterion)
+		}
+		b.WriteString("\n")
+	}
+
+	if len(st.req.Plan.TestCases) > 0 {
+		b.WriteString("### Test Cases\n\n")
+		for _, tc := range st.req.Plan.TestCases {
+			fmt.Fprintf(&b, "- %s\n", tc)
 		}
 		b.WriteString("\n")
 	}
@@ -1321,8 +1581,54 @@ func renderRepairInstructions(st *ticketRunState) string {
 		b.WriteString("\n")
 	}
 
-	b.WriteString("Fix the review findings while maintaining all acceptance criteria.\n")
+	// Changed files + prior verification results keep the worker from
+	// rebuilding context by re-running the whole ticket blindly.
+	if st.implementation != nil && len(st.implementation.ChangedFiles) > 0 {
+		b.WriteString("### Changed Files So Far\n\n")
+		for _, file := range st.implementation.ChangedFiles {
+			fmt.Fprintf(&b, "- `%s`\n", file)
+		}
+		b.WriteString("\n")
+	}
 
+	if summary := priorVerificationSummary(st.verification); summary != "" {
+		b.WriteString("### Prior Verification\n\n")
+		b.WriteString(summary)
+		b.WriteString("\n")
+	}
+
+	b.WriteString("Fix the review findings while maintaining all acceptance criteria. ")
+	b.WriteString("Do not regress the changes already on disk; extend them.\n")
+
+	return b.String()
+}
+
+// priorVerificationSummary renders a compact, human-readable summary of
+// the most recent verification run for use in repair prompts. Returns an
+// empty string when there is no verification artifact yet so callers can
+// avoid emitting an empty section.
+func priorVerificationSummary(verification *state.VerificationArtifact) string {
+	if verification == nil {
+		return ""
+	}
+	var b strings.Builder
+	if verification.Passed {
+		fmt.Fprintf(&b, "Previous verification (attempt %d) passed on %d command(s).\n", verification.Attempt, len(verification.Results))
+		return b.String()
+	}
+	fmt.Fprintf(&b, "Previous verification (attempt %d) did not pass.\n", verification.Attempt)
+	failing := make([]string, 0, len(verification.Results))
+	for _, r := range verification.Results {
+		if !r.Passed {
+			failing = append(failing, r.Command)
+		}
+	}
+	if len(failing) > 0 {
+		b.WriteString("Failing commands:\n")
+		for _, cmd := range failing {
+			fmt.Fprintf(&b, "- `%s`\n", cmd)
+		}
+	}
 	return b.String()
 }
 
@@ -1368,7 +1674,12 @@ func renderReviewInstructions(plan state.PlanArtifact, attempt int) string {
 	}
 
 	b.WriteString("Review the diff below against the ticket description and acceptance criteria. ")
-	b.WriteString("Flag any issues with appropriate severity.\n")
+	b.WriteString("Flag any issues with appropriate severity.\n\n")
+
+	b.WriteString("Treat this as a dry run for a brutally honest external review: find real gaps, incomplete implementations, ")
+	b.WriteString("and missing tests rather than manufacturing nits. For each finding, document the owning ticket (use ")
+	fmt.Fprintf(&b, "`%s` when the issue is scoped to this ticket), the affected file or behavior and the concrete risk, the specific ", plan.TicketID)
+	b.WriteString("missing validation or test evidence, and whether you believe the issue can be auto-repaired.\n")
 
 	return b.String()
 }

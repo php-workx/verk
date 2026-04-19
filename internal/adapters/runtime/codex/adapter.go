@@ -255,12 +255,19 @@ func validateReviewRequest(req runtime.ReviewRequest) error {
 
 // buildWorkerArgs constructs CLI args for `codex exec`.
 // Codex takes the prompt as a positional argument and writes output to stdout.
+//
+// Role profile mapping: Codex CLI supports `--model <name>` for model
+// selection and `-c model_reasoning_effort=<level>` for reasoning effort.
+// Both are appended only when the role profile set them, so configs that
+// omit either field fall back to Codex's built-in defaults.
 func buildWorkerArgs(req runtime.WorkerRequest, prompt string) []string {
 	args := []string{
 		"exec",
 		"--json",
 		"--full-auto",
 	}
+	args = appendModelArgs(args, req.Model)
+	args = appendReasoningArgs(args, req.Reasoning)
 	if req.WorktreePath != "" {
 		args = append(args, "--cwd", req.WorktreePath)
 	}
@@ -270,14 +277,40 @@ func buildWorkerArgs(req runtime.WorkerRequest, prompt string) []string {
 
 // buildReviewArgs constructs CLI args for `codex exec` in review mode.
 func buildReviewArgs(req runtime.ReviewRequest, prompt string) []string {
-	args := make([]string, 0, 4)
+	args := make([]string, 0, 8)
 	args = append(args,
 		"exec",
 		"--json",
 		"--full-auto",
 	)
+	args = appendModelArgs(args, req.Model)
+	args = appendReasoningArgs(args, req.Reasoning)
 	args = append(args, prompt)
 	return args
+}
+
+// appendModelArgs adds `--model <name>` to a Codex args list when the role
+// profile selected a model. Trimmed empty values are skipped so a missing
+// profile does not override Codex's own default.
+func appendModelArgs(args []string, model string) []string {
+	model = strings.TrimSpace(model)
+	if model == "" {
+		return args
+	}
+	return append(args, "--model", model)
+}
+
+// appendReasoningArgs adds `-c model_reasoning_effort=<level>` to a Codex
+// args list when the role profile selected a reasoning level. The value is
+// quoted via a key=value tuple as Codex expects; unsupported levels are
+// rejected by the Codex CLI itself, surfacing as a non-zero exit that the
+// worker/review pipeline classifies via standard stderr handling.
+func appendReasoningArgs(args []string, reasoning string) []string {
+	reasoning = strings.TrimSpace(reasoning)
+	if reasoning == "" {
+		return args
+	}
+	return append(args, "-c", "model_reasoning_effort="+reasoning)
 }
 
 // --- Status derivation from verk protocol blocks ---
