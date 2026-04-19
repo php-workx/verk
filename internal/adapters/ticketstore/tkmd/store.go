@@ -115,14 +115,7 @@ func ListReadyChildren(rootDir, parentID string, currentRunID ...string) ([]Tick
 		if err != nil {
 			return nil, err
 		}
-		if ticket.ID == parentID {
-			continue
-		}
-		isChild := parentOf(&ticket) == parentID
-		if !isChild {
-			_, isChild = epicDeps[ticket.ID]
-		}
-		if !isChild {
+		if !isChildOf(ticket, parentID, epicDeps) {
 			continue
 		}
 		if ticket.Status != StatusOpen && ticket.Status != StatusReady {
@@ -210,13 +203,7 @@ func HasChildren(rootDir, ticketID string) (bool, error) {
 		if err != nil {
 			return false, err
 		}
-		if ticket.ID == ticketID {
-			continue
-		}
-		if parentOf(&ticket) == ticketID {
-			return true, nil
-		}
-		if _, ok := epicDeps[ticket.ID]; ok {
+		if isChildOf(ticket, ticketID, epicDeps) {
 			return true, nil
 		}
 	}
@@ -248,14 +235,7 @@ func ListAllChildren(rootDir, parentID string) ([]Ticket, error) {
 		if err != nil {
 			return nil, err
 		}
-		if ticket.ID == parentID {
-			continue
-		}
-		isChild := parentOf(&ticket) == parentID
-		if !isChild {
-			_, isChild = epicDeps[ticket.ID]
-		}
-		if !isChild {
+		if !isChildOf(ticket, parentID, epicDeps) {
 			continue
 		}
 		if _, ok := seen[ticket.ID]; ok {
@@ -265,6 +245,22 @@ func ListAllChildren(rootDir, parentID string) ([]Ticket, error) {
 		children = append(children, ticket)
 	}
 	return children, nil
+}
+
+// isChildOf reports whether ticket is a direct child of parentID based on
+// canonical child-membership rules: either the ticket's parent frontmatter
+// points to parentID, or the ticket's ID appears in parentID's epic deps set.
+// The parent ticket itself is never its own child. Peer tk links are
+// navigation aids and are intentionally not treated as child edges.
+func isChildOf(ticket Ticket, parentID string, epicDeps map[string]struct{}) bool {
+	if ticket.ID == parentID {
+		return false
+	}
+	if parentOf(&ticket) == parentID {
+		return true
+	}
+	_, ok := epicDeps[ticket.ID]
+	return ok
 }
 
 // extractHeadingTitle extracts the title from the first # heading in the body.

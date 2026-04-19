@@ -1166,6 +1166,103 @@ func TestRunSubEpicBasic(t *testing.T) {
 	}
 }
 
+// TestRunEpicSubWaveVerificationFailureBlocks verifies that when wave-level
+// quality commands fail for a sub-wave, the parent epic blocks instead of
+// silently accepting nested work. This guards against sub-epic behavior being
+// weaker than top-level waves (no verification gate).
+//
+// We use a counter-based quality command that passes the first time (so the
+// single sub-ticket's ticket-level verification succeeds) and fails on all
+// subsequent calls (so the wave-level verification for the sub-wave fails).
+func TestRunEpicSubWaveVerificationFailureBlocks(t *testing.T) {
+	repoRoot := t.TempDir()
+	baseCommit := initEpicRepo(t, repoRoot)
+	cfg := policy.DefaultConfig()
+	cfg.Scheduler.MaxDepth = 3
+	// Disable wave repair so verification failure is immediate and deterministic.
+	cfg.Policy.MaxWaveRepairCycles = 0
+
+	counterFile := filepath.Join(repoRoot, ".verk", "verify-counter")
+	// Use /bin/sh: pass on first invocation, fail on any later invocation.
+	// Sub-wave verification is the 2nd call after the grandchild's
+	// ticket-level verification succeeds.
+	script := fmt.Sprintf(
+		"COUNT=$(cat %s 2>/dev/null || echo 0); NEXT=$((COUNT+1)); printf %%s $NEXT > %s; if [ \"$COUNT\" -ge 1 ]; then exit 1; fi",
+		counterFile, counterFile,
+	)
+	cfg.Verification.QualityCommands = []policy.QualityCommand{{Path: ".", Run: []string{script}}}
+
+	epic := epicTicket("epic-subwave-verify-fail")
+	mustSaveTicket(t, repoRoot, epic)
+
+	parentTask := epicChildTicket("parent-verify-fail", epic.ID, tkmd.StatusOpen, nil, []string{"internal/app"})
+	mustSaveTicket(t, repoRoot, parentTask)
+
+	grandchild := epicChildTicket("grandchild-verify-fail", parentTask.ID, tkmd.StatusOpen, nil, []string{"internal/app/sub"})
+	mustSaveTicket(t, repoRoot, grandchild)
+
+	adapter := newReflectingAdapter(2)
+
+	runID := "run-subwave-verify-fail"
+	result, err := RunEpic(context.Background(), RunEpicRequest{
+		RepoRoot:     repoRoot,
+		RunID:        runID,
+		RootTicketID: epic.ID,
+		BaseCommit:   baseCommit,
+		Adapter:      adapter,
+		Config:       cfg,
+	})
+	if err == nil {
+		t.Fatal("expected error when sub-wave verification fails, got nil")
+	}
+
+	if result.Run.Status != state.EpicRunStatusBlocked {
+		t.Fatalf("expected blocked run after sub-wave verification failure, got %q", result.Run.Status)
+	}
+
+	subWaveID := fmt.Sprintf("sub-%s-wave-1", parentTask.ID)
+	var subWave state.WaveArtifact
+	if err := state.LoadJSON(waveArtifactPath(repoRoot, runID, subWaveID), &subWave); err != nil {
+		t.Fatalf("load sub-wave artifact: %v", err)
+	}
+	if got, ok := subWave.Acceptance["wave_verification_passed"].(bool); !ok || got {
+		t.Fatalf("expected sub-wave verification_passed=false, acceptance=%v", subWave.Acceptance)
+	}
+}
+
+// TestRunSubEpicClaimCheckErrorBlocksParent verifies that if the sub-wave's
+// claim-release check returns an error (e.g., corrupted claim artifact), the
+// sub-epic returns a blocked outcome with the underlying error rather than
+// silently accepting the sub-wave.
+func TestRunSubEpicClaimCheckErrorBlocksParent(t *testing.T) {
+	repoRoot := t.TempDir()
+	runID := "run-subwave-claim-err"
+
+	// Seed an unparseable claim artifact in the claims directory so
+	// waveClaimsReleased returns an error on load. This mirrors what a
+	// corrupted on-disk claim would look like between sub-ticket completion
+	// and the parent-level acceptance gate.
+	claimDir := filepath.Join(repoRoot, ".verk", "runs", runID, "claims")
+	if err := os.MkdirAll(claimDir, 0o755); err != nil {
+		t.Fatalf("mkdir claims: %v", err)
+	}
+	ticketID := "grandchild-claim-check"
+	if err := os.WriteFile(filepath.Join(claimDir, "claim-"+ticketID+".json"), []byte("not-json"), 0o644); err != nil {
+		t.Fatalf("seed corrupt claim: %v", err)
+	}
+
+	// Directly exercise the helper to confirm a corrupt claim surfaces as an
+	// error (not (false, nil)), which is what the sub-epic gate relies on to
+	// block the parent ticket.
+	ok, err := waveClaimsReleased(repoRoot, runID, []string{ticketID})
+	if err == nil {
+		t.Fatal("expected error from waveClaimsReleased with corrupt claim, got nil")
+	}
+	if ok {
+		t.Fatalf("expected claimsReleased=false on error, got %v", ok)
+	}
+}
+
 // TestRunEpicBlockedGrandchildTerminatesRun is a regression test for the bug
 // where a blocked descendant left the parent sub-epic ticket in open/ready state,
 // causing the outer RunEpic loop to reschedule the same parent repeatedly and
@@ -1245,12 +1342,6 @@ func TestRunEpicBlockedGrandchildTerminatesRun(t *testing.T) {
 	}
 }
 
-// TestRunEpicLinkedSiblingsNotEachOthersChildren is an engine-level regression
-// test for the bug where peer tk links between siblings were treated as child
-// edges by recursive epic execution. When sib-a links to sib-b and sib-b links
-// to sib-a, neither should be discovered as a child of the other. The parent
-// epic must complete in a single wave with both siblings dispatched as flat
-// (non-sub-epic) tickets.
 // TestRunEpicContextCancellation verifies that cancelling the context passed to
 // RunEpic causes the run to terminate promptly rather than hanging until workers
 // finish normally. This mirrors the behaviour triggered by Ctrl-C / SIGINT at
@@ -1311,6 +1402,12 @@ func TestRunEpicContextCancellation(t *testing.T) {
 	}
 }
 
+// TestRunEpicLinkedSiblingsNotEachOthersChildren is an engine-level regression
+// test for the bug where peer tk links between siblings were treated as child
+// edges by recursive epic execution. When sib-a links to sib-b and sib-b links
+// to sib-a, neither should be discovered as a child of the other. The parent
+// epic must complete in a single wave with both siblings dispatched as flat
+// (non-sub-epic) tickets.
 func TestRunEpicLinkedSiblingsNotEachOthersChildren(t *testing.T) {
 	repoRoot := t.TempDir()
 	baseCommit := initEpicRepo(t, repoRoot)

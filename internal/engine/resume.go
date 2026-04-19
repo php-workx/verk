@@ -501,12 +501,14 @@ func resumeEpicMode(ctx context.Context, req ResumeRequest, artifacts *runArtifa
 			return allResumed, err
 		}
 		closedCount := countClosedTickets(outcomes)
+		blockedIDs := collectBlockedTicketIDs(outcomes)
 		SendProgress(ctx, req.Progress, ProgressEvent{
-			Type:    EventWaveCompleted,
-			WaveID:  waveOrdinal,
-			Closed:  closedCount,
-			Total:   len(wave.TicketIDs),
-			Success: acceptedWave.Status == state.WaveStatusAccepted,
+			Type:           EventWaveCompleted,
+			WaveID:         waveOrdinal,
+			Closed:         closedCount,
+			Total:          len(wave.TicketIDs),
+			Success:        acceptedWave.Status == state.WaveStatusAccepted,
+			BlockedTickets: blockedIDs,
 		})
 		artifacts.Run.WaveIDs = append(artifacts.Run.WaveIDs, acceptedWave.WaveID)
 		artifacts.Run.UpdatedAt = time.Now().UTC()

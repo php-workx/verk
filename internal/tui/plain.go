@@ -17,11 +17,25 @@ func RunPlainProgress(w io.Writer, ch <-chan engine.ProgressEvent) {
 			_, _ = fmt.Fprintf(w, "[%s] %s\n", plainWaveLabel(evt), strings.Join(evt.Tickets, ", "))
 
 		case engine.EventWaveCompleted:
+			// Three-way marker so partial (accepted-with-warnings) waves are
+			// visually distinct from fully-closed and hard-failed waves.
 			mark := "✓"
-			if !evt.Success {
+			switch {
+			case !evt.Success:
 				mark = "✗"
+			case len(evt.BlockedTickets) > 0:
+				mark = "⚠"
 			}
-			_, _ = fmt.Fprintf(w, "[%s] %d/%d closed %s\n", plainWaveLabel(evt), evt.Closed, evt.Total, mark)
+			line := fmt.Sprintf("[%s] %d/%d closed %s", plainWaveLabel(evt), evt.Closed, evt.Total, mark)
+			if len(evt.BlockedTickets) > 0 {
+				line += " — blocked: " + strings.Join(evt.BlockedTickets, ", ")
+			}
+			_, _ = fmt.Fprintln(w, line)
+			// Render per-blocked-ticket explanations so the summary never
+			// hides a blocked ticket behind a "3/4 closed" tally.
+			for _, d := range evt.BlockedTicketDetails {
+				renderPlainBlockedTicket(w, d)
+			}
 
 		case engine.EventTicketPhaseChanged:
 			label := evt.TicketID
@@ -47,7 +61,15 @@ func RunPlainProgress(w io.Writer, ch <-chan engine.ProgressEvent) {
 			}
 
 		case engine.EventTicketDetail:
-			_, _ = fmt.Fprintf(w, "           %s\n", evt.Detail)
+			// Prefix with the ticket ID when the engine attributes the detail
+			// to a specific ticket; otherwise emit a bare activity line. This
+			// preserves the ticket ID in the final blocked-epic summary where
+			// the engine emits one detail line per non-closed child.
+			if evt.TicketID != "" {
+				_, _ = fmt.Fprintf(w, "           %s: %s\n", evt.TicketID, evt.Detail)
+			} else {
+				_, _ = fmt.Fprintf(w, "           %s\n", evt.Detail)
+			}
 
 		case engine.EventRunCompleted:
 			// nothing to print — the caller handles final status
@@ -60,4 +82,29 @@ func plainWaveLabel(evt engine.ProgressEvent) string {
 		return fmt.Sprintf("sub-wave %d for %s", evt.WaveID, evt.ParentTicketID)
 	}
 	return fmt.Sprintf("wave %d", evt.WaveID)
+}
+
+// renderPlainBlockedTicket writes a single explicit blocked-ticket line,
+// covering the acceptance-criteria items for ver-ssp3: ticket id, phase,
+// block reason, whether user input is required, and whether `verk run` can
+// retry automatically.
+func renderPlainBlockedTicket(w io.Writer, d engine.BlockedTicketSummary) {
+	phase := string(d.Phase)
+	if phase == "" {
+		phase = "unknown"
+	}
+	reason := d.BlockReason
+	if reason == "" {
+		reason = "no block reason recorded"
+	}
+	var retry string
+	switch {
+	case d.RequiresOperator:
+		retry = "requires operator"
+	case d.CanRetryAutomatically:
+		retry = "retry: verk run"
+	default:
+		retry = "manual follow-up"
+	}
+	_, _ = fmt.Fprintf(w, "           - %s [%s] %s (%s)\n", d.TicketID, phase, reason, retry)
 }

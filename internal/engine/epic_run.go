@@ -23,6 +23,97 @@ import (
 // distinguish this from hard failures.
 var ErrEpicBlocked = errors.New("epic run blocked")
 
+// BlockedTicket is a terminating ticket captured at the end of a blocked epic
+// run. It aggregates the minimum information a caller needs to render operator
+// guidance ("ticket X blocked because Y, retry with `verk reopen ...`") without
+// forcing the CLI to re-load snapshots from disk.
+type BlockedTicket struct {
+	// ID is the canonical ticket identifier.
+	ID string
+	// Title is the human-readable ticket title, empty when unavailable.
+	Title string
+	// Status is the ticket-store status at the moment the run stopped.
+	Status tkmd.Status
+	// Reason is the best available block reason. It prefers the worker-reported
+	// BlockReason from the ticket snapshot and falls back to a structural
+	// description (blocked, waiting on deps, …) when no snapshot reason exists.
+	Reason string
+}
+
+// BlockedRunError is the error returned by RunEpic when a run terminates
+// without completing. It unwraps to ErrEpicBlocked so existing
+// errors.Is(err, ErrEpicBlocked) checks keep working, and it carries enough
+// structured detail for CLI callers to render actionable retry guidance.
+type BlockedRunError struct {
+	RunID          string
+	Status         state.EpicRunStatus
+	BlockedTickets []BlockedTicket
+	// Cause is the underlying engine error, if any (wave failure, acceptance
+	// error, verification error). Nil when the run simply ran out of ready
+	// tickets.
+	Cause error
+}
+
+// Error renders a compact single-line summary. The CLI prints a more detailed
+// multi-line version alongside this error; the summary is what shows up in
+// logs and when the error is printed by Cobra's default handler.
+func (e *BlockedRunError) Error() string {
+	if e == nil {
+		return ErrEpicBlocked.Error()
+	}
+	ids := make([]string, 0, len(e.BlockedTickets))
+	for _, t := range e.BlockedTickets {
+		ids = append(ids, t.ID)
+	}
+	switch {
+	case len(ids) > 0 && e.Cause != nil:
+		return fmt.Sprintf("%s: %s (blocked tickets: %s): %v", ErrEpicBlocked.Error(), e.Status, strings.Join(ids, ", "), e.Cause)
+	case len(ids) > 0:
+		return fmt.Sprintf("%s: %s (blocked tickets: %s)", ErrEpicBlocked.Error(), e.Status, strings.Join(ids, ", "))
+	case e.Cause != nil:
+		return fmt.Sprintf("%s: %s: %v", ErrEpicBlocked.Error(), e.Status, e.Cause)
+	default:
+		return fmt.Sprintf("%s: %s", ErrEpicBlocked.Error(), e.Status)
+	}
+}
+
+// Unwrap returns ErrEpicBlocked so errors.Is(err, ErrEpicBlocked) succeeds for
+// any BlockedRunError value. The underlying Cause is intentionally not exposed
+// via Unwrap: surfacing the sentinel is what existing callers rely on.
+func (e *BlockedRunError) Unwrap() error { return ErrEpicBlocked }
+
+// collectBlockedTickets builds a BlockedTicket list for the supplied children,
+// preferring the BlockReason stored in each ticket's run snapshot over the
+// structural fallback returned by describeNotReady. Closed tickets are skipped
+// so the result only contains the tickets responsible for the blocked state.
+// Snapshot read errors are silently ignored: in those cases the structural
+// description is used instead, so CLI output still names the ticket even when
+// its snapshot artifact is missing or malformed.
+func collectBlockedTickets(repoRoot, runID string, children []tkmd.Ticket) []BlockedTicket {
+	var out []BlockedTicket
+	for _, child := range children {
+		if child.Status == tkmd.StatusClosed {
+			continue
+		}
+		reason := describeNotReady(child)
+		if runID != "" {
+			var snap TicketRunSnapshot
+			if err := loadTicketSnapshot(repoRoot, runID, child.ID, &snap); err == nil {
+				if trimmed := strings.TrimSpace(snap.BlockReason); trimmed != "" {
+					reason = trimmed
+				}
+			}
+		}
+		out = append(out, BlockedTicket{
+			ID:     child.ID,
+			Title:  child.Title,
+			Status: child.Status,
+			Reason: reason,
+		})
+	}
+	return out
+}
+
 type RunEpicRequest struct {
 	RepoRoot             string
 	RunID                string
@@ -175,7 +266,12 @@ func RunEpic(ctx context.Context, req RunEpicRequest) (RunEpicResult, error) { /
 				return result, err
 			}
 			if status != state.EpicRunStatusCompleted {
-				return result, fmt.Errorf("%w: %s", ErrEpicBlocked, status)
+				emitBlockedEpicSummary(ctx, req.Progress, currentChildren)
+				return result, &BlockedRunError{
+					RunID:          req.RunID,
+					Status:         status,
+					BlockedTickets: collectBlockedTickets(req.RepoRoot, req.RunID, currentChildren),
+				}
 			}
 			return result, nil
 		}
@@ -274,6 +370,7 @@ func RunEpic(ctx context.Context, req RunEpicRequest) (RunEpicResult, error) { /
 			return result, err
 		}
 
+		ticketDetails := buildWaveTicketDetails(req.RepoRoot, req.RunID, wave.TicketIDs, outcomes)
 		acceptedWave, acceptErr := AcceptWave(WaveAcceptanceRequest{
 			Wave:                 wave,
 			TicketPhases:         ticketPhases,
@@ -281,6 +378,7 @@ func RunEpic(ctx context.Context, req RunEpicRequest) (RunEpicResult, error) { /
 			TicketScopes:         ticketScopes,
 			ClaimsReleased:       claimsReleased,
 			PersistenceSucceeded: true,
+			TicketDetails:        ticketDetails,
 		})
 		if waveFailed {
 			acceptedWave.Status = state.WaveStatusFailed
@@ -303,12 +401,16 @@ func RunEpic(ctx context.Context, req RunEpicRequest) (RunEpicResult, error) { /
 			return result, err
 		}
 		closedCount := countClosedTickets(outcomes)
+		blockedIDs := collectBlockedTicketIDs(outcomes)
+		blockedDetails := waveBlockedTicketEvents(blockedIDs, ticketPhases, wave.TicketIDs, ticketDetails)
 		SendProgress(ctx, req.Progress, ProgressEvent{
-			Type:    EventWaveCompleted,
-			WaveID:  waveOrdinal,
-			Closed:  closedCount,
-			Total:   len(wave.TicketIDs),
-			Success: acceptedWave.Status == state.WaveStatusAccepted,
+			Type:                 EventWaveCompleted,
+			WaveID:               waveOrdinal,
+			Closed:               closedCount,
+			Total:                len(wave.TicketIDs),
+			Success:              acceptedWave.Status == state.WaveStatusAccepted,
+			BlockedTickets:       blockedIDs,
+			BlockedTicketDetails: blockedDetails,
 		})
 		result.Waves = append(result.Waves, acceptedWave)
 		result.Run.WaveIDs = append(result.Run.WaveIDs, acceptedWave.WaveID)
@@ -332,7 +434,20 @@ func RunEpic(ctx context.Context, req RunEpicRequest) (RunEpicResult, error) { /
 			if err := state.SaveJSONAtomic(runPath, result.Run); err != nil {
 				return result, errors.Join(blockErr, fmt.Errorf("persist run state: %w", err))
 			}
-			return result, blockErr
+			// Wrap the wave failure in BlockedRunError so the CLI can render the
+			// same retry guidance it uses for the "no ready tickets" branch.
+			// Re-read the current ticket store so block reasons reflect the state
+			// written by each ticket's finalization defer.
+			blockedChildren, childErr := listEpicChildren(req.RepoRoot, req.RootTicketID)
+			if childErr != nil {
+				return result, blockErr
+			}
+			return result, &BlockedRunError{
+				RunID:          req.RunID,
+				Status:         state.EpicRunStatusBlocked,
+				BlockedTickets: collectBlockedTickets(req.RepoRoot, req.RunID, blockedChildren),
+				Cause:          blockErr,
+			}
 		}
 
 		// Run wave-level verification after all tickets merge. Mark pending in
@@ -523,6 +638,37 @@ func (r *subEpicRegistrar) registerSubWave(subWaveID string, descendantIDs []str
 	return state.SaveJSONAtomic(r.runPath, *r.run)
 }
 
+// setPendingSubWaveVerification marks a sub-wave as pending verification in
+// the run's resume cursor and persists the run artifact. This matches the
+// top-level wave path so a crash mid-repair is recoverable via resume.
+func (r *subEpicRegistrar) setPendingSubWaveVerification(waveID string) error {
+	if r == nil {
+		return nil
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.run.ResumeCursor == nil {
+		r.run.ResumeCursor = map[string]any{}
+	}
+	setPendingWaveVerification(r.run.ResumeCursor, waveID)
+	r.run.UpdatedAt = time.Now().UTC()
+	return state.SaveJSONAtomic(r.runPath, *r.run)
+}
+
+// clearPendingSubWaveVerification clears the pending-verification marker and
+// persists the run artifact, matching the top-level wave path after a
+// successful verification loop.
+func (r *subEpicRegistrar) clearPendingSubWaveVerification() error {
+	if r == nil {
+		return nil
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	clearPendingWaveVerification(r.run.ResumeCursor)
+	r.run.UpdatedAt = time.Now().UTC()
+	return state.SaveJSONAtomic(r.runPath, *r.run)
+}
+
 // buildTicketScopes creates a map of ticket ID -> owned paths from a ticket list.
 // This is used for per-ticket scope validation during wave acceptance.
 func buildTicketScopes(tickets []tkmd.Ticket) map[string][]string {
@@ -589,7 +735,7 @@ func resetOrphanedChildren(repoRoot string, children []tkmd.Ticket) error {
 // The parent ticket is not run here — the caller runs it after sub-tickets complete.
 // ancestors is the set of epic IDs already in the current call chain; it is used
 // to detect circular epic-child relationships and return a blocked outcome early.
-func runSubEpic(ctx context.Context, req RunEpicRequest, cfg policy.Config, parentTicketID string, parentWave state.WaveArtifact, depth int, ancestors map[string]struct{}, reg *subEpicRegistrar) waveTicketOutcome {
+func runSubEpic(ctx context.Context, req RunEpicRequest, cfg policy.Config, parentTicketID string, parentWave state.WaveArtifact, depth int, ancestors map[string]struct{}, reg *subEpicRegistrar) waveTicketOutcome { //nolint:gocognit,cyclop // orchestration loop mirroring RunEpic; refactored hotspots live in helpers
 	outcome := waveTicketOutcome{ticketID: parentTicketID, phase: state.TicketPhaseBlocked}
 
 	// Cycle guard: if this ticket already appears in the ancestor chain we have
@@ -631,6 +777,14 @@ func runSubEpic(ctx context.Context, req RunEpicRequest, cfg policy.Config, pare
 		return outcome
 	}
 
+	// Reuse a single git.Repo handle across iterations to compute per-sub-wave
+	// baselines and changed file sets, mirroring the top-level RunEpic loop.
+	repo, err := git.New(req.RepoRoot)
+	if err != nil {
+		outcome.err = fmt.Errorf("open repo for sub-epic %s: %w", parentTicketID, err)
+		return outcome
+	}
+
 	// Run the mini wave loop until all children are closed or the sub-epic is blocked.
 	subWaveOrdinal := 0
 	for {
@@ -644,6 +798,7 @@ func runSubEpic(ctx context.Context, req RunEpicRequest, cfg policy.Config, pare
 			outcome.err = fmt.Errorf("list ready children of %s: %w", parentTicketID, err)
 			return outcome
 		}
+		ticketScopes := buildTicketScopes(ready)
 		if len(ready) == 0 {
 			// Check completion status of all children.
 			currentChildren, err := tkmd.ListAllChildren(req.RepoRoot, parentTicketID)
@@ -688,6 +843,16 @@ func runSubEpic(ctx context.Context, req RunEpicRequest, cfg policy.Config, pare
 			return outcome
 		}
 
+		// Capture the pre-wave changed-file baseline so changes introduced by
+		// this sub-wave can be isolated for per-ticket scope validation.
+		subWaveBaselineChangedFiles, err := repo.ChangedFilesAgainst(subWave.WaveBaseCommit)
+		if err != nil {
+			outcome.err = fmt.Errorf("baseline changed files for sub-wave %s: %w", subWaveID, err)
+			outcome.phase = state.TicketPhaseBlocked
+			return outcome
+		}
+		subWaveBaselineChangedFiles = filterEngineOwnedFiles(subWaveBaselineChangedFiles)
+
 		SendProgress(ctx, req.Progress, ProgressEvent{
 			Type:           EventWaveStarted,
 			WaveID:         subWaveOrdinal,
@@ -708,40 +873,130 @@ func runSubEpic(ctx context.Context, req RunEpicRequest, cfg policy.Config, pare
 		}
 		wg.Wait()
 
+		ticketPhases := make([]state.TicketPhase, len(outcomes))
 		allClosed := true
-		for _, o := range outcomes {
+		waveFailed := false
+		var waveErr error
+		for i, o := range outcomes {
+			ticketPhases[i] = o.phase
 			if o.phase != state.TicketPhaseClosed {
 				allClosed = false
 			}
 			if o.err != nil {
-				outcome.err = o.err
+				waveFailed = true
+				if waveErr == nil {
+					waveErr = o.err
+				}
 			}
 		}
 
-		// Update sub-wave artifact with final status.
-		now := time.Now().UTC()
-		if allClosed && outcome.err == nil {
-			subWave.Status = state.WaveStatusAccepted
-		} else {
-			subWave.Status = state.WaveStatusFailed
+		// Compute the files this sub-wave actually touched so per-ticket scope
+		// and baseline accounting mirror the top-level wave gates.
+		changedFiles, err := repo.ChangedFilesAgainst(subWave.WaveBaseCommit)
+		if err != nil {
+			outcome.err = fmt.Errorf("list changed files for sub-wave %s: %w", subWaveID, err)
+			outcome.phase = state.TicketPhaseBlocked
+			return outcome
 		}
-		subWave.UpdatedAt = now
-		subWave.FinishedAt = now
-		// Best-effort: failure to update the artifact does not block ticket outcomes.
-		_ = state.SaveJSONAtomic(subWavePath, subWave)
+		changedFiles = filterEngineOwnedFiles(changedFiles)
+		changedFiles = subtractFiles(changedFiles, subWaveBaselineChangedFiles)
 
+		claimsReleased, err := waveClaimsReleased(req.RepoRoot, req.RunID, subWave.TicketIDs)
+		if err != nil {
+			outcome.err = fmt.Errorf("check claims released for sub-wave %s: %w", subWaveID, err)
+			outcome.phase = state.TicketPhaseBlocked
+			return outcome
+		}
+
+		subTicketDetails := buildWaveTicketDetails(req.RepoRoot, req.RunID, subWave.TicketIDs, outcomes)
+		acceptedSubWave, acceptErr := AcceptWave(WaveAcceptanceRequest{
+			Wave:                 subWave,
+			TicketPhases:         ticketPhases,
+			ChangedFiles:         changedFiles,
+			TicketScopes:         ticketScopes,
+			ClaimsReleased:       claimsReleased,
+			PersistenceSucceeded: true,
+			TicketDetails:        subTicketDetails,
+		})
+		if waveFailed {
+			acceptedSubWave.Status = state.WaveStatusFailed
+			if acceptedSubWave.Acceptance == nil {
+				acceptedSubWave.Acceptance = map[string]any{}
+			}
+			if waveErr != nil {
+				acceptedSubWave.Acceptance["crash_reason"] = waveErr.Error()
+			}
+		}
+		// The parent-ticket contract is that every child must close before the
+		// sub-wave is accepted. AcceptWave treats blocked tickets as a soft
+		// warning, so override to Failed when any child did not close.
+		if !allClosed && acceptedSubWave.Status == state.WaveStatusAccepted {
+			acceptedSubWave.Status = state.WaveStatusFailed
+		}
+		if acceptedSubWave.Acceptance == nil {
+			acceptedSubWave.Acceptance = map[string]any{}
+		}
+		acceptedSubWave.Acceptance["baseline_changed_files"] = append([]string(nil), subWaveBaselineChangedFiles...)
+		now := time.Now().UTC()
+		acceptedSubWave.UpdatedAt = now
+		if acceptedSubWave.FinishedAt.IsZero() {
+			acceptedSubWave.FinishedAt = now
+		}
+		if err := state.SaveJSONAtomic(subWavePath, acceptedSubWave); err != nil {
+			outcome.err = fmt.Errorf("persist sub-wave %s: %w", subWaveID, err)
+			outcome.phase = state.TicketPhaseBlocked
+			return outcome
+		}
+
+		subBlockedIDs := collectBlockedTicketIDs(outcomes)
+		subBlockedDetails := waveBlockedTicketEvents(subBlockedIDs, ticketPhases, subWave.TicketIDs, subTicketDetails)
 		SendProgress(ctx, req.Progress, ProgressEvent{
-			Type:           EventWaveCompleted,
-			WaveID:         subWaveOrdinal,
-			ParentTicketID: parentTicketID,
-			Closed:         countClosedTickets(outcomes),
-			Total:          len(outcomes),
-			Success:        allClosed,
+			Type:                 EventWaveCompleted,
+			WaveID:               subWaveOrdinal,
+			ParentTicketID:       parentTicketID,
+			Closed:               countClosedTickets(outcomes),
+			Total:                len(outcomes),
+			Success:              acceptedSubWave.Status == state.WaveStatusAccepted,
+			BlockedTickets:       subBlockedIDs,
+			BlockedTicketDetails: subBlockedDetails,
 		})
 
+		if acceptErr != nil {
+			outcome.err = acceptErr
+			outcome.phase = state.TicketPhaseBlocked
+			return outcome
+		}
+		if waveFailed {
+			outcome.phase = state.TicketPhaseBlocked
+			if outcome.err == nil {
+				outcome.err = waveErr
+			}
+			return outcome
+		}
 		if !allClosed {
 			outcome.phase = state.TicketPhaseBlocked
 			return outcome
+		}
+
+		// All children closed and the sub-wave was accepted — run wave-level
+		// verification under the same pending-marker discipline as top-level
+		// waves so a crash mid-repair is recoverable on resume.
+		if acceptedSubWave.Status == state.WaveStatusAccepted {
+			if err := reg.setPendingSubWaveVerification(acceptedSubWave.WaveID); err != nil {
+				outcome.err = fmt.Errorf("mark sub-wave %s pending verification: %w", subWaveID, err)
+				outcome.phase = state.TicketPhaseBlocked
+				return outcome
+			}
+			if verifyErr := runWaveVerificationLoop(ctx, req, cfg, &acceptedSubWave, subWavePath, changedFiles); verifyErr != nil {
+				outcome.err = verifyErr
+				outcome.phase = state.TicketPhaseBlocked
+				return outcome
+			}
+			if err := reg.clearPendingSubWaveVerification(); err != nil {
+				outcome.err = fmt.Errorf("clear sub-wave %s pending verification: %w", subWaveID, err)
+				outcome.phase = state.TicketPhaseBlocked
+				return outcome
+			}
 		}
 	}
 }
@@ -757,10 +1012,9 @@ func executeEpicTicket(ctx context.Context, req RunEpicRequest, cfg policy.Confi
 
 	// If this ticket has children and we haven't exceeded max depth, run the
 	// sub-tickets first (recursive mini-epic loop), then run the parent ticket.
+	// cfg has already been run through normalizeEpicConfig at the top of RunEpic,
+	// so cfg.Scheduler.MaxDepth is guaranteed positive here.
 	maxDepth := cfg.Scheduler.MaxDepth
-	if maxDepth <= 0 {
-		maxDepth = 3
-	}
 	hasChildren, err := tkmd.HasChildren(req.RepoRoot, ticketID)
 	if err != nil {
 		outcome.err = fmt.Errorf("check children of %s: %w", ticketID, err)
@@ -886,4 +1140,108 @@ func countClosedTickets(outcomes []waveTicketOutcome) int {
 		}
 	}
 	return count
+}
+
+// collectBlockedTicketIDs returns the IDs of wave tickets that did not reach
+// TicketPhaseClosed, preserving the original wave ordering. Returns nil when
+// every ticket closed.
+func collectBlockedTicketIDs(outcomes []waveTicketOutcome) []string {
+	var blocked []string
+	for _, o := range outcomes {
+		if o.phase != state.TicketPhaseClosed {
+			blocked = append(blocked, o.ticketID)
+		}
+	}
+	return blocked
+}
+
+// buildWaveTicketDetails resolves the per-ticket BlockedTicketSummary fields
+// the wave needs to write a clear "ticket X blocked because Y" entry. It
+// reads each ticket snapshot for its block reason and falls back to phase-
+// based defaults when the snapshot is missing or empty. The returned map is
+// keyed by ticket ID; tickets that closed normally are still recorded so
+// AcceptWave can pick up titles for any later "blocked" surfacing.
+func buildWaveTicketDetails(repoRoot, runID string, ticketIDs []string, outcomes []waveTicketOutcome) map[string]WaveTicketDetail {
+	details := make(map[string]WaveTicketDetail, len(ticketIDs))
+	outcomeByID := make(map[string]waveTicketOutcome, len(outcomes))
+	for _, o := range outcomes {
+		outcomeByID[o.ticketID] = o
+	}
+	for _, id := range ticketIDs {
+		detail := WaveTicketDetail{}
+		// Prefer the worker- or engine-recorded BlockReason from the
+		// per-ticket snapshot, which captures both worker-side
+		// needs_context strings and engine-side non-convergent reasons.
+		var snap TicketRunSnapshot
+		if err := loadTicketSnapshot(repoRoot, runID, id, &snap); err == nil {
+			if reason := strings.TrimSpace(snap.BlockReason); reason != "" {
+				detail.BlockReason = reason
+			}
+		}
+		// Match the snapshot's title via the ticket store if we can.
+		if t, err := loadEpicTicket(repoRoot, id); err == nil {
+			detail.Title = t.Title
+		}
+		// A canonical non-convergent escalation always requires operator
+		// input — verk's automated retry loop has already given up.
+		if strings.Contains(detail.BlockReason, string(state.EscalationNonConvergentVerification)) ||
+			strings.Contains(detail.BlockReason, string(state.EscalationNonConvergentReview)) {
+			detail.RequiresOperator = true
+		}
+		// Outcomes track in-memory phases — anything stuck in a non-terminal
+		// phase is still safe for `verk run` to pick up automatically.
+		if o, ok := outcomeByID[id]; ok && o.phase != state.TicketPhaseClosed && o.phase != state.TicketPhaseBlocked {
+			detail.CanRetryAutomatically = true
+		}
+		details[id] = detail
+	}
+	return details
+}
+
+// waveBlockedTicketEvents builds the BlockedTicketDetails slice carried on
+// EventWaveCompleted progress events. The slice mirrors the wave-level
+// blocked_ticket_details acceptance entry so downstream consumers (TUI, log
+// scrapers, automation) can render explicit per-ticket explanations without
+// re-reading the wave artifact from disk.
+func waveBlockedTicketEvents(blockedIDs []string, ticketPhases []state.TicketPhase, ticketIDs []string, details map[string]WaveTicketDetail) []BlockedTicketSummary {
+	if len(blockedIDs) == 0 {
+		return nil
+	}
+	phaseByID := make(map[string]state.TicketPhase, len(ticketIDs))
+	for i, id := range ticketIDs {
+		if i >= len(ticketPhases) {
+			break
+		}
+		phaseByID[id] = ticketPhases[i]
+	}
+	out := make([]BlockedTicketSummary, 0, len(blockedIDs))
+	for _, id := range blockedIDs {
+		out = append(out, buildBlockedTicketSummary(id, phaseByID[id], details[id]))
+	}
+	return out
+}
+
+// emitBlockedEpicSummary emits a single progress event summarising the blocked
+// or waiting tickets that prevented the epic from completing. Per-ticket
+// EventTicketDetail lines still describe each child individually; this
+// additional one-line summary makes the terminating state visible at a glance
+// even when those per-ticket lines have scrolled off the activity log.
+func emitBlockedEpicSummary(ctx context.Context, ch chan<- ProgressEvent, children []tkmd.Ticket) {
+	if ch == nil {
+		return
+	}
+	var parts []string
+	for _, child := range children {
+		if child.Status == tkmd.StatusClosed {
+			continue
+		}
+		parts = append(parts, fmt.Sprintf("%s (%s)", child.ID, describeNotReady(child)))
+	}
+	if len(parts) == 0 {
+		return
+	}
+	SendProgress(ctx, ch, ProgressEvent{
+		Type:   EventTicketDetail,
+		Detail: fmt.Sprintf("epic blocked — %d ticket(s) not closed: %s", len(parts), strings.Join(parts, ", ")),
+	})
 }

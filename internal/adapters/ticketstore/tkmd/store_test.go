@@ -341,6 +341,27 @@ func TestListAllChildren(t *testing.T) {
 	}
 }
 
+func TestListAllChildren_MissingParent(t *testing.T) {
+	dir := t.TempDir()
+
+	// Seed the repo with unrelated tickets so the .tickets directory exists and
+	// the glob has something to find, but the parent we query does not.
+	writeTicketToRepo(t, dir, "unrelated-1", "", StatusOpen)
+	writeTicketToRepo(t, dir, "unrelated-2", "some-other-parent", StatusOpen)
+
+	missingID := "nonexistent-epic"
+	children, err := ListAllChildren(dir, missingID)
+	if err == nil {
+		t.Fatalf("expected non-nil error for missing parent %q, got children=%v", missingID, children)
+	}
+	if children != nil {
+		t.Fatalf("expected nil children slice on error, got %v", children)
+	}
+	if !strings.Contains(err.Error(), missingID) {
+		t.Fatalf("expected error message to reference missing parent %q, got: %v", missingID, err)
+	}
+}
+
 func TestHasChildrenViaDeps(t *testing.T) {
 	dir := t.TempDir()
 

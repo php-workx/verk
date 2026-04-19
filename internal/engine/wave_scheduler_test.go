@@ -163,6 +163,193 @@ func TestAcceptWave_UnscopedTickets_Accepted(t *testing.T) {
 	}
 }
 
+func TestAcceptWave_PartialWave_RecordsBlockedTickets(t *testing.T) {
+	// A four-ticket wave where three tickets close and one is blocked must
+	// still be accepted (engine keeps later ready waves schedulable), but the
+	// wave acceptance must carry the blocked ticket IDs so progress plumbing
+	// can surface them in wave summaries instead of a silent success.
+	wave := state.WaveArtifact{
+		WaveID:    "wave-1",
+		Status:    state.WaveStatusRunning,
+		TicketIDs: []string{"ver-a", "ver-b", "ver-c", "ver-d"},
+	}
+
+	accepted, err := AcceptWave(WaveAcceptanceRequest{
+		Wave: wave,
+		TicketPhases: []state.TicketPhase{
+			state.TicketPhaseClosed,
+			state.TicketPhaseClosed,
+			state.TicketPhaseClosed,
+			state.TicketPhaseBlocked,
+		},
+		ClaimsReleased:       true,
+		PersistenceSucceeded: true,
+	})
+	if err != nil {
+		t.Fatalf("expected partial wave to be accepted with warnings, got error: %v", err)
+	}
+	if accepted.Status != state.WaveStatusAccepted {
+		t.Fatalf("expected WaveStatusAccepted for partial wave, got %q", accepted.Status)
+	}
+	blocked, ok := accepted.Acceptance["blocked_tickets"].([]string)
+	if !ok {
+		t.Fatalf("expected Acceptance[\"blocked_tickets\"] to be []string, got %T", accepted.Acceptance["blocked_tickets"])
+	}
+	if len(blocked) != 1 || blocked[0] != "ver-d" {
+		t.Fatalf("expected blocked_tickets=[ver-d], got %v", blocked)
+	}
+	warnings, ok := accepted.Acceptance["warnings"].([]string)
+	if !ok || len(warnings) == 0 {
+		t.Fatalf("expected warnings slice on partial wave, got %v", accepted.Acceptance["warnings"])
+	}
+}
+
+func TestCollectBlockedTicketIDs_OrderingAndEmptyCases(t *testing.T) {
+	// Helper must preserve wave ordering and return nil (not a zero-length
+	// slice) when every ticket closed, so consumers can rely on a simple
+	// len(BlockedTickets) > 0 check to detect partial waves.
+	outcomes := []waveTicketOutcome{
+		{ticketID: "ver-a", phase: state.TicketPhaseClosed},
+		{ticketID: "ver-b", phase: state.TicketPhaseBlocked},
+		{ticketID: "ver-c", phase: state.TicketPhaseImplement},
+		{ticketID: "ver-d", phase: state.TicketPhaseClosed},
+	}
+	got := collectBlockedTicketIDs(outcomes)
+	want := []string{"ver-b", "ver-c"}
+	if len(got) != len(want) {
+		t.Fatalf("expected %d blocked ids, got %d: %v", len(want), len(got), got)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("expected blocked[%d]=%q, got %q", i, want[i], got[i])
+		}
+	}
+
+	allClosed := []waveTicketOutcome{
+		{ticketID: "ver-a", phase: state.TicketPhaseClosed},
+		{ticketID: "ver-b", phase: state.TicketPhaseClosed},
+	}
+	if ids := collectBlockedTicketIDs(allClosed); ids != nil {
+		t.Fatalf("expected nil when every ticket closed, got %v", ids)
+	}
+}
+
+// TestAcceptWave_BlockedTicketDetails_RecordsExplicitReasons asserts AC3/AC5:
+// a 3-closed + 1-blocked wave records structured per-blocked-ticket details
+// on the wave artifact so downstream consumers can surface the ticket id,
+// phase, block reason, operator-required flag, and automatic-retry flag.
+func TestAcceptWave_BlockedTicketDetails_RecordsExplicitReasons(t *testing.T) {
+	wave := state.WaveArtifact{
+		WaveID:    "wave-1",
+		Status:    state.WaveStatusRunning,
+		TicketIDs: []string{"ver-a", "ver-b", "ver-c", "ver-d"},
+	}
+	details := map[string]WaveTicketDetail{
+		"ver-d": {
+			Title:                 "needs operator",
+			BlockReason:           "non_convergent_verification: give up after 3 cycles",
+			RequiresOperator:      true,
+			CanRetryAutomatically: false,
+		},
+	}
+	accepted, err := AcceptWave(WaveAcceptanceRequest{
+		Wave: wave,
+		TicketPhases: []state.TicketPhase{
+			state.TicketPhaseClosed,
+			state.TicketPhaseClosed,
+			state.TicketPhaseClosed,
+			state.TicketPhaseBlocked,
+		},
+		ClaimsReleased:       true,
+		PersistenceSucceeded: true,
+		TicketDetails:        details,
+	})
+	if err != nil {
+		t.Fatalf("expected partial wave to be accepted, got %v", err)
+	}
+	if accepted.Status != state.WaveStatusAccepted {
+		t.Fatalf("expected accepted status, got %q", accepted.Status)
+	}
+	raw, ok := accepted.Acceptance["blocked_ticket_details"].([]BlockedTicketSummary)
+	if !ok {
+		t.Fatalf("expected blocked_ticket_details []BlockedTicketSummary, got %T", accepted.Acceptance["blocked_ticket_details"])
+	}
+	if len(raw) != 1 {
+		t.Fatalf("expected 1 blocked ticket detail, got %d", len(raw))
+	}
+	got := raw[0]
+	if got.TicketID != "ver-d" {
+		t.Errorf("expected TicketID=ver-d, got %q", got.TicketID)
+	}
+	if got.Phase != state.TicketPhaseBlocked {
+		t.Errorf("expected Phase=blocked, got %q", got.Phase)
+	}
+	if got.BlockReason != "non_convergent_verification: give up after 3 cycles" {
+		t.Errorf("expected block reason preserved, got %q", got.BlockReason)
+	}
+	if !got.RequiresOperator {
+		t.Errorf("expected RequiresOperator=true")
+	}
+	if got.CanRetryAutomatically {
+		t.Errorf("expected CanRetryAutomatically=false for operator-required ticket")
+	}
+
+	// Warnings should surface the reason so log scrapers see it alongside
+	// the bare blocked-id list.
+	warnings, _ := accepted.Acceptance["warnings"].([]string)
+	var sawReason bool
+	for _, w := range warnings {
+		if w == "ver-d blocked: non_convergent_verification: give up after 3 cycles" {
+			sawReason = true
+			break
+		}
+	}
+	if !sawReason {
+		t.Errorf("expected warnings to include the ver-d block reason; got %v", warnings)
+	}
+}
+
+// TestAcceptWave_BlockedTicketDetails_DefaultsForMissingDetail verifies
+// that a blocked ticket with no supplied detail still receives a
+// structural explanation so the wave summary is never silent about why
+// the ticket did not close.
+func TestAcceptWave_BlockedTicketDetails_DefaultsForMissingDetail(t *testing.T) {
+	wave := state.WaveArtifact{
+		WaveID:    "wave-1",
+		Status:    state.WaveStatusRunning,
+		TicketIDs: []string{"ver-a", "ver-b"},
+	}
+	accepted, err := AcceptWave(WaveAcceptanceRequest{
+		Wave: wave,
+		TicketPhases: []state.TicketPhase{
+			state.TicketPhaseClosed,
+			state.TicketPhaseBlocked,
+		},
+		ClaimsReleased:       true,
+		PersistenceSucceeded: true,
+	})
+	if err != nil {
+		t.Fatalf("expected acceptance with warnings, got %v", err)
+	}
+	details, ok := accepted.Acceptance["blocked_ticket_details"].([]BlockedTicketSummary)
+	if !ok || len(details) != 1 {
+		t.Fatalf("expected 1 blocked ticket detail, got %T=%v", accepted.Acceptance["blocked_ticket_details"], accepted.Acceptance["blocked_ticket_details"])
+	}
+	d := details[0]
+	if d.TicketID != "ver-b" {
+		t.Errorf("expected TicketID=ver-b, got %q", d.TicketID)
+	}
+	if d.Phase != state.TicketPhaseBlocked {
+		t.Errorf("expected Phase=blocked, got %q", d.Phase)
+	}
+	if d.BlockReason == "" {
+		t.Errorf("expected structural default BlockReason, got empty string")
+	}
+	if !d.RequiresOperator {
+		t.Errorf("expected RequiresOperator=true for a blocked ticket with no supplied detail")
+	}
+}
+
 func TestAcceptWave_PerTicketScopeValidation(t *testing.T) {
 	wave := state.WaveArtifact{
 		WaveID:       "wave-1",

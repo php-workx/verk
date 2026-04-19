@@ -26,19 +26,27 @@ const (
 // top-level wave ordinals: a top-level wave-2 and a sub-wave-2 for ticket-X
 // are unambiguously different because the sub-wave event carries
 // ParentTicketID="ticket-X".
+//
+// BlockedTickets carries the IDs of tickets in the wave that did not reach
+// the Closed phase (soft blocked / needs-context / implement / verify /
+// review / repair / etc.). Consumers use len(BlockedTickets) > 0 combined
+// with Success to distinguish fully closed (✓), partial/accepted-with-warnings
+// (⚠) and hard-failed (✗) waves.
 type ProgressEvent struct {
-	Time           time.Time         `json:"time"`
-	Type           ProgressEventType `json:"type"`
-	TicketID       string            `json:"ticket_id,omitempty"`
-	Title          string            `json:"title,omitempty"`
-	WaveID         int               `json:"wave_id,omitempty"`
-	ParentTicketID string            `json:"parent_ticket_id,omitempty"`
-	Phase          state.TicketPhase `json:"phase,omitempty"`
-	Detail         string            `json:"detail,omitempty"`
-	Closed         int               `json:"closed,omitempty"`
-	Total          int               `json:"total,omitempty"`
-	Tickets        []string          `json:"tickets,omitempty"`
-	Success        bool              `json:"success,omitempty"`
+	Time                 time.Time              `json:"time"`
+	Type                 ProgressEventType      `json:"type"`
+	TicketID             string                 `json:"ticket_id,omitempty"`
+	Title                string                 `json:"title,omitempty"`
+	WaveID               int                    `json:"wave_id,omitempty"`
+	ParentTicketID       string                 `json:"parent_ticket_id,omitempty"`
+	Phase                state.TicketPhase      `json:"phase,omitempty"`
+	Detail               string                 `json:"detail,omitempty"`
+	Closed               int                    `json:"closed,omitempty"`
+	Total                int                    `json:"total,omitempty"`
+	Tickets              []string               `json:"tickets,omitempty"`
+	BlockedTickets       []string               `json:"blocked_tickets,omitempty"`
+	Success              bool                   `json:"success,omitempty"`
+	BlockedTicketDetails []BlockedTicketSummary `json:"blocked_ticket_details,omitempty"`
 }
 
 // SendProgress sends an event on the channel if it's not nil.

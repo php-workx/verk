@@ -37,7 +37,11 @@ type waveState struct {
 	closed         int
 	total          int
 	done           bool
+	// ok is true when the engine accepted the wave, which can include an
+	// "accepted with warnings" state where some tickets did not close.
 	ok             bool
+	blockedIDs     []string
+	blockedDetails []engine.BlockedTicketSummary
 }
 
 // Model is the Bubble Tea model for verk run progress.
@@ -122,6 +126,11 @@ func (m *Model) handleEvent(evt engine.ProgressEvent) tea.Cmd {
 			w.closed = evt.Closed
 			w.done = true
 			w.ok = evt.Success
+			w.blockedIDs = append([]string(nil), evt.BlockedTickets...)
+			// Preserve the structured blocked-ticket explanations so the
+			// wave summary can show phase / reason / retry routing per
+			// ticket rather than collapsing the blockers to a bare list.
+			w.blockedDetails = append([]engine.BlockedTicketSummary(nil), evt.BlockedTicketDetails...)
 		}
 
 	case engine.EventTicketPhaseChanged:
@@ -207,16 +216,32 @@ func (m Model) View() tea.View {
 func (m Model) renderWave(b *strings.Builder, w *waveState, isCurrent bool) {
 	// Wave header
 	if w.done {
-		mark := styleWaveSummaryOK.Render("✓")
-		if !w.ok {
+		// Three-way mark: green ✓ when every ticket closed, yellow ⚠ when the
+		// wave was accepted but some tickets remain not-closed (soft blocked,
+		// needs-context, etc.), red ✗ when the wave hard-failed.
+		var mark string
+		switch {
+		case !w.ok:
 			mark = styleWaveSummaryFail.Render("✗")
+		case len(w.blockedIDs) > 0:
+			mark = styleWaveSummaryPartial.Render("⚠")
+		default:
+			mark = styleWaveSummaryOK.Render("✓")
 		}
 		summary := fmt.Sprintf("  %s  %d/%d closed %s", waveLabel(w), w.closed, w.total, mark)
+		if len(w.blockedIDs) > 0 {
+			summary += " — blocked: " + strings.Join(w.blockedIDs, ", ")
+		}
 		if !isCurrent {
 			b.WriteString(styleDivider.Render(summary) + "\n")
-			return // Collapsed — don't show ticket lines for past waves
+			// Past waves collapse to one line, but any blocked tickets stay
+			// visible with their phase/reason/retry so the summary never
+			// silently swallows work that still needs attention.
+			renderBlockedTicketDetails(b, w.blockedDetails)
+			return
 		}
 		b.WriteString(styleWaveTitle.Render(summary) + "\n")
+		renderBlockedTicketDetails(b, w.blockedDetails)
 	} else {
 		b.WriteString(styleWaveTitle.Render(fmt.Sprintf("  %s", waveLabel(w))) + "\n")
 	}
@@ -232,6 +257,37 @@ func (m Model) renderWave(b *strings.Builder, w *waveState, isCurrent bool) {
 		m.renderTicket(b, tl)
 	}
 	b.WriteString("\n")
+}
+
+// renderBlockedTicketDetails emits one line per blocked/skipped ticket with
+// its phase, block reason, and retry routing so wave summaries never hide
+// a blocked ticket behind a "3/4 closed" tally. Details are no-ops when the
+// wave has none.
+func renderBlockedTicketDetails(b *strings.Builder, details []engine.BlockedTicketSummary) {
+	if len(details) == 0 {
+		return
+	}
+	for _, d := range details {
+		phase := string(d.Phase)
+		if phase == "" {
+			phase = "unknown"
+		}
+		reason := d.BlockReason
+		if reason == "" {
+			reason = "no block reason recorded"
+		}
+		var retry string
+		switch {
+		case d.RequiresOperator:
+			retry = "requires operator"
+		case d.CanRetryAutomatically:
+			retry = "retry: verk run"
+		default:
+			retry = "manual follow-up"
+		}
+		line := fmt.Sprintf("    - %s [%s] %s (%s)", d.TicketID, phase, reason, retry)
+		b.WriteString(styleDetailDim.Render(line) + "\n")
+	}
 }
 
 func waveLabel(w *waveState) string {

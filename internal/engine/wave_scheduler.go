@@ -17,6 +17,44 @@ type WaveAcceptanceRequest struct {
 	TicketScopes         map[string][]string // ticket ID -> owned paths for per-ticket scope validation
 	ClaimsReleased       bool
 	PersistenceSucceeded bool
+	// TicketDetails optionally provides extra per-ticket information used to
+	// build explicit blocked-ticket explanations on the wave summary. The
+	// engine populates this from snapshot block reasons and worker-reported
+	// block reasons; tests may pass it directly.
+	TicketDetails map[string]WaveTicketDetail
+}
+
+// WaveTicketDetail carries the engine's view of a single wave ticket for the
+// purpose of building explicit blocked-ticket entries on the wave summary.
+// All fields are optional: missing fields fall back to structural defaults
+// derived from TicketPhase.
+type WaveTicketDetail struct {
+	// Title is the human-readable ticket title.
+	Title string
+	// BlockReason is the worker- or engine-reported block reason. Empty
+	// when the ticket was closed normally.
+	BlockReason string
+	// RequiresOperator is true when the engine cannot safely retry this
+	// ticket without operator input (e.g. needs_context outcome).
+	RequiresOperator bool
+	// CanRetryAutomatically is true when `verk run` can pick the ticket up
+	// again without manual intervention (e.g. blocked by transient failure
+	// or by another wave that will close on the next run).
+	CanRetryAutomatically bool
+}
+
+// BlockedTicketSummary is the structured per-ticket entry the engine emits
+// for wave summaries. Each entry explains why the ticket did not close and
+// whether the engine can retry it automatically. The shape is preserved on
+// the wave artifact under Acceptance["blocked_ticket_details"] as a slice of
+// map[string]any so JSON consumers can read it without a custom decoder.
+type BlockedTicketSummary struct {
+	TicketID              string            `json:"ticket_id"`
+	Title                 string            `json:"title,omitempty"`
+	Phase                 state.TicketPhase `json:"phase"`
+	BlockReason           string            `json:"block_reason,omitempty"`
+	RequiresOperator      bool              `json:"requires_operator"`
+	CanRetryAutomatically bool              `json:"can_retry_automatically"`
 }
 
 func BuildWave(ready []tkmd.Ticket, maxConcurrency int) (state.WaveArtifact, error) {
@@ -152,14 +190,24 @@ func AcceptWave(req WaveAcceptanceRequest) (state.WaveArtifact, error) {
 	// (e.g., worker returned needs_context or blocked status).
 	var warnings []string
 	var blockedTickets []string
+	var blockedDetails []BlockedTicketSummary
 	for i, phase := range req.TicketPhases {
-		if phase != state.TicketPhaseClosed {
-			blockedTickets = append(blockedTickets, wave.TicketIDs[i])
+		if phase == state.TicketPhaseClosed {
+			continue
 		}
+		ticketID := wave.TicketIDs[i]
+		blockedTickets = append(blockedTickets, ticketID)
+		blockedDetails = append(blockedDetails, buildBlockedTicketSummary(ticketID, phase, req.TicketDetails[ticketID]))
 	}
 	if len(blockedTickets) > 0 {
 		wave.Acceptance["blocked_tickets"] = blockedTickets
+		wave.Acceptance["blocked_ticket_details"] = blockedDetails
 		warnings = append(warnings, fmt.Sprintf("%d ticket(s) not closed: %s", len(blockedTickets), strings.Join(blockedTickets, ", ")))
+		for _, d := range blockedDetails {
+			if d.BlockReason != "" {
+				warnings = append(warnings, fmt.Sprintf("%s blocked: %s", d.TicketID, d.BlockReason))
+			}
+		}
 	}
 	if !req.ClaimsReleased {
 		warnings = append(warnings, "claims not fully released")
@@ -173,6 +221,47 @@ func AcceptWave(req WaveAcceptanceRequest) (state.WaveArtifact, error) {
 		wave.Acceptance["reason"] = "accepted"
 	}
 	return wave, nil
+}
+
+// buildBlockedTicketSummary fills in defaults for a blocked ticket so the
+// summary always answers: which ticket, what phase, why it stopped, and
+// whether the engine can keep going on its own.
+//
+// The defaults are conservative: when the engine has no explicit detail it
+// assumes operator input is required and automatic retry is not safe. This
+// matches the behavior that `verk run` should never silently retry a ticket
+// whose block reason was never recorded.
+func buildBlockedTicketSummary(ticketID string, phase state.TicketPhase, detail WaveTicketDetail) BlockedTicketSummary {
+	summary := BlockedTicketSummary{
+		TicketID:              ticketID,
+		Phase:                 phase,
+		Title:                 detail.Title,
+		BlockReason:           detail.BlockReason,
+		RequiresOperator:      detail.RequiresOperator,
+		CanRetryAutomatically: detail.CanRetryAutomatically,
+	}
+	if summary.BlockReason == "" {
+		summary.BlockReason = defaultPhaseReason(phase)
+	}
+	// Phase-specific safety net: a phase that is not Blocked / Closed (e.g.
+	// stuck in Implement / Verify) typically reflects a partially-completed
+	// run that `verk run` can pick up on its own. Blocked is the canonical
+	// "needs operator" terminus unless the caller said otherwise.
+	if phase == state.TicketPhaseBlocked && !summary.RequiresOperator && !summary.CanRetryAutomatically {
+		summary.RequiresOperator = true
+	}
+	return summary
+}
+
+func defaultPhaseReason(phase state.TicketPhase) string {
+	switch phase {
+	case state.TicketPhaseBlocked:
+		return "ticket transitioned to blocked phase without an explicit reason"
+	case state.TicketPhaseImplement, state.TicketPhaseVerify, state.TicketPhaseReview, state.TicketPhaseRepair:
+		return fmt.Sprintf("ticket did not finish %s phase", phase)
+	default:
+		return fmt.Sprintf("ticket ended in phase %q without closing", phase)
+	}
 }
 
 func overlapsAny(candidateScopes, selectedScopes []string) bool {

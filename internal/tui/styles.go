@@ -20,6 +20,7 @@ var (
 
 	styleDetailDim = lipgloss.NewStyle().Faint(true)
 
-	styleWaveSummaryOK   = lipgloss.NewStyle().Foreground(lipgloss.Color("10"))
-	styleWaveSummaryFail = lipgloss.NewStyle().Foreground(lipgloss.Color("9"))
+	styleWaveSummaryOK      = lipgloss.NewStyle().Foreground(lipgloss.Color("10"))
+	styleWaveSummaryPartial = lipgloss.NewStyle().Foreground(lipgloss.Color("11"))
+	styleWaveSummaryFail    = lipgloss.NewStyle().Foreground(lipgloss.Color("9"))
 )
