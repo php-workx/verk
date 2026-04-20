@@ -1,3 +1,4 @@
+<!-- markdownlint-disable MD013 -->
 # verk v1: Deterministic Engineering Execution Engine
 
 ## Summary
@@ -223,7 +224,8 @@ v1 ticket fields must support at least:
 - `validation_commands`
 - `owned_paths`
 - `review_threshold`
-- optional runtime/model preferences
+- optional `runtime` preference
+- optional deprecated `model` (for compatibility only; not used for execution)
 
 Canonical v1 ticket-store status enum:
 
@@ -264,6 +266,8 @@ v1 ticket markdown rules:
 - `owned_paths` accepts exact file paths or directory prefixes only in v1
 - glob patterns in `owned_paths` are invalid and must fail intake deterministically
 - no alternate scope field is valid in v1; `owned_paths` is the only scheduling scope input
+- ticket-level `model` is not used by execution profile resolution (model/reasoning are
+  policy/config-owned under `runtime.worker` and `runtime.reviewer`).
 
 The store must support exclusive claims with lease renewal so parallel workers cannot race the same ticket.
 
@@ -829,7 +833,23 @@ Minimum v1 config schema:
   - `max_repair_cycles`
   - `allow_dirty_worktree`
 - `runtime`
-  - `default_runtime`
+  - `default_runtime` (legacy fallback)
+  - `worker`
+    - `runtime`
+    - `model`
+    - `reasoning`
+  - `reviewer`
+    - `runtime`
+    - `model`
+    - `reasoning`
+  - `worker_fallback`
+    - `runtime`
+    - `model`
+    - `reasoning`
+  - `reviewer_fallback`
+    - `runtime`
+    - `model`
+    - `reasoning`
   - `worker_timeout_minutes`
   - `reviewer_timeout_minutes`
   - `auth_env_vars`
@@ -843,10 +863,23 @@ Minimum v1 config schema:
 Default values:
 
 - `scheduler.max_concurrency: 4`
+- `runtime.worker.runtime: claude`
+- `runtime.worker.model: sonnet`
+- `runtime.worker.reasoning: high`
+- `runtime.reviewer.runtime: claude`
+- `runtime.reviewer.model: opus`
+- `runtime.reviewer.reasoning: xhigh`
 - `policy.review_threshold: P2`
 - `policy.max_implementation_attempts: 3`
 - `policy.max_repair_cycles: 2`
 - `verification.default_timeout_minutes: 15`
+
+Compatibility fallback:
+
+- If only `runtime.default_runtime` is set and a role profile omits its own `runtime`,
+  that role inherits the default runtime as a migration compatibility shim.
+  New config should use explicit `runtime.worker.runtime` and
+  `runtime.reviewer.runtime`.
 
 Precedence order:
 

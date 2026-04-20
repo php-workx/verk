@@ -109,6 +109,36 @@ logging:
 	}
 }
 
+func TestLoadConfig_LoadsWaveCommands(t *testing.T) {
+	repoRoot := t.TempDir()
+	configDir := filepath.Join(repoRoot, ".verk")
+	if err := os.MkdirAll(configDir, 0o755); err != nil {
+		t.Fatalf("mkdir config dir: %v", err)
+	}
+
+	configYAML := []byte(`
+verification:
+  wave_commands:
+    - path: "."
+      run:
+        - just vuln
+        - just semgrep
+`)
+	if err := os.WriteFile(filepath.Join(configDir, "config.yaml"), configYAML, 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	cfg, err := LoadConfig(repoRoot)
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+
+	want := []QualityCommand{{Path: ".", Run: []string{"just vuln", "just semgrep"}}}
+	if !reflect.DeepEqual(cfg.Verification.WaveCommands, want) {
+		t.Fatalf("unexpected wave commands: %#v", cfg.Verification.WaveCommands)
+	}
+}
+
 func TestLoadConfig_RejectsUnknownFields(t *testing.T) {
 	repoRoot := t.TempDir()
 	configDir := filepath.Join(repoRoot, ".verk")
@@ -339,6 +369,49 @@ runtime:
 	}
 	if cfg.Runtime.WorkerFallback != (RoleProfile{Runtime: "claude", Model: "sonnet", Reasoning: "high"}) {
 		t.Fatalf("worker fallback not applied: %+v", cfg.Runtime.WorkerFallback)
+	}
+}
+
+func TestLoadConfig_DefaultRuntimeFallback_AppliesToWorkerAndReviewer(t *testing.T) {
+	repoRoot := t.TempDir()
+	configDir := filepath.Join(repoRoot, ".verk")
+	if err := os.MkdirAll(configDir, 0o755); err != nil {
+		t.Fatalf("mkdir config dir: %v", err)
+	}
+	// Only default_runtime is specified; role-specific runtime fields should
+	// inherit this compatibility fallback while preserving explicitly provided
+	// role model/reasoning values where present.
+	configYAML := []byte(`
+runtime:
+  default_runtime: codex
+  worker:
+    model: gpt-5-mini
+    reasoning: medium
+`)
+	if err := os.WriteFile(filepath.Join(configDir, "config.yaml"), configYAML, 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	cfg, err := LoadConfig(repoRoot)
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	if cfg.Runtime.Worker.Runtime != "codex" {
+		t.Fatalf("expected worker runtime to inherit default_runtime, got %q", cfg.Runtime.Worker.Runtime)
+	}
+	if cfg.Runtime.Worker.Model != "gpt-5-mini" {
+		t.Fatalf("expected explicit worker model to remain configured, got %q", cfg.Runtime.Worker.Model)
+	}
+	if cfg.Runtime.Worker.Reasoning != "medium" {
+		t.Fatalf("expected explicit worker reasoning to remain configured, got %q", cfg.Runtime.Worker.Reasoning)
+	}
+	if cfg.Runtime.Reviewer.Runtime != "codex" {
+		t.Fatalf("expected reviewer runtime to inherit default_runtime, got %q", cfg.Runtime.Reviewer.Runtime)
+	}
+	if cfg.Runtime.Reviewer.Model != "opus" {
+		t.Fatalf("expected default reviewer model to remain configured, got %q", cfg.Runtime.Reviewer.Model)
+	}
+	if cfg.Runtime.Reviewer.Reasoning != "xhigh" {
+		t.Fatalf("expected default reviewer reasoning to remain configured, got %q", cfg.Runtime.Reviewer.Reasoning)
 	}
 }
 

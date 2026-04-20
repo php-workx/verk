@@ -22,6 +22,9 @@ type Ticket struct {
 	OwnedPaths         []string
 	ReviewThreshold    string
 	Runtime            string
+	// Model is retained for backward compatibility only and is ignored by
+	// execution routing. Execution model and reasoning are policy/config-owned
+	// and controlled via runtime role profiles.
 	Model              string
 	Body               string
 	UnknownFrontmatter map[string]any

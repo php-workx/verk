@@ -6,10 +6,18 @@ policy:
   max_repair_cycles: 2
   allow_dirty_worktree: true
 runtime:
-  default_runtime: claude
+  default_runtime: codex
   worker_timeout_minutes: 20
   reviewer_timeout_minutes: 10
   auth_env_vars: []
+  worker:
+    runtime: codex
+    model: gpt-5.3-codex-spark
+    reasoning: high
+  reviewer:
+    runtime: codex
+    model: gpt-5.4
+    reasoning: high
 verification:
   default_timeout_minutes: 15
   env_passthrough:
@@ -19,8 +27,21 @@ verification:
   quality_commands:
     - path: ""
       run:
-        - just autofix
-        - just check
+        - just format-check
+        - just lint-check
+        - just build-check
+  wave_commands:
+    - path: ""
+      run:
+        - just vuln
+        - just semgrep
+  epic_closure_commands:
+    - path: ""
+      run:
+        - just test-fast
+        - just test-race
+        - just vuln
+        - just semgrep
 logging:
   level: ""
   artifact_retention: 0
