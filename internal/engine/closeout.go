@@ -421,7 +421,7 @@ func validateArtifactIntegrity(req closeoutRequest, currentRunID string) error {
 			return fmt.Errorf("review artifact run %q does not match current run %q", req.review.RunID, currentRunID)
 		}
 		for _, finding := range req.review.Findings {
-			if err := validateReviewFinding(finding); err != nil {
+			if err := validateReviewFinding(finding, req.plan.EffectiveReviewThreshold); err != nil {
 				return err
 			}
 		}
@@ -640,7 +640,13 @@ func requiredValidationCoveragePassed(coverage state.ValidationCoverageArtifact)
 	return true
 }
 
-func validateReviewFinding(f state.ReviewFinding) error {
+// validateReviewFinding validates a review finding from a persisted artifact.
+// Blocking findings (at or above the configured threshold) must have a non-empty
+// file and a positive line number so repair workers have precise location context.
+// Non-blocking findings may omit file/line (speculative/informational findings are
+// allowed without precise location), but a non-empty file that is whitespace-only
+// is always rejected as a programming error.
+func validateReviewFinding(f state.ReviewFinding, threshold state.Severity) error {
 	if f.ID == "" {
 		return fmt.Errorf("review finding missing id")
 	}
@@ -653,11 +659,17 @@ func validateReviewFinding(f state.ReviewFinding) error {
 	if strings.TrimSpace(f.Body) == "" {
 		return fmt.Errorf("review finding %q missing body", f.ID)
 	}
-	if strings.TrimSpace(f.File) == "" {
-		return fmt.Errorf("review finding %q missing file", f.ID)
-	}
-	if f.Line <= 0 {
-		return fmt.Errorf("review finding %q missing line", f.ID)
+	// Blocking findings require precise file and line so repair workers can act.
+	// Non-blocking findings may omit these fields (speculative/informational).
+	if ReviewFindingBlocks(f, threshold) {
+		if strings.TrimSpace(f.File) == "" {
+			return fmt.Errorf("review finding %q missing file", f.ID)
+		}
+		if f.Line <= 0 {
+			return fmt.Errorf("review finding %q missing line", f.ID)
+		}
+	} else if f.File != "" && strings.TrimSpace(f.File) == "" {
+		return fmt.Errorf("review finding %q has whitespace-only file", f.ID)
 	}
 	switch f.Disposition {
 	case "open", "resolved":

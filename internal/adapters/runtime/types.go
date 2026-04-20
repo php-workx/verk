@@ -230,11 +230,11 @@ func (r ReviewFinding) Validate() error {
 	if strings.TrimSpace(r.Body) == "" {
 		return fmt.Errorf("review finding missing body")
 	}
-	if strings.TrimSpace(r.File) == "" {
+	// File and Line are optional for speculative (informational) findings that
+	// lack precise location context. An empty File is allowed; a non-empty File
+	// that is whitespace-only is rejected as a programming error.
+	if r.File != "" && strings.TrimSpace(r.File) == "" {
 		return fmt.Errorf("review finding missing file")
-	}
-	if r.Line <= 0 {
-		return fmt.Errorf("review finding missing line")
 	}
 	if err := ValidateReviewDisposition(r.Disposition); err != nil {
 		return err
