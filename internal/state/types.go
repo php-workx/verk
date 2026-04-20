@@ -303,18 +303,18 @@ type RepairCycleArtifact struct {
 // work item. RequiresOperator is true when no automated repair is safe —
 // this is the signal that the epic must block pending human input.
 type EpicClosureFinding struct {
-	ID                string   `json:"id"`
-	Source            string   `json:"source"`
-	Severity          Severity `json:"severity,omitempty"`
-	Title             string   `json:"title"`
-	Body              string   `json:"body,omitempty"`
-	File              string   `json:"file,omitempty"`
-	Line              int      `json:"line,omitempty"`
-	OwningTicketID    string   `json:"owning_ticket_id,omitempty"`
-	RequiresOperator  bool     `json:"requires_operator,omitempty"`
-	AutoRepairPossible bool    `json:"auto_repair_possible,omitempty"`
-	Resolved          bool     `json:"resolved,omitempty"`
-	NextAction        string   `json:"next_action,omitempty"`
+	ID                 string   `json:"id"`
+	Source             string   `json:"source"`
+	Severity           Severity `json:"severity,omitempty"`
+	Title              string   `json:"title"`
+	Body               string   `json:"body,omitempty"`
+	File               string   `json:"file,omitempty"`
+	Line               int      `json:"line,omitempty"`
+	OwningTicketID     string   `json:"owning_ticket_id,omitempty"`
+	RequiresOperator   bool     `json:"requires_operator,omitempty"`
+	AutoRepairPossible bool     `json:"auto_repair_possible,omitempty"`
+	Resolved           bool     `json:"resolved,omitempty"`
+	NextAction         string   `json:"next_action,omitempty"`
 }
 
 // EpicClosureCycle records the state of a single epic-level repair cycle.

@@ -33,9 +33,10 @@ func TestEpicMultipleWavesNoConflicts(t *testing.T) {
 			"ticket-c": workerDone(repoRoot, "worker-c.json", 4*time.Second),
 		},
 		map[string]runtime.ReviewResult{
-			"ticket-a": reviewPassed(repoRoot, "review-a.json", 2*time.Second),
-			"ticket-b": reviewPassed(repoRoot, "review-b.json", 10*time.Second),
-			"ticket-c": reviewPassed(repoRoot, "review-c.json", 6*time.Second),
+			"ticket-a":  reviewPassed(repoRoot, "review-a.json", 2*time.Second),
+			"ticket-b":  reviewPassed(repoRoot, "review-b.json", 10*time.Second),
+			"ticket-c":  reviewPassed(repoRoot, "review-c.json", 6*time.Second),
+			"epic-root": reviewPassed(repoRoot, "review-epic.json", 12*time.Second),
 		},
 	)
 
@@ -74,8 +75,9 @@ func TestEpicConflictSerialization(t *testing.T) {
 			"ticket-b": workerDone(repoRoot, "worker-b.json", 4*time.Second),
 		},
 		map[string]runtime.ReviewResult{
-			"ticket-a": reviewPassed(repoRoot, "review-a.json", 2*time.Second),
-			"ticket-b": reviewPassed(repoRoot, "review-b.json", 6*time.Second),
+			"ticket-a":      reviewPassed(repoRoot, "review-a.json", 2*time.Second),
+			"ticket-b":      reviewPassed(repoRoot, "review-b.json", 6*time.Second),
+			"epic-conflict": reviewPassed(repoRoot, "review-epic.json", 8*time.Second),
 		},
 	)
 
@@ -285,7 +287,7 @@ func (a *e2eReflectingAdapter) ReviewRequests() []runtime.ReviewRequest {
 func newE2EReflectingAdapter(numTickets int) *e2eReflectingAdapter {
 	start := testTime()
 	workerResults := make([]runtime.WorkerResult, numTickets)
-	reviewResults := make([]runtime.ReviewResult, numTickets)
+	reviewResults := make([]runtime.ReviewResult, numTickets+1)
 	for i := 0; i < numTickets; i++ {
 		workerResults[i] = runtime.WorkerResult{
 			Status:             runtime.WorkerStatusDone,
@@ -305,6 +307,17 @@ func newE2EReflectingAdapter(numTickets int) *e2eReflectingAdapter {
 			Summary:            "clean",
 			ResultArtifactPath: "review.json",
 		}
+	}
+	epicIdx := numTickets
+	reviewResults[epicIdx] = runtime.ReviewResult{
+		Status:             runtime.WorkerStatusDone,
+		RetryClass:         runtime.RetryClassTerminal,
+		LeaseID:            "placeholder",
+		StartedAt:          start.Add(time.Duration(epicIdx) * time.Second).Add(2 * time.Second),
+		FinishedAt:         start.Add(time.Duration(epicIdx) * time.Second).Add(3 * time.Second),
+		ReviewStatus:       runtime.ReviewStatusPassed,
+		Summary:            "epic gate clean",
+		ResultArtifactPath: "epic-review.json",
 	}
 	return &e2eReflectingAdapter{
 		workerResults: workerResults,

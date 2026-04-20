@@ -13,6 +13,7 @@ func DefaultConfig() Config {
 			MaxImplementationAttempts: 3,
 			MaxRepairCycles:           5,
 			MaxWaveRepairCycles:       3,
+			MaxEpicRepairCycles:       1,
 			AllowDirtyWorktree:        true,
 		},
 		Runtime: RuntimeConfig{

@@ -92,10 +92,17 @@ func runWaveVerificationLoop(
 	failingIDs := failingExecutionIDs(coverage)
 
 	for cycle := 1; cycle <= cfg.Policy.MaxWaveRepairCycles; cycle++ {
+		// Emit a structured repair-cycle-started event so consumers (plain
+		// output, TUI) can show "repair cycle N/M: failing-check-ids" without
+		// parsing the free-text detail string.
 		SendProgress(ctx, req.Progress, ProgressEvent{
-			Type:     EventTicketDetail,
-			TicketID: wave.WaveID,
-			Detail:   fmt.Sprintf("wave repair cycle %d/%d", cycle, cfg.Policy.MaxWaveRepairCycles),
+			Type:            EventRepairCycleStarted,
+			TicketID:        wave.WaveID,
+			WaveID:          wave.Ordinal,
+			RepairCycle:     cycle,
+			MaxRepairCycles: cfg.Policy.MaxWaveRepairCycles,
+			CheckIDs:        append([]string(nil), failingIDs...),
+			Detail:          fmt.Sprintf("wave repair cycle %d/%d", cycle, cfg.Policy.MaxWaveRepairCycles),
 		})
 
 		failureOutput := collectWaveVerificationOutput(combineCommandResults(qualityResults, derivedResults))
@@ -144,6 +151,16 @@ func runWaveVerificationLoop(
 			markRetriedFailuresRepaired(coverage, failingIDs)
 			markWaveCoveragePassed(coverage, cycle)
 			syncWaveAcceptanceFromCoverage(wave, coverage)
+			// Emit repair-succeeded so consumers can render "repaired" rather
+			// than only seeing the final wave-closed summary.
+			SendProgress(ctx, req.Progress, ProgressEvent{
+				Type:            EventRepairCycleSucceeded,
+				TicketID:        wave.WaveID,
+				WaveID:          wave.Ordinal,
+				RepairCycle:     cycle,
+				MaxRepairCycles: cfg.Policy.MaxWaveRepairCycles,
+				Detail:          fmt.Sprintf("wave repair cycle %d succeeded", cycle),
+			})
 			return state.SaveJSONAtomic(wavePath, wave)
 		}
 
@@ -155,6 +172,18 @@ func runWaveVerificationLoop(
 
 	finalFailingIDs := failingExecutionIDs(coverage)
 	appendWaveCheckBlockers(coverage, finalFailingIDs, "unresolved after repair budget exhausted")
+	// Emit repair-exhausted with the remaining failing check ids so the plain
+	// and TUI renderers can tell the operator exactly which checks could not be
+	// repaired and that manual follow-up is required.
+	SendProgress(ctx, req.Progress, ProgressEvent{
+		Type:            EventRepairCycleExhausted,
+		TicketID:        wave.WaveID,
+		WaveID:          wave.Ordinal,
+		RepairCycle:     cfg.Policy.MaxWaveRepairCycles,
+		MaxRepairCycles: cfg.Policy.MaxWaveRepairCycles,
+		CheckIDs:        append([]string(nil), finalFailingIDs...),
+		Detail:          fmt.Sprintf("wave repair exhausted after %d cycle(s); manual follow-up required", cfg.Policy.MaxWaveRepairCycles),
+	})
 	recordWaveRepairLimit(coverage, finalFailingIDs, cfg.Policy.MaxWaveRepairCycles, cfg.Policy.MaxWaveRepairCycles,
 		fmt.Sprintf("wave repair exhausted after %d cycle(s)", cfg.Policy.MaxWaveRepairCycles))
 	markWaveCoverageFailed(coverage, cfg.Policy.MaxWaveRepairCycles, finalFailingIDs,
@@ -173,7 +202,7 @@ func resolveWaveAdapter(req RunEpicRequest) (runtime.Adapter, error) {
 		return req.Adapter, nil
 	}
 	if req.AdapterFactory != nil {
-		return req.AdapterFactory("")
+		return req.AdapterFactory(strings.TrimSpace(req.Config.Runtime.DefaultRuntime))
 	}
 	return nil, fmt.Errorf("no runtime adapter available for wave repair")
 }

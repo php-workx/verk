@@ -34,10 +34,28 @@ type BlockedTicket struct {
 	Title string
 	// Status is the ticket-store status at the moment the run stopped.
 	Status tkmd.Status
+	// Phase is the ticket run phase from the latest snapshot, when available.
+	Phase state.TicketPhase
+	// RetryPhase is the default phase this ticket may be reopened to. Empty
+	// means the ticket is not automatically retryable from its current phase.
+	RetryPhase state.TicketPhase
 	// Reason is the best available block reason. It prefers the worker-reported
 	// BlockReason from the ticket snapshot and falls back to a structural
 	// description (blocked, waiting on deps, …) when no snapshot reason exists.
 	Reason string
+}
+
+// DefaultReopenTargetForPhase returns the CLI's default reopen target for a
+// ticket phase. A false return means the phase is not automatically retryable.
+func DefaultReopenTargetForPhase(from state.TicketPhase) (state.TicketPhase, bool) {
+	switch from {
+	case state.TicketPhaseBlocked:
+		return state.TicketPhaseImplement, true
+	case state.TicketPhaseClosed:
+		return state.TicketPhaseRepair, true
+	default:
+		return "", false
+	}
 }
 
 // BlockedRunError is the error returned by RunEpic when a run terminates
@@ -96,19 +114,29 @@ func collectBlockedTickets(repoRoot, runID string, children []tkmd.Ticket) []Blo
 			continue
 		}
 		reason := describeNotReady(child)
+		phase := state.TicketPhase("")
+		if child.Status == tkmd.StatusBlocked {
+			phase = state.TicketPhaseBlocked
+		}
 		if runID != "" {
 			var snap TicketRunSnapshot
 			if err := loadTicketSnapshot(repoRoot, runID, child.ID, &snap); err == nil {
+				if snap.CurrentPhase != "" {
+					phase = snap.CurrentPhase
+				}
 				if trimmed := strings.TrimSpace(snap.BlockReason); trimmed != "" {
 					reason = trimmed
 				}
 			}
 		}
+		retryPhase, _ := DefaultReopenTargetForPhase(phase)
 		out = append(out, BlockedTicket{
-			ID:     child.ID,
-			Title:  child.Title,
-			Status: child.Status,
-			Reason: reason,
+			ID:         child.ID,
+			Title:      child.Title,
+			Status:     child.Status,
+			Phase:      phase,
+			RetryPhase: retryPhase,
+			Reason:     reason,
 		})
 	}
 	return out
@@ -272,6 +300,40 @@ func RunEpic(ctx context.Context, req RunEpicRequest) (RunEpicResult, error) { /
 					Status:         status,
 					BlockedTickets: collectBlockedTickets(req.RepoRoot, req.RunID, currentChildren),
 				}
+			}
+
+			// All child tickets closed — run the epic closure gate before marking
+			// the epic completed. Mark it pending in the cursor so a crash during
+			// the gate's repair loop is detectable on resume (the next run will
+			// find all children closed and re-enter the gate).
+			setPendingEpicGate(result.Run.ResumeCursor)
+			result.Run.UpdatedAt = time.Now().UTC()
+			if err := state.SaveJSONAtomic(runPath, result.Run); err != nil {
+				return result, err
+			}
+
+			allChangedFiles, changedErr := repo.ChangedFilesAgainst(baseCommit)
+			if changedErr != nil {
+				allChangedFiles = nil // non-fatal: reviewer still runs with empty file list
+			}
+			allChangedFiles = filterEngineOwnedFiles(allChangedFiles)
+
+			if gateErr := runEpicClosureGate(ctx, req, cfg, currentChildren, allChangedFiles); gateErr != nil {
+				result.Run.Status = state.EpicRunStatusBlocked
+				result.Run.CurrentPhase = state.TicketPhaseBlocked
+				result.Run.UpdatedAt = time.Now().UTC()
+				if saveErr := state.SaveJSONAtomic(runPath, result.Run); saveErr != nil {
+					return result, errors.Join(gateErr, fmt.Errorf("persist run state: %w", saveErr))
+				}
+				return result, gateErr
+			}
+
+			clearPendingEpicGate(result.Run.ResumeCursor)
+			result.Run.Status = state.EpicRunStatusCompleted
+			result.Run.CurrentPhase = state.TicketPhaseClosed
+			result.Run.UpdatedAt = time.Now().UTC()
+			if err := state.SaveJSONAtomic(runPath, result.Run); err != nil {
+				return result, err
 			}
 			return result, nil
 		}
@@ -1002,11 +1064,17 @@ func runSubEpic(ctx context.Context, req RunEpicRequest, cfg policy.Config, pare
 }
 
 func executeEpicTicket(ctx context.Context, req RunEpicRequest, cfg policy.Config, wave state.WaveArtifact, ticketID string, depth int, ancestors map[string]struct{}, reg *subEpicRegistrar) waveTicketOutcome {
-	outcome := waveTicketOutcome{ticketID: ticketID, phase: state.TicketPhaseBlocked}
+	// Default to Implement rather than Blocked: a ticket we never even loaded
+	// has not "blocked" in any meaningful sense, and defaulting to Blocked
+	// causes the wave summary to lie about a ticket that errored before it
+	// had a chance to transition its own phase. Error paths that follow
+	// reset outcome.phase to whatever the ticket's snapshot actually records.
+	outcome := waveTicketOutcome{ticketID: ticketID, phase: state.TicketPhaseImplement}
 
 	ticket, err := loadEpicTicket(req.RepoRoot, ticketID)
 	if err != nil {
 		outcome.err = err
+		outcome.phase = snapshotPhaseOrImplement(req.RepoRoot, req.RunID, ticketID)
 		return outcome
 	}
 
@@ -1018,6 +1086,7 @@ func executeEpicTicket(ctx context.Context, req RunEpicRequest, cfg policy.Confi
 	hasChildren, err := tkmd.HasChildren(req.RepoRoot, ticketID)
 	if err != nil {
 		outcome.err = fmt.Errorf("check children of %s: %w", ticketID, err)
+		outcome.phase = snapshotPhaseOrImplement(req.RepoRoot, req.RunID, ticketID)
 		return outcome
 	}
 	if hasChildren && depth < maxDepth {
@@ -1046,17 +1115,20 @@ func executeEpicTicket(ctx context.Context, req RunEpicRequest, cfg policy.Confi
 	plan, err := BuildPlanArtifact(ticket, cfg)
 	if err != nil {
 		outcome.err = err
+		outcome.phase = snapshotPhaseOrImplement(req.RepoRoot, req.RunID, ticketID)
 		return outcome
 	}
 	claim, err := tkmd.AcquireClaim(req.RepoRoot, req.RunID, ticket.ID, fmt.Sprintf("lease-%s-%s-%s", req.RunID, ticket.ID, wave.WaveID), wave.WaveID, 10*time.Minute, time.Now().UTC())
 	if err != nil {
 		outcome.err = err
+		outcome.phase = snapshotPhaseOrImplement(req.RepoRoot, req.RunID, ticketID)
 		return outcome
 	}
 	adapter, err := adapterForEpicTicket(req, plan)
 	if err != nil {
 		_ = tkmd.ReleaseClaim(req.RepoRoot, req.RunID, ticket.ID, claim.LeaseID, "runtime adapter selection failed")
 		outcome.err = err
+		outcome.phase = snapshotPhaseOrImplement(req.RepoRoot, req.RunID, ticketID)
 		return outcome
 	}
 
@@ -1074,10 +1146,36 @@ func executeEpicTicket(ctx context.Context, req RunEpicRequest, cfg policy.Confi
 	})
 	if err != nil {
 		outcome.err = err
+		// RunTicket errored without transitioning its own phase to Blocked /
+		// Closed. Read the per-ticket snapshot so the wave summary reports
+		// where the ticket actually was (Implement / Verify / Review / …)
+		// rather than falsely claiming it's blocked. Missing snapshot ⇒
+		// Implement so the scheduler will pick it up on the next run.
+		outcome.phase = snapshotPhaseOrImplement(req.RepoRoot, req.RunID, ticketID)
 		return outcome
 	}
 	outcome.phase = ticketResult.Snapshot.CurrentPhase
 	return outcome
+}
+
+// snapshotPhaseOrImplement reads the persisted ticket snapshot and returns
+// its current phase. When no snapshot exists, or the snapshot could not be
+// loaded, it returns TicketPhaseImplement so the scheduler can legitimately
+// pick the ticket up on the next run. Errors are swallowed: this helper
+// feeds a wave-summary field, not a correctness-critical gate.
+//
+// Callers use this to avoid reporting a ticket as Blocked when its own state
+// machine never made that transition — the wave-default Blocked was wrong
+// because it made errored-mid-phase tickets look like "needs operator".
+func snapshotPhaseOrImplement(repoRoot, runID, ticketID string) state.TicketPhase {
+	var snap TicketRunSnapshot
+	if err := loadTicketSnapshot(repoRoot, runID, ticketID, &snap); err != nil {
+		return state.TicketPhaseImplement
+	}
+	if snap.CurrentPhase == "" {
+		return state.TicketPhaseImplement
+	}
+	return snap.CurrentPhase
 }
 
 func adapterForEpicTicket(req RunEpicRequest, plan state.PlanArtifact) (runtime.Adapter, error) {
@@ -1176,6 +1274,16 @@ func buildWaveTicketDetails(repoRoot, runID string, ticketIDs []string, outcomes
 		if err := loadTicketSnapshot(repoRoot, runID, id, &snap); err == nil {
 			if reason := strings.TrimSpace(snap.BlockReason); reason != "" {
 				detail.BlockReason = reason
+			}
+		}
+		// Fall back to the wave-level outcome error when the ticket never
+		// got to persist its own block reason (e.g. reviewer adapter returned
+		// an unexpected error before transitionTo(Blocked)). Without this
+		// the wave summary collapses those tickets into the generic
+		// "transitioned to blocked phase without an explicit reason" string.
+		if detail.BlockReason == "" {
+			if o, ok := outcomeByID[id]; ok && o.err != nil {
+				detail.BlockReason = o.err.Error()
 			}
 		}
 		// Match the snapshot's title via the ticket store if we can.

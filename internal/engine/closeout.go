@@ -439,7 +439,7 @@ func validateArtifactIntegrity(req closeoutRequest, currentRunID string) error {
 		if req.verification.RunID != "" && currentRunID != "" && req.verification.RunID != currentRunID {
 			return fmt.Errorf("verification artifact run %q does not match current run %q", req.verification.RunID, currentRunID)
 		}
-		if req.verification.Passed != derivedVerificationPassed(req.verification.Results) {
+		if req.verification.Passed != verificationArtifactPassed(req.verification) {
 			return fmt.Errorf("verification artifact passed flag contradicts derived verification outcome")
 		}
 	}
@@ -514,7 +514,7 @@ func validateVerification(req closeoutRequest) error {
 	if req.verification.TicketID != req.ticket.ID {
 		return fmt.Errorf("verification artifact ticket %q does not match ticket %q", req.verification.TicketID, req.ticket.ID)
 	}
-	if !derivedVerificationPassed(req.verification.Results) {
+	if !verificationArtifactPassed(req.verification) {
 		return fmt.Errorf("verification artifact did not pass")
 	}
 	return nil
@@ -593,10 +593,51 @@ func validateDeclaredChecks(req closeoutRequest) error {
 	if req.verification == nil {
 		return fmt.Errorf("declared checks require verification artifacts")
 	}
-	if !derivedVerificationPassed(req.verification.Results) {
+	if !verificationArtifactPassed(req.verification) {
 		return fmt.Errorf("declared checks failed because verification did not pass")
 	}
 	return nil
+}
+
+func verificationArtifactPassed(verification *state.VerificationArtifact) bool {
+	if verification == nil {
+		return false
+	}
+	if verification.ValidationCoverage == nil {
+		return derivedVerificationPassed(verification.Results)
+	}
+	return requiredValidationCoveragePassed(*verification.ValidationCoverage)
+}
+
+func requiredValidationCoveragePassed(coverage state.ValidationCoverageArtifact) bool {
+	latest := make(map[string]state.ValidationCheckExecution, len(coverage.ExecutedChecks))
+	for _, execution := range coverage.ExecutedChecks {
+		if execution.CheckID == "" {
+			continue
+		}
+		current, found := latest[execution.CheckID]
+		if !found || current.FinishedAt.IsZero() || execution.FinishedAt.After(current.FinishedAt) {
+			latest[execution.CheckID] = execution
+		}
+	}
+	if len(latest) == 0 {
+		return false
+	}
+	// Verification.Passed is derived from check executions only. Coverage
+	// blockers may also represent review findings, which are gated separately.
+	for checkID, execution := range latest {
+		check, found := coverage.CheckByID(checkID)
+		if found && check.Advisory {
+			continue
+		}
+		switch execution.Result {
+		case state.ValidationCheckResultPassed, state.ValidationCheckResultRepaired:
+			continue
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 func validateReviewFinding(f state.ReviewFinding) error {

@@ -84,7 +84,10 @@ func (a *reflectingAdapter) ReviewRequests() []runtime.ReviewRequest {
 func newReflectingAdapter(numTickets int) *reflectingAdapter {
 	start := epicTestStart()
 	workerResults := make([]runtime.WorkerResult, numTickets)
-	reviewResults := make([]runtime.ReviewResult, numTickets)
+	// +1 review result: the extra slot is reserved for the epic closure gate
+	// reviewer that runs after all child tickets close. Without it the gate
+	// tries to invoke the reviewer but runs out of scripted results.
+	reviewResults := make([]runtime.ReviewResult, numTickets+1)
 	for i := 0; i < numTickets; i++ {
 		workerResults[i] = runtime.WorkerResult{
 			Status:             runtime.WorkerStatusDone,
@@ -104,6 +107,18 @@ func newReflectingAdapter(numTickets int) *reflectingAdapter {
 			Summary:            "clean",
 			ResultArtifactPath: "review.json",
 		}
+	}
+	// Epic closure gate reviewer result (index numTickets).
+	epicIdx := numTickets
+	reviewResults[epicIdx] = runtime.ReviewResult{
+		Status:             runtime.WorkerStatusDone,
+		RetryClass:         runtime.RetryClassTerminal,
+		LeaseID:            "placeholder", // will be overwritten by reflectingAdapter
+		StartedAt:          start.Add(time.Duration(epicIdx+1) * time.Second).Add(2 * time.Second),
+		FinishedAt:         start.Add(time.Duration(epicIdx+1) * time.Second).Add(3 * time.Second),
+		ReviewStatus:       runtime.ReviewStatusPassed,
+		Summary:            "epic gate: no blocking findings",
+		ResultArtifactPath: "epic-review.json",
 	}
 	return &reflectingAdapter{
 		inner:         runtimefake.New(workerResults, reviewResults),
@@ -570,7 +585,7 @@ func TestRunEpicSelectsRuntimePerTicket(t *testing.T) {
 	got := append([]string(nil), requestedRuntimes...)
 	mu.Unlock()
 	sort.Strings(got)
-	if !reflect.DeepEqual(got, []string{"claude", "codex"}) {
+	if !reflect.DeepEqual(got, []string{"claude", "claude", "codex"}) {
 		t.Fatalf("unexpected requested runtimes: %#v", requestedRuntimes)
 	}
 }
@@ -681,6 +696,16 @@ func TestRunEpicIgnoresBaselineDirtyFilesInScopeChecks(t *testing.T) {
 				ReviewStatus:       runtime.ReviewStatusPassed,
 				Summary:            "clean",
 				ResultArtifactPath: filepath.Join(repoRoot, "review-baseline.json"),
+			},
+			{
+				Status:             runtime.WorkerStatusDone,
+				RetryClass:         runtime.RetryClassTerminal,
+				LeaseID:            "epic-review-epic-baseline-1",
+				StartedAt:          epicTestStart().Add(4 * time.Second),
+				FinishedAt:         epicTestStart().Add(5 * time.Second),
+				ReviewStatus:       runtime.ReviewStatusPassed,
+				Summary:            "epic gate clean",
+				ResultArtifactPath: filepath.Join(repoRoot, "review-baseline-epic.json"),
 			},
 		},
 	)

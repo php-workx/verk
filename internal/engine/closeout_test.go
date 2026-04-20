@@ -87,6 +87,83 @@ func TestBuildCloseoutArtifact_GateResultsAreTyped(t *testing.T) {
 	}
 }
 
+func TestBuildCloseoutArtifact_AllowsFailedAdvisoryDerivedCheck(t *testing.T) {
+	req := baseCloseoutRequest()
+	now := fixedTime()
+	req.plan.DeclaredChecks = []string{"go test ./..."}
+	req.verification.Results = []state.VerificationResult{
+		{
+			Command:    "go test ./...",
+			ExitCode:   0,
+			Passed:     true,
+			StartedAt:  now,
+			FinishedAt: now.Add(time.Minute),
+		},
+		{
+			Command:    "ruff check src/modal_mcp/agent_targets/codex.py",
+			ExitCode:   1,
+			Passed:     false,
+			StartedAt:  now,
+			FinishedAt: now.Add(time.Minute),
+		},
+	}
+	req.verification.Passed = true
+	req.verification.ValidationCoverage = &state.ValidationCoverageArtifact{
+		ArtifactMeta: state.ArtifactMeta{SchemaVersion: 1, RunID: req.plan.RunID},
+		Scope:        state.ValidationScopeTicket,
+		TicketID:     req.ticket.ID,
+		DeclaredChecks: []state.ValidationCheck{
+			{
+				ID:       "declared-go-test",
+				Scope:    state.ValidationScopeTicket,
+				Source:   state.ValidationCheckSourceDeclared,
+				Command:  "go test ./...",
+				TicketID: req.ticket.ID,
+			},
+		},
+		DerivedChecks: []state.ValidationCheck{
+			{
+				ID:       "derived-ruff",
+				Scope:    state.ValidationScopeTicket,
+				Source:   state.ValidationCheckSourceDerived,
+				Command:  "ruff check src/modal_mcp/agent_targets/codex.py",
+				TicketID: req.ticket.ID,
+				Advisory: true,
+			},
+		},
+		ExecutedChecks: []state.ValidationCheckExecution{
+			{
+				CheckID:    "declared-go-test",
+				Result:     state.ValidationCheckResultPassed,
+				ExitCode:   0,
+				StartedAt:  now,
+				FinishedAt: now.Add(time.Minute),
+			},
+			{
+				CheckID:        "derived-ruff",
+				Result:         state.ValidationCheckResultFailed,
+				ExitCode:       1,
+				FailureSummary: "advisory derived check failed",
+				StartedAt:      now,
+				FinishedAt:     now.Add(time.Minute),
+			},
+		},
+		Closable:      true,
+		ClosureReason: "required checks passed; advisory check reported",
+	}
+
+	artifact, err := BuildCloseoutArtifact(req.ticket, req.plan, req.verification, req.review)
+	if err != nil {
+		t.Fatalf("BuildCloseoutArtifact returned error: %v", err)
+	}
+	if !artifact.Closable {
+		t.Fatalf("expected advisory failure not to block closeout, failed gate: %s", artifact.FailedGate)
+	}
+	if got := artifact.GateResults[gateVerification].Status; got != gatePassed {
+		t.Fatalf("expected verification gate to pass, got %q", got)
+	}
+}
+
 func TestReviewFindingBlocks(t *testing.T) {
 	now := fixedTime()
 	cases := []struct {

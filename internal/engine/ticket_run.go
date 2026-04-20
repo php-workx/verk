@@ -197,7 +197,7 @@ func RunTicket(ctx context.Context, req RunTicketRequest) (result RunTicketResul
 				OnProgress:      func(detail string) { st.progressDetail(detail) },
 			}
 			st.progressDetail(fmt.Sprintf("%s worker running", workerProfile.Runtime))
-			result, err := st.runWorkerWithRuntimeControls(ctx, workerReq)
+			result, effectiveWorkerReq, err := st.runWorkerWithRuntimeControls(ctx, workerReq)
 			if err != nil {
 				if errors.Is(err, errRuntimeExecutionBlocked) {
 					if err := st.persist(); err != nil {
@@ -210,7 +210,7 @@ func RunTicket(ctx context.Context, req RunTicketRequest) (result RunTicketResul
 				}
 				return RunTicketResult{}, err
 			}
-			if err := handleImplementResult(st, result, workerReq); err != nil {
+			if err := handleImplementResult(st, result, effectiveWorkerReq); err != nil {
 				return RunTicketResult{}, err
 			}
 			st.progressDetail(fmt.Sprintf("worker %s (%s)", result.Status, result.CompletionCode))
@@ -295,7 +295,7 @@ func RunTicket(ctx context.Context, req RunTicketRequest) (result RunTicketResul
 				OnProgress:               func(detail string) { st.progressDetail(detail) },
 			}
 			st.progressDetail(fmt.Sprintf("%s reviewer running", reviewerProfile.Runtime))
-			result, err := st.runReviewerWithRuntimeControls(ctx, reviewReq)
+			result, effectiveReviewReq, err := st.runReviewerWithRuntimeControls(ctx, reviewReq)
 			if err != nil {
 				if errors.Is(err, errRuntimeExecutionBlocked) {
 					if err := st.persist(); err != nil {
@@ -308,7 +308,7 @@ func RunTicket(ctx context.Context, req RunTicketRequest) (result RunTicketResul
 				}
 				return RunTicketResult{}, err
 			}
-			if err := handleReviewOutcome(st, result, reviewReq); err != nil {
+			if err := handleReviewOutcome(st, result, effectiveReviewReq); err != nil {
 				return RunTicketResult{}, err
 			}
 			if result.ReviewStatus == runtime.ReviewStatusPassed {
@@ -380,7 +380,7 @@ func RunTicket(ctx context.Context, req RunTicketRequest) (result RunTicketResul
 				OnProgress:      func(detail string) { st.progressDetail(detail) },
 			}
 			st.progressDetail(fmt.Sprintf("%s repair worker running", workerProfile.Runtime))
-			result, err := st.runWorkerWithRuntimeControls(ctx, workerReq)
+			result, effectiveRepairReq, err := st.runWorkerWithRuntimeControls(ctx, workerReq)
 			if err != nil {
 				if errors.Is(err, errRuntimeExecutionBlocked) {
 					if err := st.persist(); err != nil {
@@ -393,7 +393,7 @@ func RunTicket(ctx context.Context, req RunTicketRequest) (result RunTicketResul
 				}
 				return RunTicketResult{}, err
 			}
-			if err := handleImplementResult(st, result, workerReq); err != nil {
+			if err := handleImplementResult(st, result, effectiveRepairReq); err != nil {
 				return RunTicketResult{}, err
 			}
 			if st.currentPhase == state.TicketPhaseVerify {
@@ -925,19 +925,37 @@ func (st *ticketRunState) runVerification(ctx context.Context, repoRoot string) 
 	return artifact, artifact.Passed, nil
 }
 
-func (st *ticketRunState) runWorkerWithRuntimeControls(ctx context.Context, req runtime.WorkerRequest) (runtime.WorkerResult, error) {
+// runWorkerWithRuntimeControls executes a worker with retry logic and fallback
+// profile support. On the first retry (attempt > 0), it switches to the
+// configured WorkerFallback profile when one is set, so that transient model
+// unavailability or rate-limiting can recover without operator intervention.
+// The effective request (primary or fallback) is returned alongside the result
+// so the caller can record the runtime/model/reasoning that was actually used.
+func (st *ticketRunState) runWorkerWithRuntimeControls(ctx context.Context, req runtime.WorkerRequest) (runtime.WorkerResult, runtime.WorkerRequest, error) {
 	var lastErr error
+	effectiveReq := req
 	for attempt := 0; attempt <= maxRuntimeRetryAttempts; attempt++ {
-		result, err := st.runWorkerWithClaimRenewal(ctx, req)
+		effectiveReq = req
+		if attempt > 0 && !st.cfg.Runtime.WorkerFallback.IsZero() {
+			// Apply the configured fallback profile on any retry so that
+			// transient model failures (rate-limit, model-unavailable, etc.)
+			// can recover automatically without operator input.
+			fallback := st.cfg.Runtime.WorkerFallback
+			effectiveReq.Runtime = strings.TrimSpace(fallback.Runtime)
+			effectiveReq.Model = strings.TrimSpace(fallback.Model)
+			effectiveReq.Reasoning = strings.TrimSpace(fallback.Reasoning)
+			effectiveReq.FallbackReason = "primary profile unavailable, retrying with fallback"
+		}
+		result, err := st.runWorkerWithClaimRenewal(ctx, effectiveReq)
 		if err != nil {
 			if errors.Is(err, errClaimRenewalLost) {
 				if err := st.blockRuntimeExecution(fmt.Sprintf("claim renewal lost during worker execution: %v", err)); err != nil {
-					return runtime.WorkerResult{}, err
+					return runtime.WorkerResult{}, effectiveReq, err
 				}
-				return runtime.WorkerResult{}, errRuntimeExecutionBlocked
+				return runtime.WorkerResult{}, effectiveReq, errRuntimeExecutionBlocked
 			}
 			if errors.Is(err, context.Canceled) {
-				return runtime.WorkerResult{}, err
+				return runtime.WorkerResult{}, effectiveReq, err
 			}
 			if shouldRetryRuntimeError(err) && attempt < maxRuntimeRetryAttempts {
 				lastErr = err
@@ -966,11 +984,11 @@ func (st *ticketRunState) runWorkerWithRuntimeControls(ctx context.Context, req 
 				RetryClass:     result.RetryClass,
 			}))
 			if err := st.blockRuntimeExecution(reason); err != nil {
-				return runtime.WorkerResult{}, err
+				return runtime.WorkerResult{}, effectiveReq, err
 			}
-			return runtime.WorkerResult{}, errRuntimeExecutionBlocked
+			return runtime.WorkerResult{}, effectiveReq, errRuntimeExecutionBlocked
 		default:
-			return result, nil
+			return result, effectiveReq, nil
 		}
 
 		if attempt >= maxRuntimeRetryAttempts {
@@ -982,27 +1000,41 @@ func (st *ticketRunState) runWorkerWithRuntimeControls(ctx context.Context, req 
 		lastErr = fmt.Errorf("worker runtime failed")
 	}
 	if !shouldRetryRuntimeError(lastErr) {
-		return runtime.WorkerResult{}, lastErr
+		return runtime.WorkerResult{}, effectiveReq, lastErr
 	}
 	if err := st.blockRuntimeExecution(fmt.Sprintf("retryable worker failure after %d retries: %v", maxRuntimeRetryAttempts, lastErr)); err != nil {
-		return runtime.WorkerResult{}, err
+		return runtime.WorkerResult{}, effectiveReq, err
 	}
-	return runtime.WorkerResult{}, errRuntimeExecutionBlocked
+	return runtime.WorkerResult{}, effectiveReq, errRuntimeExecutionBlocked
 }
 
-func (st *ticketRunState) runReviewerWithRuntimeControls(ctx context.Context, req runtime.ReviewRequest) (runtime.ReviewResult, error) {
+// runReviewerWithRuntimeControls executes a reviewer with retry logic and
+// fallback profile support. On the first retry (attempt > 0), it switches to
+// the configured ReviewerFallback profile when one is set. The effective
+// request is returned so the caller can record the runtime/model/reasoning
+// actually used for the attempt.
+func (st *ticketRunState) runReviewerWithRuntimeControls(ctx context.Context, req runtime.ReviewRequest) (runtime.ReviewResult, runtime.ReviewRequest, error) {
 	var lastErr error
+	effectiveReq := req
 	for attempt := 0; attempt <= maxRuntimeRetryAttempts; attempt++ {
-		result, err := st.runReviewerWithClaimRenewal(ctx, req)
+		effectiveReq = req
+		if attempt > 0 && !st.cfg.Runtime.ReviewerFallback.IsZero() {
+			fallback := st.cfg.Runtime.ReviewerFallback
+			effectiveReq.Runtime = strings.TrimSpace(fallback.Runtime)
+			effectiveReq.Model = strings.TrimSpace(fallback.Model)
+			effectiveReq.Reasoning = strings.TrimSpace(fallback.Reasoning)
+			effectiveReq.FallbackReason = "primary profile unavailable, retrying with fallback"
+		}
+		result, err := st.runReviewerWithClaimRenewal(ctx, effectiveReq)
 		if err != nil {
 			if errors.Is(err, errClaimRenewalLost) {
 				if err := st.blockRuntimeExecution(fmt.Sprintf("claim renewal lost during reviewer execution: %v", err)); err != nil {
-					return runtime.ReviewResult{}, err
+					return runtime.ReviewResult{}, effectiveReq, err
 				}
-				return runtime.ReviewResult{}, errRuntimeExecutionBlocked
+				return runtime.ReviewResult{}, effectiveReq, errRuntimeExecutionBlocked
 			}
 			if errors.Is(err, context.Canceled) {
-				return runtime.ReviewResult{}, err
+				return runtime.ReviewResult{}, effectiveReq, err
 			}
 			if shouldRetryRuntimeError(err) && attempt < maxRuntimeRetryAttempts {
 				lastErr = err
@@ -1029,11 +1061,11 @@ func (st *ticketRunState) runReviewerWithRuntimeControls(ctx context.Context, re
 				RetryClass:     result.RetryClass,
 			}))
 			if err := st.blockRuntimeExecution(reason); err != nil {
-				return runtime.ReviewResult{}, err
+				return runtime.ReviewResult{}, effectiveReq, err
 			}
-			return runtime.ReviewResult{}, errRuntimeExecutionBlocked
+			return runtime.ReviewResult{}, effectiveReq, errRuntimeExecutionBlocked
 		default:
-			return result, nil
+			return result, effectiveReq, nil
 		}
 
 		if attempt >= maxRuntimeRetryAttempts {
@@ -1045,12 +1077,12 @@ func (st *ticketRunState) runReviewerWithRuntimeControls(ctx context.Context, re
 		lastErr = fmt.Errorf("reviewer runtime failed")
 	}
 	if !shouldRetryRuntimeError(lastErr) {
-		return runtime.ReviewResult{}, lastErr
+		return runtime.ReviewResult{}, effectiveReq, lastErr
 	}
 	if err := st.blockRuntimeExecution(fmt.Sprintf("retryable reviewer failure after %d retries: %v", maxRuntimeRetryAttempts, lastErr)); err != nil {
-		return runtime.ReviewResult{}, err
+		return runtime.ReviewResult{}, effectiveReq, err
 	}
-	return runtime.ReviewResult{}, errRuntimeExecutionBlocked
+	return runtime.ReviewResult{}, effectiveReq, errRuntimeExecutionBlocked
 }
 
 func (st *ticketRunState) runWorkerWithClaimRenewal(ctx context.Context, req runtime.WorkerRequest) (runtime.WorkerResult, error) {
