@@ -121,6 +121,7 @@ func runEpicClosureGate(
 	if err != nil {
 		return fmt.Errorf("epic closure gate: resolve adapter: %w", err)
 	}
+	workerProfile := cfg.EffectiveWorkerProfile()
 
 	// --- Load child snapshots for reviewer context. ---
 	childSnapshots := loadChildSnapshotsForEpicGate(req.RepoRoot, req.RunID, childIDs)
@@ -197,7 +198,9 @@ func runEpicClosureGate(
 			TicketID:        req.RootTicketID,
 			LeaseID:         repairLeaseID,
 			Attempt:         cycle,
-			Runtime:         cfg.Runtime.DefaultRuntime,
+			Runtime:         workerProfile.Runtime,
+			Model:           workerProfile.Model,
+			Reasoning:       workerProfile.Reasoning,
 			WorktreePath:    req.RepoRoot,
 			Instructions:    repairInstructions,
 			ExecutionConfig: executionConfigFromPolicy(cfg),

@@ -160,10 +160,10 @@ func RunCommands(ctx context.Context, repoRoot string, cmds []string, cfg policy
 	return results, nil
 }
 
-// RunQualityCommands runs structured quality commands before per-ticket validation
-// commands. Each QualityCommand specifies an optional subdirectory (relative to
-// repoRoot) and one or more shell commands to run sequentially from that directory.
-// This supports monorepo setups where different packages have different quality gates.
+// RunQualityCommands runs structured verification commands from optional
+// subdirectories. Each QualityCommand specifies a path relative to repoRoot and
+// one or more shell commands to run sequentially from that directory. This
+// supports monorepo setups where different packages have different gates.
 func RunQualityCommands(ctx context.Context, repoRoot string, cmds []policy.QualityCommand, cfg policy.VerificationConfig) ([]CommandResult, error) {
 	if ctx == nil {
 		ctx = context.Background()

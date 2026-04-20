@@ -18,10 +18,10 @@ import (
 
 const waveVerificationOutputLimit = 4 * 1024 // 4 KB
 
-// runWaveVerificationLoop runs the configured quality commands and any
+// runWaveVerificationLoop runs the configured wave gate commands and any
 // engine-derived wave-scoped checks against the merged wave baseline. If any
 // check fails it routes the failure into a wave repair worker, re-running
-// only the relevant failed checks plus the configured quality gate. The wave
+// only the relevant failed checks plus the configured wave gate. The wave
 // artifact is updated in place: ValidationCoverage records the declared,
 // derived, and executed checks, plus the repair cycles that were spawned.
 //
@@ -44,20 +44,21 @@ func runWaveVerificationLoop(
 		StaleWordingTerms: staleWordingTermsProvider(),
 	})
 	derivedChecks := promoteDerivedToWave(derivation.Checks, wave.WaveID)
+	waveCommands := waveGateCommands(cfg.Verification)
 
-	hasQualityCmds := len(cfg.Verification.QualityCommands) > 0
+	hasWaveCommands := len(waveCommands) > 0
 	hasDerivedCmds := derivedHasExecutableCommand(derivedChecks)
 
-	// No quality and no derived checks → nothing to verify.
-	if !hasQualityCmds && !hasDerivedCmds {
+	// No configured and no derived checks → nothing to verify.
+	if !hasWaveCommands && !hasDerivedCmds {
 		return nil
 	}
 
-	coverage := newWaveValidationCoverage(*wave, plan, cfg.Verification.QualityCommands, derivedChecks, derivation.Skipped)
+	coverage := newWaveValidationCoverage(*wave, plan, waveCommands, derivedChecks, derivation.Skipped)
 	wave.ValidationCoverage = coverage
 	syncWaveAcceptanceFromCoverage(wave, coverage)
 
-	qualityResults, derivedResults, err := executeWaveChecks(ctx, req.RepoRoot, cfg.Verification, hasQualityCmds, derivedChecks)
+	qualityResults, derivedResults, err := executeWaveChecks(ctx, req.RepoRoot, cfg.Verification, waveCommands, derivedChecks)
 	if err != nil {
 		return fmt.Errorf("wave verification: run checks: %w", err)
 	}
@@ -90,6 +91,7 @@ func runWaveVerificationLoop(
 	// Track which derived check ids are still failing so subsequent cycles
 	// only re-run the relevant ones (plus the broader quality gate).
 	failingIDs := failingExecutionIDs(coverage)
+	workerProfile := cfg.EffectiveWorkerProfile()
 
 	for cycle := 1; cycle <= cfg.Policy.MaxWaveRepairCycles; cycle++ {
 		// Emit a structured repair-cycle-started event so consumers (plain
@@ -114,7 +116,9 @@ func runWaveVerificationLoop(
 			WaveID:          wave.WaveID,
 			LeaseID:         fmt.Sprintf("wave-repair-%s-%d", wave.WaveID, cycle),
 			Attempt:         cycle,
-			Runtime:         cfg.Runtime.DefaultRuntime,
+			Runtime:         workerProfile.Runtime,
+			Model:           workerProfile.Model,
+			Reasoning:       workerProfile.Reasoning,
 			WorktreePath:    req.RepoRoot,
 			Instructions:    instructions,
 			ExecutionConfig: executionConfigFromPolicy(cfg),
@@ -136,11 +140,10 @@ func runWaveVerificationLoop(
 			return primary
 		}
 
-		// Re-run only the previously failing derived checks plus the broader
-		// quality gate, not the entire derived set: relevant failures plus
-		// the required broad gate, per the ticket's ACs.
+		// Re-run only the previously failing derived checks plus the configured
+		// wave gate, not the entire derived set.
 		retryDerivedChecks := derivedChecksByIDs(derivedChecks, failingIDs)
-		qualityResults, derivedResults, err = executeWaveChecks(ctx, req.RepoRoot, cfg.Verification, hasQualityCmds, retryDerivedChecks)
+		qualityResults, derivedResults, err = executeWaveChecks(ctx, req.RepoRoot, cfg.Verification, waveCommands, retryDerivedChecks)
 		if err != nil {
 			return fmt.Errorf("wave verification: run checks after repair cycle %d: %w", cycle, err)
 		}
@@ -231,6 +234,13 @@ func anyMarkdownFile(files []string) bool {
 		}
 	}
 	return false
+}
+
+func waveGateCommands(cfg policy.VerificationConfig) []policy.QualityCommand {
+	out := make([]policy.QualityCommand, 0, len(cfg.QualityCommands)+len(cfg.WaveCommands))
+	out = append(out, cfg.QualityCommands...)
+	out = append(out, cfg.WaveCommands...)
+	return out
 }
 
 // promoteDerivedToWave rewrites a slice of ticket-scoped derived checks so
@@ -339,23 +349,23 @@ func buildWaveQualityChecks(runID, waveID string, cmds []policy.QualityCommand) 
 	return out
 }
 
-// executeWaveChecks runs the configured quality commands and the supplied
-// derived checks. Either set may be empty (when the policy disables quality
+// executeWaveChecks runs the configured wave gate commands and the supplied
+// derived checks. Either set may be empty (when the policy disables configured
 // commands or when no failing derived checks remain to retry). Returns the
-// quality results, the derived results map (keyed by check id), and any
-// fatal error.
+// configured-command results, the derived results map (keyed by check id), and
+// any fatal error.
 func executeWaveChecks(
 	ctx context.Context,
 	repoRoot string,
 	cfg policy.VerificationConfig,
-	hasQualityCmds bool,
+	waveCommands []policy.QualityCommand,
 	derivedChecks []state.ValidationCheck,
 ) ([]verifycommand.CommandResult, map[string]verifycommand.CommandResult, error) {
 	var qualityResults []verifycommand.CommandResult
-	if hasQualityCmds {
-		results, err := verifycommand.RunQualityCommands(ctx, repoRoot, cfg.QualityCommands, cfg)
+	if len(waveCommands) > 0 {
+		results, err := verifycommand.RunQualityCommands(ctx, repoRoot, waveCommands, cfg)
 		if err != nil {
-			return nil, nil, fmt.Errorf("run quality commands: %w", err)
+			return nil, nil, fmt.Errorf("run wave gate commands: %w", err)
 		}
 		qualityResults = results
 	}
