@@ -15,7 +15,7 @@ default:
 # --- Quality gates ---
 
 # Pre-commit: fast local checks + fresh non-race tests
-pre-commit: fmt vet lint build-check mod-tidy actionlint betterleaks test-fast
+pre-commit: format-check vet lint-check build-check mod-tidy-check actionlint betterleaks test-fast
 
 # Pre-push: pre-commit + race tests + vulnerability scan + semgrep
 pre-push: pre-commit test-race vuln semgrep
@@ -30,7 +30,7 @@ dev: check sonar
 # --- Static analysis ---
 
 # Check formatting via golangci-lint gofumpt (detect-only, no auto-fix)
-fmt:
+format-check:
     @test -z "$({{go_tool}} golangci-lint fmt --diff 2>&1)" || (echo "gofumpt: unformatted files" && {{go_tool}} golangci-lint fmt --diff 2>&1 && exit 1)
 
 # Go vet
@@ -39,6 +39,10 @@ vet:
 
 # Lint with golangci-lint
 lint:
+    {{go_tool}} golangci-lint run --fix
+
+# Verify lint with golangci-lint
+lint-check:
     {{go_tool}} golangci-lint run
 
 # Lint GitHub Actions workflows
@@ -76,7 +80,7 @@ build-check:
     go build ./...
 
 # Verify go.mod/go.sum and tools.mod/tools.sum are tidy (detect-only)
-mod-tidy:
+mod-tidy-check:
     @cp go.mod go.mod.bak
     @if [ -f go.sum ]; then cp go.sum go.sum.bak; fi
     @go mod tidy
@@ -97,6 +101,11 @@ mod-tidy:
         mv tools.mod.bak tools.mod; \
         if [ -f tools.sum.bak ]; then mv tools.sum.bak tools.sum; elif [ -f tools.sum ]; then rm tools.sum; fi; \
         if [ "$DIRTY" = "1" ]; then echo "tools.mod/tools.sum not tidy — run 'go mod tidy -modfile=tools.mod'" && exit 1; fi
+
+# Tidy go.mod/go.sum and tools.mod/tools.sum in-place.
+mod-tidy:
+    go mod tidy
+    go mod tidy -modfile=tools.mod
 
 # Run all tests without race detector (fresh)
 test: test-fast
@@ -157,10 +166,12 @@ autofix: format
     {{go_tool}} golangci-lint run --fix ./... 2>/dev/null || true
 
 # Set up git hooks and development environment
-setup: install-dev
-    git config core.hooksPath .githooks
-    @echo "Git hooks configured (.githooks/)"
+setup: install-dev install-hooks
     @echo "Development environment ready."
+
+# Install local git hooks into .git/hooks.
+install-hooks:
+    bash scripts/install-hooks.sh
 
 # Cache required development tools (pinned in tools.mod)
 install-dev:

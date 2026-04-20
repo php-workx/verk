@@ -18,7 +18,8 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
-      - run: go tool -modfile=tools.mod actionlint .github/workflows/*.yml
+      - uses: extractions/setup-just@v2
+      - run: just actionlint
 
   vet:
     name: Vet
@@ -28,7 +29,8 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
-      - run: go vet ./...
+      - uses: extractions/setup-just@v2
+      - run: just vet
 
   lint:
     name: Lint
@@ -38,7 +40,8 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
-      - run: go tool -modfile=tools.mod golangci-lint run
+      - uses: extractions/setup-just@v2
+      - run: just lint-check
 
   fmt:
     name: Format
@@ -48,9 +51,9 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
+      - uses: extractions/setup-just@v2
       - name: Check formatting
-        run: |
-          test -z "$(go tool -modfile=tools.mod golangci-lint fmt --diff 2>&1)" || (echo "gofumpt: unformatted files" && go tool -modfile=tools.mod golangci-lint fmt --diff 2>&1 && exit 1)
+        run: just format-check
 
   test:
     name: Test
@@ -60,7 +63,8 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
-      - run: go test -race -count=1 ./...
+      - uses: extractions/setup-just@v2
+      - run: just test-race
 
   build:
     name: Build
@@ -72,7 +76,8 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
-      - run: go build -ldflags "-X verk/internal/cli.Version=$(git describe --tags --always --dirty) -X verk/internal/cli.GitCommit=$(git rev-parse --short HEAD) -X verk/internal/cli.BuildDate=$(date -u +%Y-%m-%dT%H:%M:%SZ)" -o /dev/null ./cmd/verk
+      - uses: extractions/setup-just@v2
+      - run: just build-check
 
   mod-tidy:
     name: Mod Tidy
@@ -82,16 +87,9 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
+      - uses: extractions/setup-just@v2
       - name: Check go.mod and go.sum are tidy
-        run: |
-          go mod tidy
-          git diff --exit-code go.mod || (echo "go.mod not tidy — run 'go mod tidy'" && exit 1)
-          if [ -f go.sum ]; then git diff --exit-code go.sum || (echo "go.sum not tidy — run 'go mod tidy'" && exit 1); fi
-      - name: Check tools.mod and tools.sum are tidy
-        run: |
-          go mod tidy -modfile=tools.mod
-          git diff --exit-code tools.mod || (echo "tools.mod not tidy — run 'go mod tidy -modfile=tools.mod'" && exit 1)
-          if [ -f tools.sum ]; then git diff --exit-code tools.sum || (echo "tools.sum not tidy — run 'go mod tidy -modfile=tools.mod'" && exit 1); fi
+        run: just mod-tidy-check
 
   vuln:
     name: Vulnerability Scan
@@ -101,7 +99,8 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
-      - run: go tool -modfile=tools.mod govulncheck ./...
+      - uses: extractions/setup-just@v2
+      - run: just vuln
 
   trufflehog:
     name: Secret Scan
@@ -120,13 +119,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      # Pinned to semgrep/semgrep-action v1 (commit SHA, not mutable tag/branch).
-      # Note: the previous reference `semgrep/action@v1` is not a real upstream
-      # repository (workflow failed to resolve it). `semgrep/semgrep-action` is the
-      # canonical Semgrep GitHub Action repo (archived but still functional for v1,
-      # which accepts `config: auto` as documented). If this action is retired, swap
-      # to the container-based approach: `container: { image: semgrep/semgrep }` +
-      # `run: semgrep scan --config auto`.
-      - uses: semgrep/semgrep-action@713efdd345f3035192eaa63f56867b88e63e4e5d # v1
+      - uses: extractions/setup-just@v2
+      - uses: actions/setup-python@v5
         with:
-          config: auto
+          python-version: "3.x"
+      - name: Install semgrep
+        run: python -m pip install --upgrade pip semgrep
+      - name: Run semgrep
+        run: just semgrep
