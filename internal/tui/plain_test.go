@@ -182,6 +182,144 @@ func TestRunPlainProgress_PartialWave_AutoRetryRouting(t *testing.T) {
 	}
 }
 
+// TestRunPlainProgress_RepairCycleStarted_ShowsCheckIDs covers TC2 (first half):
+// when a repair cycle starts, the plain output shows which check IDs triggered
+// it so operators can correlate the failure without reading the wave artifact.
+func TestRunPlainProgress_RepairCycleStarted_ShowsCheckIDs(t *testing.T) {
+	ch := feedEvents([]engine.ProgressEvent{
+		{
+			Type:            engine.EventRepairCycleStarted,
+			TicketID:        "wave-1",
+			RepairCycle:     1,
+			MaxRepairCycles: 3,
+			CheckIDs:        []string{"check-go-test", "check-lint"},
+		},
+	})
+
+	var buf bytes.Buffer
+	RunPlainProgress(&buf, ch)
+	out := buf.String()
+
+	if !strings.Contains(out, "repair") {
+		t.Fatalf("repair cycle start must mention repair; output:\n%s", out)
+	}
+	if !strings.Contains(out, "check-go-test") {
+		t.Fatalf("repair cycle start must include check ID; output:\n%s", out)
+	}
+	if !strings.Contains(out, "1/3") {
+		t.Fatalf("repair cycle start must include cycle N/M; output:\n%s", out)
+	}
+}
+
+// TestRunPlainProgress_RepairCycleSucceeded_ShowsRepairedStatus covers TC2:
+// when a repair cycle succeeds, the output shows "repaired" so the operator
+// sees the fix rather than only the final close.
+func TestRunPlainProgress_RepairCycleSucceeded_ShowsRepairedStatus(t *testing.T) {
+	ch := feedEvents([]engine.ProgressEvent{
+		{
+			Type:            engine.EventRepairCycleStarted,
+			TicketID:        "wave-1",
+			RepairCycle:     1,
+			MaxRepairCycles: 2,
+			CheckIDs:        []string{"check-go-test"},
+		},
+		{
+			Type:            engine.EventRepairCycleSucceeded,
+			TicketID:        "wave-1",
+			RepairCycle:     1,
+			MaxRepairCycles: 2,
+		},
+		{
+			Type:    engine.EventWaveCompleted,
+			WaveID:  1,
+			Closed:  1,
+			Total:   1,
+			Success: true,
+		},
+	})
+
+	var buf bytes.Buffer
+	RunPlainProgress(&buf, ch)
+	out := buf.String()
+
+	// The output must contain both the repaired marker AND the final close
+	// marker — not just the close.
+	if !strings.Contains(out, "repaired") {
+		t.Fatalf("output must contain repaired marker; output:\n%s", out)
+	}
+	if !strings.Contains(out, "1/1 closed ✓") {
+		t.Fatalf("output must also show wave close; output:\n%s", out)
+	}
+}
+
+// TestRunPlainProgress_RepairCycleExhausted_ShowsFailedChecksAndNextAction
+// covers TC3: when repair budget is exhausted, the output names the checks
+// that could not be repaired and directs the operator to follow up manually.
+func TestRunPlainProgress_RepairCycleExhausted_ShowsFailedChecksAndNextAction(t *testing.T) {
+	ch := feedEvents([]engine.ProgressEvent{
+		{
+			Type:            engine.EventRepairCycleStarted,
+			TicketID:        "wave-1",
+			RepairCycle:     1,
+			MaxRepairCycles: 1,
+			CheckIDs:        []string{"check-go-test"},
+		},
+		{
+			Type:            engine.EventRepairCycleExhausted,
+			TicketID:        "wave-1",
+			RepairCycle:     1,
+			MaxRepairCycles: 1,
+			CheckIDs:        []string{"check-go-test"},
+		},
+	})
+
+	var buf bytes.Buffer
+	RunPlainProgress(&buf, ch)
+	out := buf.String()
+
+	if !strings.Contains(out, "check-go-test") {
+		t.Fatalf("exhausted repair must name the failing check; output:\n%s", out)
+	}
+	if !strings.Contains(out, "manual follow-up") {
+		t.Fatalf("exhausted repair must indicate manual follow-up required; output:\n%s", out)
+	}
+}
+
+// TestRunPlainProgress_AdvisorySkippedChecks_DoesNotAddNoise covers TC6:
+// a wave that closes cleanly with no blocked tickets must not emit any
+// advisory/skipped check noise — a quiet success is the right default.
+func TestRunPlainProgress_AdvisorySkippedChecks_DoesNotAddNoise(t *testing.T) {
+	ch := feedEvents([]engine.ProgressEvent{
+		{
+			Type:    engine.EventWaveStarted,
+			WaveID:  1,
+			Tickets: []string{"ver-a"},
+		},
+		{
+			Type:    engine.EventWaveCompleted,
+			WaveID:  1,
+			Closed:  1,
+			Total:   1,
+			Success: true,
+			// No BlockedTicketDetails — all checks passed or were skipped quietly.
+		},
+	})
+
+	var buf bytes.Buffer
+	RunPlainProgress(&buf, ch)
+	out := buf.String()
+
+	if !strings.Contains(out, "1/1 closed ✓") {
+		t.Fatalf("all-closed wave must render ✓; output:\n%s", out)
+	}
+	// No advisory or skipped label should appear in quiet output.
+	for _, noisyToken := range []string{"advisory", "skipped", "[repair]"} {
+		if strings.Contains(strings.ToLower(out), noisyToken) {
+			t.Fatalf("all-closed wave must not mention %q; output:\n%s", noisyToken, out)
+		}
+	}
+}
+
 func TestRunPlainProgress_TicketDetail_IncludesTicketID(t *testing.T) {
 	// The final blocked-epic summary relies on per-child EventTicketDetail
 	// events that carry a TicketID. The plain renderer must surface that ID

@@ -56,7 +56,15 @@ type Model struct {
 	cancelRequested bool
 	spinner         spinner.Model
 	startTime       time.Time
+	width           int
 }
+
+const (
+	defaultViewWidth  = 100
+	compactTitleWidth = 26
+	minTitleWidth     = 20
+	ticketIDWidth     = 10
+)
 
 // NewRunModel creates a new run progress model.
 func NewRunModel(runID string, ch <-chan engine.ProgressEvent) Model {
@@ -89,6 +97,7 @@ func (m Model) Init() tea.Cmd {
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
+		m.width = msg.Width
 		return m, nil
 
 	case tea.KeyPressMsg:
@@ -130,6 +139,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 func (m *Model) handleEvent(evt engine.ProgressEvent) tea.Cmd {
 	switch evt.Type {
 	case engine.EventWaveStarted:
+		// Guard against duplicate wave entries. A duplicate can arise if the
+		// engine emits a second EventWaveStarted for an already-registered wave
+		// (e.g. due to resume or a race in sub-wave progress delivery). Without
+		// this guard the TUI would render duplicate wave headers.
+		for _, w := range m.waves {
+			if w.id == evt.WaveID && w.parentTicketID == evt.ParentTicketID {
+				return nil // already registered; skip
+			}
+		}
 		m.waves = append(m.waves, waveState{
 			id:             evt.WaveID,
 			parentTicketID: evt.ParentTicketID,
@@ -143,8 +161,10 @@ func (m *Model) handleEvent(evt engine.ProgressEvent) tea.Cmd {
 		}
 
 	case engine.EventWaveCompleted:
-		if len(m.waves) > 0 {
-			w := &m.waves[len(m.waves)-1]
+		// Match by wave ID and parent ticket ID rather than always taking the
+		// last wave: concurrent sub-waves may complete in any order.
+		w := m.findWave(evt.WaveID, evt.ParentTicketID)
+		if w != nil {
 			w.closed = evt.Closed
 			w.done = true
 			w.ok = evt.Success
@@ -180,9 +200,46 @@ func (m *Model) handleEvent(evt engine.ProgressEvent) tea.Cmd {
 		tl.active = evt.Detail
 		m.addDetail(fmt.Sprintf("%s: %s", evt.TicketID, evt.Detail))
 
+	case engine.EventRepairCycleStarted:
+		// Log to the rolling activity window so the operator sees which checks
+		// triggered the repair without cluttering the wave summary line.
+		if len(evt.CheckIDs) > 0 {
+			m.addDetail(fmt.Sprintf("repair cycle %d/%d: %s",
+				evt.RepairCycle, evt.MaxRepairCycles, strings.Join(evt.CheckIDs, ", ")))
+		} else {
+			m.addDetail(fmt.Sprintf("repair cycle %d/%d started", evt.RepairCycle, evt.MaxRepairCycles))
+		}
+
+	case engine.EventRepairCycleSucceeded:
+		m.addDetail(fmt.Sprintf("repair cycle %d: repaired ✓", evt.RepairCycle))
+
+	case engine.EventRepairCycleExhausted:
+		// Show in the activity log so the operator sees it immediately even
+		// before the blocked-wave summary appears.
+		if len(evt.CheckIDs) > 0 {
+			m.addDetail(fmt.Sprintf("repair exhausted after %d cycle(s): %s — manual follow-up required",
+				evt.RepairCycle, strings.Join(evt.CheckIDs, ", ")))
+		} else {
+			m.addDetail(fmt.Sprintf("repair exhausted after %d cycle(s) — manual follow-up required",
+				evt.RepairCycle))
+		}
+
 	case engine.EventRunCompleted:
 		m.done = true
 		return tea.Quit
+	}
+	return nil
+}
+
+// findWave returns a pointer to the waveState with the given id and
+// parentTicketID, or nil when no matching wave exists. The returned pointer
+// is into the m.waves slice and remains valid as long as the slice is not
+// reallocated, so callers must not hold it across Update calls.
+func (m *Model) findWave(id int, parentTicketID string) *waveState {
+	for i := range m.waves {
+		if m.waves[i].id == id && m.waves[i].parentTicketID == parentTicketID {
+			return &m.waves[i]
+		}
 	}
 	return nil
 }
@@ -329,37 +386,22 @@ func waveLabel(w *waveState) string {
 }
 
 func (m Model) renderTicket(b *strings.Builder, tl *ticketLine) {
-	// ID
-	id := styleTicketID.Render(fmt.Sprintf("  %-10s", tl.id))
+	id := styleTicketID.Render(formatTicketID(tl.id))
+	elapsedPlain := m.renderElapsedPlain(tl)
+	elapsed := styleElapsed.Render(elapsedPlain)
 
-	// Title (truncated)
-	title := ""
-	if tl.title != "" {
-		t := tl.title
-		if len(t) > 26 {
-			t = t[:23] + "..."
-		}
-		title = styleTicketTitle.Render(fmt.Sprintf("%-26s", t))
-	} else {
-		title = strings.Repeat(" ", 26)
+	if tl.active != "" && !tl.done {
+		titleBudget := m.viewWidth() - len(ticketContinuationIndent()) - len(elapsedPlain)
+		titleBudget = max(titleBudget, minTitleWidth)
+		title := styleTicketTitle.Render(truncateString(tl.title, titleBudget))
+		b.WriteString(id + " " + title + elapsed + "\n")
+		b.WriteString(ticketContinuationIndent() + m.renderPhaseChain(tl) + "\n")
+		b.WriteString(ticketContinuationIndent() + m.renderActiveDetail(tl) + "\n")
+		return
 	}
 
-	// Phase chain + active state
-	chain := m.renderPhaseChain(tl)
-
-	// Elapsed time — frozen for done tickets, live for active
-	elapsed := ""
-	if !tl.startedAt.IsZero() {
-		var dur time.Duration
-		if tl.done && !tl.finishedAt.IsZero() {
-			dur = tl.finishedAt.Sub(tl.startedAt)
-		} else {
-			dur = time.Since(tl.startedAt)
-		}
-		elapsed = styleElapsed.Render(fmt.Sprintf(" (%s)", formatDuration(dur)))
-	}
-
-	b.WriteString(id + " " + title + " " + chain + elapsed + "\n")
+	title := styleTicketTitle.Render(fmt.Sprintf("%-*s", compactTitleWidth, truncateString(tl.title, compactTitleWidth)))
+	b.WriteString(id + " " + title + " " + m.renderPhaseChain(tl) + elapsed + "\n")
 }
 
 func (m Model) renderPhaseChain(tl *ticketLine) string {
@@ -381,16 +423,54 @@ func (m Model) renderPhaseChain(tl *ticketLine) string {
 
 	chain := strings.Join(parts, styleDivider.Render(" → "))
 
-	// Show active operation with spinner
-	if tl.active != "" && !tl.done {
-		active := tl.active
-		if len(active) > 30 {
-			active = active[:27] + "..."
-		}
-		chain += " " + m.spinner.View() + " " + styleActive.Render(active)
-	}
-
 	return chain
+}
+
+func (m Model) renderActiveDetail(tl *ticketLine) string {
+	if tl.active == "" || tl.done {
+		return ""
+	}
+	budget := m.viewWidth() - len(ticketContinuationIndent()) - len(m.spinner.View()) - 2
+	budget = max(budget, minTitleWidth)
+	return m.spinner.View() + "  " + styleActive.Render(truncateString(tl.active, budget))
+}
+
+func (m Model) renderElapsedPlain(tl *ticketLine) string {
+	if tl.startedAt.IsZero() {
+		return ""
+	}
+	var dur time.Duration
+	if tl.done && !tl.finishedAt.IsZero() {
+		dur = tl.finishedAt.Sub(tl.startedAt)
+	} else {
+		dur = time.Since(tl.startedAt)
+	}
+	return fmt.Sprintf(" (%s)", formatDuration(dur))
+}
+
+func (m Model) viewWidth() int {
+	if m.width > 0 {
+		return m.width
+	}
+	return defaultViewWidth
+}
+
+func formatTicketID(id string) string {
+	return fmt.Sprintf("  %-*s", ticketIDWidth, id)
+}
+
+func ticketContinuationIndent() string {
+	return strings.Repeat(" ", len(formatTicketID(""))+1)
+}
+
+func truncateString(s string, maxLen int) string {
+	if maxLen <= 0 || len(s) <= maxLen {
+		return s
+	}
+	if maxLen <= 3 {
+		return s[:maxLen]
+	}
+	return s[:maxLen-3] + "..."
 }
 
 func formatDuration(d time.Duration) string {

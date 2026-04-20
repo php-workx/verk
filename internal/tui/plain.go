@@ -71,6 +71,34 @@ func RunPlainProgress(w io.Writer, ch <-chan engine.ProgressEvent) {
 				_, _ = fmt.Fprintf(w, "           %s\n", evt.Detail)
 			}
 
+		case engine.EventRepairCycleStarted:
+			// Show which checks triggered the repair cycle so the operator can
+			// correlate output with the check that failed.
+			if len(evt.CheckIDs) > 0 {
+				_, _ = fmt.Fprintf(w, "  [repair] cycle %d/%d: %s\n",
+					evt.RepairCycle, evt.MaxRepairCycles, strings.Join(evt.CheckIDs, ", "))
+			} else {
+				_, _ = fmt.Fprintf(w, "  [repair] cycle %d/%d started\n",
+					evt.RepairCycle, evt.MaxRepairCycles)
+			}
+
+		case engine.EventRepairCycleSucceeded:
+			// A short "repaired" line so the operator sees the fix rather than
+			// only the final wave-closed or ticket-closed summary.
+			_, _ = fmt.Fprintf(w, "  [repair] cycle %d: repaired ✓\n", evt.RepairCycle)
+
+		case engine.EventRepairCycleExhausted:
+			// Show the failing checks and the next action so operators know what
+			// manual work is required. This mirrors the blocked-ticket guidance
+			// style used by renderPlainBlockedTicket.
+			if len(evt.CheckIDs) > 0 {
+				_, _ = fmt.Fprintf(w, "  [repair] exhausted after %d cycle(s): %s — manual follow-up required\n",
+					evt.RepairCycle, strings.Join(evt.CheckIDs, ", "))
+			} else {
+				_, _ = fmt.Fprintf(w, "  [repair] exhausted after %d cycle(s) — manual follow-up required\n",
+					evt.RepairCycle)
+			}
+
 		case engine.EventRunCompleted:
 			// nothing to print — the caller handles final status
 		}
