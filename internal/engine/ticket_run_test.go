@@ -1773,3 +1773,479 @@ func TestBuildReviewRepairBlockReason_EmptyFindingIDs(t *testing.T) {
 		t.Fatalf("expected no unresolved-findings tail when list is empty, got %q", reason)
 	}
 }
+
+// TestRunTicket_WorkerRequestIncludesRoleProfile covers ver-laq2 test case 6:
+// the engine must forward the configured role profile fields (runtime, model,
+// reasoning) to the adapter via WorkerRequest and ReviewRequest so that CLI
+// adapters can pass them to their underlying tools. The implementation and
+// review artifacts must also record the profile so runs are auditable.
+func TestRunTicket_WorkerRequestIncludesRoleProfile(t *testing.T) {
+	repoRoot := t.TempDir()
+	cfg := policy.DefaultConfig()
+	// DefaultConfig sets Worker={claude/sonnet/high}, Reviewer={claude/opus/xhigh}.
+	ticket := testTicket("ver-role-profile")
+	plan, claim := testPlanAndClaim(t, repoRoot, ticket, cfg, "run-role-profile", "lease-role-profile", []string{`true`})
+
+	started, finished := testRunTimes()
+	adapter := runtimefake.New(
+		[]runtime.WorkerResult{
+			{
+				Status:             runtime.WorkerStatusDone,
+				RetryClass:         runtime.RetryClassTerminal,
+				LeaseID:            claim.LeaseID,
+				StartedAt:          started,
+				FinishedAt:         finished,
+				ResultArtifactPath: filepath.Join(repoRoot, "worker.json"),
+			},
+		},
+		[]runtime.ReviewResult{
+			{
+				Status:             runtime.WorkerStatusDone,
+				RetryClass:         runtime.RetryClassTerminal,
+				LeaseID:            claim.LeaseID,
+				StartedAt:          finished.Add(time.Second),
+				FinishedAt:         finished.Add(2 * time.Second),
+				ReviewStatus:       runtime.ReviewStatusPassed,
+				Summary:            "clean",
+				ResultArtifactPath: filepath.Join(repoRoot, "review.json"),
+			},
+		},
+	)
+
+	result, err := RunTicket(context.Background(), RunTicketRequest{
+		RepoRoot: repoRoot,
+		RunID:    "run-role-profile",
+		Ticket:   ticket,
+		Plan:     plan,
+		Claim:    claim,
+		Adapter:  adapter,
+		Config:   cfg,
+	})
+	if err != nil {
+		t.Fatalf("RunTicket returned error: %v", err)
+	}
+	if result.Snapshot.CurrentPhase != state.TicketPhaseClosed {
+		t.Fatalf("expected closed phase, got %q", result.Snapshot.CurrentPhase)
+	}
+
+	// Verify the worker request carried the configured worker profile.
+	workerReqs := adapter.WorkerRequests()
+	if len(workerReqs) != 1 {
+		t.Fatalf("expected 1 worker request, got %d", len(workerReqs))
+	}
+	if got := workerReqs[0].Runtime; got != "claude" {
+		t.Errorf("worker request: want Runtime %q, got %q", "claude", got)
+	}
+	if got := workerReqs[0].Model; got != "sonnet" {
+		t.Errorf("worker request: want Model %q, got %q", "sonnet", got)
+	}
+	if got := workerReqs[0].Reasoning; got != "high" {
+		t.Errorf("worker request: want Reasoning %q, got %q", "high", got)
+	}
+	if got := workerReqs[0].FallbackReason; got != "" {
+		t.Errorf("worker request: expected empty FallbackReason on primary attempt, got %q", got)
+	}
+
+	// Verify the reviewer request carried the configured reviewer profile.
+	reviewReqs := adapter.ReviewRequests()
+	if len(reviewReqs) != 1 {
+		t.Fatalf("expected 1 review request, got %d", len(reviewReqs))
+	}
+	if got := reviewReqs[0].Runtime; got != "claude" {
+		t.Errorf("review request: want Runtime %q, got %q", "claude", got)
+	}
+	if got := reviewReqs[0].Model; got != "opus" {
+		t.Errorf("review request: want Model %q, got %q", "opus", got)
+	}
+	if got := reviewReqs[0].Reasoning; got != "xhigh" {
+		t.Errorf("review request: want Reasoning %q, got %q", "xhigh", got)
+	}
+	if got := reviewReqs[0].FallbackReason; got != "" {
+		t.Errorf("review request: expected empty FallbackReason on primary attempt, got %q", got)
+	}
+
+	// Verify the implementation artifact records the worker profile.
+	impl := result.Snapshot.Implementation
+	if impl == nil {
+		t.Fatal("expected implementation artifact, got nil")
+	}
+	if impl.Runtime != "claude" {
+		t.Errorf("implementation artifact: want Runtime %q, got %q", "claude", impl.Runtime)
+	}
+	if impl.Model != "sonnet" {
+		t.Errorf("implementation artifact: want Model %q, got %q", "sonnet", impl.Model)
+	}
+	if impl.Reasoning != "high" {
+		t.Errorf("implementation artifact: want Reasoning %q, got %q", "high", impl.Reasoning)
+	}
+	if impl.FallbackReason != "" {
+		t.Errorf("implementation artifact: expected empty FallbackReason, got %q", impl.FallbackReason)
+	}
+
+	// Verify the review artifact records the reviewer profile.
+	rev := result.Snapshot.Review
+	if rev == nil {
+		t.Fatal("expected review artifact, got nil")
+	}
+	if rev.ReviewerRuntime != "claude" {
+		t.Errorf("review artifact: want ReviewerRuntime %q, got %q", "claude", rev.ReviewerRuntime)
+	}
+	if rev.ReviewerModel != "opus" {
+		t.Errorf("review artifact: want ReviewerModel %q, got %q", "opus", rev.ReviewerModel)
+	}
+	if rev.ReviewerReasoning != "xhigh" {
+		t.Errorf("review artifact: want ReviewerReasoning %q, got %q", "xhigh", rev.ReviewerReasoning)
+	}
+	if rev.FallbackReason != "" {
+		t.Errorf("review artifact: expected empty FallbackReason, got %q", rev.FallbackReason)
+	}
+}
+
+// TestRunTicket_FallbackProfileUsedOnRetry covers ver-laq2 test case 9:
+// when the primary worker profile returns a retryable failure the retry must
+// switch to the configured WorkerFallback profile, and the implementation
+// artifact must record the fallback model/reasoning/fallback_reason so the
+// audit trail is accurate even when the primary profile was not the one that
+// ultimately produced the result.
+func TestRunTicket_FallbackProfileUsedOnRetry(t *testing.T) {
+	repoRoot := t.TempDir()
+	cfg := policy.DefaultConfig()
+	cfg.Runtime.WorkerFallback = policy.RoleProfile{
+		Runtime:   "claude",
+		Model:     "haiku",
+		Reasoning: "low",
+	}
+	ticket := testTicket("ver-fallback-retry")
+	plan, claim := testPlanAndClaim(t, repoRoot, ticket, cfg, "run-fallback-retry", "lease-fallback-retry", []string{`true`})
+
+	started, finished := testRunTimes()
+	adapter := runtimefake.New(
+		[]runtime.WorkerResult{
+			// First attempt uses the primary profile and returns retryable.
+			{
+				Status:             runtime.WorkerStatusBlocked,
+				RetryClass:         runtime.RetryClassRetryable,
+				LeaseID:            claim.LeaseID,
+				StartedAt:          started,
+				FinishedAt:         finished,
+				ResultArtifactPath: filepath.Join(repoRoot, "worker-1.json"),
+			},
+			// Second attempt (fallback) succeeds.
+			{
+				Status:             runtime.WorkerStatusDone,
+				RetryClass:         runtime.RetryClassTerminal,
+				LeaseID:            claim.LeaseID,
+				StartedAt:          finished.Add(time.Second),
+				FinishedAt:         finished.Add(2 * time.Second),
+				ResultArtifactPath: filepath.Join(repoRoot, "worker-2.json"),
+			},
+		},
+		[]runtime.ReviewResult{
+			{
+				Status:             runtime.WorkerStatusDone,
+				RetryClass:         runtime.RetryClassTerminal,
+				LeaseID:            claim.LeaseID,
+				StartedAt:          finished.Add(3 * time.Second),
+				FinishedAt:         finished.Add(4 * time.Second),
+				ReviewStatus:       runtime.ReviewStatusPassed,
+				Summary:            "clean",
+				ResultArtifactPath: filepath.Join(repoRoot, "review.json"),
+			},
+		},
+	)
+
+	result, err := RunTicket(context.Background(), RunTicketRequest{
+		RepoRoot: repoRoot,
+		RunID:    "run-fallback-retry",
+		Ticket:   ticket,
+		Plan:     plan,
+		Claim:    claim,
+		Adapter:  adapter,
+		Config:   cfg,
+	})
+	if err != nil {
+		t.Fatalf("RunTicket returned error: %v", err)
+	}
+	if result.Snapshot.CurrentPhase != state.TicketPhaseClosed {
+		t.Fatalf("expected closed phase, got %q", result.Snapshot.CurrentPhase)
+	}
+
+	workerReqs := adapter.WorkerRequests()
+	if len(workerReqs) != 2 {
+		t.Fatalf("expected 2 worker requests (primary + fallback retry), got %d", len(workerReqs))
+	}
+
+	// First request must use the primary (sonnet) profile with no fallback reason.
+	if got := workerReqs[0].Model; got != "sonnet" {
+		t.Errorf("attempt 1: want primary Model %q, got %q", "sonnet", got)
+	}
+	if got := workerReqs[0].FallbackReason; got != "" {
+		t.Errorf("attempt 1: expected empty FallbackReason on primary attempt, got %q", got)
+	}
+
+	// Second request must use the fallback (haiku) profile with a non-empty fallback reason.
+	if got := workerReqs[1].Model; got != "haiku" {
+		t.Errorf("attempt 2: want fallback Model %q, got %q", "haiku", got)
+	}
+	if got := workerReqs[1].Reasoning; got != "low" {
+		t.Errorf("attempt 2: want fallback Reasoning %q, got %q", "low", got)
+	}
+	if got := workerReqs[1].FallbackReason; got == "" {
+		t.Error("attempt 2: expected non-empty FallbackReason on fallback attempt")
+	}
+
+	// The implementation artifact must reflect the fallback profile that
+	// produced the successful result, not the primary profile.
+	impl := result.Snapshot.Implementation
+	if impl == nil {
+		t.Fatal("expected implementation artifact, got nil")
+	}
+	if impl.Model != "haiku" {
+		t.Errorf("implementation artifact: want fallback Model %q, got %q", "haiku", impl.Model)
+	}
+	if impl.Reasoning != "low" {
+		t.Errorf("implementation artifact: want fallback Reasoning %q, got %q", "low", impl.Reasoning)
+	}
+	if impl.FallbackReason == "" {
+		t.Error("implementation artifact: expected non-empty FallbackReason when fallback was used")
+	}
+}
+
+// TestRunTicket_VerifyBudgetExhaustedBlocks verifies that when the
+// MaxImplementationAttempts limit is reached after repeated verification
+// failures, the ticket transitions to blocked with a clear reason that cites
+// the non-convergent verification prefix and the number of attempts.
+// This is an end-to-end regression test for AC5 (ticket ver-1qru): the
+// ticket must block with a clear reason only after repair budget is exhausted.
+func TestRunTicket_VerifyBudgetExhaustedBlocks(t *testing.T) {
+	repoRoot := t.TempDir()
+	cfg := policy.DefaultConfig()
+	cfg.Policy.MaxImplementationAttempts = 2
+	ticket := testTicket("ver-verify-budget")
+	// Use a command that always fails so verification never passes.
+	plan, claim := testPlanAndClaim(t, repoRoot, ticket, cfg, "run-verify-budget", "lease-verify-budget", []string{`false`})
+
+	started, finished := testRunTimes()
+	adapter := runtimefake.New(
+		[]runtime.WorkerResult{
+			{
+				Status:             runtime.WorkerStatusDone,
+				RetryClass:         runtime.RetryClassTerminal,
+				LeaseID:            claim.LeaseID,
+				StartedAt:          started,
+				FinishedAt:         finished,
+				ResultArtifactPath: filepath.Join(repoRoot, "worker-1.json"),
+			},
+			{
+				Status:             runtime.WorkerStatusDone,
+				RetryClass:         runtime.RetryClassTerminal,
+				LeaseID:            claim.LeaseID,
+				StartedAt:          finished.Add(3 * time.Second),
+				FinishedAt:         finished.Add(4 * time.Second),
+				ResultArtifactPath: filepath.Join(repoRoot, "worker-2.json"),
+			},
+		},
+		nil, // verification never passes, no review reached
+	)
+
+	result, err := RunTicket(context.Background(), RunTicketRequest{
+		RepoRoot: repoRoot,
+		RunID:    "run-verify-budget",
+		Ticket:   ticket,
+		Plan:     plan,
+		Claim:    claim,
+		Adapter:  adapter,
+		Config:   cfg,
+	})
+	if err != nil {
+		t.Fatalf("RunTicket returned error: %v", err)
+	}
+
+	// AC5: the ticket must block, not close.
+	if result.Snapshot.CurrentPhase != state.TicketPhaseBlocked {
+		t.Fatalf("expected blocked phase after budget exhausted, got %q", result.Snapshot.CurrentPhase)
+	}
+	// AC5: block reason must be clear and cite the canonical non-convergent prefix.
+	if !strings.Contains(result.Snapshot.BlockReason, string(state.EscalationNonConvergentVerification)) {
+		t.Fatalf("expected non-convergent verification prefix in block reason, got %q", result.Snapshot.BlockReason)
+	}
+	if !strings.Contains(result.Snapshot.BlockReason, "2 attempt") {
+		t.Fatalf("expected attempt count in block reason, got %q", result.Snapshot.BlockReason)
+	}
+	// AC7: repair limit must be persisted in the coverage artifact.
+	if result.Snapshot.Verification == nil {
+		t.Fatal("expected verification artifact to be present")
+	}
+	if result.Snapshot.Verification.ValidationCoverage == nil {
+		t.Fatal("expected validation coverage to be present on verification artifact")
+	}
+	limit := result.Snapshot.Verification.ValidationCoverage.RepairLimit
+	if limit == nil {
+		t.Fatal("expected ValidationRepairLimit to be recorded on coverage after budget exhaustion")
+	}
+	if limit.Name != "max_implementation_attempts" {
+		t.Fatalf("expected repair limit name max_implementation_attempts, got %q", limit.Name)
+	}
+	if limit.Limit != 2 || limit.Reached != 2 {
+		t.Fatalf("expected limit=2 reached=2, got limit=%d reached=%d", limit.Limit, limit.Reached)
+	}
+	// AC6: existing behavior compatible — 2 worker requests, 0 review requests.
+	if len(adapter.WorkerRequests()) != 2 {
+		t.Fatalf("expected 2 worker requests, got %d", len(adapter.WorkerRequests()))
+	}
+	if len(adapter.ReviewRequests()) != 0 {
+		t.Fatalf("expected 0 review requests (verify never passed), got %d", len(adapter.ReviewRequests()))
+	}
+}
+
+// TestBuildImplementPhaseInstructions_FirstAttemptUnchanged verifies that the
+// first attempt (no repair cycles) returns the same instructions as
+// renderImplementInstructions so the existing behavior is preserved (AC6).
+func TestBuildImplementPhaseInstructions_FirstAttemptUnchanged(t *testing.T) {
+	plan := state.PlanArtifact{
+		ArtifactMeta:             state.ArtifactMeta{RunID: "run-first"},
+		TicketID:                 "ver-first",
+		Title:                    "Test ticket",
+		Description:              "Description here.",
+		AcceptanceCriteria:       []string{"criterion one"},
+		ValidationCommands:       []string{"go test ./..."},
+		EffectiveReviewThreshold: state.SeverityP2,
+	}
+	st := &ticketRunState{
+		req:          RunTicketRequest{Plan: plan},
+		currentPhase: state.TicketPhaseImplement,
+	}
+
+	got := buildImplementPhaseInstructions(st, 1)
+	want := renderImplementInstructions(plan, state.TicketPhaseImplement, 1)
+	if got != want {
+		t.Fatalf("expected first-attempt instructions to be identical to renderImplementInstructions output")
+	}
+}
+
+// TestBuildImplementPhaseInstructions_RetryIncludesVerificationRepairContext
+// verifies that when a retry is triggered by failing verification checks, the
+// implement instructions include the prior verification summary and the
+// specific failing check details. This ensures the worker gets focused repair
+// context rather than a generic retry note (AC2, AC3 for ticket ver-1qru).
+func TestBuildImplementPhaseInstructions_RetryIncludesVerificationRepairContext(t *testing.T) {
+	plan := state.PlanArtifact{
+		ArtifactMeta:             state.ArtifactMeta{RunID: "run-repair-ctx"},
+		TicketID:                 "ver-repair-ctx",
+		EffectiveReviewThreshold: state.SeverityP2,
+	}
+
+	const failingCheckID = "check-derived-ruff"
+	const failingCmd = "ruff check src/app.py"
+
+	verification := &state.VerificationArtifact{
+		ArtifactMeta: state.ArtifactMeta{RunID: "run-repair-ctx"},
+		TicketID:     "ver-repair-ctx",
+		Attempt:      1,
+		Passed:       false,
+		Results: []state.VerificationResult{
+			{Command: failingCmd, ExitCode: 1, Passed: false},
+		},
+		ValidationCoverage: &state.ValidationCoverageArtifact{
+			ArtifactMeta: state.ArtifactMeta{RunID: "run-repair-ctx"},
+			Scope:        state.ValidationScopeTicket,
+			TicketID:     "ver-repair-ctx",
+			DerivedChecks: []state.ValidationCheck{{
+				ID:           failingCheckID,
+				Scope:        state.ValidationScopeTicket,
+				Source:       state.ValidationCheckSourceDerived,
+				Command:      failingCmd,
+				Reason:       "ruff check for changed Python files",
+				MatchedFiles: []string{"src/app.py"},
+				TicketID:     "ver-repair-ctx",
+				Advisory:     true,
+			}},
+			ExecutedChecks: []state.ValidationCheckExecution{{
+				CheckID:  failingCheckID,
+				Result:   state.ValidationCheckResultFailed,
+				ExitCode: 1,
+				Attempt:  1,
+			}},
+		},
+	}
+
+	repairCycle := state.RepairCycleArtifact{
+		TicketID:        "ver-repair-ctx",
+		Cycle:           1,
+		TriggerCheckIDs: []string{failingCheckID},
+		Status:          "repair_pending",
+		Scope:           state.ValidationScopeTicket,
+	}
+
+	st := &ticketRunState{
+		req: RunTicketRequest{
+			Plan: plan,
+		},
+		currentPhase: state.TicketPhaseImplement,
+		verification: verification,
+		repairCycles: []state.RepairCycleArtifact{repairCycle},
+		implementation: &state.ImplementationArtifact{
+			TicketID:     "ver-repair-ctx",
+			ChangedFiles: []string{"src/app.py"},
+		},
+	}
+
+	instructions := buildImplementPhaseInstructions(st, 2)
+
+	// The retry instructions must mention the failing command.
+	if !strings.Contains(instructions, failingCmd) {
+		t.Fatalf("expected retry instructions to include failing command %q, got:\n%s", failingCmd, instructions)
+	}
+	// The instructions must reference the matched file that triggered the check.
+	if !strings.Contains(instructions, "src/app.py") {
+		t.Fatalf("expected retry instructions to include matched file, got:\n%s", instructions)
+	}
+	// The instructions must include a "Checks to Fix" or similar section.
+	if !strings.Contains(instructions, "Checks to Fix") {
+		t.Fatalf("expected 'Checks to Fix' section in retry instructions, got:\n%s", instructions)
+	}
+	// Prior verification summary must be present (shows which commands failed).
+	if !strings.Contains(instructions, "Prior Verification") {
+		t.Fatalf("expected 'Prior Verification' section in retry instructions, got:\n%s", instructions)
+	}
+	// Changed files section must be present.
+	if !strings.Contains(instructions, "Changed Files") {
+		t.Fatalf("expected 'Changed Files' section in retry instructions, got:\n%s", instructions)
+	}
+	// The base attempt number must still be present.
+	if !strings.Contains(instructions, "Attempt:") {
+		t.Fatalf("expected 'Attempt:' field in retry instructions, got:\n%s", instructions)
+	}
+}
+
+// TestBuildImplementPhaseInstructions_RetryWithoutVerificationCyclesUnchanged
+// verifies that a retry with NO verification repair cycles returns the same
+// output as the base renderImplementInstructions. This covers the case where
+// a retry is needed but not triggered by failing derived/declared checks
+// (e.g. a worker crash retry before any verification ran).
+func TestBuildImplementPhaseInstructions_RetryWithoutVerificationCyclesUnchanged(t *testing.T) {
+	plan := state.PlanArtifact{
+		ArtifactMeta:             state.ArtifactMeta{RunID: "run-no-cycles"},
+		TicketID:                 "ver-no-cycles",
+		EffectiveReviewThreshold: state.SeverityP2,
+	}
+	st := &ticketRunState{
+		req:          RunTicketRequest{Plan: plan},
+		currentPhase: state.TicketPhaseImplement,
+		repairCycles: []state.RepairCycleArtifact{
+			// Only review-triggered cycle (TriggerFindingIDs), no check IDs.
+			{
+				TicketID:          "ver-no-cycles",
+				Cycle:             1,
+				TriggerFindingIDs: []string{"finding-1"},
+				Status:            "completed",
+			},
+		},
+	}
+
+	got := buildImplementPhaseInstructions(st, 2)
+	want := renderImplementInstructions(plan, state.TicketPhaseImplement, 2)
+	if got != want {
+		t.Fatalf("expected retry with only review cycles to return base instructions unchanged")
+	}
+}

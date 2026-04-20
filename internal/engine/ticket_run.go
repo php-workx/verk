@@ -192,7 +192,7 @@ func RunTicket(ctx context.Context, req RunTicketRequest) (result RunTicketResul
 				Model:           workerProfile.Model,
 				Reasoning:       workerProfile.Reasoning,
 				WorktreePath:    absRepoRoot,
-				Instructions:    renderImplementInstructions(req.Plan, st.currentPhase, st.implementationAttempts+1),
+				Instructions:    buildImplementPhaseInstructions(st, st.implementationAttempts+1),
 				ExecutionConfig: executionConfigFromPolicy(cfg),
 				OnProgress:      func(detail string) { st.progressDetail(detail) },
 			}
@@ -752,6 +752,7 @@ func handleReviewOutcome(st *ticketRunState, result runtime.ReviewResult, req ru
 	}
 
 	if len(blockingIDs) == 0 {
+		// Mark the last repair cycle as completed now that review has passed.
 		if len(st.repairCycles) > 0 {
 			last := &st.repairCycles[len(st.repairCycles)-1]
 			last.VerificationArtifact = st.paths.verificationPath
@@ -759,6 +760,7 @@ func handleReviewOutcome(st *ticketRunState, result runtime.ReviewResult, req ru
 			last.Status = "completed"
 			last.FinishedAt = time.Now().UTC()
 		}
+
 		closeout, err := BuildCloseoutArtifact(st.req.Ticket, st.req.Plan, st.verification, st.review)
 		if err != nil {
 			return err
@@ -1525,6 +1527,106 @@ func renderImplementInstructions(plan state.PlanArtifact, phase state.TicketPhas
 	}
 
 	return b.String()
+}
+
+// buildImplementPhaseInstructions constructs instructions for a worker in the
+// implement phase. On the first attempt this is identical to
+// renderImplementInstructions. On subsequent attempts triggered by verification
+// failures, it enriches the instructions with the prior verification summary,
+// changed files, and the specific failing check details from the most recent
+// verification repair cycle so the worker can focus its repair effort.
+func buildImplementPhaseInstructions(st *ticketRunState, attempt int) string {
+	base := renderImplementInstructions(st.req.Plan, st.currentPhase, attempt)
+	if attempt <= 1 {
+		return base
+	}
+	verifyCycles := filterVerificationRepairCycles(st.repairCycles)
+	if len(verifyCycles) == 0 {
+		return base
+	}
+
+	var b strings.Builder
+	b.WriteString(base)
+
+	// Changed files focus the worker on which files triggered the derived checks.
+	if st.implementation != nil && len(st.implementation.ChangedFiles) > 0 {
+		b.WriteString("\n### Changed Files\n\n")
+		for _, f := range st.implementation.ChangedFiles {
+			fmt.Fprintf(&b, "- `%s`\n", f)
+		}
+		b.WriteString("\n")
+	}
+
+	// Prior verification shows which commands failed.
+	if summary := priorVerificationSummary(st.verification); summary != "" {
+		b.WriteString("### Prior Verification\n\n")
+		b.WriteString(summary)
+		b.WriteString("\n")
+	}
+
+	// Failing check details from the most recent verification repair cycle.
+	last := verifyCycles[len(verifyCycles)-1]
+	if len(last.TriggerCheckIDs) > 0 {
+		b.WriteString("### Checks to Fix\n\n")
+		b.WriteString("These checks triggered the retry and must pass:\n\n")
+		for _, id := range last.TriggerCheckIDs {
+			cmd := lookupCheckCommand(st.verification, id)
+			if cmd == "" {
+				fmt.Fprintf(&b, "- check `%s` failed\n", id)
+				continue
+			}
+			matched := lookupCheckMatchedFiles(st.verification, id)
+			if len(matched) > 0 {
+				fmt.Fprintf(&b, "- `%s` (covering: %s)\n", cmd, strings.Join(matched, ", "))
+			} else {
+				fmt.Fprintf(&b, "- `%s`\n", cmd)
+			}
+		}
+		b.WriteString("\n")
+	}
+
+	return b.String()
+}
+
+// filterVerificationRepairCycles returns repair cycles that were triggered by
+// failing verification checks (TriggerCheckIDs set). These are distinct from
+// review-triggered repair cycles (TriggerFindingIDs set).
+func filterVerificationRepairCycles(cycles []state.RepairCycleArtifact) []state.RepairCycleArtifact {
+	out := make([]state.RepairCycleArtifact, 0, len(cycles))
+	for _, c := range cycles {
+		if len(c.TriggerCheckIDs) > 0 {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+// lookupCheckCommand returns the command for a check in the verification
+// coverage's declared or derived checks. Returns "" when the check cannot be
+// found or the coverage is absent.
+func lookupCheckCommand(verification *state.VerificationArtifact, checkID string) string {
+	if verification == nil || verification.ValidationCoverage == nil {
+		return ""
+	}
+	check, ok := verification.ValidationCoverage.CheckByID(checkID)
+	if !ok {
+		return ""
+	}
+	return check.Command
+}
+
+// lookupCheckMatchedFiles returns the matched files for a check in the
+// verification coverage. Returns nil when the check is not found or has no
+// matched files recorded.
+func lookupCheckMatchedFiles(verification *state.VerificationArtifact, checkID string) []string {
+	if verification == nil || verification.ValidationCoverage == nil {
+		return nil
+	}
+	check, ok := verification.ValidationCoverage.CheckByID(checkID)
+	if !ok {
+		return nil
+	}
+	return check.MatchedFiles
 }
 
 func renderRepairInstructions(st *ticketRunState) string {
