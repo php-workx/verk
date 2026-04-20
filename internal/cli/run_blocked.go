@@ -12,7 +12,6 @@ import (
 	"verk/internal/adapters/runtime"
 	"verk/internal/engine"
 	"verk/internal/policy"
-	"verk/internal/state"
 
 	term "github.com/charmbracelet/x/term"
 )
@@ -71,26 +70,47 @@ func printBlockedRunGuidance(w io.Writer, blocked *engine.BlockedRunError) {
 		_, _ = fmt.Fprintf(w, "  %s: %s\n", t.ID, reason)
 	}
 	_, _ = fmt.Fprintln(w)
+	retryable := retryableBlockedTickets(blocked)
+	if len(retryable) == 0 {
+		_, _ = fmt.Fprintln(w, "Retry: no tickets can be reopened automatically")
+		_, _ = fmt.Fprintln(w, "  resolve blockers or dependencies, then run verk run")
+		return
+	}
 	_, _ = fmt.Fprintln(w, "Retry:")
-	for _, t := range blocked.BlockedTickets {
-		_, _ = fmt.Fprintf(w, "  verk reopen %s %s --to implement\n", blocked.RunID, t.ID)
+	for _, t := range retryable {
+		_, _ = fmt.Fprintf(w, "  verk reopen %s %s --to %s\n", blocked.RunID, t.ID, t.RetryPhase)
 	}
 	_, _ = fmt.Fprintln(w, "  verk run")
 }
 
+func retryableBlockedTickets(blocked *engine.BlockedRunError) []engine.BlockedTicket {
+	if blocked == nil {
+		return nil
+	}
+	out := make([]engine.BlockedTicket, 0, len(blocked.BlockedTickets))
+	for _, ticket := range blocked.BlockedTickets {
+		if ticket.RetryPhase == "" {
+			continue
+		}
+		out = append(out, ticket)
+	}
+	return out
+}
+
 // promptBlockedRetry asks the operator, one ticket at a time, which blocked
-// tickets they want to reopen and retry. It returns the list of selected
-// ticket IDs and whether the prompt was cancelled. The default for every prompt
+// tickets they want to reopen and retry. It returns the selected retryable
+// tickets and whether the prompt was cancelled. The default for every prompt
 // is "no" so that accidentally hitting Enter never retries a ticket.
 //
 // Reading is line-buffered: an empty line counts as "no" and EOF on stdin
 // aborts the selection loop (treated as "no for all remaining tickets"). Any
 // scan error is treated as a "no" to fail closed.
-func promptBlockedRetry(ctx context.Context, r io.Reader, w io.Writer, blocked *engine.BlockedRunError) ([]string, bool) {
+func promptBlockedRetry(ctx context.Context, r io.Reader, w io.Writer, blocked *engine.BlockedRunError) ([]engine.BlockedTicket, bool) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	if r == nil || blocked == nil || len(blocked.BlockedTickets) == 0 {
+	retryable := retryableBlockedTickets(blocked)
+	if r == nil || len(retryable) == 0 {
 		return nil, false
 	}
 	scanner := bufio.NewScanner(r)
@@ -100,8 +120,8 @@ func promptBlockedRetry(ctx context.Context, r io.Reader, w io.Writer, blocked *
 	_, _ = fmt.Fprintln(w)
 	_, _ = fmt.Fprintln(w, "Select blocked tickets to reopen and retry (default=no):")
 
-	var selected []string
-	for _, t := range blocked.BlockedTickets {
+	var selected []engine.BlockedTicket
+	for _, t := range retryable {
 		_, _ = fmt.Fprintf(w, "  Reopen %s? [y/N] ", t.ID)
 		answer, ok, cancelled := scanPromptLine(ctx, scanner)
 		if cancelled {
@@ -114,7 +134,7 @@ func promptBlockedRetry(ctx context.Context, r io.Reader, w io.Writer, blocked *
 		}
 		answer = strings.ToLower(strings.TrimSpace(answer))
 		if answer == "y" || answer == "yes" {
-			selected = append(selected, t.ID)
+			selected = append(selected, t)
 		}
 	}
 	return selected, false
@@ -143,7 +163,7 @@ func scanPromptLine(ctx context.Context, scanner *bufio.Scanner) (string, bool, 
 	}
 }
 
-func promptBlockedRetryTTY(ctx context.Context, in *os.File, w io.Writer, blocked *engine.BlockedRunError) ([]string, bool) {
+func promptBlockedRetryTTY(ctx context.Context, in *os.File, w io.Writer, blocked *engine.BlockedRunError) ([]engine.BlockedTicket, bool) {
 	if in == nil {
 		return promptBlockedRetry(ctx, nil, w, blocked)
 	}
@@ -155,19 +175,20 @@ func promptBlockedRetryTTY(ctx context.Context, in *os.File, w io.Writer, blocke
 	return promptBlockedRetryKeys(ctx, in, w, blocked)
 }
 
-func promptBlockedRetryKeys(ctx context.Context, r io.Reader, w io.Writer, blocked *engine.BlockedRunError) ([]string, bool) {
+func promptBlockedRetryKeys(ctx context.Context, r io.Reader, w io.Writer, blocked *engine.BlockedRunError) ([]engine.BlockedTicket, bool) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	if r == nil || blocked == nil || len(blocked.BlockedTickets) == 0 {
+	retryable := retryableBlockedTickets(blocked)
+	if r == nil || len(retryable) == 0 {
 		return nil, false
 	}
 
-	_, _ = fmt.Fprintln(w)
-	_, _ = fmt.Fprintln(w, "Select blocked tickets to reopen and retry (default=no):")
+	_, _ = fmt.Fprint(w, "\r\n")
+	_, _ = fmt.Fprint(w, "Select blocked tickets to reopen and retry (default=no):\r\n")
 
-	var selected []string
-	for _, t := range blocked.BlockedTickets {
+	var selected []engine.BlockedTicket
+	for _, t := range retryable {
 		_, _ = fmt.Fprintf(w, "  Reopen %s? [y/N] ", t.ID)
 		for {
 			b, ok, cancelled := readPromptByte(ctx, r)
@@ -180,20 +201,20 @@ func promptBlockedRetryKeys(ctx context.Context, r io.Reader, w io.Writer, block
 			}
 			switch b {
 			case 0x03:
-				_, _ = fmt.Fprintln(w, "^C")
+				_, _ = fmt.Fprint(w, "^C\r\n")
 				return selected, true
 			case 0x18:
-				_, _ = fmt.Fprintln(w, "^X")
+				_, _ = fmt.Fprint(w, "^X\r\n")
 				return selected, true
 			case 'y', 'Y':
-				selected = append(selected, t.ID)
-				_, _ = fmt.Fprintln(w, "y")
+				selected = append(selected, t)
+				_, _ = fmt.Fprint(w, "y\r\n")
 				goto nextTicket
 			case 'n', 'N':
-				_, _ = fmt.Fprintln(w, "n")
+				_, _ = fmt.Fprint(w, "n\r\n")
 				goto nextTicket
 			case '\r', '\n':
-				_, _ = fmt.Fprintln(w)
+				_, _ = fmt.Fprint(w, "\r\n")
 				goto nextTicket
 			default:
 				// Ignore any other key while staying on the same prompt.
@@ -245,18 +266,18 @@ func reopenAndResume(
 	repoRoot string,
 	cfg contextCfgForResume,
 	runID string,
-	ticketIDs []string,
+	tickets []engine.BlockedTicket,
 ) error {
-	for _, id := range ticketIDs {
+	for _, ticket := range tickets {
 		if err := engine.ReopenTicket(ctx, engine.ReopenRequest{
 			RepoRoot: repoRoot,
 			RunID:    runID,
-			TicketID: id,
-			ToPhase:  state.TicketPhaseImplement,
+			TicketID: ticket.ID,
+			ToPhase:  ticket.RetryPhase,
 		}); err != nil {
-			return fmt.Errorf("reopen %s: %w", id, err)
+			return fmt.Errorf("reopen %s: %w", ticket.ID, err)
 		}
-		_, _ = fmt.Fprintf(w, "reopened %s → implement\n", id)
+		_, _ = fmt.Fprintf(w, "reopened %s → %s\n", ticket.ID, ticket.RetryPhase)
 	}
 
 	if err := writeCurrentRunID(repoRoot, runID); err != nil {

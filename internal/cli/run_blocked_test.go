@@ -24,16 +24,20 @@ func fakeBlocked() *engine.BlockedRunError {
 		Status: state.EpicRunStatusBlocked,
 		BlockedTickets: []engine.BlockedTicket{
 			{
-				ID:     "ver-uqs5",
-				Title:  "Example ticket",
-				Status: tkmd.StatusBlocked,
-				Reason: "needs context: reviewer asked for missing fixture details",
+				ID:         "ver-uqs5",
+				Title:      "Example ticket",
+				Status:     tkmd.StatusBlocked,
+				Phase:      state.TicketPhaseBlocked,
+				RetryPhase: state.TicketPhaseImplement,
+				Reason:     "needs context: reviewer asked for missing fixture details",
 			},
 			{
-				ID:     "ver-abcd",
-				Title:  "Second ticket",
-				Status: tkmd.StatusBlocked,
-				Reason: "repair limit exceeded",
+				ID:         "ver-abcd",
+				Title:      "Second ticket",
+				Status:     tkmd.StatusBlocked,
+				Phase:      state.TicketPhaseBlocked,
+				RetryPhase: state.TicketPhaseImplement,
+				Reason:     "repair limit exceeded",
 			},
 		},
 	}
@@ -80,6 +84,39 @@ func TestPrintBlockedRunGuidance_FallbackReasonWhenEmpty(t *testing.T) {
 	}
 }
 
+func TestPrintBlockedRunGuidance_SkipsNonRetryableDependencyWaiters(t *testing.T) {
+	var buf bytes.Buffer
+	printBlockedRunGuidance(&buf, &engine.BlockedRunError{
+		RunID:  "run-x",
+		Status: state.EpicRunStatusBlocked,
+		BlockedTickets: []engine.BlockedTicket{
+			{
+				ID:     "mm-4for",
+				Status: tkmd.StatusOpen,
+				Phase:  state.TicketPhaseIntake,
+				Reason: "waiting on 7 deps",
+			},
+			{
+				ID:         "mm-e7e1",
+				Status:     tkmd.StatusBlocked,
+				Phase:      state.TicketPhaseBlocked,
+				RetryPhase: state.TicketPhaseImplement,
+				Reason:     "verification artifact passed flag contradicts derived verification outcome",
+			},
+		},
+	})
+	out := buf.String()
+	if !strings.Contains(out, "mm-4for: waiting on 7 deps") {
+		t.Fatalf("expected non-retryable blocker to be listed, got:\n%s", out)
+	}
+	if strings.Contains(out, "verk reopen run-x mm-4for") {
+		t.Fatalf("dependency-waiting tickets must not be offered for reopen, got:\n%s", out)
+	}
+	if !strings.Contains(out, "verk reopen run-x mm-e7e1 --to implement") {
+		t.Fatalf("expected retry command for blocked ticket, got:\n%s", out)
+	}
+}
+
 func TestPrintBlockedRunGuidance_NoTickets(t *testing.T) {
 	var buf bytes.Buffer
 	printBlockedRunGuidance(&buf, &engine.BlockedRunError{
@@ -122,8 +159,31 @@ func TestPromptBlockedRetry_SelectsYesAnswers(t *testing.T) {
 	if cancelled {
 		t.Fatal("did not expect prompt cancellation")
 	}
-	if len(selected) != 1 || selected[0] != "ver-uqs5" {
+	if len(selected) != 1 || selected[0].ID != "ver-uqs5" {
 		t.Fatalf("expected only ver-uqs5 selected, got %v", selected)
+	}
+}
+
+func TestPromptBlockedRetry_SkipsNonRetryableTickets(t *testing.T) {
+	blocked := &engine.BlockedRunError{
+		RunID:  "run-x",
+		Status: state.EpicRunStatusBlocked,
+		BlockedTickets: []engine.BlockedTicket{
+			{ID: "mm-4for", Status: tkmd.StatusOpen, Phase: state.TicketPhaseIntake, Reason: "waiting on 7 deps"},
+			{ID: "mm-e7e1", Status: tkmd.StatusBlocked, Phase: state.TicketPhaseBlocked, RetryPhase: state.TicketPhaseImplement, Reason: "blocked"},
+		},
+	}
+	in := strings.NewReader("y\n")
+	var out bytes.Buffer
+	selected, cancelled := promptBlockedRetry(context.Background(), in, &out, blocked)
+	if cancelled {
+		t.Fatal("did not expect prompt cancellation")
+	}
+	if len(selected) != 1 || selected[0].ID != "mm-e7e1" {
+		t.Fatalf("expected only retryable ticket selected, got %v", selected)
+	}
+	if strings.Contains(out.String(), "mm-4for") {
+		t.Fatalf("non-retryable ticket should not be prompted, got:\n%s", out.String())
 	}
 }
 
@@ -150,13 +210,13 @@ func TestPromptBlockedRetry_ContextCancellationStopsBlockedRead(t *testing.T) {
 	var out bytes.Buffer
 
 	done := make(chan struct {
-		selected  []string
+		selected  []engine.BlockedTicket
 		cancelled bool
 	}, 1)
 	go func() {
 		selected, cancelled := promptBlockedRetry(ctx, reader, &out, fakeBlocked())
 		done <- struct {
-			selected  []string
+			selected  []engine.BlockedTicket
 			cancelled bool
 		}{selected: selected, cancelled: cancelled}
 	}()
