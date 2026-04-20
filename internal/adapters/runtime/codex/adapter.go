@@ -269,7 +269,7 @@ func buildWorkerArgs(req runtime.WorkerRequest, prompt string) []string {
 	args = appendModelArgs(args, req.Model)
 	args = appendReasoningArgs(args, req.Reasoning)
 	if req.WorktreePath != "" {
-		args = append(args, "--cwd", req.WorktreePath)
+		args = append(args, "-C", req.WorktreePath)
 	}
 	args = append(args, prompt)
 	return args

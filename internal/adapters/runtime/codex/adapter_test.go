@@ -440,6 +440,18 @@ func TestBuildWorkerArgs_IncludesModelAndReasoning(t *testing.T) {
 	}
 }
 
+func TestBuildWorkerArgs_UsesCodexCdFlagForWorktree(t *testing.T) {
+	req := runtime.WorkerRequest{
+		LeaseID:      "lease-1",
+		WorktreePath: "/tmp/worktree",
+	}
+	args := buildWorkerArgs(req, "prompt-body")
+	assertArgValue(t, args, "-C", "/tmp/worktree")
+	if hasArg(args, "--cwd") {
+		t.Fatalf("expected Codex -C/--cd flag, not unsupported --cwd: %v", args)
+	}
+}
+
 // TestBuildWorkerArgs_OmitsModelAndReasoningWhenEmpty verifies that an empty
 // role profile leaves both `--model` and `-c model_reasoning_effort=...` off
 // the command line so Codex's own defaults apply. Passing empty flags would
