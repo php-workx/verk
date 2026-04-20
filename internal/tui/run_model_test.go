@@ -173,6 +173,49 @@ func TestBubbleModel_PartialWave_RendersExplicitBlockedDetails(t *testing.T) {
 	}
 }
 
+func TestBubbleModel_CancelKeysInvokeCancelCallback(t *testing.T) {
+	tests := []struct {
+		name string
+		key  tea.KeyPressMsg
+	}{
+		{
+			name: "ctrl+c",
+			key:  tea.KeyPressMsg(tea.Key{Mod: tea.ModCtrl, Code: 'c'}),
+		},
+		{
+			name: "ctrl+x",
+			key:  tea.KeyPressMsg(tea.Key{Mod: tea.ModCtrl, Code: 'x'}),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ch := make(chan engine.ProgressEvent)
+			cancelCalls := 0
+			m := NewRunModelWithCancel("run-test", ch, func() {
+				cancelCalls++
+			})
+
+			next, _ := m.Update(tt.key)
+			casted, ok := next.(Model)
+			if !ok {
+				t.Fatalf("Update returned non-Model tea.Model: %T", next)
+			}
+			if cancelCalls != 1 {
+				t.Fatalf("expected cancel callback once, got %d", cancelCalls)
+			}
+			if !casted.cancelRequested {
+				t.Fatal("model should remember cancellation was requested")
+			}
+
+			_, _ = casted.Update(tt.key)
+			if cancelCalls != 1 {
+				t.Fatalf("cancel callback should be idempotent, got %d calls", cancelCalls)
+			}
+		})
+	}
+}
+
 // viewString is a compact helper around Model.View for tests.
 func viewString(m Model) string {
 	return m.View().Content

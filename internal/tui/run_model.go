@@ -46,23 +46,32 @@ type waveState struct {
 
 // Model is the Bubble Tea model for verk run progress.
 type Model struct {
-	runID     string
-	ch        <-chan engine.ProgressEvent
-	tickets   map[string]*ticketLine
-	waves     []waveState
-	details   []string // rolling activity log (last 3)
-	done      bool
-	spinner   spinner.Model
-	startTime time.Time
+	runID           string
+	ch              <-chan engine.ProgressEvent
+	onCancel        func()
+	tickets         map[string]*ticketLine
+	waves           []waveState
+	details         []string // rolling activity log (last 3)
+	done            bool
+	cancelRequested bool
+	spinner         spinner.Model
+	startTime       time.Time
 }
 
 // NewRunModel creates a new run progress model.
 func NewRunModel(runID string, ch <-chan engine.ProgressEvent) Model {
+	return NewRunModelWithCancel(runID, ch, nil)
+}
+
+// NewRunModelWithCancel creates a run progress model that invokes onCancel
+// when the operator presses a cancellation key in the TUI.
+func NewRunModelWithCancel(runID string, ch <-chan engine.ProgressEvent, onCancel func()) Model {
 	s := spinner.New()
 	s.Spinner = spinner.Dot
 	return Model{
 		runID:     runID,
 		ch:        ch,
+		onCancel:  onCancel,
 		tickets:   make(map[string]*ticketLine),
 		startTime: time.Now(),
 		spinner:   s,
@@ -80,6 +89,19 @@ func (m Model) Init() tea.Cmd {
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
+		return m, nil
+
+	case tea.KeyPressMsg:
+		if isCancelKey(msg) {
+			if !m.cancelRequested {
+				m.cancelRequested = true
+				m.addDetail("cancellation requested; stopping workers")
+				if m.onCancel != nil {
+					m.onCancel()
+				}
+			}
+			return m, nil
+		}
 		return m, nil
 
 	case engine.ProgressEvent:
@@ -163,6 +185,15 @@ func (m *Model) handleEvent(evt engine.ProgressEvent) tea.Cmd {
 		return tea.Quit
 	}
 	return nil
+}
+
+func isCancelKey(msg tea.KeyPressMsg) bool {
+	switch msg.String() {
+	case "ctrl+c", "ctrl+x":
+		return true
+	default:
+		return false
+	}
 }
 
 func (m *Model) ensureTicket(id, title string) *ticketLine {

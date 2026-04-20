@@ -172,7 +172,7 @@ func TestDrainGoroutine_PreventsDeadlockOnEarlyTUIReturn(t *testing.T) {
 	// Inject a fake runProgress that returns an error immediately without
 	// draining ch, simulating a BubbleTea TUI that exits on a render error.
 	original := runProgress
-	runProgress = func(_ string, _ <-chan engine.ProgressEvent, _ io.Writer) error {
+	runProgress = func(_ string, _ <-chan engine.ProgressEvent, _ io.Writer, _ func()) error {
 		return errors.New("TUI exited early")
 	}
 	defer func() { runProgress = original }()
@@ -206,7 +206,7 @@ func TestDrainGoroutine_PreventsDeadlockOnEarlyTUIReturn(t *testing.T) {
 	// engine goroutine can complete its sends and close(ch) fires. Without it
 	// the engine blocks on SendProgress once the buffer is full and wg.Wait()
 	// below would hang forever.
-	if tuiErr := runProgress("test-run", ch, io.Discard); tuiErr != nil {
+	if tuiErr := runProgress("test-run", ch, io.Discard, nil); tuiErr != nil {
 		drainProgress(ch)
 	}
 

@@ -80,15 +80,18 @@ func printBlockedRunGuidance(w io.Writer, blocked *engine.BlockedRunError) {
 
 // promptBlockedRetry asks the operator, one ticket at a time, which blocked
 // tickets they want to reopen and retry. It returns the list of selected
-// ticket IDs. The default for every prompt is "no" so that accidentally
-// hitting Enter never retries a ticket.
+// ticket IDs and whether the prompt was cancelled. The default for every prompt
+// is "no" so that accidentally hitting Enter never retries a ticket.
 //
 // Reading is line-buffered: an empty line counts as "no" and EOF on stdin
 // aborts the selection loop (treated as "no for all remaining tickets"). Any
 // scan error is treated as a "no" to fail closed.
-func promptBlockedRetry(r io.Reader, w io.Writer, blocked *engine.BlockedRunError) []string {
-	if blocked == nil || len(blocked.BlockedTickets) == 0 {
-		return nil
+func promptBlockedRetry(ctx context.Context, r io.Reader, w io.Writer, blocked *engine.BlockedRunError) ([]string, bool) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if r == nil || blocked == nil || len(blocked.BlockedTickets) == 0 {
+		return nil, false
 	}
 	scanner := bufio.NewScanner(r)
 	// Allow pasted multi-line block reasons etc. without surprises.
@@ -100,16 +103,134 @@ func promptBlockedRetry(r io.Reader, w io.Writer, blocked *engine.BlockedRunErro
 	var selected []string
 	for _, t := range blocked.BlockedTickets {
 		_, _ = fmt.Fprintf(w, "  Reopen %s? [y/N] ", t.ID)
-		if !scanner.Scan() {
-			// EOF or scan error: treat remaining tickets as "no".
-			return selected
+		answer, ok, cancelled := scanPromptLine(ctx, scanner)
+		if cancelled {
+			_, _ = fmt.Fprintln(w)
+			return selected, true
 		}
-		answer := strings.ToLower(strings.TrimSpace(scanner.Text()))
+		if !ok {
+			// EOF or scan error: treat remaining tickets as "no".
+			return selected, false
+		}
+		answer = strings.ToLower(strings.TrimSpace(answer))
 		if answer == "y" || answer == "yes" {
 			selected = append(selected, t.ID)
 		}
 	}
-	return selected
+	return selected, false
+}
+
+type promptLineResult struct {
+	text string
+	ok   bool
+}
+
+func scanPromptLine(ctx context.Context, scanner *bufio.Scanner) (string, bool, bool) {
+	ch := make(chan promptLineResult, 1)
+	go func() {
+		if scanner.Scan() {
+			ch <- promptLineResult{text: scanner.Text(), ok: true}
+			return
+		}
+		ch <- promptLineResult{}
+	}()
+
+	select {
+	case <-ctx.Done():
+		return "", false, true
+	case result := <-ch:
+		return result.text, result.ok, false
+	}
+}
+
+func promptBlockedRetryTTY(ctx context.Context, in *os.File, w io.Writer, blocked *engine.BlockedRunError) ([]string, bool) {
+	if in == nil {
+		return promptBlockedRetry(ctx, nil, w, blocked)
+	}
+	oldState, err := term.MakeRaw(in.Fd())
+	if err != nil {
+		return promptBlockedRetry(ctx, in, w, blocked)
+	}
+	defer func() { _ = term.Restore(in.Fd(), oldState) }()
+	return promptBlockedRetryKeys(ctx, in, w, blocked)
+}
+
+func promptBlockedRetryKeys(ctx context.Context, r io.Reader, w io.Writer, blocked *engine.BlockedRunError) ([]string, bool) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if r == nil || blocked == nil || len(blocked.BlockedTickets) == 0 {
+		return nil, false
+	}
+
+	_, _ = fmt.Fprintln(w)
+	_, _ = fmt.Fprintln(w, "Select blocked tickets to reopen and retry (default=no):")
+
+	var selected []string
+	for _, t := range blocked.BlockedTickets {
+		_, _ = fmt.Fprintf(w, "  Reopen %s? [y/N] ", t.ID)
+		for {
+			b, ok, cancelled := readPromptByte(ctx, r)
+			if cancelled {
+				_, _ = fmt.Fprintln(w)
+				return selected, true
+			}
+			if !ok {
+				return selected, false
+			}
+			switch b {
+			case 0x03:
+				_, _ = fmt.Fprintln(w, "^C")
+				return selected, true
+			case 0x18:
+				_, _ = fmt.Fprintln(w, "^X")
+				return selected, true
+			case 'y', 'Y':
+				selected = append(selected, t.ID)
+				_, _ = fmt.Fprintln(w, "y")
+				goto nextTicket
+			case 'n', 'N':
+				_, _ = fmt.Fprintln(w, "n")
+				goto nextTicket
+			case '\r', '\n':
+				_, _ = fmt.Fprintln(w)
+				goto nextTicket
+			default:
+				// Ignore any other key while staying on the same prompt.
+			}
+		}
+	nextTicket:
+	}
+	return selected, false
+}
+
+type promptByteResult struct {
+	b  byte
+	ok bool
+}
+
+func readPromptByte(ctx context.Context, r io.Reader) (byte, bool, bool) {
+	ch := make(chan promptByteResult, 1)
+	go func() {
+		var buf [1]byte
+		n, err := r.Read(buf[:])
+		if n > 0 {
+			ch <- promptByteResult{b: buf[0], ok: true}
+			return
+		}
+		if err != nil {
+			ch <- promptByteResult{}
+			return
+		}
+		ch <- promptByteResult{}
+	}()
+
+	select {
+	case <-ctx.Done():
+		return 0, false, true
+	case result := <-ch:
+		return result.b, result.ok, false
+	}
 }
 
 // reopenAndResume reopens each selected ticket to the implement phase and then
@@ -143,6 +264,9 @@ func reopenAndResume(
 	}
 	_, _ = fmt.Fprintf(w, "Resuming run %s...\n", runID)
 
+	resumeCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
 	ch := make(chan engine.ProgressEvent, 64)
 	var report engine.ResumeReport
 	var resumeErr error
@@ -151,7 +275,7 @@ func reopenAndResume(
 	go func() {
 		defer wg.Done()
 		defer close(ch)
-		report, resumeErr = engine.ResumeRun(ctx, engine.ResumeRequest{
+		report, resumeErr = engine.ResumeRun(resumeCtx, engine.ResumeRequest{
 			RepoRoot: repoRoot,
 			RunID:    runID,
 			AdapterFactory: func(ticketPreference string) (runtime.Adapter, error) {
@@ -162,7 +286,7 @@ func reopenAndResume(
 		})
 	}()
 
-	if tuiErr := runProgress(runID, ch, w); tuiErr != nil {
+	if tuiErr := runProgress(runID, ch, w, cancel); tuiErr != nil {
 		_, _ = fmt.Fprintf(errw, "warning: TUI error: %v\n", tuiErr)
 		drainProgress(ch)
 	}
@@ -205,7 +329,10 @@ func handleBlockedEpicRun(
 		return false, nil
 	}
 
-	selected := promptBlockedRetry(interactor.in, interactor.out, blocked)
+	selected, cancelled := promptBlockedRetryTTY(ctx, interactor.in, interactor.out, blocked)
+	if cancelled {
+		return false, context.Canceled
+	}
 	if len(selected) == 0 {
 		return false, nil
 	}

@@ -23,7 +23,7 @@ import (
 // runProgress is the function used to display run progress. It is a
 // package-level variable so tests can inject a fake implementation that
 // returns early (simulating a TUI error) without draining the progress channel.
-var runProgress = tui.RunProgress
+var runProgress = tui.RunProgressWithCancel
 
 // drainProgress consumes progress events from ch in a background goroutine
 // until the channel is closed. It is the intentional fallback used when
@@ -267,7 +267,7 @@ func doRunTicket(w, errw io.Writer, ticketID string) (string, error) {
 		})
 	}()
 
-	if tuiErr := runProgress(runID, ch, w); tuiErr != nil {
+	if tuiErr := runProgress(runID, ch, w, stop); tuiErr != nil {
 		_, _ = fmt.Fprintf(errw, "warning: TUI error: %v\n", tuiErr)
 		drainProgress(ch)
 	}
@@ -363,7 +363,7 @@ func doRunEpic(w, errw io.Writer, ticketID string) (string, error) {
 		})
 	}()
 
-	if tuiErr := runProgress(runID, ch, w); tuiErr != nil {
+	if tuiErr := runProgress(runID, ch, w, stop); tuiErr != nil {
 		_, _ = fmt.Fprintf(errw, "warning: TUI error: %v\n", tuiErr)
 		drainProgress(ch)
 	}
@@ -472,7 +472,7 @@ func doAutoResume(w, errw io.Writer) error {
 		})
 	}()
 
-	if tuiErr := runProgress(runID, ch, w); tuiErr != nil {
+	if tuiErr := runProgress(runID, ch, w, stop); tuiErr != nil {
 		_, _ = fmt.Fprintf(errw, "warning: TUI error: %v\n", tuiErr)
 		drainProgress(ch)
 	}

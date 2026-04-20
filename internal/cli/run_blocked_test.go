@@ -8,6 +8,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 	"verk/internal/adapters/ticketstore/tkmd"
 	"verk/internal/engine"
 	"verk/internal/state"
@@ -99,7 +100,10 @@ func TestPromptBlockedRetry_DefaultNoSelection(t *testing.T) {
 	// Empty answers for every prompt: both tickets should be skipped.
 	in := strings.NewReader("\n\n")
 	var out bytes.Buffer
-	selected := promptBlockedRetry(in, &out, fakeBlocked())
+	selected, cancelled := promptBlockedRetry(context.Background(), in, &out, fakeBlocked())
+	if cancelled {
+		t.Fatal("did not expect prompt cancellation")
+	}
 	if len(selected) != 0 {
 		t.Fatalf("expected no tickets selected by default, got %v", selected)
 	}
@@ -114,7 +118,10 @@ func TestPromptBlockedRetry_DefaultNoSelection(t *testing.T) {
 func TestPromptBlockedRetry_SelectsYesAnswers(t *testing.T) {
 	in := strings.NewReader("y\nn\n")
 	var out bytes.Buffer
-	selected := promptBlockedRetry(in, &out, fakeBlocked())
+	selected, cancelled := promptBlockedRetry(context.Background(), in, &out, fakeBlocked())
+	if cancelled {
+		t.Fatal("did not expect prompt cancellation")
+	}
 	if len(selected) != 1 || selected[0] != "ver-uqs5" {
 		t.Fatalf("expected only ver-uqs5 selected, got %v", selected)
 	}
@@ -124,9 +131,71 @@ func TestPromptBlockedRetry_EOFStopsLoop(t *testing.T) {
 	// Scanner returns false on EOF before any line: no selections, no panic.
 	in := strings.NewReader("")
 	var out bytes.Buffer
-	selected := promptBlockedRetry(in, &out, fakeBlocked())
+	selected, cancelled := promptBlockedRetry(context.Background(), in, &out, fakeBlocked())
+	if cancelled {
+		t.Fatal("did not expect prompt cancellation")
+	}
 	if len(selected) != 0 {
 		t.Fatalf("expected no selections on EOF, got %v", selected)
+	}
+}
+
+func TestPromptBlockedRetry_ContextCancellationStopsBlockedRead(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	reader, writer := io.Pipe()
+	t.Cleanup(func() {
+		_ = reader.Close()
+		_ = writer.Close()
+	})
+	var out bytes.Buffer
+
+	done := make(chan struct {
+		selected  []string
+		cancelled bool
+	}, 1)
+	go func() {
+		selected, cancelled := promptBlockedRetry(ctx, reader, &out, fakeBlocked())
+		done <- struct {
+			selected  []string
+			cancelled bool
+		}{selected: selected, cancelled: cancelled}
+	}()
+
+	cancel()
+
+	select {
+	case result := <-done:
+		if !result.cancelled {
+			t.Fatal("expected prompt cancellation")
+		}
+		if len(result.selected) != 0 {
+			t.Fatalf("expected no selected tickets, got %v", result.selected)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("prompt did not return after context cancellation")
+	}
+}
+
+func TestPromptBlockedRetryKeys_CancelKeysAbortWithoutEnter(t *testing.T) {
+	tests := []struct {
+		name string
+		key  string
+	}{
+		{name: "ctrl+c", key: "\x03"},
+		{name: "ctrl+x", key: "\x18"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var out bytes.Buffer
+			selected, cancelled := promptBlockedRetryKeys(context.Background(), strings.NewReader(tt.key), &out, fakeBlocked())
+			if !cancelled {
+				t.Fatal("expected prompt cancellation")
+			}
+			if len(selected) != 0 {
+				t.Fatalf("expected no selected tickets, got %v", selected)
+			}
+		})
 	}
 }
 
