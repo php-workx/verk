@@ -398,10 +398,19 @@ func TestValidatedExecutable(t *testing.T) {
 		})
 	}
 
-	for _, raw := range []string{"", "   ", "codex --danger", "sh -c echo", "codex\nrm"} {
-		t.Run(raw, func(t *testing.T) {
-			if _, err := runtime.ValidatedExecutable(raw); err == nil {
-				t.Fatalf("expected %q to be rejected", raw)
+	for _, tc := range []struct {
+		name string
+		raw  string
+	}{
+		{name: "empty", raw: ""},
+		{name: "whitespace only", raw: "   "},
+		{name: "with flag", raw: "codex --danger"},
+		{name: "shell command", raw: "sh -c echo"},
+		{name: "with newline", raw: "codex\nrm"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := runtime.ValidatedExecutable(tc.raw); err == nil {
+				t.Fatalf("expected %q to be rejected", tc.raw)
 			}
 		})
 	}

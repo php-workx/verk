@@ -20,6 +20,7 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -37,7 +38,7 @@ const epicGateOutputLimit = 8 * 1024 // 8 KB per failing command
 // defaultEpicClosureDocs is the fallback doc path list used when
 // EpicClosureDocs is empty. These are the most common locations for
 // cross-ticket documentation inconsistencies.
-var defaultEpicClosureDocs = []string{"README.md", "CONTRIBUTING.md", "docs/**/*.md"}
+var defaultEpicClosureDocs = []string{"README.md", "CONTRIBUTING.md", "docs"}
 
 // runEpicClosureGate executes the epic-level broad quality commands, derived
 // stale-wording checks, and an epic reviewer pass before the epic closes. It
@@ -48,6 +49,8 @@ var defaultEpicClosureDocs = []string{"README.md", "CONTRIBUTING.md", "docs/**/*
 // Returns nil when all checks pass and the reviewer finds no blocking gaps.
 // Returns a *BlockedRunError (wrapping ErrEpicBlocked) when repair is
 // exhausted or when operator input is required.
+//
+//nolint:cyclop // explicit terminal branches keep closure-gate failure handling readable.
 func runEpicClosureGate(
 	ctx context.Context,
 	req RunEpicRequest,
@@ -147,7 +150,9 @@ func runEpicClosureGate(
 	if allClear {
 		epicCloseSuccess(&artifact, coverage, 0)
 		artifact.UpdatedAt = stateTime()
-		_ = state.SaveJSONAtomic(artifactPath, artifact)
+		if saveErr := saveEpicClosureArtifact(artifactPath, artifact, "persist success artifact"); saveErr != nil {
+			return saveErr
+		}
 		SendProgress(ctx, req.Progress, ProgressEvent{
 			Type:   EventTicketDetail,
 			Detail: fmt.Sprintf("epic closure gate: all checks passed for %s", req.RootTicketID),
@@ -155,12 +160,28 @@ func runEpicClosureGate(
 		return nil
 	}
 
+	if reviewErr != nil {
+		blockReason := buildEpicBlockReason(checksAllPassed, artifact.Findings, reviewErr)
+		epicCloseBlocked(&artifact, coverage, blockReason, 0, "epic reviewer failed before repair")
+		artifact.UpdatedAt = stateTime()
+		if saveErr := saveEpicClosureArtifact(artifactPath, artifact, "persist reviewer error block"); saveErr != nil {
+			return saveErr
+		}
+		return &BlockedRunError{
+			RunID:  req.RunID,
+			Status: state.EpicRunStatusBlocked,
+			Cause:  fmt.Errorf("epic gate reviewer failed: %s", blockReason),
+		}
+	}
+
 	// --- Handle repair-disabled case. ---
 	if cfg.Policy.MaxEpicRepairCycles == 0 {
 		blockReason := buildEpicBlockReason(checksAllPassed, artifact.Findings, reviewErr)
 		epicCloseBlocked(&artifact, coverage, blockReason, 0, "epic repair disabled by policy.max_epic_repair_cycles=0")
 		artifact.UpdatedAt = stateTime()
-		_ = state.SaveJSONAtomic(artifactPath, artifact)
+		if saveErr := saveEpicClosureArtifact(artifactPath, artifact, "persist repair-disabled block"); saveErr != nil {
+			return saveErr
+		}
 		return &BlockedRunError{
 			RunID:  req.RunID,
 			Status: state.EpicRunStatusBlocked,
@@ -220,7 +241,9 @@ func runEpicClosureGate(
 			blockReason := fmt.Sprintf("epic repair cycle %d worker failed: %v", cycle, repairErr)
 			epicCloseBlocked(&artifact, coverage, blockReason, cycle, blockReason)
 			artifact.UpdatedAt = stateTime()
-			_ = state.SaveJSONAtomic(artifactPath, artifact)
+			if saveErr := saveEpicClosureArtifact(artifactPath, artifact, fmt.Sprintf("persist repair cycle %d failure", cycle)); saveErr != nil {
+				return saveErr
+			}
 			return &BlockedRunError{
 				RunID:  req.RunID,
 				Status: state.EpicRunStatusBlocked,
@@ -261,11 +284,28 @@ func runEpicClosureGate(
 		artifact.Cycles[cycleIdx].Status = "completed"
 		artifact.Cycles[cycleIdx].FinishedAt = stateTime()
 
+		if reviewErr != nil {
+			artifact.Cycles[cycleIdx].Status = "review_failed"
+			blockReason := buildEpicBlockReason(checksAllPassed, artifact.Findings, reviewErr)
+			epicCloseBlocked(&artifact, coverage, blockReason, cycle, blockReason)
+			artifact.UpdatedAt = stateTime()
+			if saveErr := saveEpicClosureArtifact(artifactPath, artifact, fmt.Sprintf("persist cycle %d reviewer error block", cycle)); saveErr != nil {
+				return saveErr
+			}
+			return &BlockedRunError{
+				RunID:  req.RunID,
+				Status: state.EpicRunStatusBlocked,
+				Cause:  fmt.Errorf("epic gate reviewer failed after repair cycle %d: %s", cycle, blockReason),
+			}
+		}
+
 		allClear = checksAllPassed && reviewErr == nil && !hasUnresolvedFindings(artifact.Findings)
 		if allClear {
 			epicCloseSuccess(&artifact, coverage, cycle)
 			artifact.UpdatedAt = stateTime()
-			_ = state.SaveJSONAtomic(artifactPath, artifact)
+			if saveErr := saveEpicClosureArtifact(artifactPath, artifact, fmt.Sprintf("persist cycle %d success", cycle)); saveErr != nil {
+				return saveErr
+			}
 			SendProgress(ctx, req.Progress, ProgressEvent{
 				Type:   EventTicketDetail,
 				Detail: fmt.Sprintf("epic closure gate: all checks passed after %d repair cycle(s) for %s", cycle, req.RootTicketID),
@@ -284,7 +324,9 @@ func runEpicClosureGate(
 	limitReason := fmt.Sprintf("epic repair exhausted after %d cycle(s)", cfg.Policy.MaxEpicRepairCycles)
 	epicCloseBlocked(&artifact, coverage, blockReason, cfg.Policy.MaxEpicRepairCycles, limitReason)
 	artifact.UpdatedAt = stateTime()
-	_ = state.SaveJSONAtomic(artifactPath, artifact)
+	if saveErr := saveEpicClosureArtifact(artifactPath, artifact, "persist repair-exhausted block"); saveErr != nil {
+		return saveErr
+	}
 
 	return &BlockedRunError{
 		RunID:  req.RunID,
@@ -308,6 +350,13 @@ func epicCloseSuccess(artifact *state.EpicClosureArtifact, coverage *state.Valid
 		coverage.UpdatedAt = stateTime()
 		coverage.ClosureReason = artifact.ClosureReason
 	}
+}
+
+func saveEpicClosureArtifact(artifactPath string, artifact state.EpicClosureArtifact, reason string) error {
+	if err := state.SaveJSONAtomic(artifactPath, artifact); err != nil {
+		return fmt.Errorf("epic closure gate: %s: %w", reason, err)
+	}
+	return nil
 }
 
 // epicCloseBlocked marks the artifact and coverage as non-closable and records
@@ -536,9 +585,7 @@ func deriveEpicScopedChecks(epicID string, cfg policy.VerificationConfig) []stat
 //   - when docs are clean (grep exits 1 — no matches), the overall command
 //     exits 0 (success) and the gate may proceed.
 func buildEpicStaleWordingCommand(terms, docPaths []string) string {
-	pattern := strings.Join(terms, "|")
-	paths := strings.Join(docPaths, " ")
-	return fmt.Sprintf("! grep -nrE '%s' %s", pattern, paths)
+	return buildStaleWordingGrepCommand(terms, docPaths, true)
 }
 
 // epicBroadCommandLines extracts the raw command strings from a QualityCommand
@@ -764,19 +811,22 @@ func collectEpicVerificationOutput(
 			if path == "" {
 				continue
 			}
-			data, err := os.ReadFile(path)
-			if err != nil || len(data) == 0 {
+			file, err := os.Open(path)
+			if err != nil {
 				continue
 			}
 			remaining := epicGateOutputLimit - b.Len()
 			if remaining <= 0 {
+				_ = file.Close()
 				return b.String()
 			}
-			if len(data) > remaining {
-				data = data[:remaining]
+			data, readErr := io.ReadAll(io.LimitReader(file, int64(remaining)))
+			closeErr := file.Close()
+			if readErr != nil || closeErr != nil || len(data) == 0 {
+				continue
 			}
 			b.Write(data)
-			if !strings.HasSuffix(b.String(), "\n") {
+			if data[len(data)-1] != '\n' && b.Len() < epicGateOutputLimit {
 				b.WriteByte('\n')
 			}
 		}

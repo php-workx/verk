@@ -4,12 +4,14 @@ import (
 	"context"
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 	"verk/internal/adapters/runtime"
 	"verk/internal/adapters/ticketstore/tkmd"
+	verifycommand "verk/internal/adapters/verify/command"
 	"verk/internal/policy"
 	"verk/internal/state"
 
@@ -432,6 +434,61 @@ func TestRunEpicClosureGate_StaleWordingRepaired(t *testing.T) {
 	}
 }
 
+func TestBuildEpicStaleWordingCommand_EscapesTermsAndPaths(t *testing.T) {
+	repoRoot := t.TempDir()
+	docsDir := filepath.Join(repoRoot, "docs with spaces")
+	if err := os.MkdirAll(docsDir, 0o755); err != nil {
+		t.Fatalf("mkdir docs dir: %v", err)
+	}
+	docPath := filepath.Join(docsDir, "guide.md")
+	if err := os.WriteFile(docPath, []byte("this text says don't use old.scanner\n"), 0o644); err != nil {
+		t.Fatalf("write stale doc: %v", err)
+	}
+
+	command := buildEpicStaleWordingCommand(
+		[]string{"don't", "old.scanner"},
+		[]string{"docs with spaces/guide.md"},
+	)
+	result := exec.Command("/bin/sh", "-c", command)
+	result.Dir = repoRoot
+	if err := result.Run(); err == nil {
+		t.Fatal("expected inverted stale wording command to fail when a quoted term matches")
+	}
+
+	if err := os.WriteFile(docPath, []byte("clean text\n"), 0o644); err != nil {
+		t.Fatalf("write clean doc: %v", err)
+	}
+	result = exec.Command("/bin/sh", "-c", command)
+	result.Dir = repoRoot
+	if output, err := result.CombinedOutput(); err != nil {
+		t.Fatalf("expected escaped stale wording command to pass for clean docs, err=%v output=%s", err, output)
+	}
+}
+
+func TestCollectEpicVerificationOutput_CapsLargeArtifacts(t *testing.T) {
+	repoRoot := t.TempDir()
+	stdoutPath := filepath.Join(repoRoot, "large.stdout.log")
+	if err := os.WriteFile(stdoutPath, []byte(strings.Repeat("x", epicGateOutputLimit*2)), 0o644); err != nil {
+		t.Fatalf("write large stdout: %v", err)
+	}
+
+	output := collectEpicVerificationOutput(
+		[]verifycommand.CommandResult{{
+			Command:    "failing-check",
+			ExitCode:   1,
+			StdoutPath: stdoutPath,
+		}},
+		nil,
+		nil,
+	)
+	if len(output) > epicGateOutputLimit {
+		t.Fatalf("expected output length <= %d, got %d", epicGateOutputLimit, len(output))
+	}
+	if !strings.Contains(output, "$ failing-check (exit 1)") {
+		t.Fatalf("expected command header in output, got %q", output)
+	}
+}
+
 // staleWordingRepairAdapter is a test double that rewrites a target doc file
 // when the repair worker is called, simulating a real worker fixing stale
 // wording in documentation. The reviewer always returns the pre-configured
@@ -516,6 +573,47 @@ func TestRunEpicClosureGate_ReviewerFindingBlocks(t *testing.T) {
 	}
 	if len(artifact.Findings) == 0 {
 		t.Error("expected at least one finding in artifact")
+	}
+}
+
+func TestRunEpicClosureGate_ReviewerErrorBlocksWithoutRepair(t *testing.T) {
+	repoRoot := t.TempDir()
+	epicID := "epic-gate-reviewer-error"
+
+	adapter := runtimefake.New([]runtime.WorkerResult{
+		epicGateWorkerResult("epic-repair-" + epicID + "-1"),
+	}, nil)
+
+	cfg := policy.DefaultConfig()
+	cfg.Policy.MaxEpicRepairCycles = 1
+	cfg.Verification.EpicClosureCommands = nil
+
+	req := makeEpicGateReq(repoRoot, epicID, adapter)
+	req.Config = cfg
+
+	err := runEpicClosureGate(context.Background(), req, cfg, makeEpicGateChildren(), nil)
+	if err == nil {
+		t.Fatal("expected BlockedRunError for reviewer runtime error, got nil")
+	}
+	if !errors.Is(err, ErrEpicBlocked) {
+		t.Fatalf("expected ErrEpicBlocked, got: %v", err)
+	}
+	if len(adapter.WorkerRequests()) != 0 {
+		t.Errorf("expected reviewer error to block without repair, got %d repair calls", len(adapter.WorkerRequests()))
+	}
+
+	var artifact state.EpicClosureArtifact
+	if err := state.LoadJSON(epicClosureArtifactPath(repoRoot, req.RunID), &artifact); err != nil {
+		t.Fatalf("load artifact: %v", err)
+	}
+	if artifact.Closable {
+		t.Error("expected Closable=false when reviewer execution fails")
+	}
+	if !strings.Contains(artifact.BlockReason, "reviewer error") {
+		t.Fatalf("expected reviewer error in block reason, got %q", artifact.BlockReason)
+	}
+	if len(artifact.Cycles) != 0 {
+		t.Fatalf("expected no repair cycles for reviewer execution error, got %d", len(artifact.Cycles))
 	}
 }
 

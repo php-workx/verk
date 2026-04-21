@@ -255,7 +255,7 @@ func TestDeriveChecks_MarkdownStaleWordingForDocsTicket(t *testing.T) {
 	}
 	if !strings.Contains(stale.Command, "README.md") ||
 		!strings.Contains(stale.Command, "CONTRIBUTING.md") ||
-		!strings.Contains(stale.Command, "docs/**/*.md") {
+		!strings.Contains(stale.Command, "docs") {
 		t.Fatalf("expected stale-wording command to scan README, CONTRIBUTING, and docs, got %q", stale.Command)
 	}
 	if !strings.Contains(stale.Command, "betterleaks") {

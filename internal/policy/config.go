@@ -115,7 +115,7 @@ type VerificationConfig struct {
 	EpicStaleWordingTerms []string `yaml:"epic_stale_wording_terms" json:"epic_stale_wording_terms"`
 	// EpicClosureDocs lists doc paths the epic closure gate may scan for
 	// stale wording and cross-ticket consistency. When empty, a built-in
-	// default set (README.md, CONTRIBUTING.md, docs/**/*.md) is used.
+	// default set (README.md, CONTRIBUTING.md, docs) is used.
 	EpicClosureDocs []string `yaml:"epic_closure_docs" json:"epic_closure_docs"`
 }
 

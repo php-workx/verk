@@ -614,11 +614,7 @@ func normalizeStaleWordingTerms(terms []string) []string {
 }
 
 func buildStaleWordingCommand(terms, docPaths []string) string {
-	pattern := strings.Join(terms, "|")
-	if len(docPaths) == 0 {
-		docPaths = defaultEpicClosureDocs
-	}
-	return "grep -nE '" + pattern + "' " + strings.Join(docPaths, " ")
+	return buildStaleWordingGrepCommand(terms, docPaths, false)
 }
 
 // addYAMLChecks derives a yamllint command for touched YAML files. When

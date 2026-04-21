@@ -259,7 +259,7 @@ func (r ReviewFinding) Validate() error {
 	// lack precise location context. An empty File is allowed; a non-empty File
 	// that is whitespace-only is rejected as a programming error.
 	if r.File != "" && strings.TrimSpace(r.File) == "" {
-		return fmt.Errorf("review finding missing file")
+		return fmt.Errorf("review finding has whitespace-only file")
 	}
 	if err := ValidateReviewDisposition(r.Disposition); err != nil {
 		return err
@@ -338,7 +338,7 @@ func isCanonicalSeverity(severity Severity) bool {
 func isBlockingFinding(finding ReviewFinding, threshold Severity) bool {
 	if finding.Disposition != ReviewDispositionOpen {
 		// Re-evaluate expired waivers as if they were open; otherwise reject.
-		isExpiredWaiver := finding.Disposition == ReviewDispositionWaived && finding.WaiverExpiresAt != nil && !finding.WaiverExpiresAt.After(time.Now())
+		isExpiredWaiver := finding.Disposition == ReviewDispositionWaived && finding.WaiverExpiresAt != nil && finding.WaiverExpiresAt.Before(time.Now())
 		if !isExpiredWaiver {
 			return false
 		}

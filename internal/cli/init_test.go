@@ -97,7 +97,7 @@ func runInitInDir(t *testing.T, dir, stdin string) (string, string, error) {
 	}
 	t.Cleanup(func() {
 		if err := os.Chdir(originalWD); err != nil {
-			t.Fatalf("restore wd: %v", err)
+			t.Errorf("restore wd: %v", err)
 		}
 	})
 

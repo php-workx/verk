@@ -2,10 +2,10 @@ package cli
 
 import (
 	"fmt"
-	"html/template"
 	"os"
 	"sort"
 	"strings"
+	"text/template" // nosemgrep: go.lang.security.audit.xss.import-text-template.import-text-template -- Cobra renders terminal help, not HTML.
 	"unicode/utf8"
 
 	"github.com/spf13/cobra"
