@@ -2,10 +2,10 @@ package cli
 
 import (
 	"fmt"
+	"html/template"
 	"os"
 	"sort"
 	"strings"
-	"text/template"
 	"unicode/utf8"
 
 	"github.com/spf13/cobra"

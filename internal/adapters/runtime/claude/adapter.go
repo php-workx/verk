@@ -637,6 +637,13 @@ func defaultRunCommand(ctx context.Context, binary string, args []string, stdin 
 		ctx, cancel = context.WithTimeout(ctx, timeout)
 		defer cancel()
 	}
+	binary, err := runtime.ValidatedExecutable(binary)
+	if err != nil {
+		return commandResult{}, err
+	}
+	// Runtime executable is validated above, and exec.Command does not invoke a
+	// shell; arguments are passed as argv entries.
+	// nosemgrep: go.lang.security.audit.dangerous-exec-command.dangerous-exec-command
 	cmd := exec.CommandContext(ctx, binary, args...)
 	cmd.Stdin = bytes.NewReader(stdin)
 	cmd.Env = env
@@ -649,7 +656,7 @@ func defaultRunCommand(ctx context.Context, binary string, args []string, stdin 
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 
-	err := cmd.Run()
+	err = cmd.Run()
 	result := commandResult{
 		stdout: stdout.Bytes(),
 		stderr: stderr.Bytes(),
@@ -769,6 +776,13 @@ func defaultRunStreamingCommand(ctx context.Context, binary string, args []strin
 		ctx, cancel = context.WithTimeout(ctx, timeout)
 		defer cancel()
 	}
+	binary, err := runtime.ValidatedExecutable(binary)
+	if err != nil {
+		return commandResult{}, err
+	}
+	// Runtime executable is validated above, and exec.Command does not invoke a
+	// shell; arguments are passed as argv entries.
+	// nosemgrep: go.lang.security.audit.dangerous-exec-command.dangerous-exec-command
 	cmd := exec.CommandContext(ctx, binary, args...)
 	cmd.Stdin = bytes.NewReader(stdin)
 	cmd.Env = env

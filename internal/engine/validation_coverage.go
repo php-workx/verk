@@ -12,7 +12,7 @@
 package engine
 
 import (
-	"crypto/sha1"
+	"crypto/sha256"
 	"fmt"
 	"strings"
 	"verk/internal/state"
@@ -205,7 +205,7 @@ func declaredCheckID(ticketID, command string) string {
 	if trimmed == "" {
 		return fmt.Sprintf("check-%s-empty", ticketID)
 	}
-	sum := sha1.Sum([]byte(ticketID + "\x00" + trimmed))
+	sum := sha256.Sum256([]byte(ticketID + "\x00" + trimmed))
 	return fmt.Sprintf("check-%s-%x", ticketID, sum[:4])
 }
 

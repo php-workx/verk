@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strings"
 	"time"
+	"unicode"
 	"verk/internal/state"
 )
 
@@ -143,6 +144,26 @@ type ReviewResult struct {
 type Adapter interface {
 	RunWorker(ctx context.Context, req WorkerRequest) (WorkerResult, error)
 	RunReviewer(ctx context.Context, req ReviewRequest) (ReviewResult, error)
+}
+
+// ValidatedExecutable normalizes a runtime executable name or path before it is
+// passed to exec.Command. Runtime adapters do not invoke a shell, but accepting
+// a whole command line here would be ambiguous and could hide operator mistakes
+// such as "codex --flag" or "sh -c ...".
+func ValidatedExecutable(binary string) (string, error) {
+	trimmed := strings.TrimSpace(binary)
+	if trimmed == "" {
+		return "", fmt.Errorf("runtime executable is empty")
+	}
+	if strings.Fields(trimmed)[0] != trimmed {
+		return "", fmt.Errorf("runtime executable %q must be a single executable path without arguments", binary)
+	}
+	for _, r := range trimmed {
+		if unicode.IsControl(r) {
+			return "", fmt.Errorf("runtime executable %q contains control characters", binary)
+		}
+	}
+	return trimmed, nil
 }
 
 var severityOrder = map[Severity]int{

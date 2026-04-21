@@ -1,7 +1,7 @@
 package engine
 
 import (
-	"crypto/sha1"
+	"crypto/sha256"
 	"fmt"
 	"strings"
 	"time"
@@ -103,7 +103,7 @@ func buildPlanCriteria(criteria []string) []state.PlanCriterion {
 		if trimmed == "" {
 			continue
 		}
-		sum := sha1.Sum([]byte(trimmed))
+		sum := sha256.Sum256([]byte(trimmed))
 		out = append(out, state.PlanCriterion{
 			ID:   fmt.Sprintf("criterion-%02d-%x", i+1, sum[:4]),
 			Text: trimmed,

@@ -110,6 +110,11 @@ func RunCommands(ctx context.Context, repoRoot string, cmds []string, cfg policy
 			startedAt := time.Now().UTC()
 			cmdCtx, cancel := context.WithTimeout(ctx, timeout)
 			defer cancel()
+			// Verification commands are explicit project policy/ticket inputs
+			// and intentionally run through a shell to support normal developer
+			// checks such as "just lint" and compound commands. They run with a
+			// bounded cwd, timeout, and allowlisted environment.
+			// nosemgrep: go.lang.security.audit.dangerous-exec-command.dangerous-exec-command
 			cmd := exec.CommandContext(cmdCtx, "/bin/sh", "-c", command)
 			cmd.Dir = absRepoRoot
 			cmd.Env = env
@@ -246,6 +251,12 @@ func RunQualityCommands(ctx context.Context, repoRoot string, cmds []policy.Qual
 				startedAt := time.Now().UTC()
 				cmdCtx, cancel := context.WithTimeout(ctx, timeout)
 				defer cancel()
+				// Quality commands are explicit project policy inputs and
+				// intentionally run through a shell to support normal developer
+				// checks such as "just lint" and compound commands. The working
+				// directory is constrained to the repo and the environment is
+				// allowlisted.
+				// nosemgrep: go.lang.security.audit.dangerous-exec-command.dangerous-exec-command
 				cmd := exec.CommandContext(cmdCtx, "/bin/sh", "-c", command)
 				cmd.Dir = workDir
 				cmd.Env = env
