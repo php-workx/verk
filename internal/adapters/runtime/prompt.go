@@ -245,7 +245,7 @@ func ParseResultBlock(text string) (VerkResultBlock, bool) {
 	}
 
 	// 2. Sentinel-prefixed line fallback.
-	if b, ok := parseSentinelLine[VerkResultBlock](text, ResultSentinel); ok && ValidateWorkerStatus(WorkerStatus(b.Status)) == nil {
+	if b, ok := parseSentinelLine[VerkResultBlock](text, ResultSentinel); ok && b.Status != "" && ValidateWorkerStatus(WorkerStatus(b.Status)) == nil {
 		return b, true
 	}
 
@@ -267,7 +267,7 @@ func ParseReviewBlock(text string) (VerkReviewBlock, bool) {
 		return block, true
 	}
 
-	if b, ok := parseSentinelLine[VerkReviewBlock](text, ReviewSentinel); ok && ValidateReviewStatus(ReviewStatus(b.ReviewStatus)) == nil {
+	if b, ok := parseSentinelLine[VerkReviewBlock](text, ReviewSentinel); ok && b.ReviewStatus != "" && ValidateReviewStatus(ReviewStatus(b.ReviewStatus)) == nil {
 		return b, true
 	}
 
