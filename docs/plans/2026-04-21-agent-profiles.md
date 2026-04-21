@@ -148,7 +148,7 @@ profile: contract-engineer
 
 Run at pre-run ticket verification time. Signals are evaluated in priority order; first match wins.
 
-```
+```go
 func DetectProfile(ticket Ticket) Profile {
     // Priority 1: security
     if matchesSecurity(ticket) {
@@ -189,16 +189,16 @@ Token budget is not the concern — placement is. Rationalization tables placed 
 
 **Target placement in worker prompt:**
 
-```
+```text
 [1] Role framing sentence           ← new, ~30 tokens
-[2] Rationalization tables          ← new, ~600 tokens
 [3] Ticket content                  ← existing
+[2] Rationalization tables          ← new, ~600 tokens
 [4] WorkerSystemPrompt() rules      ← existing, move here
 [5] Standards (universal + lang)    ← existing
 [6] Code context (owned_paths)      ← existing
 ```
 
-Rationale: the worker reads the prompt top-to-bottom before taking any action. Rationalizations placed at position [2] — after role framing but before the ticket — prime the worker's vigilance before it reads the requirements. This mirrors how the agent-skills pattern works: the counter-argument is in working memory when the temptation arises.
+Rationale: the worker reads the prompt top-to-bottom before taking any action. Rationalizations placed at position [2] — after ticket content and before standards — prime the worker's vigilance once the requirements are understood, but before it dives into implementation mechanics. This mirrors how the agent-skills pattern works: the counter-argument is in working memory when the temptation arises.
 
 The role framing sentence [1] is deliberately short:
 
