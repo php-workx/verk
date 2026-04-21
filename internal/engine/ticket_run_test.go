@@ -33,6 +33,8 @@ func TestRunTicket_HappyPath(t *testing.T) {
 				LeaseID:            claim.LeaseID,
 				StartedAt:          started,
 				FinishedAt:         finished,
+				TokenUsage:         &state.RuntimeTokenUsage{InputTokens: 100, CachedInputTokens: 60, OutputTokens: 20, TotalTokens: 120},
+				ActivityStats:      &state.RuntimeActivityStats{EventCount: 5, CommandCount: 2, AgentMessageCount: 1},
 				ResultArtifactPath: filepath.Join(repoRoot, "worker.json"),
 			},
 		},
@@ -45,6 +47,8 @@ func TestRunTicket_HappyPath(t *testing.T) {
 				FinishedAt:         finished.Add(2 * time.Second),
 				ReviewStatus:       runtime.ReviewStatusPassed,
 				Summary:            "clean",
+				TokenUsage:         &state.RuntimeTokenUsage{InputTokens: 200, CachedInputTokens: 150, OutputTokens: 30, TotalTokens: 230},
+				ActivityStats:      &state.RuntimeActivityStats{EventCount: 4, CommandCount: 1, AgentMessageCount: 1},
 				ResultArtifactPath: filepath.Join(repoRoot, "review.json"),
 			},
 		},
@@ -70,6 +74,12 @@ func TestRunTicket_HappyPath(t *testing.T) {
 	}
 	if result.Snapshot.BlockReason != "" {
 		t.Fatalf("expected no block reason, got %q", result.Snapshot.BlockReason)
+	}
+	if got := result.Snapshot.Implementation; got == nil || got.TokenUsage == nil || got.TokenUsage.InputTokens != 100 || got.ActivityStats == nil || got.ActivityStats.CommandCount != 2 {
+		t.Fatalf("expected implementation runtime telemetry to persist, got %#v", got)
+	}
+	if got := result.Snapshot.Review; got == nil || got.StartedAt.IsZero() || got.FinishedAt.IsZero() || got.TokenUsage == nil || got.TokenUsage.InputTokens != 200 || got.ActivityStats == nil || got.ActivityStats.CommandCount != 1 || len(got.Artifacts) != 1 {
+		t.Fatalf("expected review timing and runtime telemetry to persist, got %#v", got)
 	}
 
 	snapshotPath := filepath.Join(repoRoot, ".verk", "runs", "run-happy", "tickets", ticket.ID, "ticket-run.json")
@@ -1355,6 +1365,7 @@ func TestRenderReviewInstructions_RequestsOwnerRiskAndValidationEvidence(t *test
 	for _, phrase := range []string{
 		"brutally honest external review",
 		"owning ticket",
+		"severity",
 		"`VER-42`",
 		"concrete risk",
 		"missing validation or test evidence",

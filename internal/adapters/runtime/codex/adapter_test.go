@@ -51,8 +51,15 @@ func TestRunWorker_NormalizesAndCapturesArtifacts(t *testing.T) {
 			t.Fatalf("expected worker timeout 7m, got %s", timeout)
 		}
 
-		// AI returns JSON-only as instructed
-		outputJSON := `{"status":"done_with_concerns","completion_code":"ok","concerns":["minor style issue"]}`
+		// Codex streams JSONL events and may include the structured result as
+		// a sentinel line before the final usage event.
+		outputJSON := strings.Join([]string{
+			`{"type":"thread.started","thread_id":"thread-1"}`,
+			`{"type":"item.completed","item":{"type":"command_execution"}}`,
+			`{"type":"item.completed","item":{"type":"agent_message","text":"done"}}`,
+			`VERK_RESULT: {"status":"done_with_concerns","completion_code":"ok","concerns":["minor style issue"]}`,
+			`{"type":"turn.completed","usage":{"input_tokens":1200,"cached_input_tokens":900,"output_tokens":80}}`,
+		}, "\n")
 
 		return commandResult{
 			stdout:   []byte(outputJSON),
@@ -91,6 +98,12 @@ func TestRunWorker_NormalizesAndCapturesArtifacts(t *testing.T) {
 	}
 	if result.StdoutPath == "" || result.StderrPath == "" || result.ResultArtifactPath == "" {
 		t.Fatalf("expected captured artifact paths, got %#v", result)
+	}
+	if result.TokenUsage == nil || result.TokenUsage.InputTokens != 1200 || result.TokenUsage.CachedInputTokens != 900 || result.TokenUsage.OutputTokens != 80 {
+		t.Fatalf("expected token usage from Codex stream, got %#v", result.TokenUsage)
+	}
+	if result.ActivityStats == nil || result.ActivityStats.EventCount != 4 || result.ActivityStats.CommandCount != 1 || result.ActivityStats.AgentMessageCount != 1 {
+		t.Fatalf("expected activity stats from Codex stream, got %#v", result.ActivityStats)
 	}
 
 	stderrBytes, err := os.ReadFile(result.StderrPath)
@@ -148,7 +161,12 @@ func TestRunReviewer_NormalizesFindingsAndDerivesStatus(t *testing.T) {
 			t.Fatalf("expected reviewer timeout 9m, got %s", timeout)
 		}
 
-		outputJSON := `{"review_status":"findings","summary":"needs fixes","findings":[{"severity":"P2","title":"blocking issue","body":"blocking issue","file":"internal/example.go","line":12,"disposition":"open"}]}`
+		outputJSON := strings.Join([]string{
+			`{"type":"thread.started","thread_id":"thread-review"}`,
+			`{"type":"item.completed","item":{"type":"command_execution"}}`,
+			`VERK_REVIEW: {"review_status":"findings","summary":"needs fixes","findings":[{"severity":"P2","title":"blocking issue","body":"blocking issue","file":"internal/example.go","line":12,"disposition":"open"}]}`,
+			`{"type":"turn.completed","usage":{"input_tokens":2200,"cached_input_tokens":1100,"output_tokens":140}}`,
+		}, "\n")
 
 		return commandResult{
 			stdout: []byte(outputJSON),
@@ -188,6 +206,12 @@ func TestRunReviewer_NormalizesFindingsAndDerivesStatus(t *testing.T) {
 	}
 	if result.Findings[0].Severity != runtime.SeverityP2 {
 		t.Fatalf("expected canonical severity P2, got %q", result.Findings[0].Severity)
+	}
+	if result.TokenUsage == nil || result.TokenUsage.InputTokens != 2200 || result.TokenUsage.CachedInputTokens != 1100 || result.TokenUsage.OutputTokens != 140 {
+		t.Fatalf("expected token usage from Codex review stream, got %#v", result.TokenUsage)
+	}
+	if result.ActivityStats == nil || result.ActivityStats.EventCount != 3 || result.ActivityStats.CommandCount != 1 {
+		t.Fatalf("expected activity stats from Codex review stream, got %#v", result.ActivityStats)
 	}
 	if result.Findings[0].Disposition != runtime.ReviewDispositionOpen {
 		t.Fatalf("expected canonical open disposition, got %q", result.Findings[0].Disposition)

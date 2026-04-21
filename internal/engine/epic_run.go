@@ -124,7 +124,7 @@ func collectBlockedTickets(repoRoot, runID string, children []tkmd.Ticket) []Blo
 				if snap.CurrentPhase != "" {
 					phase = snap.CurrentPhase
 				}
-				if trimmed := strings.TrimSpace(snap.BlockReason); trimmed != "" {
+				if trimmed := ticketStatusReason(snap); trimmed != "" {
 					reason = trimmed
 				}
 			}
@@ -1272,7 +1272,7 @@ func buildWaveTicketDetails(repoRoot, runID string, ticketIDs []string, outcomes
 		// needs_context strings and engine-side non-convergent reasons.
 		var snap TicketRunSnapshot
 		if err := loadTicketSnapshot(repoRoot, runID, id, &snap); err == nil {
-			if reason := strings.TrimSpace(snap.BlockReason); reason != "" {
+			if reason := ticketStatusReason(snap); reason != "" {
 				detail.BlockReason = reason
 			}
 		}

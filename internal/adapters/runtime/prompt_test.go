@@ -357,6 +357,7 @@ func TestReviewerSystemPrompt_ActionableFindings(t *testing.T) {
 	for _, phrase := range []string{
 		"owning ticket",
 		"affected file or behavior",
+		"severity",
 		"missing validation",
 		"auto-repaired",
 	} {

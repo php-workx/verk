@@ -429,6 +429,132 @@ func TestResumeRun_CloseoutPhase_Closable_BecomesClosed(t *testing.T) {
 	}
 }
 
+func TestResumeRun_ResumeFromVerifyPhase_UsesSavedVerificationCoverage(t *testing.T) {
+	repoRoot := t.TempDir()
+	runID := "run-verify-resume"
+	ticketID := "ticket-1"
+
+	writeOpRunFixture(t, repoRoot, runID, state.RunArtifact{
+		ArtifactMeta: state.ArtifactMeta{SchemaVersion: 1, RunID: runID},
+		Mode:         "ticket",
+		RootTicketID: ticketID,
+		Status:       state.EpicRunStatusRunning,
+		CurrentPhase: state.TicketPhaseVerify,
+		TicketIDs:    []string{ticketID},
+	})
+	writeTicketMarkdownFixture(t, repoRoot, tkmd.Ticket{
+		ID:                 ticketID,
+		Title:              "Verify phase ticket",
+		Status:             tkmd.StatusInProgress,
+		OwnedPaths:         []string{"internal/app"},
+		AcceptanceCriteria: []string{"all checks pass"},
+		ValidationCommands: []string{"echo resume verify"},
+		UnknownFrontmatter: map[string]any{"type": "task"},
+	})
+	writePlanFixture(t, repoRoot, runID, state.PlanArtifact{
+		ArtifactMeta:             state.ArtifactMeta{SchemaVersion: 1, RunID: runID},
+		TicketID:                 ticketID,
+		ValidationCommands:       []string{"echo resume verify"},
+		EffectiveReviewThreshold: state.SeverityP2,
+	})
+	coverage := state.ValidationCoverageArtifact{
+		ArtifactMeta: state.ArtifactMeta{SchemaVersion: 1, RunID: runID},
+		Scope:        state.ValidationScopeTicket,
+		TicketID:     ticketID,
+		DeclaredChecks: []state.ValidationCheck{{
+			ID:      "declared-verify",
+			Scope:   state.ValidationScopeTicket,
+			Source:  state.ValidationCheckSourceDeclared,
+			Command: "echo previous-fail",
+			Reason:  "verification artifact was pending",
+		}},
+		ExecutedChecks: []state.ValidationCheckExecution{{
+			CheckID:    "declared-verify",
+			Result:     state.ValidationCheckResultFailed,
+			StartedAt:  testRunTime(),
+			FinishedAt: testRunTime().Add(time.Second),
+		}},
+		Closable:    false,
+		BlockReason: "verification pending restart",
+	}
+	writeTicketRunFixture(t, repoRoot, runID, TicketRunSnapshot{
+		ArtifactMeta: state.ArtifactMeta{SchemaVersion: 1, RunID: runID},
+		TicketID:     ticketID,
+		CurrentPhase: state.TicketPhaseVerify,
+		Verification: &state.VerificationArtifact{
+			ArtifactMeta: state.ArtifactMeta{SchemaVersion: 1, RunID: runID},
+			TicketID:     ticketID,
+			Attempt:      1,
+			Commands:     []string{"echo previous-fail"},
+			Results: []state.VerificationResult{
+				{
+					Command:    "echo previous-fail",
+					ExitCode:   1,
+					Passed:     false,
+					StartedAt:  testRunTime(),
+					FinishedAt: testRunTime().Add(time.Second),
+				},
+			},
+			Passed:             false,
+			ValidationCoverage: &coverage,
+		},
+	})
+
+	reviewArtifactPath := filepath.Join(repoRoot, "review-verify.json")
+	if err := os.WriteFile(reviewArtifactPath, []byte("{}"), 0o644); err != nil {
+		t.Fatalf("write review artifact: %v", err)
+	}
+	reviewResult := runtime.ReviewResult{
+		Status:             runtime.WorkerStatusDone,
+		RetryClass:         runtime.RetryClassTerminal,
+		LeaseID:            "lease-review-verify",
+		StartedAt:          testRunTime(),
+		FinishedAt:         testRunTime().Add(time.Second),
+		ReviewStatus:       runtime.ReviewStatusPassed,
+		Summary:            "clean",
+		ResultArtifactPath: reviewArtifactPath,
+	}
+	adapter := &reflectingAdapter{
+		reviewResults: []runtime.ReviewResult{reviewResult},
+	}
+	cfg := policy.DefaultConfig()
+	cfg.Verification.QualityCommands = nil
+
+	report, err := ResumeRun(context.Background(), ResumeRequest{
+		RepoRoot: repoRoot,
+		RunID:    runID,
+		Adapter:  adapter,
+		Config:   cfg,
+	})
+	if err != nil {
+		t.Fatalf("ResumeRun returned error: %v", err)
+	}
+
+	if len(report.ResumedTickets) != 1 || report.ResumedTickets[0] != ticketID {
+		t.Fatalf("expected resumed ticket %q, got %#v", ticketID, report.ResumedTickets)
+	}
+	if report.Status.CurrentPhase != state.TicketPhaseClosed {
+		t.Fatalf("expected closed phase after rerun, got %q", report.Status.CurrentPhase)
+	}
+
+	var snapshot TicketRunSnapshot
+	if err := state.LoadJSON(ticketSnapshotPath(repoRoot, runID, ticketID), &snapshot); err != nil {
+		t.Fatalf("load ticket snapshot: %v", err)
+	}
+	if snapshot.CurrentPhase != state.TicketPhaseClosed {
+		t.Fatalf("expected closed phase, got %q", snapshot.CurrentPhase)
+	}
+	if snapshot.Verification == nil || snapshot.Verification.Attempt <= 1 {
+		t.Fatalf("expected verification to rerun during resume, got %#v", snapshot.Verification)
+	}
+	if snapshot.Verification.ValidationCoverage == nil {
+		t.Fatalf("expected verification coverage after resumed verify run")
+	}
+	if len(snapshot.Verification.ValidationCoverage.DeclaredChecks) == 0 {
+		t.Fatalf("expected declared checks in verification coverage")
+	}
+}
+
 func TestReloadTicketSnapshots_UpdatesStalePhases(t *testing.T) {
 	repoRoot := t.TempDir()
 	runID := "run-reload"

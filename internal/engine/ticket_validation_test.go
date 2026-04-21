@@ -17,6 +17,52 @@ import (
 	"verk/internal/state"
 )
 
+func TestDeriveTicketChecks_UsesConfiguredStaleWordingTermsAndDocs(t *testing.T) {
+	originalToolSignals := toolSignalsProvider
+	originalStaleTerms := staleWordingTermsProvider
+	originalRepoRoot := t.TempDir()
+	t.Cleanup(func() {
+		toolSignalsProvider = originalToolSignals
+		staleWordingTermsProvider = originalStaleTerms
+	})
+	toolSignalsProvider = func(string) ToolSignals {
+		return ToolSignals{HasMarkdownlint: true}
+	}
+	staleWordingTermsProvider = func() []string { return nil }
+
+	cfg := policy.DefaultConfig()
+	cfg.Verification.EpicStaleWordingTerms = []string{"old-scanner", "betterleaks"}
+	cfg.Verification.EpicClosureDocs = []string{"POLICY_SCOPE.md"}
+	st := &ticketRunState{
+		cfg: cfg,
+		req: RunTicketRequest{
+			Plan: state.PlanArtifact{
+				TicketID:    "ver-y29o",
+				Title:       "docs refresh",
+				Description: "refresh docs and wording",
+				OwnedPaths:  []string{"docs"},
+			},
+		},
+		repoRoot:       originalRepoRoot,
+		implementation: &state.ImplementationArtifact{ChangedFiles: []string{"docs/self-hosting.md"}},
+	}
+
+	result := deriveTicketChecks(st)
+	stale, ok := findCheck(result.Checks, "grep -nE")
+	if !ok {
+		t.Fatalf("expected stale wording check derived from policy config, got %#v", result.Checks)
+	}
+	if !strings.Contains(stale.Command, "POLICY_SCOPE.md") {
+		t.Fatalf("expected policy-scoped docs path in stale-wording command, got %q", stale.Command)
+	}
+	if strings.Contains(stale.Command, "README.md") {
+		t.Fatalf("expected default docs fallback not to be used when policy docs are configured, got %q", stale.Command)
+	}
+	if _, ok := findCheck(result.Checks, "markdownlint docs/self-hosting.md"); !ok {
+		t.Fatalf("expected markdownlint check to be derived with configured terms available, got %#v", result.Checks)
+	}
+}
+
 // TestAssembleTicketValidationCoverage_FailingRequiredDerivedCheckBlocks
 // verifies that a non-advisory (required) derived check that fails is
 // recorded in ExecutedChecks and surfaces as an UnresolvedBlocker with the

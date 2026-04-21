@@ -2,6 +2,7 @@ package cli
 
 import (
 	"fmt"
+	"io"
 	"sort"
 	"strings"
 	"verk/internal/engine"
@@ -77,6 +78,12 @@ func initStatusCmd(root *cobra.Command) {
 					reason := shortenBlockReason(ticket.BlockReason)
 					_, _ = fmt.Fprintf(w, "  %s %s\n", strings.Repeat(" ", len(tag)), r.dim(reason))
 				}
+				for _, step := range ticket.Steps {
+					renderStatusStep(w, r, strings.Repeat(" ", len(tag)), step)
+				}
+				for _, failure := range ticket.Failures {
+					renderStatusFailure(w, r, strings.Repeat(" ", len(tag)), failure)
+				}
 
 				switch ticket.Phase {
 				case state.TicketPhaseClosed:
@@ -114,6 +121,84 @@ func initStatusCmd(root *cobra.Command) {
 
 	statusCmd.Flags().BoolVar(&statusJSONFlag, "json", false, "Output as JSON")
 	root.AddCommand(statusCmd)
+}
+
+func renderStatusStep(w io.Writer, r doctorRenderer, indent string, step engine.StatusStep) {
+	if step.Name == "" {
+		return
+	}
+	parts := []string{step.Name}
+	if step.DurationMS > 0 {
+		parts = append(parts, formatStatusDuration(step.DurationMS))
+	}
+	if step.Runtime != "" {
+		profile := step.Runtime
+		if step.Model != "" {
+			profile += "/" + step.Model
+		}
+		if step.Reasoning != "" {
+			profile += "/" + step.Reasoning
+		}
+		parts = append(parts, profile)
+	}
+	if step.CommandCount > 0 {
+		parts = append(parts, fmt.Sprintf("%d command(s)", step.CommandCount))
+	}
+	if step.ActivityStats != nil {
+		if step.ActivityStats.CommandCount > 0 {
+			parts = append(parts, fmt.Sprintf("%d agent command(s)", step.ActivityStats.CommandCount))
+		}
+		if step.ActivityStats.AgentMessageCount > 0 {
+			parts = append(parts, fmt.Sprintf("%d message(s)", step.ActivityStats.AgentMessageCount))
+		}
+	}
+	if step.TokenUsage != nil {
+		parts = append(parts, formatTokenUsage(step.TokenUsage.InputTokens, step.TokenUsage.CachedInputTokens, step.TokenUsage.OutputTokens))
+	}
+	_, _ = fmt.Fprintf(w, "  %s %s\n", indent, r.dim(strings.Join(parts, " · ")))
+}
+
+func renderStatusFailure(w io.Writer, r doctorRenderer, indent string, failure engine.StatusFailure) {
+	if failure.Summary == "" {
+		return
+	}
+	_, _ = fmt.Fprintf(w, "  %s %s\n", indent, r.dim(failure.Summary))
+	if failure.Detail != "" {
+		_, _ = fmt.Fprintf(w, "  %s %s\n", indent, r.dim(failure.Detail))
+	}
+}
+
+func formatStatusDuration(ms int64) string {
+	if ms < 1000 {
+		return fmt.Sprintf("%dms", ms)
+	}
+	seconds := ms / 1000
+	if seconds < 60 {
+		return fmt.Sprintf("%ds", seconds)
+	}
+	minutes := seconds / 60
+	seconds %= 60
+	return fmt.Sprintf("%dm%02ds", minutes, seconds)
+}
+
+func formatTokenUsage(input, cached, output int64) string {
+	parts := []string{fmt.Sprintf("%s in", compactTokenCount(input))}
+	if cached > 0 {
+		parts = append(parts, fmt.Sprintf("%s cached", compactTokenCount(cached)))
+	}
+	parts = append(parts, fmt.Sprintf("%s out", compactTokenCount(output)))
+	return strings.Join(parts, ", ")
+}
+
+func compactTokenCount(tokens int64) string {
+	switch {
+	case tokens >= 1_000_000:
+		return fmt.Sprintf("%.1fM", float64(tokens)/1_000_000)
+	case tokens >= 1_000:
+		return fmt.Sprintf("%.1fk", float64(tokens)/1_000)
+	default:
+		return fmt.Sprintf("%d", tokens)
+	}
 }
 
 type tagFormatter func(r doctorRenderer, tag string) string
@@ -198,6 +283,9 @@ func shortenBlockReason(reason string) string {
 	// Collapse the claim-renewal sentinel emitted by ticket execution.
 	if strings.HasPrefix(reason, "claim renewal failed:") {
 		reason = "lease expired"
+	}
+	if strings.HasPrefix(reason, "worker blocked by operator input: {\"type\":") {
+		reason = "worker blocked by operator input from runtime event stream"
 	}
 	if len(reason) > 72 {
 		reason = reason[:69] + "..."

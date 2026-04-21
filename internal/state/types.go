@@ -147,24 +147,39 @@ type PlanCriterion struct {
 
 type ImplementationArtifact struct {
 	ArtifactMeta
-	TicketID          string     `json:"ticket_id"`
-	Attempt           int        `json:"attempt"`
-	Runtime           string     `json:"runtime"`
-	Model             string     `json:"model,omitempty"`
-	Reasoning         string     `json:"reasoning,omitempty"`
-	FallbackReason    string     `json:"fallback_reason,omitempty"`
-	Status            string     `json:"status"`
-	CompletionCode    string     `json:"completion_code"`
-	RetryClass        RetryClass `json:"retry_class"`
-	Concerns          []string   `json:"concerns"`
-	FailureReason     string     `json:"failure_reason"`
-	BlockReason       string     `json:"block_reason"`
-	ChangedFiles      []string   `json:"changed_files"`
-	Artifacts         []string   `json:"artifacts"`
-	LeaseID           string     `json:"lease_id"`
-	InputArtifactPath string     `json:"input_artifact_path,omitempty"`
-	StartedAt         time.Time  `json:"started_at"`
-	FinishedAt        time.Time  `json:"finished_at"`
+	TicketID          string                `json:"ticket_id"`
+	Attempt           int                   `json:"attempt"`
+	Runtime           string                `json:"runtime"`
+	Model             string                `json:"model,omitempty"`
+	Reasoning         string                `json:"reasoning,omitempty"`
+	FallbackReason    string                `json:"fallback_reason,omitempty"`
+	Status            string                `json:"status"`
+	CompletionCode    string                `json:"completion_code"`
+	RetryClass        RetryClass            `json:"retry_class"`
+	Concerns          []string              `json:"concerns"`
+	FailureReason     string                `json:"failure_reason"`
+	BlockReason       string                `json:"block_reason"`
+	ChangedFiles      []string              `json:"changed_files"`
+	Artifacts         []string              `json:"artifacts"`
+	TokenUsage        *RuntimeTokenUsage    `json:"token_usage,omitempty"`
+	ActivityStats     *RuntimeActivityStats `json:"activity_stats,omitempty"`
+	LeaseID           string                `json:"lease_id"`
+	InputArtifactPath string                `json:"input_artifact_path,omitempty"`
+	StartedAt         time.Time             `json:"started_at"`
+	FinishedAt        time.Time             `json:"finished_at"`
+}
+
+type RuntimeTokenUsage struct {
+	InputTokens       int64 `json:"input_tokens,omitempty"`
+	CachedInputTokens int64 `json:"cached_input_tokens,omitempty"`
+	OutputTokens      int64 `json:"output_tokens,omitempty"`
+	TotalTokens       int64 `json:"total_tokens,omitempty"`
+}
+
+type RuntimeActivityStats struct {
+	EventCount        int `json:"event_count,omitempty"`
+	CommandCount      int `json:"command_count,omitempty"`
+	AgentMessageCount int `json:"agent_message_count,omitempty"`
 }
 
 type VerificationResult struct {
@@ -212,17 +227,22 @@ type ReviewFinding struct {
 
 type ReviewFindingsArtifact struct {
 	ArtifactMeta
-	TicketID                 string          `json:"ticket_id"`
-	Attempt                  int             `json:"attempt"`
-	ReviewerRuntime          string          `json:"reviewer_runtime"`
-	ReviewerModel            string          `json:"reviewer_model,omitempty"`
-	ReviewerReasoning        string          `json:"reviewer_reasoning,omitempty"`
-	FallbackReason           string          `json:"fallback_reason,omitempty"`
-	Summary                  string          `json:"summary"`
-	Findings                 []ReviewFinding `json:"findings"`
-	BlockingFindings         []string        `json:"blocking_findings"`
-	Passed                   bool            `json:"passed"`
-	EffectiveReviewThreshold Severity        `json:"effective_review_threshold"`
+	TicketID                 string                `json:"ticket_id"`
+	Attempt                  int                   `json:"attempt"`
+	ReviewerRuntime          string                `json:"reviewer_runtime"`
+	ReviewerModel            string                `json:"reviewer_model,omitempty"`
+	ReviewerReasoning        string                `json:"reviewer_reasoning,omitempty"`
+	FallbackReason           string                `json:"fallback_reason,omitempty"`
+	Summary                  string                `json:"summary"`
+	Findings                 []ReviewFinding       `json:"findings"`
+	BlockingFindings         []string              `json:"blocking_findings"`
+	Passed                   bool                  `json:"passed"`
+	EffectiveReviewThreshold Severity              `json:"effective_review_threshold"`
+	Artifacts                []string              `json:"artifacts,omitempty"`
+	TokenUsage               *RuntimeTokenUsage    `json:"token_usage,omitempty"`
+	ActivityStats            *RuntimeActivityStats `json:"activity_stats,omitempty"`
+	StartedAt                time.Time             `json:"started_at,omitempty"`
+	FinishedAt               time.Time             `json:"finished_at,omitempty"`
 }
 
 type GateResult struct {

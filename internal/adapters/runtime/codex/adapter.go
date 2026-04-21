@@ -1,6 +1,7 @@
 package codex
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/sha256"
@@ -13,6 +14,7 @@ import (
 	"strings"
 	"time"
 	"verk/internal/adapters/runtime"
+	"verk/internal/state"
 )
 
 const (
@@ -114,6 +116,7 @@ func (a *Adapter) RunWorker(ctx context.Context, req runtime.WorkerRequest) (run
 		StartedAt:      startedAt,
 		FinishedAt:     finishedAt,
 	}
+	result.TokenUsage, result.ActivityStats = extractCodexTelemetry(execResult.stdout)
 
 	result.StdoutPath, err = writeBytesArtifact(runtimeName+"-worker-stdout", execResult.stdout)
 	if err != nil {
@@ -187,6 +190,7 @@ func (a *Adapter) RunReviewer(ctx context.Context, req runtime.ReviewRequest) (r
 		Summary:        extractReviewSummary(reviewBlock, blockFound),
 		Findings:       findings,
 	}
+	normalized.TokenUsage, normalized.ActivityStats = extractCodexTelemetry(execResult.stdout)
 
 	if err := checkReviewStatusContradiction(reviewBlock, blockFound, normalized.ReviewStatus); err != nil {
 		return runtime.ReviewResult{}, err
@@ -227,6 +231,59 @@ func (a *Adapter) RunReviewer(ctx context.Context, req runtime.ReviewRequest) (r
 		return runtime.ReviewResult{}, err
 	}
 	return normalized, nil
+}
+
+func extractCodexTelemetry(stdout []byte) (*state.RuntimeTokenUsage, *state.RuntimeActivityStats) {
+	scanner := bufio.NewScanner(bytes.NewReader(stdout))
+	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	stats := &state.RuntimeActivityStats{}
+	usage := &state.RuntimeTokenUsage{}
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+		var event struct {
+			Type string `json:"type"`
+			Item struct {
+				Type string `json:"type"`
+			} `json:"item"`
+			Usage struct {
+				InputTokens       int64 `json:"input_tokens"`
+				CachedInputTokens int64 `json:"cached_input_tokens"`
+				OutputTokens      int64 `json:"output_tokens"`
+				TotalTokens       int64 `json:"total_tokens"`
+			} `json:"usage"`
+		}
+		if err := json.Unmarshal([]byte(line), &event); err != nil || event.Type == "" {
+			continue
+		}
+		stats.EventCount++
+		if event.Type == "item.completed" {
+			switch event.Item.Type {
+			case "command_execution":
+				stats.CommandCount++
+			case "agent_message":
+				stats.AgentMessageCount++
+			}
+		}
+		if event.Type == "turn.completed" {
+			usage.InputTokens += event.Usage.InputTokens
+			usage.CachedInputTokens += event.Usage.CachedInputTokens
+			usage.OutputTokens += event.Usage.OutputTokens
+			usage.TotalTokens += event.Usage.TotalTokens
+		}
+	}
+	if usage.TotalTokens == 0 && (usage.InputTokens != 0 || usage.OutputTokens != 0) {
+		usage.TotalTokens = usage.InputTokens + usage.OutputTokens
+	}
+	if usage.InputTokens == 0 && usage.CachedInputTokens == 0 && usage.OutputTokens == 0 && usage.TotalTokens == 0 {
+		usage = nil
+	}
+	if stats.EventCount == 0 {
+		stats = nil
+	}
+	return usage, stats
 }
 
 func (a *Adapter) binary() string {

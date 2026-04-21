@@ -238,8 +238,17 @@ func resumeTicketMode(ctx context.Context, req ResumeRequest, artifacts *runArti
 			}
 			plan.RunID = req.RunID
 		}
-		// Resume at implement phase (the furthest-back supported entry point)
-		plan.Phase = state.TicketPhaseImplement
+		// Resume as close as possible to the last persisted phase so
+		// pending verify/review/repair work continues correctly without
+		// losing provenance. Blocked tickets are intentionally moved back to
+		// implement so resume can unblock under new conditions.
+		if snapshot.CurrentPhase == state.TicketPhaseBlocked {
+			plan.Phase = state.TicketPhaseImplement
+		} else if snapshot.CurrentPhase != "" {
+			plan.Phase = snapshot.CurrentPhase
+		} else {
+			plan.Phase = state.TicketPhaseImplement
+		}
 
 		// Resolve adapter
 		adapter, err := resumeAdapter(req, plan)

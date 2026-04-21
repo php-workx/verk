@@ -107,18 +107,67 @@ func TestDeriveChecks_GoTestOnlyFilesStillDeriveCheck(t *testing.T) {
 	}
 }
 
-func TestDeriveChecks_GoFilesOutsideKnownRootsAreIgnored(t *testing.T) {
-	// Files outside conventional Go roots (internal, cmd, pkg) should not
-	// produce a derived go test command — derivation stays conservative.
+func TestDeriveChecks_GoFilesOutsideKnownRootsFallBackToInternal(t *testing.T) {
+	// Files outside conventional Go roots should still get a narrow fallback
+	// check so regressions in touched Go files are not skipped entirely.
 	result := DeriveChecks(DeriveChecksInput{
 		Plan:         state.PlanArtifact{TicketID: "ver-y29o"},
 		ChangedFiles: []string{"scripts/tool.go", "vendor/foo/bar.go"},
 	})
 
-	for _, c := range result.Checks {
-		if strings.HasPrefix(c.Command, "go test") {
-			t.Fatalf("did not expect derived go test for out-of-root files, got %q", c.Command)
-		}
+	got, ok := findCheck(result.Checks, "go test ./internal/...")
+	if !ok {
+		t.Fatalf("expected fallback internal package check for out-of-root Go files, got %#v", result.Checks)
+	}
+	if !got.Advisory {
+		t.Fatalf("expected fallback go check to be advisory")
+	}
+	if len(got.MatchedFiles) != 2 {
+		t.Fatalf("expected both out-of-root go files in matched files, got %#v", got.MatchedFiles)
+	}
+	if !strings.Contains(got.Reason, "fallback") {
+		t.Fatalf("expected fallback reason, got %q", got.Reason)
+	}
+}
+
+func TestDeriveChecks_DuplicateExplicitlyDeclaredCheckIsNotRederived(t *testing.T) {
+	result := DeriveChecks(DeriveChecksInput{
+		Plan: state.PlanArtifact{
+			TicketID: "ver-y29o",
+			ValidationCommands: []string{
+				"go test ./internal/engine",
+			},
+		},
+		ChangedFiles: []string{"internal/engine/ticket_run.go"},
+	})
+
+	if _, ok := findCheck(result.Checks, "go test ./internal/engine"); ok {
+		t.Fatalf("expected no duplicate derived check when declared command already exists")
+	}
+}
+
+func TestDeriveChecks_DocsOnlyDeclaredMarkdownlintStillGetsStaleWording(t *testing.T) {
+	plan := state.PlanArtifact{
+		TicketID:    "ver-docs",
+		Title:       "Update docs for scanner",
+		Description: "prune stale wording and refresh docs",
+		OwnedPaths:  []string{"docs"},
+		ValidationCommands: []string{
+			"markdownlint docs/self-hosting.md",
+		},
+	}
+	result := DeriveChecks(DeriveChecksInput{
+		Plan:              plan,
+		ChangedFiles:      []string{"docs/self-hosting.md"},
+		Tools:             ToolSignals{HasMarkdownlint: true},
+		StaleWordingTerms: []string{"trufflehog"},
+	})
+
+	if _, ok := findCheck(result.Checks, "markdownlint docs/self-hosting.md"); ok {
+		t.Fatalf("expected markdownlint to be suppressed when explicitly declared")
+	}
+	if _, ok := findCheck(result.Checks, "grep -nE"); !ok {
+		t.Fatalf("expected stale wording check to remain active when markdownlint is already declared")
 	}
 }
 

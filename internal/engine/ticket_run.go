@@ -123,12 +123,35 @@ func RunTicket(ctx context.Context, req RunTicketRequest) (result RunTicketResul
 		currentPhase: req.Plan.Phase,
 	}
 
-	// Restore createdAt from any existing snapshot so it is preserved across saves.
-	// Ignore errors: on first run the snapshot does not exist yet, and on resume
-	// any read failure is non-fatal — snapshot() will lazily set createdAt instead.
+	restoredPhaseFromSnapshot := false
+
+	// Restore persisted lifecycle state when the ticket is being resumed.
+	// Ignore errors for fresh tickets: missing artifacts are normal before
+	// first run or when run artifacts were manually reset.
 	var prevSnapshot TicketRunSnapshot
-	if err := state.LoadJSON(st.paths.snapshotPath, &prevSnapshot); err == nil && !prevSnapshot.CreatedAt.IsZero() {
-		st.createdAt = prevSnapshot.CreatedAt
+	if err := loadTicketSnapshot(absRepoRoot, req.RunID, req.Ticket.ID, &prevSnapshot); err == nil {
+		if !prevSnapshot.CreatedAt.IsZero() {
+			st.createdAt = prevSnapshot.CreatedAt
+		}
+		switch {
+		case prevSnapshot.CurrentPhase == "":
+		case prevSnapshot.CurrentPhase == st.currentPhase:
+			restoredPhaseFromSnapshot = true
+		case st.currentPhase == state.TicketPhaseIntake && prevSnapshot.CurrentPhase != state.TicketPhaseBlocked:
+			st.currentPhase = prevSnapshot.CurrentPhase
+			restoredPhaseFromSnapshot = true
+		}
+		st.blockReason = prevSnapshot.BlockReason
+		st.implementationAttempts = prevSnapshot.ImplementationAttempts
+		st.verificationAttempts = prevSnapshot.VerificationAttempts
+		st.reviewAttempts = prevSnapshot.ReviewAttempts
+		st.implementation = prevSnapshot.Implementation
+		st.verification = prevSnapshot.Verification
+		st.review = prevSnapshot.Review
+		st.closeout = prevSnapshot.Closeout
+		if len(prevSnapshot.RepairCycles) > 0 {
+			st.repairCycles = append(st.repairCycles, prevSnapshot.RepairCycles...)
+		}
 	}
 
 	// Release claim on any error return to prevent leaked claims blocking retries.
@@ -159,7 +182,7 @@ func RunTicket(ctx context.Context, req RunTicketRequest) (result RunTicketResul
 	if st.currentPhase == "" {
 		st.currentPhase = state.TicketPhaseIntake
 	}
-	if st.currentPhase != state.TicketPhaseIntake && st.currentPhase != state.TicketPhaseImplement {
+	if !canStartTicketRunFromPhase(st.currentPhase, restoredPhaseFromSnapshot) {
 		return RunTicketResult{}, fmt.Errorf("ticket run cannot start from phase %q", st.currentPhase)
 	}
 	if err := state.SaveJSONAtomic(filepath.Join(st.paths.runDir, "plan.json"), req.Plan); err != nil {
@@ -219,10 +242,11 @@ func RunTicket(ctx context.Context, req RunTicketRequest) (result RunTicketResul
 			}
 
 			if st.currentPhase == state.TicketPhaseVerify {
-				if err := checkSingleTicketScope(st); err != nil {
+				blocked, err := st.executeVerification(ctx, absRepoRoot)
+				if err != nil {
 					return RunTicketResult{}, err
 				}
-				if st.currentPhase == state.TicketPhaseBlocked {
+				if blocked {
 					if err := st.persist(); err != nil {
 						return RunTicketResult{}, err
 					}
@@ -230,34 +254,6 @@ func RunTicket(ctx context.Context, req RunTicketRequest) (result RunTicketResul
 						return RunTicketResult{}, err
 					}
 					return RunTicketResult{Snapshot: st.snapshot(), Path: st.paths.snapshotPath}, nil
-				}
-				if err := st.persist(); err != nil {
-					return RunTicketResult{}, err
-				}
-				verifyArtifact, verifyPassed, err := st.runVerification(ctx, absRepoRoot)
-				if err != nil {
-					return RunTicketResult{}, err
-				}
-				st.verification = verifyArtifact
-				st.verificationAttempts = verifyArtifact.Attempt
-				if err := st.persist(); err != nil {
-					return RunTicketResult{}, err
-				}
-				if !verifyPassed {
-					if err := handleVerificationFailure(st, *verifyArtifact); err != nil {
-						return RunTicketResult{}, err
-					}
-					if err := st.persist(); err != nil {
-						return RunTicketResult{}, err
-					}
-					continue
-				}
-
-				if err := st.transitionTo(state.TicketPhaseReview); err != nil {
-					return RunTicketResult{}, err
-				}
-				if err := st.persist(); err != nil {
-					return RunTicketResult{}, err
 				}
 				continue
 			}
@@ -335,6 +331,22 @@ func RunTicket(ctx context.Context, req RunTicketRequest) (result RunTicketResul
 				continue
 			}
 
+		case state.TicketPhaseVerify:
+			blocked, err := st.executeVerification(ctx, absRepoRoot)
+			if err != nil {
+				return RunTicketResult{}, err
+			}
+			if blocked {
+				if err := st.persist(); err != nil {
+					return RunTicketResult{}, err
+				}
+				if err := st.releaseClaim(); err != nil {
+					return RunTicketResult{}, err
+				}
+				return RunTicketResult{Snapshot: st.snapshot(), Path: st.paths.snapshotPath}, nil
+			}
+			continue
+
 		case state.TicketPhaseCloseout:
 			if st.closeout == nil {
 				closeout, err := BuildCloseoutArtifact(st.req.Ticket, st.req.Plan, st.verification, st.review)
@@ -397,10 +409,11 @@ func RunTicket(ctx context.Context, req RunTicketRequest) (result RunTicketResul
 				return RunTicketResult{}, err
 			}
 			if st.currentPhase == state.TicketPhaseVerify {
-				if err := checkSingleTicketScope(st); err != nil {
+				blocked, err := st.executeVerification(ctx, absRepoRoot)
+				if err != nil {
 					return RunTicketResult{}, err
 				}
-				if st.currentPhase == state.TicketPhaseBlocked {
+				if blocked {
 					if err := st.persist(); err != nil {
 						return RunTicketResult{}, err
 					}
@@ -408,34 +421,6 @@ func RunTicket(ctx context.Context, req RunTicketRequest) (result RunTicketResul
 						return RunTicketResult{}, err
 					}
 					return RunTicketResult{Snapshot: st.snapshot(), Path: st.paths.snapshotPath}, nil
-				}
-				if err := st.persist(); err != nil {
-					return RunTicketResult{}, err
-				}
-				verifyArtifact, verifyPassed, err := st.runVerification(ctx, absRepoRoot)
-				if err != nil {
-					return RunTicketResult{}, err
-				}
-				st.verification = verifyArtifact
-				st.verificationAttempts = verifyArtifact.Attempt
-				if err := st.persist(); err != nil {
-					return RunTicketResult{}, err
-				}
-				if !verifyPassed {
-					if err := handleVerificationFailure(st, *verifyArtifact); err != nil {
-						return RunTicketResult{}, err
-					}
-					if err := st.persist(); err != nil {
-						return RunTicketResult{}, err
-					}
-					continue
-				}
-
-				if err := st.transitionTo(state.TicketPhaseReview); err != nil {
-					return RunTicketResult{}, err
-				}
-				if err := st.persist(); err != nil {
-					return RunTicketResult{}, err
 				}
 				continue
 			}
@@ -507,6 +492,8 @@ func handleImplementResult(st *ticketRunState, result runtime.WorkerResult, req 
 		StartedAt:         result.StartedAt,
 		FinishedAt:        result.FinishedAt,
 		Artifacts:         compactStrings([]string{result.StdoutPath, result.StderrPath, result.ResultArtifactPath}),
+		TokenUsage:        cloneRuntimeTokenUsage(result.TokenUsage),
+		ActivityStats:     cloneRuntimeActivityStats(result.ActivityStats),
 		ChangedFiles:      []string{},
 	}
 
@@ -537,6 +524,59 @@ func handleImplementResult(st *ticketRunState, result runtime.WorkerResult, req 
 		return err
 	}
 	return nil
+}
+
+func canStartTicketRunFromPhase(phase state.TicketPhase, restoredFromSnapshot bool) bool {
+	switch phase {
+	case state.TicketPhaseIntake, state.TicketPhaseImplement, state.TicketPhaseVerify:
+		return true
+	case state.TicketPhaseReview, state.TicketPhaseRepair, state.TicketPhaseCloseout:
+		return restoredFromSnapshot
+	default:
+		return false
+	}
+}
+
+// executeVerification runs the verification gate for the current ticket and
+// transitions into review on success. A true return value indicates the ticket
+// is blocked and can be safely returned immediately by the caller.
+func (st *ticketRunState) executeVerification(ctx context.Context, repoRoot string) (bool, error) {
+	if err := checkSingleTicketScope(st); err != nil {
+		return false, err
+	}
+	if st.currentPhase == state.TicketPhaseBlocked {
+		return true, nil
+	}
+
+	if err := st.persist(); err != nil {
+		return false, err
+	}
+	verifyArtifact, verifyPassed, err := st.runVerification(ctx, repoRoot)
+	if err != nil {
+		return false, err
+	}
+	st.verification = verifyArtifact
+	st.verificationAttempts = verifyArtifact.Attempt
+	if err := st.persist(); err != nil {
+		return false, err
+	}
+	if !verifyPassed {
+		if err := handleVerificationFailure(st, *verifyArtifact); err != nil {
+			return false, err
+		}
+		if err := st.persist(); err != nil {
+			return false, err
+		}
+		return false, nil
+	}
+
+	if err := st.transitionTo(state.TicketPhaseReview); err != nil {
+		return false, err
+	}
+	if err := st.persist(); err != nil {
+		return false, err
+	}
+	return false, nil
 }
 
 func checkSingleTicketScope(st *ticketRunState) error {
@@ -749,6 +789,11 @@ func handleReviewOutcome(st *ticketRunState, result runtime.ReviewResult, req ru
 		BlockingFindings:         append([]string(nil), blockingIDs...),
 		Passed:                   len(blockingIDs) == 0,
 		EffectiveReviewThreshold: st.req.Plan.EffectiveReviewThreshold,
+		Artifacts:                compactStrings([]string{result.StdoutPath, result.StderrPath, result.ResultArtifactPath}),
+		TokenUsage:               cloneRuntimeTokenUsage(result.TokenUsage),
+		ActivityStats:            cloneRuntimeActivityStats(result.ActivityStats),
+		StartedAt:                result.StartedAt,
+		FinishedAt:               result.FinishedAt,
 	}
 
 	if len(blockingIDs) == 0 {
@@ -1811,7 +1856,7 @@ func renderReviewInstructions(plan state.PlanArtifact, attempt int) string {
 	b.WriteString("Flag any issues with appropriate severity.\n\n")
 
 	b.WriteString("Treat this as a dry run for a brutally honest external review: find real gaps, incomplete implementations, ")
-	b.WriteString("and missing tests rather than manufacturing nits. For each finding, document the owning ticket (use ")
+	b.WriteString("and missing tests rather than manufacturing nits. For each finding, document the severity and the owning ticket (use ")
 	fmt.Fprintf(&b, "`%s` when the issue is scoped to this ticket), the affected file or behavior and the concrete risk, the specific ", plan.TicketID)
 	b.WriteString("missing validation or test evidence, and whether you believe the issue can be auto-repaired.\n")
 
@@ -1841,6 +1886,22 @@ func compactStrings(values []string) []string {
 		out = append(out, value)
 	}
 	return out
+}
+
+func cloneRuntimeTokenUsage(usage *state.RuntimeTokenUsage) *state.RuntimeTokenUsage {
+	if usage == nil {
+		return nil
+	}
+	copy := *usage
+	return &copy
+}
+
+func cloneRuntimeActivityStats(stats *state.RuntimeActivityStats) *state.RuntimeActivityStats {
+	if stats == nil {
+		return nil
+	}
+	copy := *stats
+	return &copy
 }
 
 func convertVerificationResults(commands []string, results []verifycommand.CommandResult) []state.VerificationResult {

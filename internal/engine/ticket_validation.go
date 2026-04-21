@@ -52,15 +52,25 @@ var staleWordingTermsProvider = func() []string { return nil }
 // implementation artifact is missing — the caller falls back to running
 // only declared and quality commands.
 func deriveTicketChecks(st *ticketRunState) DeriveChecksResult {
+	if st == nil {
+		return DeriveChecksResult{}
+	}
 	var changed []string
 	if st.implementation != nil {
 		changed = append(changed, st.implementation.ChangedFiles...)
 	}
+
+	terms := staleWordingTermsProvider()
+	if len(terms) == 0 {
+		terms = st.cfg.Verification.EpicStaleWordingTerms
+	}
+
 	return DeriveChecks(DeriveChecksInput{
 		Plan:              st.req.Plan,
 		ChangedFiles:      changed,
 		Tools:             toolSignalsProvider(st.repoRoot),
-		StaleWordingTerms: staleWordingTermsProvider(),
+		StaleWordingTerms: terms,
+		StaleWordingDocs:  st.cfg.Verification.EpicClosureDocs,
 	})
 }
 

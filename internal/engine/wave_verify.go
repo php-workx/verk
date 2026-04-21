@@ -38,10 +38,11 @@ func runWaveVerificationLoop(
 ) error {
 	plan := waveDerivationPlan(*wave, changedFiles)
 	derivation := DeriveChecks(DeriveChecksInput{
-		Plan:              plan,
-		ChangedFiles:      changedFiles,
-		Tools:             toolSignalsProvider(req.RepoRoot),
-		StaleWordingTerms: staleWordingTermsProvider(),
+		Plan:                   plan,
+		ChangedFiles:           changedFiles,
+		Tools:                  toolSignalsProvider(req.RepoRoot),
+		StaleWordingTerms:      staleWordingTermsProvider(),
+		SkipUnscopedGoFallback: true,
 	})
 	derivedChecks := promoteDerivedToWave(derivation.Checks, wave.WaveID)
 	waveCommands := waveGateCommands(cfg.Verification)

@@ -94,17 +94,19 @@ type ExecutionConfig struct {
 }
 
 type WorkerResult struct {
-	Status             WorkerStatus `json:"status"`
-	CompletionCode     string       `json:"completion_code,omitempty"`
-	Concerns           []string     `json:"concerns,omitempty"`
-	BlockReason        string       `json:"block_reason,omitempty"`
-	RetryClass         RetryClass   `json:"retry_class"`
-	StdoutPath         string       `json:"stdout_path,omitempty"`
-	StderrPath         string       `json:"stderr_path,omitempty"`
-	ResultArtifactPath string       `json:"result_artifact_path,omitempty"`
-	LeaseID            string       `json:"lease_id"`
-	StartedAt          time.Time    `json:"started_at"`
-	FinishedAt         time.Time    `json:"finished_at"`
+	Status             WorkerStatus                `json:"status"`
+	CompletionCode     string                      `json:"completion_code,omitempty"`
+	Concerns           []string                    `json:"concerns,omitempty"`
+	BlockReason        string                      `json:"block_reason,omitempty"`
+	RetryClass         RetryClass                  `json:"retry_class"`
+	StdoutPath         string                      `json:"stdout_path,omitempty"`
+	StderrPath         string                      `json:"stderr_path,omitempty"`
+	ResultArtifactPath string                      `json:"result_artifact_path,omitempty"`
+	LeaseID            string                      `json:"lease_id"`
+	TokenUsage         *state.RuntimeTokenUsage    `json:"token_usage,omitempty"`
+	ActivityStats      *state.RuntimeActivityStats `json:"activity_stats,omitempty"`
+	StartedAt          time.Time                   `json:"started_at"`
+	FinishedAt         time.Time                   `json:"finished_at"`
 }
 
 type ReviewFinding struct {
@@ -122,18 +124,20 @@ type ReviewFinding struct {
 }
 
 type ReviewResult struct {
-	Status             WorkerStatus    `json:"status"`
-	CompletionCode     string          `json:"completion_code,omitempty"`
-	RetryClass         RetryClass      `json:"retry_class"`
-	StdoutPath         string          `json:"stdout_path,omitempty"`
-	StderrPath         string          `json:"stderr_path,omitempty"`
-	ResultArtifactPath string          `json:"result_artifact_path,omitempty"`
-	LeaseID            string          `json:"lease_id"`
-	StartedAt          time.Time       `json:"started_at"`
-	FinishedAt         time.Time       `json:"finished_at"`
-	ReviewStatus       ReviewStatus    `json:"review_status"`
-	Summary            string          `json:"summary"`
-	Findings           []ReviewFinding `json:"findings"`
+	Status             WorkerStatus                `json:"status"`
+	CompletionCode     string                      `json:"completion_code,omitempty"`
+	RetryClass         RetryClass                  `json:"retry_class"`
+	StdoutPath         string                      `json:"stdout_path,omitempty"`
+	StderrPath         string                      `json:"stderr_path,omitempty"`
+	ResultArtifactPath string                      `json:"result_artifact_path,omitempty"`
+	LeaseID            string                      `json:"lease_id"`
+	TokenUsage         *state.RuntimeTokenUsage    `json:"token_usage,omitempty"`
+	ActivityStats      *state.RuntimeActivityStats `json:"activity_stats,omitempty"`
+	StartedAt          time.Time                   `json:"started_at"`
+	FinishedAt         time.Time                   `json:"finished_at"`
+	ReviewStatus       ReviewStatus                `json:"review_status"`
+	Summary            string                      `json:"summary"`
+	Findings           []ReviewFinding             `json:"findings"`
 }
 
 type Adapter interface {

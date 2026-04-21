@@ -77,7 +77,7 @@ Rules:
 
 For every finding, make the body actionable by naming (concisely):
 - the owning ticket when you can identify it from the diff or context
-- the affected file or behavior and the specific risk
+- the finding severity, affected file or behavior, and the specific risk
 - the exact missing validation or test evidence
 - whether you believe the issue can be auto-repaired by another worker pass
 

@@ -161,7 +161,8 @@ func hasMarkdownlintConfig(root string) bool {
 // fields default to safe zero values.
 type DeriveChecksInput struct {
 	// Plan is the ticket plan artifact. TicketID, Title, Description, and
-	// OwnedPaths are consulted; the plan is not mutated.
+	// OwnedPaths, ValidationCommands, and DeclaredChecks are consulted;
+	// the plan is not mutated.
 	Plan state.PlanArtifact
 	// ChangedFiles lists repository-relative paths touched by the ticket's
 	// implementation or repair work. Empty / whitespace entries are
@@ -174,6 +175,16 @@ type DeriveChecksInput struct {
 	// in docs when the ticket touches documentation. Empty disables the
 	// stale-wording derivation; the derivation layer never invents terms.
 	StaleWordingTerms []string
+	// StaleWordingDocs are doc paths to include in stale-wording scans.
+	// Empty falls back to default docs paths used by epic closure.
+	StaleWordingDocs []string
+
+	// SkipUnscopedGoFallback disables the uncertain fallback command
+	// (go test ./internal/...) when touched .go files are outside
+	// internal/cmd/pkg. This is useful in higher scopes like wave
+	// verification where unscoped fallback checks can cause false repair
+	// cycles.
+	SkipUnscopedGoFallback bool
 }
 
 // DeriveChecksResult carries the derived checks plus any optional tooling
@@ -206,13 +217,47 @@ func DeriveChecks(input DeriveChecksInput) DeriveChecksResult {
 		}
 	}
 
+	declared := explicitDeclaredCommands(input.Plan)
 	result := DeriveChecksResult{}
-	addGoChecks(&result, ticketID, files)
-	addPythonChecks(&result, ticketID, files, input.Tools)
-	addMarkdownChecks(&result, input.Plan, files, input.Tools, input.StaleWordingTerms)
-	addYAMLChecks(&result, ticketID, files, input.Tools)
-	addShellChecks(&result, ticketID, files, input.Tools)
+	addGoChecks(&result, ticketID, files, declared, input.SkipUnscopedGoFallback)
+	addPythonChecks(&result, ticketID, files, input.Tools, declared)
+	addMarkdownChecks(&result, input.Plan, files, input.Tools, input.StaleWordingTerms, input.StaleWordingDocs, declared)
+	addYAMLChecks(&result, ticketID, files, input.Tools, declared)
+	addShellChecks(&result, ticketID, files, input.Tools, declared)
 	return result
+}
+
+// explicitDeclaredCommands returns normalized commands from plan fields that
+// were already explicitly declared (validation_commands + declared_checks).
+// We use this set to avoid deriving duplicate checks that the ticket already
+// asks to run.
+func explicitDeclaredCommands(plan state.PlanArtifact) map[string]struct{} {
+	capacity := len(plan.ValidationCommands) + len(plan.DeclaredChecks)
+	out := make(map[string]struct{}, capacity)
+	collect := func(commands []string) {
+		for _, cmd := range commands {
+			trimmed := strings.TrimSpace(cmd)
+			if trimmed == "" {
+				continue
+			}
+			out[trimmed] = struct{}{}
+		}
+	}
+	collect(plan.ValidationCommands)
+	collect(plan.DeclaredChecks)
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+func shouldSkipDerivedCommand(declared map[string]struct{}, cmd string) bool {
+	trimmed := strings.TrimSpace(cmd)
+	if trimmed == "" || len(declared) == 0 {
+		return false
+	}
+	_, ok := declared[trimmed]
+	return ok
 }
 
 // normalizeChangedFiles trims whitespace, drops empties, converts to
@@ -252,7 +297,13 @@ func filesWithSuffix(files []string, suffix string) []string {
 // ignored here — broad fallback gates stay on wave/epic closure.
 // _test.go files are treated the same as normal package files: a change
 // to a test still means the containing package should be rerun.
-func addGoChecks(result *DeriveChecksResult, ticketID string, files []string) {
+func addGoChecks(
+	result *DeriveChecksResult,
+	ticketID string,
+	files []string,
+	declared map[string]struct{},
+	skipFallback bool,
+) {
 	goFiles := filesWithSuffix(files, ".go")
 	if len(goFiles) == 0 {
 		return
@@ -276,6 +327,9 @@ func addGoChecks(result *DeriveChecksResult, ticketID string, files []string) {
 		matched := append([]string(nil), packages[pkg]...)
 		sort.Strings(matched)
 		cmd := "go test ./" + pkg
+		if shouldSkipDerivedCommand(declared, cmd) {
+			continue
+		}
 		reason := "go test for changed package " + pkg
 		if anyHasSuffix(matched, "_test.go") && !anyLacksSuffix(matched, "_test.go") {
 			reason = "go test for changed test files in " + pkg
@@ -287,10 +341,39 @@ func addGoChecks(result *DeriveChecksResult, ticketID string, files []string) {
 			Command:      cmd,
 			Reason:       reason,
 			MatchedFiles: matched,
+			Severity:     state.SeverityP2,
 			TicketID:     ticketID,
 			Advisory:     true,
 		})
 	}
+
+	if len(order) > 0 {
+		return
+	}
+
+	// No package inference was possible (no recognized root under
+	// internal/cmd/pkg); use a narrow internal-package fallback unless
+	// explicitly disabled.
+	if skipFallback {
+		return
+	}
+	cmd := "go test ./internal/..."
+	if shouldSkipDerivedCommand(declared, cmd) {
+		return
+	}
+	matched := append([]string(nil), goFiles...)
+	sort.Strings(matched)
+	result.Checks = append(result.Checks, state.ValidationCheck{
+		ID:           declaredCheckID(ticketID, cmd),
+		Scope:        state.ValidationScopeTicket,
+		Source:       state.ValidationCheckSourceDerived,
+		Command:      cmd,
+		Reason:       "go test for unclear go package changes; fallback to internal packages",
+		MatchedFiles: matched,
+		Severity:     state.SeverityP2,
+		TicketID:     ticketID,
+		Advisory:     true,
+	})
 }
 
 // goPackageDir returns the repo-relative directory of a Go source file
@@ -341,7 +424,7 @@ func anyLacksSuffix(files []string, suffix string) bool {
 // `ruff check` for all touched Python files when the repo advertises Ruff.
 // Missing `ruff` binary with a Ruff-configured repo produces a skipped
 // check with the explanation that the optional tool is absent.
-func addPythonChecks(result *DeriveChecksResult, ticketID string, files []string, tools ToolSignals) {
+func addPythonChecks(result *DeriveChecksResult, ticketID string, files []string, tools ToolSignals, declared map[string]struct{}) {
 	pyFiles := filesWithSuffix(files, ".py")
 	if len(pyFiles) == 0 {
 		return
@@ -350,16 +433,19 @@ func addPythonChecks(result *DeriveChecksResult, ticketID string, files []string
 	testFiles := filterPyTestFiles(pyFiles)
 	if len(testFiles) > 0 {
 		cmd := "pytest " + strings.Join(testFiles, " ")
-		result.Checks = append(result.Checks, state.ValidationCheck{
-			ID:           declaredCheckID(ticketID, cmd),
-			Scope:        state.ValidationScopeTicket,
-			Source:       state.ValidationCheckSourceDerived,
-			Command:      cmd,
-			Reason:       "focused pytest for changed Python test files",
-			MatchedFiles: append([]string(nil), testFiles...),
-			TicketID:     ticketID,
-			Advisory:     true,
-		})
+		if !shouldSkipDerivedCommand(declared, cmd) {
+			result.Checks = append(result.Checks, state.ValidationCheck{
+				ID:           declaredCheckID(ticketID, cmd),
+				Scope:        state.ValidationScopeTicket,
+				Source:       state.ValidationCheckSourceDerived,
+				Command:      cmd,
+				Reason:       "focused pytest for changed Python test files",
+				MatchedFiles: append([]string(nil), testFiles...),
+				Severity:     state.SeverityP2,
+				TicketID:     ticketID,
+				Advisory:     true,
+			})
+		}
 	}
 
 	ruffAdvertised := tools.HasRuffConfig || tools.HasPyproject
@@ -368,6 +454,9 @@ func addPythonChecks(result *DeriveChecksResult, ticketID string, files []string
 	}
 	if tools.HasRuff {
 		cmd := "ruff check " + strings.Join(pyFiles, " ")
+		if shouldSkipDerivedCommand(declared, cmd) {
+			return
+		}
 		result.Checks = append(result.Checks, state.ValidationCheck{
 			ID:           declaredCheckID(ticketID, cmd),
 			Scope:        state.ValidationScopeTicket,
@@ -375,6 +464,7 @@ func addPythonChecks(result *DeriveChecksResult, ticketID string, files []string
 			Command:      cmd,
 			Reason:       "ruff check for changed Python files",
 			MatchedFiles: append([]string(nil), pyFiles...),
+			Severity:     state.SeverityP2,
 			TicketID:     ticketID,
 			Advisory:     true,
 		})
@@ -416,6 +506,8 @@ func addMarkdownChecks(
 	files []string,
 	tools ToolSignals,
 	staleTerms []string,
+	staleDocs []string,
+	declared map[string]struct{},
 ) {
 	mdFiles := filesWithSuffix(files, ".md")
 	if len(mdFiles) == 0 {
@@ -425,16 +517,19 @@ func addMarkdownChecks(
 
 	if tools.HasMarkdownlint {
 		cmd := "markdownlint " + strings.Join(mdFiles, " ")
-		result.Checks = append(result.Checks, state.ValidationCheck{
-			ID:           declaredCheckID(ticketID, cmd),
-			Scope:        state.ValidationScopeTicket,
-			Source:       state.ValidationCheckSourceDerived,
-			Command:      cmd,
-			Reason:       "markdownlint for changed markdown files",
-			MatchedFiles: append([]string(nil), mdFiles...),
-			TicketID:     ticketID,
-			Advisory:     true,
-		})
+		if !shouldSkipDerivedCommand(declared, cmd) {
+			result.Checks = append(result.Checks, state.ValidationCheck{
+				ID:           declaredCheckID(ticketID, cmd),
+				Scope:        state.ValidationScopeTicket,
+				Source:       state.ValidationCheckSourceDerived,
+				Command:      cmd,
+				Reason:       "markdownlint for changed markdown files",
+				MatchedFiles: append([]string(nil), mdFiles...),
+				Severity:     state.SeverityP2,
+				TicketID:     ticketID,
+				Advisory:     true,
+			})
+		}
 	} else {
 		result.Skipped = append(result.Skipped, state.ValidationCheckSkip{
 			CheckID: declaredCheckID(ticketID, "derived-markdownlint"),
@@ -447,7 +542,10 @@ func addMarkdownChecks(
 	terms := normalizeStaleWordingTerms(staleTerms)
 	switch {
 	case docsTicket && len(terms) > 0:
-		cmd := buildStaleWordingCommand(terms)
+		cmd := buildStaleWordingCommand(terms, staleDocs)
+		if shouldSkipDerivedCommand(declared, cmd) {
+			return
+		}
 		result.Checks = append(result.Checks, state.ValidationCheck{
 			ID:           declaredCheckID(ticketID, cmd),
 			Scope:        state.ValidationScopeTicket,
@@ -455,6 +553,7 @@ func addMarkdownChecks(
 			Command:      cmd,
 			Reason:       "stale wording sweep for docs-related ticket",
 			MatchedFiles: append([]string(nil), mdFiles...),
+			Severity:     state.SeverityP2,
 			TicketID:     ticketID,
 			Advisory:     true,
 		})
@@ -514,21 +613,27 @@ func normalizeStaleWordingTerms(terms []string) []string {
 	return out
 }
 
-func buildStaleWordingCommand(terms []string) string {
+func buildStaleWordingCommand(terms, docPaths []string) string {
 	pattern := strings.Join(terms, "|")
-	return "grep -nE '" + pattern + "' README.md CONTRIBUTING.md docs/**/*.md"
+	if len(docPaths) == 0 {
+		docPaths = defaultEpicClosureDocs
+	}
+	return "grep -nE '" + pattern + "' " + strings.Join(docPaths, " ")
 }
 
 // addYAMLChecks derives a yamllint command for touched YAML files. When
 // yamllint is not installed, a skipped check records the missing optional
 // linter so operators can see why no YAML coverage was derived.
-func addYAMLChecks(result *DeriveChecksResult, ticketID string, files []string, tools ToolSignals) {
+func addYAMLChecks(result *DeriveChecksResult, ticketID string, files []string, tools ToolSignals, declared map[string]struct{}) {
 	yamlFiles := yamlFilesOf(files)
 	if len(yamlFiles) == 0 {
 		return
 	}
 	if tools.HasYamllint {
 		cmd := "yamllint " + strings.Join(yamlFiles, " ")
+		if shouldSkipDerivedCommand(declared, cmd) {
+			return
+		}
 		result.Checks = append(result.Checks, state.ValidationCheck{
 			ID:           declaredCheckID(ticketID, cmd),
 			Scope:        state.ValidationScopeTicket,
@@ -536,6 +641,7 @@ func addYAMLChecks(result *DeriveChecksResult, ticketID string, files []string, 
 			Command:      cmd,
 			Reason:       "yamllint for changed YAML files",
 			MatchedFiles: append([]string(nil), yamlFiles...),
+			Severity:     state.SeverityP2,
 			TicketID:     ticketID,
 			Advisory:     true,
 		})
@@ -561,13 +667,16 @@ func yamlFilesOf(files []string) []string {
 // addShellChecks derives shellcheck coverage for touched .sh files. When
 // shellcheck is not installed, a skipped check records the missing
 // optional linter rather than producing a failing check.
-func addShellChecks(result *DeriveChecksResult, ticketID string, files []string, tools ToolSignals) {
+func addShellChecks(result *DeriveChecksResult, ticketID string, files []string, tools ToolSignals, declared map[string]struct{}) {
 	shFiles := filesWithSuffix(files, ".sh")
 	if len(shFiles) == 0 {
 		return
 	}
 	if tools.HasShellcheck {
 		cmd := "shellcheck " + strings.Join(shFiles, " ")
+		if shouldSkipDerivedCommand(declared, cmd) {
+			return
+		}
 		result.Checks = append(result.Checks, state.ValidationCheck{
 			ID:           declaredCheckID(ticketID, cmd),
 			Scope:        state.ValidationScopeTicket,
@@ -575,6 +684,7 @@ func addShellChecks(result *DeriveChecksResult, ticketID string, files []string,
 			Command:      cmd,
 			Reason:       "shellcheck for changed shell scripts",
 			MatchedFiles: append([]string(nil), shFiles...),
+			Severity:     state.SeverityP2,
 			TicketID:     ticketID,
 			Advisory:     true,
 		})
