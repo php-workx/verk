@@ -18,12 +18,14 @@ package engine
 import (
 	"context"
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 	"verk/internal/adapters/runtime"
 	"verk/internal/adapters/ticketstore/tkmd"
 	"verk/internal/policy"
@@ -32,7 +34,10 @@ import (
 	verifycommand "verk/internal/adapters/verify/command"
 )
 
-const epicGateOutputLimit = 8 * 1024 // 8 KB per failing command
+const (
+	epicGateOutputLimit        = 8 * 1024 // 8 KB per failing command
+	epicGateInitialBlockReason = "in-progress: initial checks running"
+)
 
 // defaultEpicClosureDocs is the fallback doc path list used when
 // EpicClosureDocs is empty. These are the most common locations for
@@ -62,33 +67,27 @@ func runEpicClosureGate(
 	// --- Build the initial artifact so partial progress is persisted. ---
 	artifactPath := epicClosureArtifactPath(req.RepoRoot, req.RunID)
 	reviewProfile := cfg.EffectiveReviewerProfile()
-	now := stateTime()
-	artifact := state.EpicClosureArtifact{
-		ArtifactMeta: state.ArtifactMeta{
-			SchemaVersion: artifactSchemaVersion,
-			RunID:         req.RunID,
-			CreatedAt:     now,
-			UpdatedAt:     now,
-		},
-		EpicID:          req.RootTicketID,
-		ChildTicketIDs:  childIDs,
-		BroadCommands:   epicBroadCommandLines(cfg.Verification.EpicClosureCommands),
-		ReviewerRuntime: reviewProfile.Runtime,
-		ReviewerModel:   reviewProfile.Model,
-		Closable:        false,
-		BlockReason:     "in-progress: initial checks running",
-	}
 
 	// --- Derive epic-scope checks (stale wording across doc paths). ---
 	derivedChecks := deriveEpicScopedChecks(req.RootTicketID, cfg.Verification)
-	artifact.DerivedCommands = epicDerivedCommandLines(derivedChecks)
 
 	// --- Build coverage artifact (declared broad + derived). ---
 	coverage := newEpicValidationCoverage(
 		req.RunID, req.RootTicketID, childIDs,
 		cfg.Verification.EpicClosureCommands, derivedChecks,
 	)
-	artifact.Coverage = coverage
+	artifact, coverage, err := loadOrInitEpicClosureArtifact(
+		artifactPath,
+		req,
+		reviewProfile,
+		childIDs,
+		epicBroadCommandLines(cfg.Verification.EpicClosureCommands),
+		epicDerivedCommandLines(derivedChecks),
+		coverage,
+	)
+	if err != nil {
+		return err
+	}
 
 	if err := state.SaveJSONAtomic(artifactPath, artifact); err != nil {
 		return fmt.Errorf("epic closure gate: persist initial artifact: %w", err)
@@ -338,6 +337,81 @@ func runEpicClosureGate(
 }
 
 // ---- Artifact helpers -------------------------------------------------------
+
+func loadOrInitEpicClosureArtifact(
+	artifactPath string,
+	req RunEpicRequest,
+	reviewProfile policy.RoleProfile,
+	childIDs []string,
+	broadCommands []string,
+	derivedCommands []string,
+	coverage *state.ValidationCoverageArtifact,
+) (state.EpicClosureArtifact, *state.ValidationCoverageArtifact, error) {
+	now := stateTime()
+	artifact := state.EpicClosureArtifact{}
+	if err := state.LoadJSON(artifactPath, &artifact); err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			return state.EpicClosureArtifact{}, nil, fmt.Errorf("epic closure gate: load existing artifact: %w", err)
+		}
+		artifact = state.EpicClosureArtifact{
+			ArtifactMeta: state.ArtifactMeta{
+				CreatedAt: now,
+			},
+		}
+	}
+	if artifact.CreatedAt.IsZero() {
+		artifact.CreatedAt = now
+	}
+
+	artifact.SchemaVersion = artifactSchemaVersion
+	artifact.RunID = req.RunID
+	artifact.UpdatedAt = now
+	artifact.EpicID = req.RootTicketID
+	artifact.ChildTicketIDs = append([]string(nil), childIDs...)
+	artifact.BroadCommands = append([]string(nil), broadCommands...)
+	artifact.DerivedCommands = append([]string(nil), derivedCommands...)
+	artifact.ReviewerRuntime = reviewProfile.Runtime
+	artifact.ReviewerModel = reviewProfile.Model
+	artifact.Closable = false
+	artifact.ClosureReason = ""
+	artifact.BlockReason = epicGateInitialBlockReason
+	artifact.RepairLimit = nil
+	coverage = refreshEpicCoverageForRetry(artifact.Coverage, coverage, now)
+	artifact.Coverage = coverage
+	return artifact, coverage, nil
+}
+
+func refreshEpicCoverageForRetry(
+	existing *state.ValidationCoverageArtifact,
+	fresh *state.ValidationCoverageArtifact,
+	now time.Time,
+) *state.ValidationCoverageArtifact {
+	if fresh == nil {
+		return existing
+	}
+	if existing == nil {
+		fresh.BlockReason = epicGateInitialBlockReason
+		return fresh
+	}
+	createdAt := fresh.CreatedAt
+	if !existing.CreatedAt.IsZero() {
+		createdAt = existing.CreatedAt
+	}
+	executedChecks := append([]state.ValidationCheckExecution(nil), existing.ExecutedChecks...)
+	skippedChecks := append([]state.ValidationCheckSkip(nil), existing.SkippedChecks...)
+	repairRefs := append([]state.ValidationRepairRef(nil), existing.RepairRefs...)
+
+	fresh.CreatedAt = createdAt
+	fresh.UpdatedAt = now
+	fresh.ExecutedChecks = executedChecks
+	fresh.SkippedChecks = skippedChecks
+	fresh.RepairRefs = repairRefs
+	fresh.Closable = false
+	fresh.ClosureReason = ""
+	fresh.BlockReason = epicGateInitialBlockReason
+	fresh.RepairLimit = nil
+	return fresh
+}
 
 // epicCloseSuccess marks the artifact and coverage as closable.
 func epicCloseSuccess(artifact *state.EpicClosureArtifact, coverage *state.ValidationCoverageArtifact, cycles int) {

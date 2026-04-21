@@ -180,6 +180,95 @@ func TestRunEpicClosureGate_HappyPath(t *testing.T) {
 	}
 }
 
+func TestRunEpicClosureGate_PreservesExistingArtifactHistory(t *testing.T) {
+	repoRoot := t.TempDir()
+	epicID := "epic-gate-preserve-history"
+
+	adapter := runtimefake.New(nil, []runtime.ReviewResult{
+		epicGateReviewPassed("epic-review-" + epicID + "-0"),
+	})
+
+	cfg := policy.DefaultConfig()
+	cfg.Verification.EpicClosureCommands = nil
+	cfg.Verification.EpicStaleWordingTerms = nil
+
+	req := makeEpicGateReq(repoRoot, epicID, adapter)
+	req.Config = cfg
+
+	createdAt := time.Date(2026, 4, 1, 8, 0, 0, 0, time.UTC)
+	existing := state.EpicClosureArtifact{
+		ArtifactMeta: state.ArtifactMeta{
+			SchemaVersion: artifactSchemaVersion,
+			RunID:         req.RunID,
+			CreatedAt:     createdAt,
+			UpdatedAt:     createdAt,
+		},
+		EpicID: epicID,
+		Findings: []state.EpicClosureFinding{{
+			ID:       "review-prior",
+			Source:   "epic_reviewer",
+			Title:    "prior resolved finding",
+			Resolved: true,
+		}},
+		Cycles: []state.EpicClosureCycle{{
+			Cycle:     1,
+			StartedAt: createdAt,
+			Status:    "completed",
+		}},
+		Coverage: &state.ValidationCoverageArtifact{
+			ArtifactMeta: state.ArtifactMeta{
+				SchemaVersion: artifactSchemaVersion,
+				RunID:         req.RunID,
+				CreatedAt:     createdAt,
+				UpdatedAt:     createdAt,
+			},
+			Scope:  state.ValidationScopeEpic,
+			EpicID: epicID,
+			ExecutedChecks: []state.ValidationCheckExecution{{
+				CheckID: "prior-check",
+				Result:  state.ValidationCheckResultFailed,
+				Attempt: 1,
+			}},
+		},
+		Closable:    false,
+		BlockReason: "previously blocked",
+	}
+	if err := state.SaveJSONAtomic(epicClosureArtifactPath(repoRoot, req.RunID), existing); err != nil {
+		t.Fatalf("save existing artifact: %v", err)
+	}
+
+	if err := runEpicClosureGate(context.Background(), req, cfg, makeEpicGateChildren(), nil); err != nil {
+		t.Fatalf("expected nil error for resumed happy-path gate, got: %v", err)
+	}
+
+	var got state.EpicClosureArtifact
+	if err := state.LoadJSON(epicClosureArtifactPath(repoRoot, req.RunID), &got); err != nil {
+		t.Fatalf("load epic closure artifact: %v", err)
+	}
+
+	if !got.CreatedAt.Equal(createdAt) {
+		t.Fatalf("expected CreatedAt to be preserved, got %s", got.CreatedAt)
+	}
+	if len(got.Cycles) != 1 || got.Cycles[0].Cycle != 1 {
+		t.Fatalf("expected prior cycle history to be preserved, got %#v", got.Cycles)
+	}
+	if len(got.Findings) != 1 || got.Findings[0].ID != "review-prior" {
+		t.Fatalf("expected prior findings to be preserved, got %#v", got.Findings)
+	}
+	if got.Coverage == nil {
+		t.Fatal("expected coverage artifact to be preserved")
+	}
+	if !got.Coverage.CreatedAt.Equal(createdAt) {
+		t.Fatalf("expected coverage CreatedAt to be preserved, got %s", got.Coverage.CreatedAt)
+	}
+	if len(got.Coverage.ExecutedChecks) != 1 || got.Coverage.ExecutedChecks[0].CheckID != "prior-check" {
+		t.Fatalf("expected prior executed checks to be preserved, got %#v", got.Coverage.ExecutedChecks)
+	}
+	if !got.Closable || got.BlockReason != "" {
+		t.Fatalf("expected terminal success to clear block state, closable=%v block_reason=%q", got.Closable, got.BlockReason)
+	}
+}
+
 // ---- Reviewer instructions contain required framing ---------------------------
 
 // TestRunEpicClosureGate_ReviewerInstructionsContainFraming verifies that the
