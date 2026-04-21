@@ -35,6 +35,7 @@ or ticket first, then update this file.
 | Ticket quality pre-run gate | Planned | [2026-04-21-ticket-quality-gate.md](2026-04-21-ticket-quality-gate.md) | no active epic found in this index pass | Needed before `verk run`: deterministic ticket lint, planner-role review, traceability checks, and safe auto-repair for underspecified tickets. |
 | Memory learning loop | Planned | [2026-04-21-memory-learning-loop.md](2026-04-21-memory-learning-loop.md) | no active epic found in this index pass | Repo-local escaped-defect memory, human-reviewed lesson promotion, and advisory feedback into ticket quality review. |
 | Anti-rationalization catalog | Planned | [Rationalizations.md](Rationalizations.md) | none | Detailed spec for P3 (impl-verify-improvements). Full catalog of 91 named rationalizations + verk-specific additions, with injection point mapping per worker phase. |
+| Agent profiles | Planned | [2026-04-21-agent-profiles.md](2026-04-21-agent-profiles.md) | none | Role-based worker profiles (security-engineer, contract-engineer, frontend-engineer, backend-engineer). Project-agnostic detection, `profile` frontmatter field, pre-run validation, rationalization injection per profile, and prompt placement. Full implementation of P3. |
 
 ## Priority And Parallelism
 
