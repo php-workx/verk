@@ -18,7 +18,6 @@ package engine
 import (
 	"context"
 	"crypto/sha256"
-	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -143,7 +142,7 @@ func runEpicClosureGate(
 		newFindings := mapReviewToEpicFindings(reviewResult, cfg.Policy.ReviewThreshold, children)
 		artifact.Findings = mergeEpicFindings(artifact.Findings, newFindings)
 	}
-	checkFindings := collectEpicCheckFailureFindings(broadResults, derivedChecks, derivedResults, 0)
+	checkFindings := collectEpicCheckFailureFindings(broadResults, derivedChecks, derivedResults)
 	artifact.Findings = mergeEpicFindings(artifact.Findings, checkFindings)
 
 	allClear := checksAllPassed && reviewErr == nil && !hasUnresolvedFindings(artifact.Findings)
@@ -275,10 +274,11 @@ func runEpicClosureGate(
 		// Refresh findings: resolve ones that are no longer present, add new ones.
 		if reviewErr == nil {
 			freshFindings := mapReviewToEpicFindings(reviewResult, cfg.Policy.ReviewThreshold, children)
-			resolveRepairedFindings(artifact.Findings, freshFindings)
+			resolveRepairedFindings(artifact.Findings, freshFindings, "epic_reviewer")
 			artifact.Findings = mergeEpicFindings(artifact.Findings, freshFindings)
 		}
-		freshCheckFindings := collectEpicCheckFailureFindings(broadResults, derivedChecks, derivedResults, cycle)
+		freshCheckFindings := collectEpicCheckFailureFindings(broadResults, derivedChecks, derivedResults)
+		resolveRepairedFindings(artifact.Findings, freshCheckFindings, "broad_check", "derived_check")
 		artifact.Findings = mergeEpicFindings(artifact.Findings, freshCheckFindings)
 
 		artifact.Cycles[cycleIdx].Status = "completed"
@@ -898,14 +898,13 @@ func collectEpicCheckFailureFindings(
 	broadResults []verifycommand.CommandResult,
 	derivedChecks []state.ValidationCheck,
 	derivedResults map[string]verifycommand.CommandResult,
-	cycle int,
 ) []state.EpicClosureFinding {
 	var out []state.EpicClosureFinding
 	for _, r := range broadResults {
 		if r.ExitCode == 0 && !r.TimedOut {
 			continue
 		}
-		id := epicCheckFindingID("broad_check", r.Command, cycle)
+		id := epicCheckFindingID("broad_check", r.Command)
 		body := fmt.Sprintf("Command `%s` exited with code %d", r.Command, r.ExitCode)
 		if r.TimedOut {
 			body = fmt.Sprintf("Command `%s` timed out", r.Command)
@@ -924,7 +923,7 @@ func collectEpicCheckFailureFindings(
 		if !ok || (r.ExitCode == 0 && !r.TimedOut) {
 			continue
 		}
-		id := epicCheckFindingID("derived_check", c.ID, cycle)
+		id := epicCheckFindingID("derived_check", c.ID)
 		body := fmt.Sprintf("Derived check `%s` exited with code %d: %s", c.Command, r.ExitCode, c.Reason)
 		if r.TimedOut {
 			body = fmt.Sprintf("Derived check `%s` timed out: %s", c.Command, c.Reason)
@@ -967,18 +966,27 @@ func mergeEpicFindings(existing, fresh []state.EpicClosureFinding) []state.EpicC
 	return out
 }
 
-// resolveRepairedFindings marks existing findings as resolved when they no
-// longer appear in the fresh set (evidence that the repair fixed them).
-func resolveRepairedFindings(existing, fresh []state.EpicClosureFinding) {
+// resolveRepairedFindings marks existing findings from the selected sources as
+// resolved when they no longer appear in the same-source fresh set.
+func resolveRepairedFindings(existing, fresh []state.EpicClosureFinding, sources ...string) {
 	freshIDs := make(map[string]struct{}, len(fresh))
 	for _, f := range fresh {
 		if f.ID != "" {
 			freshIDs[f.ID] = struct{}{}
 		}
 	}
+	sourceSet := make(map[string]struct{}, len(sources))
+	for _, source := range sources {
+		sourceSet[source] = struct{}{}
+	}
 	for i := range existing {
 		if existing[i].Resolved || existing[i].ID == "" {
 			continue
+		}
+		if len(sourceSet) > 0 {
+			if _, ok := sourceSet[existing[i].Source]; !ok {
+				continue
+			}
 		}
 		if _, stillPresent := freshIDs[existing[i].ID]; !stillPresent {
 			existing[i].Resolved = true
@@ -1127,8 +1135,8 @@ func epicReviewFindingID(f runtime.ReviewFinding) string {
 }
 
 // epicCheckFindingID returns a stable finding ID for a failed check command.
-func epicCheckFindingID(source, key string, cycle int) string {
-	h := sha256.Sum256([]byte(strings.Join([]string{source, key, fmt.Sprintf("%d", cycle)}, ":")))
+func epicCheckFindingID(source, key string) string {
+	h := sha256.Sum256([]byte(source + ":" + key))
 	return fmt.Sprintf("%s-%x", source, h[:4])
 }
 
@@ -1177,6 +1185,3 @@ func clearPendingEpicGate(cursor map[string]any) {
 		delete(cursor, "pending_epic_gate")
 	}
 }
-
-// ---- Unused import guard: ensure errors is imported via errors.Is usage -----
-var _ = errors.Is

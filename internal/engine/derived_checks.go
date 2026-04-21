@@ -61,7 +61,7 @@ func DefaultToolLookup() ToolLookup {
 // the real filesystem or PATH.
 type ToolSignals struct {
 	// Go tooling
-	HasGolangciConfig bool
+	HasGolangciLint bool
 
 	// Python tooling
 	HasPyproject  bool
@@ -73,7 +73,7 @@ type ToolSignals struct {
 	// Optional tool availability (detected via ToolLookup)
 	HasRuff         bool
 	HasMarkdownlint bool
-	HasYamllint     bool
+	HasYAML         bool
 	HasShellcheck   bool
 }
 
@@ -92,13 +92,13 @@ func DetectToolSignals(repoRoot string, lookup ToolLookup) ToolSignals {
 	signals := ToolSignals{
 		HasRuff:         lookup("ruff"),
 		HasMarkdownlint: lookup("markdownlint"),
-		HasYamllint:     lookup("yamllint"),
+		HasYAML:         lookup("yamllint"),
 		HasShellcheck:   lookup("shellcheck"),
 	}
 	if strings.TrimSpace(repoRoot) == "" {
 		return signals
 	}
-	signals.HasGolangciConfig = anyFileExists(repoRoot,
+	signals.HasGolangciLint = anyFileExists(repoRoot,
 		".golangci.yml", ".golangci.yaml", ".golangci.toml")
 	signals.HasPyproject = fileExists(repoRoot, "pyproject.toml")
 	signals.HasRuffConfig = hasRuffConfig(repoRoot)
@@ -625,7 +625,7 @@ func addYAMLChecks(result *DeriveChecksResult, ticketID string, files []string, 
 	if len(yamlFiles) == 0 {
 		return
 	}
-	if tools.HasYamllint {
+	if tools.HasYAML {
 		cmd := "yamllint " + strings.Join(yamlFiles, " ")
 		if shouldSkipDerivedCommand(declared, cmd) {
 			return

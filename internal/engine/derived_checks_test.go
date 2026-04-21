@@ -314,7 +314,7 @@ func TestDeriveChecks_YAMLEmitsCheckOrSkip(t *testing.T) {
 	available := DeriveChecks(DeriveChecksInput{
 		Plan:         state.PlanArtifact{TicketID: "ver-y29o"},
 		ChangedFiles: []string{".github/workflows/ci.yml"},
-		Tools:        ToolSignals{HasYamllint: true},
+		Tools:        ToolSignals{HasYAML: true},
 	})
 	yl, ok := findCheck(available.Checks, "yamllint .github/workflows/ci.yml")
 	if !ok {
@@ -328,7 +328,7 @@ func TestDeriveChecks_YAMLEmitsCheckOrSkip(t *testing.T) {
 	missing := DeriveChecks(DeriveChecksInput{
 		Plan:         state.PlanArtifact{TicketID: "ver-y29o"},
 		ChangedFiles: []string{".github/workflows/ci.yml"},
-		Tools:        ToolSignals{HasYamllint: false},
+		Tools:        ToolSignals{HasYAML: false},
 	})
 	if _, ok := findCheck(missing.Checks, "yamllint"); ok {
 		t.Fatalf("did not expect a yamllint check when tool is missing")
@@ -396,7 +396,7 @@ func TestDeriveChecks_AllDerivedChecksAreAdvisoryByDefault(t *testing.T) {
 			HasRuffConfig:   true,
 			HasRuff:         true,
 			HasMarkdownlint: true,
-			HasYamllint:     true,
+			HasYAML:         true,
 			HasShellcheck:   true,
 		},
 	})
@@ -456,9 +456,10 @@ func TestDetectToolSignals_ReadsRuffConfigFromPyproject(t *testing.T) {
 }
 
 func TestDetectToolSignals_MissingRepoRootProducesZeroSignals(t *testing.T) {
-	signals := DetectToolSignals("", fakeLookup())
-	if signals.HasPyproject || signals.HasRuffConfig || signals.HasMarkdownlintConfig || signals.HasGolangciConfig {
-		t.Fatalf("expected zero config signals for empty repo root, got %#v", signals)
+	missingRoot := filepath.Join(t.TempDir(), "does-not-exist")
+	signals := DetectToolSignals(missingRoot, fakeLookup())
+	if signals.HasPyproject || signals.HasRuffConfig || signals.HasMarkdownlintConfig || signals.HasGolangciLint {
+		t.Fatalf("expected zero config signals for missing repo root, got %#v", signals)
 	}
 }
 
@@ -469,10 +470,10 @@ func TestDetectToolSignals_NilLookupIsSafe(t *testing.T) {
 		t.Fatalf("write golangci: %v", err)
 	}
 	signals := DetectToolSignals(dir, nil)
-	if !signals.HasGolangciConfig {
+	if !signals.HasGolangciLint {
 		t.Fatalf("expected golangci signal from file on disk")
 	}
-	if signals.HasRuff || signals.HasMarkdownlint || signals.HasYamllint || signals.HasShellcheck {
+	if signals.HasRuff || signals.HasMarkdownlint || signals.HasYAML || signals.HasShellcheck {
 		t.Fatalf("expected optional tools to be false with nil lookup, got %#v", signals)
 	}
 }

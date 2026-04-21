@@ -49,6 +49,28 @@ func epicGateReviewPassed(leaseID string) runtime.ReviewResult {
 	}
 }
 
+func TestResolveRepairedFindingsFiltersBySource(t *testing.T) {
+	findings := []state.EpicClosureFinding{
+		{ID: "review-one", Source: "epic_reviewer"},
+		{ID: "broad-one", Source: "broad_check"},
+	}
+
+	resolveRepairedFindings(findings, nil, "epic_reviewer")
+
+	if !findings[0].Resolved {
+		t.Fatalf("expected missing reviewer finding to resolve")
+	}
+	if findings[1].Resolved {
+		t.Fatalf("did not expect check finding to resolve during reviewer refresh")
+	}
+
+	resolveRepairedFindings(findings, nil, "broad_check", "derived_check")
+
+	if !findings[1].Resolved {
+		t.Fatalf("expected missing check finding to resolve during check refresh")
+	}
+}
+
 // epicGateReviewWithP1Finding builds a valid ReviewResult that carries one P1
 // blocking finding (blocks at the default P2 threshold). LeaseID is required by
 // the fake adapter's Validate call.
