@@ -5,7 +5,6 @@ import (
 	"path/filepath"
 	"reflect"
 	"testing"
-
 	"verk/internal/state"
 )
 
@@ -110,6 +109,36 @@ logging:
 	}
 }
 
+func TestLoadConfig_LoadsWaveCommands(t *testing.T) {
+	repoRoot := t.TempDir()
+	configDir := filepath.Join(repoRoot, ".verk")
+	if err := os.MkdirAll(configDir, 0o755); err != nil {
+		t.Fatalf("mkdir config dir: %v", err)
+	}
+
+	configYAML := []byte(`
+verification:
+  wave_commands:
+    - path: "."
+      run:
+        - just vuln
+        - just semgrep
+`)
+	if err := os.WriteFile(filepath.Join(configDir, "config.yaml"), configYAML, 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	cfg, err := LoadConfig(repoRoot)
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+
+	want := []QualityCommand{{Path: ".", Run: []string{"just vuln", "just semgrep"}}}
+	if !reflect.DeepEqual(cfg.Verification.WaveCommands, want) {
+		t.Fatalf("unexpected wave commands: %#v", cfg.Verification.WaveCommands)
+	}
+}
+
 func TestLoadConfig_RejectsUnknownFields(t *testing.T) {
 	repoRoot := t.TempDir()
 	configDir := filepath.Join(repoRoot, ".verk")
@@ -187,6 +216,202 @@ func TestValidate_RejectsNegativeMaxWaveRepairCycles(t *testing.T) {
 	}
 	if err.Error() != "policy.max_wave_repair_cycles must be zero or greater" {
 		t.Fatalf("unexpected error message: %q", err.Error())
+	}
+}
+
+func TestDefaultConfig_RoleProfiles(t *testing.T) {
+	cfg := DefaultConfig()
+	// Worker must default to claude/sonnet/high — this is the benchmark-critical
+	// pairing that makes runs reproducible without relying on CLI defaults.
+	wantWorker := RoleProfile{Runtime: "claude", Model: "sonnet", Reasoning: "high"}
+	if cfg.Runtime.Worker != wantWorker {
+		t.Fatalf("unexpected default worker profile: got %+v want %+v", cfg.Runtime.Worker, wantWorker)
+	}
+	// Reviewer must default to claude/opus/xhigh so reviewer judgments are
+	// higher-effort than worker implementations by default.
+	wantReviewer := RoleProfile{Runtime: "claude", Model: "opus", Reasoning: "xhigh"}
+	if cfg.Runtime.Reviewer != wantReviewer {
+		t.Fatalf("unexpected default reviewer profile: got %+v want %+v", cfg.Runtime.Reviewer, wantReviewer)
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("default config must validate cleanly, got: %v", err)
+	}
+}
+
+func TestEffectiveWorkerAndReviewerProfile_Defaults(t *testing.T) {
+	cfg := DefaultConfig()
+	worker := cfg.EffectiveWorkerProfile()
+	reviewer := cfg.EffectiveReviewerProfile()
+	if worker.Runtime != "claude" || worker.Model != "sonnet" || worker.Reasoning != "high" {
+		t.Fatalf("effective worker profile drift: %+v", worker)
+	}
+	if reviewer.Runtime != "claude" || reviewer.Model != "opus" || reviewer.Reasoning != "xhigh" {
+		t.Fatalf("effective reviewer profile drift: %+v", reviewer)
+	}
+}
+
+func TestValidate_RejectsEmptyRoleProfiles(t *testing.T) {
+	cases := []struct {
+		name    string
+		mutate  func(*Config)
+		wantMsg string
+	}{
+		{
+			name:    "worker runtime empty",
+			mutate:  func(c *Config) { c.Runtime.Worker.Runtime = "" },
+			wantMsg: "runtime.worker.runtime must not be empty",
+		},
+		{
+			name:    "worker model empty",
+			mutate:  func(c *Config) { c.Runtime.Worker.Model = "" },
+			wantMsg: "runtime.worker.model must not be empty",
+		},
+		{
+			name:    "worker reasoning empty",
+			mutate:  func(c *Config) { c.Runtime.Worker.Reasoning = "" },
+			wantMsg: "runtime.worker.reasoning must not be empty",
+		},
+		{
+			name:    "reviewer runtime empty",
+			mutate:  func(c *Config) { c.Runtime.Reviewer.Runtime = "" },
+			wantMsg: "runtime.reviewer.runtime must not be empty",
+		},
+		{
+			name:    "reviewer model empty",
+			mutate:  func(c *Config) { c.Runtime.Reviewer.Model = "" },
+			wantMsg: "runtime.reviewer.model must not be empty",
+		},
+		{
+			name:    "reviewer reasoning empty",
+			mutate:  func(c *Config) { c.Runtime.Reviewer.Reasoning = "" },
+			wantMsg: "runtime.reviewer.reasoning must not be empty",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := DefaultConfig()
+			tc.mutate(&cfg)
+			err := cfg.Validate()
+			if err == nil {
+				t.Fatalf("expected validation error for %s", tc.name)
+			}
+			if err.Error() != tc.wantMsg {
+				t.Fatalf("expected error %q, got %q", tc.wantMsg, err.Error())
+			}
+		})
+	}
+}
+
+func TestValidate_PartialFallbackProfileRejected(t *testing.T) {
+	cfg := DefaultConfig()
+	// Populate only one field of the fallback profile — a partial fallback is
+	// almost certainly a config typo, and the validator should surface it at
+	// load time rather than at retry time when a real model is unavailable.
+	cfg.Runtime.WorkerFallback = RoleProfile{Runtime: "codex"}
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("expected partial worker fallback profile to fail validation")
+	}
+	if err.Error() != "runtime.worker_fallback.model must not be empty" {
+		t.Fatalf("unexpected error: %q", err.Error())
+	}
+}
+
+func TestValidate_EmptyFallbackProfileAllowed(t *testing.T) {
+	cfg := DefaultConfig()
+	// A fully-zero fallback profile means "no fallback configured"; it must
+	// pass validation so operators are not forced to configure fallbacks.
+	cfg.Runtime.WorkerFallback = RoleProfile{}
+	cfg.Runtime.ReviewerFallback = RoleProfile{}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("expected empty fallback profiles to pass validation, got %v", err)
+	}
+}
+
+func TestLoadConfig_ExplicitRoleProfilesOverrideDefaults(t *testing.T) {
+	repoRoot := t.TempDir()
+	configDir := filepath.Join(repoRoot, ".verk")
+	if err := os.MkdirAll(configDir, 0o755); err != nil {
+		t.Fatalf("mkdir config dir: %v", err)
+	}
+	// The YAML overrides every role-profile field so the loaded config must
+	// report the explicit selections, not the claude/sonnet/high fallback.
+	configYAML := []byte(`
+runtime:
+  default_runtime: claude
+  worker_timeout_minutes: 30
+  reviewer_timeout_minutes: 15
+  worker:
+    runtime: codex
+    model: gpt-5-mini
+    reasoning: medium
+  reviewer:
+    runtime: claude
+    model: sonnet
+    reasoning: high
+  worker_fallback:
+    runtime: claude
+    model: sonnet
+    reasoning: high
+`)
+	if err := os.WriteFile(filepath.Join(configDir, "config.yaml"), configYAML, 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	cfg, err := LoadConfig(repoRoot)
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	if cfg.Runtime.Worker != (RoleProfile{Runtime: "codex", Model: "gpt-5-mini", Reasoning: "medium"}) {
+		t.Fatalf("worker override not applied: %+v", cfg.Runtime.Worker)
+	}
+	if cfg.Runtime.Reviewer != (RoleProfile{Runtime: "claude", Model: "sonnet", Reasoning: "high"}) {
+		t.Fatalf("reviewer override not applied: %+v", cfg.Runtime.Reviewer)
+	}
+	if cfg.Runtime.WorkerFallback != (RoleProfile{Runtime: "claude", Model: "sonnet", Reasoning: "high"}) {
+		t.Fatalf("worker fallback not applied: %+v", cfg.Runtime.WorkerFallback)
+	}
+}
+
+func TestLoadConfig_DefaultRuntimeFallback_AppliesToWorkerAndReviewer(t *testing.T) {
+	repoRoot := t.TempDir()
+	configDir := filepath.Join(repoRoot, ".verk")
+	if err := os.MkdirAll(configDir, 0o755); err != nil {
+		t.Fatalf("mkdir config dir: %v", err)
+	}
+	// Only default_runtime is specified; role-specific runtime fields should
+	// inherit this compatibility fallback while preserving explicitly provided
+	// role model/reasoning values where present.
+	configYAML := []byte(`
+runtime:
+  default_runtime: codex
+  worker:
+    model: gpt-5-mini
+    reasoning: medium
+`)
+	if err := os.WriteFile(filepath.Join(configDir, "config.yaml"), configYAML, 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	cfg, err := LoadConfig(repoRoot)
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	if cfg.Runtime.Worker.Runtime != "codex" {
+		t.Fatalf("expected worker runtime to inherit default_runtime, got %q", cfg.Runtime.Worker.Runtime)
+	}
+	if cfg.Runtime.Worker.Model != "gpt-5-mini" {
+		t.Fatalf("expected explicit worker model to remain configured, got %q", cfg.Runtime.Worker.Model)
+	}
+	if cfg.Runtime.Worker.Reasoning != "medium" {
+		t.Fatalf("expected explicit worker reasoning to remain configured, got %q", cfg.Runtime.Worker.Reasoning)
+	}
+	if cfg.Runtime.Reviewer.Runtime != "codex" {
+		t.Fatalf("expected reviewer runtime to inherit default_runtime, got %q", cfg.Runtime.Reviewer.Runtime)
+	}
+	if cfg.Runtime.Reviewer.Model != "opus" {
+		t.Fatalf("expected default reviewer model to remain configured, got %q", cfg.Runtime.Reviewer.Model)
+	}
+	if cfg.Runtime.Reviewer.Reasoning != "xhigh" {
+		t.Fatalf("expected default reviewer reasoning to remain configured, got %q", cfg.Runtime.Reviewer.Reasoning)
 	}
 }
 

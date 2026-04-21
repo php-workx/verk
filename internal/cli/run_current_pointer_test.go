@@ -8,7 +8,6 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
-
 	"verk/internal/adapters/ticketstore/tkmd"
 )
 

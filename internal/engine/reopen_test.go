@@ -6,7 +6,6 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
-
 	"verk/internal/adapters/ticketstore/tkmd"
 	"verk/internal/state"
 )

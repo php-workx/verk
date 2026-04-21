@@ -1,8 +1,9 @@
 package engine
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
-
 	"verk/internal/adapters/ticketstore/tkmd"
 	"verk/internal/state"
 )
@@ -109,5 +110,107 @@ func TestDeriveStatus_UsesRunArtifactsAndClaimsOnly(t *testing.T) {
 	}
 	if report.ClaimDivergence {
 		t.Fatal("expected no claim divergence")
+	}
+}
+
+func TestDeriveStatus_IncludesFailureSummaries(t *testing.T) {
+	repoRoot := t.TempDir()
+	runID := "run-status-failures"
+	ticketID := "ticket-1"
+
+	writeOpRunFixture(t, repoRoot, runID, state.RunArtifact{
+		ArtifactMeta: state.ArtifactMeta{SchemaVersion: 1, RunID: runID},
+		Mode:         "epic",
+		RootTicketID: "epic-1",
+		Status:       state.EpicRunStatusBlocked,
+		CurrentPhase: state.TicketPhaseBlocked,
+		TicketIDs:    []string{ticketID},
+	})
+	writePlanFixture(t, repoRoot, runID, state.PlanArtifact{
+		ArtifactMeta: state.ArtifactMeta{SchemaVersion: 1, RunID: runID},
+		TicketID:     ticketID,
+	})
+	writeTicketRunFixture(t, repoRoot, runID, TicketRunSnapshot{
+		ArtifactMeta: state.ArtifactMeta{SchemaVersion: 1, RunID: runID},
+		TicketID:     ticketID,
+		CurrentPhase: state.TicketPhaseBlocked,
+		BlockReason:  "worker blocked by operator input: {\"type\":\"thread.started\"}",
+	})
+	verification := state.VerificationArtifact{
+		ArtifactMeta: state.ArtifactMeta{SchemaVersion: 1, RunID: runID},
+		TicketID:     ticketID,
+		Passed:       false,
+		Results: []state.VerificationResult{{
+			Command:    "just lint-check",
+			ExitCode:   1,
+			Passed:     false,
+			StdoutPath: filepath.Join(repoRoot, ".verk", "verification", "command.stdout.log"),
+			StderrPath: filepath.Join(repoRoot, ".verk", "verification", "command.stderr.log"),
+		}},
+	}
+	if err := os.MkdirAll(filepath.Join(repoRoot, ".verk", "verification"), 0o755); err != nil {
+		t.Fatalf("create verification log dir: %v", err)
+	}
+	if err := os.WriteFile(verification.Results[0].StdoutPath, []byte("internal/policy/config.go:176:23: unnecessary conversion (unconvert)\n"), 0o644); err != nil {
+		t.Fatalf("write stdout log: %v", err)
+	}
+	if err := state.SaveJSONAtomic(verificationArtifactPath(repoRoot, runID, ticketID), verification); err != nil {
+		t.Fatalf("save verification fixture: %v", err)
+	}
+	repair := state.RepairCycleArtifact{
+		ArtifactMeta:         state.ArtifactMeta{SchemaVersion: 1, RunID: runID},
+		TicketID:             ticketID,
+		Cycle:                1,
+		Status:               "repair_pending",
+		TriggerCheckIDs:      []string{"check-1"},
+		RepairNotes:          "repair cycle 1 triggered by failing checks: check-1",
+		VerificationArtifact: verificationArtifactPath(repoRoot, runID, ticketID),
+	}
+	if err := state.SaveJSONAtomic(filepath.Join(ticketDir(repoRoot, runID, ticketID), "cycles", "repair-1.json"), repair); err != nil {
+		t.Fatalf("save repair cycle fixture: %v", err)
+	}
+
+	report, err := DeriveStatus(StatusRequest{RepoRoot: repoRoot, RunID: runID})
+	if err != nil {
+		t.Fatalf("DeriveStatus returned error: %v", err)
+	}
+	if len(report.Tickets) != 1 {
+		t.Fatalf("expected one ticket, got %#v", report.Tickets)
+	}
+	failures := report.Tickets[0].Failures
+	if len(failures) != 2 {
+		t.Fatalf("expected verification and repair failures, got %#v", failures)
+	}
+	if failures[0].Kind != "verification" || failures[0].Command != "just lint-check" {
+		t.Fatalf("expected lint-check verification failure first, got %#v", failures[0])
+	}
+	if failures[0].ExitCode != 1 || failures[0].StdoutPath == "" || failures[0].StderrPath == "" {
+		t.Fatalf("expected verification failure details, got %#v", failures[0])
+	}
+	if failures[0].Detail != "internal/policy/config.go:176:23: unnecessary conversion (unconvert)" {
+		t.Fatalf("expected concise failure detail from log, got %#v", failures[0])
+	}
+	if failures[1].Kind != "repair" || failures[1].Summary == "" {
+		t.Fatalf("expected repair failure summary, got %#v", failures[1])
+	}
+}
+
+func TestTicketStatusReason_UsesFailuresForRuntimeEventStream(t *testing.T) {
+	snapshot := TicketRunSnapshot{
+		CurrentPhase: state.TicketPhaseBlocked,
+		BlockReason:  "worker blocked by operator input: {\"type\":\"thread.started\"}",
+		Verification: &state.VerificationArtifact{
+			Passed: false,
+			Results: []state.VerificationResult{{
+				Command:  "just lint-check",
+				ExitCode: 1,
+			}},
+		},
+	}
+
+	got := ticketStatusReason(snapshot)
+	want := "verification: just lint-check failed with exit code 1"
+	if got != want {
+		t.Fatalf("expected concise verification reason %q, got %q", want, got)
 	}
 }

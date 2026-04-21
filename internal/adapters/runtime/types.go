@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"strings"
 	"time"
-
+	"unicode"
 	"verk/internal/state"
 )
 
@@ -59,6 +59,9 @@ type WorkerRequest struct {
 	LeaseID           string              `json:"lease_id"`
 	Attempt           int                 `json:"attempt,omitempty"`
 	Runtime           string              `json:"runtime,omitempty"`
+	Model             string              `json:"model,omitempty"`
+	Reasoning         string              `json:"reasoning,omitempty"`
+	FallbackReason    string              `json:"fallback_reason,omitempty"`
 	WorktreePath      string              `json:"worktree_path,omitempty"`
 	InputArtifactPath string              `json:"input_artifact_path,omitempty"`
 	Instructions      string              `json:"instructions,omitempty"`
@@ -73,6 +76,9 @@ type ReviewRequest struct {
 	LeaseID                  string              `json:"lease_id"`
 	Attempt                  int                 `json:"attempt,omitempty"`
 	Runtime                  string              `json:"runtime,omitempty"`
+	Model                    string              `json:"model,omitempty"`
+	Reasoning                string              `json:"reasoning,omitempty"`
+	FallbackReason           string              `json:"fallback_reason,omitempty"`
 	InputArtifactPath        string              `json:"input_artifact_path,omitempty"`
 	Instructions             string              `json:"instructions,omitempty"`
 	Diff                     string              `json:"diff,omitempty"`
@@ -89,17 +95,19 @@ type ExecutionConfig struct {
 }
 
 type WorkerResult struct {
-	Status             WorkerStatus `json:"status"`
-	CompletionCode     string       `json:"completion_code,omitempty"`
-	Concerns           []string     `json:"concerns,omitempty"`
-	BlockReason        string       `json:"block_reason,omitempty"`
-	RetryClass         RetryClass   `json:"retry_class"`
-	StdoutPath         string       `json:"stdout_path,omitempty"`
-	StderrPath         string       `json:"stderr_path,omitempty"`
-	ResultArtifactPath string       `json:"result_artifact_path,omitempty"`
-	LeaseID            string       `json:"lease_id"`
-	StartedAt          time.Time    `json:"started_at"`
-	FinishedAt         time.Time    `json:"finished_at"`
+	Status             WorkerStatus                `json:"status"`
+	CompletionCode     string                      `json:"completion_code,omitempty"`
+	Concerns           []string                    `json:"concerns,omitempty"`
+	BlockReason        string                      `json:"block_reason,omitempty"`
+	RetryClass         RetryClass                  `json:"retry_class"`
+	StdoutPath         string                      `json:"stdout_path,omitempty"`
+	StderrPath         string                      `json:"stderr_path,omitempty"`
+	ResultArtifactPath string                      `json:"result_artifact_path,omitempty"`
+	LeaseID            string                      `json:"lease_id"`
+	TokenUsage         *state.RuntimeTokenUsage    `json:"token_usage,omitempty"`
+	ActivityStats      *state.RuntimeActivityStats `json:"activity_stats,omitempty"`
+	StartedAt          time.Time                   `json:"started_at"`
+	FinishedAt         time.Time                   `json:"finished_at"`
 }
 
 type ReviewFinding struct {
@@ -117,23 +125,45 @@ type ReviewFinding struct {
 }
 
 type ReviewResult struct {
-	Status             WorkerStatus    `json:"status"`
-	CompletionCode     string          `json:"completion_code,omitempty"`
-	RetryClass         RetryClass      `json:"retry_class"`
-	StdoutPath         string          `json:"stdout_path,omitempty"`
-	StderrPath         string          `json:"stderr_path,omitempty"`
-	ResultArtifactPath string          `json:"result_artifact_path,omitempty"`
-	LeaseID            string          `json:"lease_id"`
-	StartedAt          time.Time       `json:"started_at"`
-	FinishedAt         time.Time       `json:"finished_at"`
-	ReviewStatus       ReviewStatus    `json:"review_status"`
-	Summary            string          `json:"summary"`
-	Findings           []ReviewFinding `json:"findings"`
+	Status             WorkerStatus                `json:"status"`
+	CompletionCode     string                      `json:"completion_code,omitempty"`
+	RetryClass         RetryClass                  `json:"retry_class"`
+	StdoutPath         string                      `json:"stdout_path,omitempty"`
+	StderrPath         string                      `json:"stderr_path,omitempty"`
+	ResultArtifactPath string                      `json:"result_artifact_path,omitempty"`
+	LeaseID            string                      `json:"lease_id"`
+	TokenUsage         *state.RuntimeTokenUsage    `json:"token_usage,omitempty"`
+	ActivityStats      *state.RuntimeActivityStats `json:"activity_stats,omitempty"`
+	StartedAt          time.Time                   `json:"started_at"`
+	FinishedAt         time.Time                   `json:"finished_at"`
+	ReviewStatus       ReviewStatus                `json:"review_status"`
+	Summary            string                      `json:"summary"`
+	Findings           []ReviewFinding             `json:"findings"`
 }
 
 type Adapter interface {
 	RunWorker(ctx context.Context, req WorkerRequest) (WorkerResult, error)
 	RunReviewer(ctx context.Context, req ReviewRequest) (ReviewResult, error)
+}
+
+// ValidatedExecutable normalizes a runtime executable name or path before it is
+// passed to exec.Command. Runtime adapters do not invoke a shell, but accepting
+// a whole command line here would be ambiguous and could hide operator mistakes
+// such as "codex --flag" or "sh -c ...".
+func ValidatedExecutable(binary string) (string, error) {
+	trimmed := strings.TrimSpace(binary)
+	if trimmed == "" {
+		return "", fmt.Errorf("runtime executable is empty")
+	}
+	if strings.Fields(trimmed)[0] != trimmed {
+		return "", fmt.Errorf("runtime executable %q must be a single executable path without arguments", binary)
+	}
+	for _, r := range trimmed {
+		if unicode.IsControl(r) {
+			return "", fmt.Errorf("runtime executable %q contains control characters", binary)
+		}
+	}
+	return trimmed, nil
 }
 
 var severityOrder = map[Severity]int{
@@ -225,11 +255,11 @@ func (r ReviewFinding) Validate() error {
 	if strings.TrimSpace(r.Body) == "" {
 		return fmt.Errorf("review finding missing body")
 	}
-	if strings.TrimSpace(r.File) == "" {
-		return fmt.Errorf("review finding missing file")
-	}
-	if r.Line <= 0 {
-		return fmt.Errorf("review finding missing line")
+	// File and Line are optional for speculative (informational) findings that
+	// lack precise location context. An empty File is allowed; a non-empty File
+	// that is whitespace-only is rejected as a programming error.
+	if r.File != "" && strings.TrimSpace(r.File) == "" {
+		return fmt.Errorf("review finding has whitespace-only file")
 	}
 	if err := ValidateReviewDisposition(r.Disposition); err != nil {
 		return err
@@ -307,10 +337,9 @@ func isCanonicalSeverity(severity Severity) bool {
 
 func isBlockingFinding(finding ReviewFinding, threshold Severity) bool {
 	if finding.Disposition != ReviewDispositionOpen {
-		// Re-evaluate expired waivers as if they were open.
-		if finding.Disposition == ReviewDispositionWaived && finding.WaiverExpiresAt != nil && !finding.WaiverExpiresAt.After(time.Now()) {
-			// Waiver has expired: fall through to severity comparison below.
-		} else {
+		// Re-evaluate expired waivers as if they were open; otherwise reject.
+		isExpiredWaiver := finding.Disposition == ReviewDispositionWaived && finding.WaiverExpiresAt != nil && finding.WaiverExpiresAt.Before(time.Now())
+		if !isExpiredWaiver {
 			return false
 		}
 	}

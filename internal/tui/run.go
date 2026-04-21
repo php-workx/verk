@@ -1,31 +1,40 @@
 package tui
 
 import (
+	"errors"
 	"io"
 	"os"
+	"syscall"
 	"time"
+	"verk/internal/engine"
 
 	tea "charm.land/bubbletea/v2"
 	term "github.com/charmbracelet/x/term"
-
-	"verk/internal/engine"
 )
 
 // RunProgress starts the appropriate progress display for a verk run.
 // Uses Bubble Tea TUI if the output writer is a terminal, plain log output otherwise.
 func RunProgress(runID string, ch <-chan engine.ProgressEvent, w io.Writer) error {
+	return RunProgressWithCancel(runID, ch, w, nil)
+}
+
+// RunProgressWithCancel starts the appropriate progress display for a verk run
+// and invokes onCancel when an interactive operator presses a cancellation key.
+func RunProgressWithCancel(runID string, ch <-chan engine.ProgressEvent, w io.Writer, onCancel func()) error {
 	if isTerminal(w) {
-		return runBubbleTea(runID, ch)
+		return runBubbleTea(runID, ch, onCancel)
 	}
 	RunPlainProgress(w, ch)
 	return nil
 }
 
-func runBubbleTea(runID string, ch <-chan engine.ProgressEvent) error {
-	m := NewRunModel(runID, ch)
-	p := tea.NewProgram(m,
-		tea.WithInput(nil), // no keyboard input — prevents terminal capability query leaks
-	)
+func runBubbleTea(runID string, ch <-chan engine.ProgressEvent, onCancel func()) error {
+	m := NewRunModelWithCancel(runID, ch, onCancel)
+	opts := []tea.ProgramOption{}
+	if !term.IsTerminal(os.Stdin.Fd()) {
+		opts = append(opts, tea.WithInput(nil))
+	}
+	p := tea.NewProgram(m, opts...)
 	_, err := p.Run()
 
 	// Drain any leftover terminal capability responses (CSI ?2026$p,
@@ -42,44 +51,46 @@ func runBubbleTea(runID string, ch <-chan engine.ProgressEvent) error {
 // (mode 2026 for synchronized output, mode 2027 for unicode core, and
 // Kitty keyboard protocol). The terminal's responses can arrive after
 // the TUI exits, causing escape sequence garbage on the command line.
+//
+// The drain is fully synchronous: stdin is switched into non-blocking mode,
+// read until it reports EAGAIN (or a short budget elapses), then restored.
+// No background goroutine survives this call, so a subsequent reader on
+// stdin (e.g. the reopen-retry prompt) cannot race us for the first byte.
 func drainTerminalResponses() {
 	if !term.IsTerminal(os.Stdin.Fd()) {
 		return
 	}
-	// Set stdin to non-blocking raw mode briefly to drain responses.
-	// The DECRQM responses arrive almost instantly from the terminal.
-	oldState, err := term.MakeRaw(os.Stdin.Fd())
+	fd := int(os.Stdin.Fd())
+	oldState, err := term.MakeRaw(uintptr(fd))
 	if err != nil {
 		return
 	}
-	// Set a short read deadline so we don't block if there's nothing to drain.
-	// We use a goroutine with a timeout since os.File doesn't support deadlines
-	// on all platforms. A cancel channel is closed before restoring the terminal
-	// so the goroutine stops looping as soon as its current Read unblocks.
-	cancel := make(chan struct{})
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		buf := make([]byte, 256)
-		for {
-			// Check for cancellation before attempting another read so the
-			// goroutine terminates promptly once the timeout fires.
-			select {
-			case <-cancel:
-				return
-			default:
-			}
-			if _, err := os.Stdin.Read(buf); err != nil {
-				return
-			}
-		}
-	}()
-	select {
-	case <-done:
-	case <-time.After(50 * time.Millisecond):
+	defer func() { _ = term.Restore(uintptr(fd), oldState) }()
+
+	if err := syscall.SetNonblock(fd, true); err != nil {
+		return
 	}
-	close(cancel) // Signal goroutine to stop on its next iteration
-	_ = term.Restore(os.Stdin.Fd(), oldState)
+	defer func() { _ = syscall.SetNonblock(fd, false) }()
+
+	// Response bytes typically arrive within a few milliseconds; 50ms keeps
+	// parity with the previous budget and stays well below any interactive
+	// delay a human operator would notice.
+	deadline := time.Now().Add(50 * time.Millisecond)
+	buf := make([]byte, 256)
+	for time.Now().Before(deadline) {
+		n, err := syscall.Read(fd, buf)
+		if n > 0 {
+			continue
+		}
+		if errors.Is(err, syscall.EAGAIN) || errors.Is(err, syscall.EWOULDBLOCK) {
+			// Nothing pending right now; wait a beat for in-flight responses.
+			time.Sleep(2 * time.Millisecond)
+			continue
+		}
+		// Any other error (EBADF, EIO, …) leaves stdin in a state we can't
+		// usefully drain; stop rather than spinning.
+		return
+	}
 }
 
 func isTerminal(w io.Writer) bool {

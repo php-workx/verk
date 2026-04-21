@@ -4,8 +4,8 @@ import (
 	"context"
 	"testing"
 	"time"
-
 	"verk/internal/adapters/runtime"
+
 	runtimefake "verk/internal/adapters/runtime/fake"
 )
 
@@ -372,6 +372,45 @@ func TestReviewFindingValidate_RejectsWhitespaceOnlyFields(t *testing.T) {
 			tc.mutate(&f)
 			if err := f.Validate(); err == nil {
 				t.Fatalf("expected whitespace-only %s to be rejected", tc.name)
+			}
+		})
+	}
+}
+
+func TestValidatedExecutable(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		raw  string
+		want string
+	}{
+		{name: "bare name", raw: "codex", want: "codex"},
+		{name: "absolute path", raw: "/usr/local/bin/codex", want: "/usr/local/bin/codex"},
+		{name: "trimmed", raw: "  ./bin/claude  ", want: "./bin/claude"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := runtime.ValidatedExecutable(tc.raw)
+			if err != nil {
+				t.Fatalf("expected executable to validate, got error: %v", err)
+			}
+			if got != tc.want {
+				t.Fatalf("expected %q, got %q", tc.want, got)
+			}
+		})
+	}
+
+	for _, tc := range []struct {
+		name string
+		raw  string
+	}{
+		{name: "empty", raw: ""},
+		{name: "whitespace only", raw: "   "},
+		{name: "with flag", raw: "codex --danger"},
+		{name: "shell command", raw: "sh -c echo"},
+		{name: "with newline", raw: "codex\nrm"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := runtime.ValidatedExecutable(tc.raw); err == nil {
+				t.Fatalf("expected %q to be rejected", tc.raw)
 			}
 		})
 	}

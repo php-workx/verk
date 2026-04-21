@@ -11,7 +11,6 @@ import (
 	"sort"
 	"strings"
 	"time"
-
 	"verk/internal/policy"
 )
 
@@ -32,7 +31,7 @@ var createArtifactFile = func(name string) (artifactFile, error) {
 	return os.Create(name)
 }
 
-type CommandResult struct {
+type CommandResult struct { //nolint:revive // stuttering name is intentional for clarity
 	Command    string    `json:"command"`
 	Cwd        string    `json:"cwd"`
 	ExitCode   int       `json:"exit_code"`
@@ -111,11 +110,19 @@ func RunCommands(ctx context.Context, repoRoot string, cmds []string, cfg policy
 			startedAt := time.Now().UTC()
 			cmdCtx, cancel := context.WithTimeout(ctx, timeout)
 			defer cancel()
+			// Verification commands are explicit project policy/ticket inputs
+			// and intentionally run through a shell to support normal developer
+			// checks such as "just lint" and compound commands. They run with a
+			// bounded cwd, timeout, and allowlisted environment.
+			// nosemgrep: go.lang.security.audit.dangerous-exec-command.dangerous-exec-command
 			cmd := exec.CommandContext(cmdCtx, "/bin/sh", "-c", command)
 			cmd.Dir = absRepoRoot
 			cmd.Env = env
 			cmd.Stdout = stdoutFile
 			cmd.Stderr = stderrFile
+			// Put the subprocess in its own process group so that any processes
+			// spawned by the shell command are also killed on context cancellation.
+			setupProcessGroup(cmd)
 
 			execErr := cmd.Run()
 			finishedAt := time.Now().UTC()
@@ -158,10 +165,10 @@ func RunCommands(ctx context.Context, repoRoot string, cmds []string, cfg policy
 	return results, nil
 }
 
-// RunQualityCommands runs structured quality commands before per-ticket validation
-// commands. Each QualityCommand specifies an optional subdirectory (relative to
-// repoRoot) and one or more shell commands to run sequentially from that directory.
-// This supports monorepo setups where different packages have different quality gates.
+// RunQualityCommands runs structured verification commands from optional
+// subdirectories. Each QualityCommand specifies a path relative to repoRoot and
+// one or more shell commands to run sequentially from that directory. This
+// supports monorepo setups where different packages have different gates.
 func RunQualityCommands(ctx context.Context, repoRoot string, cmds []policy.QualityCommand, cfg policy.VerificationConfig) ([]CommandResult, error) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -244,11 +251,20 @@ func RunQualityCommands(ctx context.Context, repoRoot string, cmds []policy.Qual
 				startedAt := time.Now().UTC()
 				cmdCtx, cancel := context.WithTimeout(ctx, timeout)
 				defer cancel()
+				// Quality commands are explicit project policy inputs and
+				// intentionally run through a shell to support normal developer
+				// checks such as "just lint" and compound commands. The working
+				// directory is constrained to the repo and the environment is
+				// allowlisted.
+				// nosemgrep: go.lang.security.audit.dangerous-exec-command.dangerous-exec-command
 				cmd := exec.CommandContext(cmdCtx, "/bin/sh", "-c", command)
 				cmd.Dir = workDir
 				cmd.Env = env
 				cmd.Stdout = stdoutFile
 				cmd.Stderr = stderrFile
+				// Put the subprocess in its own process group so that any processes
+				// spawned by the shell command are also killed on context cancellation.
+				setupProcessGroup(cmd)
 
 				execErr := cmd.Run()
 				finishedAt := time.Now().UTC()

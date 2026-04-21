@@ -1,10 +1,8 @@
 # verk project quality gate
 # Single source of truth for "my code is clean" — hooks and CI delegate here.
 
-# Pinned tool versions — keep in sync with CI
-golangci_lint_ver := "v2.11.3"
-gofumpt_ver := "v0.7.0"
-govulncheck_ver := "v1.1.4"
+# Developer tools are pinned in tools.mod and invoked through go tool.
+go_tool := "go tool -modfile=tools.mod"
 
 version := `git describe --tags --always --dirty 2>/dev/null || echo "dev"`
 commit := `git rev-parse --short HEAD 2>/dev/null || echo "unknown"`
@@ -16,11 +14,14 @@ default:
 
 # --- Quality gates ---
 
-# Pre-commit: local checks + tests (~30s)
-pre-commit: fmt vet lint build-check mod-tidy test
+# Pre-commit: fast local checks + fresh non-race tests
+pre-commit: format-check vet lint-check build-check mod-tidy-check actionlint betterleaks test-fast
 
-# Full quality gate: pre-commit + vuln
-check: pre-commit vuln
+# Pre-push: pre-commit + race tests + vulnerability scan + semgrep
+pre-push: pre-commit test-race vuln semgrep
+
+# Full quality gate: same as pre-push
+check: pre-push
 
 # Full dev suite: quality gate + sonar
 dev: check sonar
@@ -28,10 +29,15 @@ dev: check sonar
 
 # --- Static analysis ---
 
-# Check formatting with gofumpt (detect-only, no auto-fix)
-fmt:
-    @command -v gofumpt >/dev/null 2>&1 || (echo "gofumpt not installed (run: just install-dev)" && exit 1)
-    @test -z "$(gofumpt --extra -l .)" || (echo "gofumpt: unformatted files:" && gofumpt --extra -l . && exit 1)
+# Cache pinned Go tool dependencies before checks that parse tool output. This
+# keeps cold CI runners from treating `go: downloading ...` diagnostics as
+# formatter diffs.
+tools-ready:
+    go mod download -modfile=tools.mod
+
+# Check formatting via golangci-lint gofumpt (detect-only, no auto-fix)
+format-check: tools-ready
+    @test -z "$({{go_tool}} golangci-lint fmt --diff 2>&1)" || (echo "gofumpt: unformatted files" && {{go_tool}} golangci-lint fmt --diff 2>&1 && exit 1)
 
 # Go vet
 vet:
@@ -39,26 +45,39 @@ vet:
 
 # Lint with golangci-lint
 lint:
-    @command -v golangci-lint >/dev/null 2>&1 || (echo "golangci-lint not installed (run: just install-dev)" && exit 1)
-    golangci-lint run
+    {{go_tool}} golangci-lint run --fix
+
+# Verify lint with golangci-lint
+lint-check: tools-ready
+    {{go_tool}} golangci-lint run
+
+# Lint GitHub Actions workflows
+actionlint:
+    @if [ -d .github/workflows ]; then \
+        {{go_tool}} actionlint .github/workflows/*.yml; \
+    fi
 
 # --- Security ---
 
 # Scan for leaked secrets
-gitleaks:
-    @if command -v gitleaks >/dev/null 2>&1; then \
-        gitleaks git --no-banner; \
+betterleaks:
+    @if command -v betterleaks >/dev/null 2>&1; then \
+        betterleaks git --no-banner; \
     else \
-        echo "warning: gitleaks not installed, skipping secret scan"; \
+        echo "warning: betterleaks not installed, skipping secret scan"; \
+    fi
+
+# Semantic code scan (optional, skip if not installed)
+semgrep:
+    @if command -v semgrep >/dev/null 2>&1; then \
+        semgrep --config auto .; \
+    else \
+        echo "warning: semgrep not installed, skipping semantic scan"; \
     fi
 
 # Scan for known vulnerabilities in dependencies
 vuln:
-    @if command -v govulncheck >/dev/null 2>&1; then \
-        govulncheck ./...; \
-    else \
-        echo "govulncheck not installed, skipping (run: just install-dev)"; \
-    fi
+    {{go_tool}} govulncheck ./...
 
 # --- Testing ---
 
@@ -66,8 +85,8 @@ vuln:
 build-check:
     go build ./...
 
-# Verify go.mod and go.sum are tidy (detect-only)
-mod-tidy:
+# Verify go.mod/go.sum and tools.mod/tools.sum are tidy (detect-only)
+mod-tidy-check:
     @cp go.mod go.mod.bak
     @if [ -f go.sum ]; then cp go.sum go.sum.bak; fi
     @go mod tidy
@@ -77,10 +96,32 @@ mod-tidy:
         elif [ -f go.sum ]; then DIRTY=1; fi; \
         mv go.mod.bak go.mod; \
         if [ -f go.sum.bak ]; then mv go.sum.bak go.sum; elif [ -f go.sum ]; then rm go.sum; fi; \
-        if [ "$$DIRTY" = "1" ]; then echo "go.mod/go.sum not tidy — run 'go mod tidy'" && exit 1; fi
+        if [ "$DIRTY" = "1" ]; then echo "go.mod/go.sum not tidy — run 'go mod tidy'" && exit 1; fi
+    @cp tools.mod tools.mod.bak
+    @if [ -f tools.sum ]; then cp tools.sum tools.sum.bak; fi
+    @go mod tidy -modfile=tools.mod
+    @DIRTY=0; \
+        diff -q tools.mod tools.mod.bak >/dev/null 2>&1 || DIRTY=1; \
+        if [ -f tools.sum.bak ]; then diff -q tools.sum tools.sum.bak >/dev/null 2>&1 || DIRTY=1; \
+        elif [ -f tools.sum ]; then DIRTY=1; fi; \
+        mv tools.mod.bak tools.mod; \
+        if [ -f tools.sum.bak ]; then mv tools.sum.bak tools.sum; elif [ -f tools.sum ]; then rm tools.sum; fi; \
+        if [ "$DIRTY" = "1" ]; then echo "tools.mod/tools.sum not tidy — run 'go mod tidy -modfile=tools.mod'" && exit 1; fi
 
-# Run all tests with race detector (no cache)
-test:
+# Tidy go.mod/go.sum and tools.mod/tools.sum in-place.
+mod-tidy:
+    go mod tidy
+    go mod tidy -modfile=tools.mod
+
+# Run all tests without race detector (fresh)
+test: test-fast
+
+# Run all tests without race detector (fresh)
+test-fast:
+    go test -count=1 ./...
+
+# Run all tests with race detector (fresh)
+test-race:
     go test -race -count=1 ./...
 
 # Run tests with coverage report
@@ -97,8 +138,12 @@ sonar:
         echo "sonar-scanner not installed, skipping"; \
     elif [ ! -f .env ]; then \
         echo ".env missing, skipping sonar scan"; \
+    elif ! command -v curl >/dev/null 2>&1; then \
+        echo "curl not installed, skipping sonar scan"; \
+    elif ! curl -fsS http://localhost:9000/api/server/version >/dev/null 2>&1; then \
+        echo "SonarQube server unavailable on localhost:9000, skipping sonar scan"; \
     else \
-        TOKEN=$(grep -E '^SONAR_TOKEN=[A-Za-z0-9_]+$$' .env | cut -d= -f2); \
+        TOKEN=$(grep -m1 '^SONAR_TOKEN=' .env | sed 's/^SONAR_TOKEN=//' | sed 's/^"//; s/"$$//'); \
         if [ -z "$$TOKEN" ]; then \
             echo "error: SONAR_TOKEN not found or invalid in .env"; exit 1; \
         fi; \
@@ -120,24 +165,25 @@ install:
 
 # Format all Go files in-place (use when `just fmt` fails)
 format:
-    gofumpt --extra -w .
+    {{go_tool}} golangci-lint fmt
 
 # Auto-fix formatting and lint issues, then verify
 autofix: format
-    @command -v golangci-lint >/dev/null 2>&1 || (echo "golangci-lint not installed (run: just install-dev)" && exit 1)
-    golangci-lint run --fix ./... 2>/dev/null || true
+    {{go_tool}} golangci-lint run --fix ./... 2>/dev/null || true
 
-# Set up development environment
-setup: install-dev
+# Set up git hooks and development environment
+setup: install-dev install-hooks
     @echo "Development environment ready."
 
-# Install required development tools (pinned versions)
+# Install local git hooks into .git/hooks.
+install-hooks:
+    bash scripts/install-hooks.sh
+
+# Cache required development tools (pinned in tools.mod)
 install-dev:
-    @echo "Installing Go tools..."
-    go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@{{golangci_lint_ver}}
-    go install mvdan.cc/gofumpt@{{gofumpt_ver}}
-    go install golang.org/x/vuln/cmd/govulncheck@{{govulncheck_ver}}
-    @echo "Done!"
+    @echo "Caching Go tool dependencies from tools.mod..."
+    just tools-ready
+    @echo "Done! Development tools are available through go tool -modfile=tools.mod."
 
 # Remove build artifacts (refuses to delete runs if any run lock is held)
 clean:

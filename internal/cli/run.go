@@ -6,10 +6,11 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"sync"
+	"syscall"
 	"time"
-
 	"verk/internal/adapters/runtime"
 	"verk/internal/adapters/ticketstore/tkmd"
 	"verk/internal/engine"
@@ -22,7 +23,21 @@ import (
 // runProgress is the function used to display run progress. It is a
 // package-level variable so tests can inject a fake implementation that
 // returns early (simulating a TUI error) without draining the progress channel.
-var runProgress = tui.RunProgress
+var runProgress = tui.RunProgressWithCancel
+
+// drainProgress consumes progress events from ch in a background goroutine
+// until the channel is closed. It is the intentional fallback used when
+// runProgress returns an error before draining the channel itself: without
+// the drain, a full buffer would cause the engine goroutine to block on
+// SendProgress and wg.Wait to hang. Centralising it keeps the goroutine-leak
+// prevention pattern consistent across the ticket, epic, and auto-resume
+// paths.
+func drainProgress(ch <-chan engine.ProgressEvent) {
+	go func() {
+		for range ch { //nolint:revive // intentional drain loop to prevent goroutine leak
+		}
+	}()
+}
 
 // saveJSONAtomic and saveTicket are package-level variables so tests can inject
 // fake implementations to exercise error paths without a real filesystem.
@@ -59,15 +74,25 @@ func finalizeRun(
 }
 
 func initRunCmd(root *cobra.Command) {
+	// SilenceUsage is deliberately NOT set on the parent runCmd here. Cobra
+	// inherits SilenceUsage from parents, so enabling it on the group would
+	// suppress the usage block even for argument-validation errors on the
+	// `ticket` / `epic` subcommands — an operator who forgets a ticket id
+	// should see `Usage:` telling them how to invoke the command. Each RunE
+	// below toggles SilenceUsage itself once control has entered the function,
+	// which only happens after arg validation passes.
 	runCmd := &cobra.Command{
-		Use:          "run [command]",
-		Short:        "Run a ticket or epic, or resume the current run",
-		GroupID:      groupExecution,
-		SilenceUsage: true,
+		Use:     "run [command]",
+		Short:   "Run a ticket or epic, or resume the current run",
+		GroupID: groupExecution,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			err := doAutoResume(cmd.OutOrStdout(), cmd.ErrOrStderr())
 			if err != nil {
+				// doAutoResume already printed a human-readable error line to
+				// stdout; silence Cobra's own print+usage so the operator sees
+				// a single, non-redundant message.
 				cmd.SilenceErrors = true
+				cmd.SilenceUsage = true
 				return err
 			}
 			return nil
@@ -81,6 +106,9 @@ func initRunCmd(root *cobra.Command) {
 		RunE: func(cmd *cobra.Command, args []string) error {
 			_, err := doRunTicket(cmd.OutOrStdout(), cmd.ErrOrStderr(), args[0])
 			if err != nil {
+				// Runtime errors from RunE do not benefit from a usage dump;
+				// arg errors (which run before RunE) are unaffected.
+				cmd.SilenceUsage = true
 				return withExitCode(err, 1)
 			}
 			return nil
@@ -94,6 +122,18 @@ func initRunCmd(root *cobra.Command) {
 		RunE: func(cmd *cobra.Command, args []string) error {
 			_, err := doRunEpic(cmd.OutOrStdout(), cmd.ErrOrStderr(), args[0])
 			if err != nil {
+				// Runtime errors from RunE — including blocked-run errors —
+				// never want a usage dump: the operator supplied a valid
+				// ticket id, so the usage block would only add noise. Arg
+				// errors are validated before RunE runs and are untouched.
+				cmd.SilenceUsage = true
+				// Blocked-run errors print their own retry guidance to
+				// stderr; suppress Cobra's default error print so the
+				// actionable block is the last thing on the operator's
+				// screen. Other runtime errors still get printed by Cobra.
+				if _, ok := asBlockedRunError(err); ok {
+					cmd.SilenceErrors = true
+				}
 				return withExitCode(err, 1)
 			}
 			return nil
@@ -105,6 +145,13 @@ func initRunCmd(root *cobra.Command) {
 }
 
 func doRunTicket(w, errw io.Writer, ticketID string) (string, error) {
+	// Cancel engine execution on SIGINT (Ctrl-C) or SIGTERM so that worker
+	// processes and MCP helpers are terminated and claims are released before
+	// the process exits.  stop() removes the signal handler when the function
+	// returns so that subsequent commands get the default signal behaviour.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
 	repoRoot, cfg, repo, err := loadExecutionContext()
 	if err != nil {
 		return "", err
@@ -207,7 +254,7 @@ func doRunTicket(w, errw io.Writer, ticketID string) (string, error) {
 	go func() {
 		defer wg.Done()
 		defer close(ch)
-		result, runErr = engine.RunTicket(context.Background(), engine.RunTicketRequest{
+		result, runErr = engine.RunTicket(ctx, engine.RunTicketRequest{
 			RepoRoot:   repoRoot,
 			RunID:      runID,
 			Ticket:     ticket,
@@ -220,15 +267,9 @@ func doRunTicket(w, errw io.Writer, ticketID string) (string, error) {
 		})
 	}()
 
-	if tuiErr := runProgress(runID, ch, w); tuiErr != nil {
+	if tuiErr := runProgress(runID, ch, w, stop); tuiErr != nil {
 		_, _ = fmt.Fprintf(errw, "warning: TUI error: %v\n", tuiErr)
-		// Drain the channel so the engine goroutine can always complete its
-		// sends and call close(ch). Without this, a full buffer causes the
-		// engine goroutine to block on SendProgress, and wg.Wait() hangs.
-		go func() {
-			for range ch {
-			}
-		}()
+		drainProgress(ch)
 	}
 	// Wait for the engine goroutine to finish before reading result/runErr.
 	// runProgress can return early (e.g. on a TUI render error) while the
@@ -264,6 +305,12 @@ func doRunTicket(w, errw io.Writer, ticketID string) (string, error) {
 }
 
 func doRunEpic(w, errw io.Writer, ticketID string) (string, error) {
+	// Cancel engine execution on SIGINT (Ctrl-C) or SIGTERM so that worker
+	// processes and MCP helpers are terminated and claims are released before
+	// the process exits.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
 	repoRoot, cfg, repo, err := loadExecutionContext()
 	if err != nil {
 		return "", err
@@ -301,7 +348,7 @@ func doRunEpic(w, errw io.Writer, ticketID string) (string, error) {
 	go func() {
 		defer wg.Done()
 		defer close(ch)
-		result, runErr = engine.RunEpic(context.Background(), engine.RunEpicRequest{
+		result, runErr = engine.RunEpic(ctx, engine.RunEpicRequest{
 			RepoRoot:     repoRoot,
 			RunID:        runID,
 			RootTicketID: ticketID,
@@ -316,15 +363,9 @@ func doRunEpic(w, errw io.Writer, ticketID string) (string, error) {
 		})
 	}()
 
-	if tuiErr := runProgress(runID, ch, w); tuiErr != nil {
+	if tuiErr := runProgress(runID, ch, w, stop); tuiErr != nil {
 		_, _ = fmt.Fprintf(errw, "warning: TUI error: %v\n", tuiErr)
-		// Drain the channel so the engine goroutine can always complete its
-		// sends and call close(ch). Without this, a full buffer causes the
-		// engine goroutine to block on SendProgress, and wg.Wait() hangs.
-		go func() {
-			for range ch {
-			}
-		}()
+		drainProgress(ch)
 	}
 	// Wait for the engine goroutine to finish before reading result/runErr.
 	wg.Wait()
@@ -335,6 +376,24 @@ func doRunEpic(w, errw io.Writer, ticketID string) (string, error) {
 		if clearErr := writeCurrentRunID(repoRoot, ""); clearErr != nil {
 			_, _ = fmt.Fprintf(errw, "warning: could not clear current run: %v\n", clearErr)
 		}
+
+		// If the run ended in a structured blocked state, hand off to the
+		// blocked-run handler so the operator sees which tickets are blocked
+		// and how to retry them. For interactive terminals the handler may
+		// reopen the selected tickets and resume the run in place; a
+		// successful retry replaces runErr with nil so the command exits 0.
+		if blocked, ok := asBlockedRunError(runErr); ok {
+			retried, retryErr := handleBlockedEpicRun(ctx, w, errw, repoRoot, contextCfgForResume{
+				cfg:            cfg,
+				defaultRuntime: cfg.Runtime.DefaultRuntime,
+			}, blocked)
+			if retryErr != nil {
+				return runID, retryErr
+			}
+			if retried {
+				return runID, nil
+			}
+		}
 		return runID, runErr
 	}
 
@@ -343,6 +402,12 @@ func doRunEpic(w, errw io.Writer, ticketID string) (string, error) {
 }
 
 func doAutoResume(w, errw io.Writer) error {
+	// Cancel engine execution on SIGINT (Ctrl-C) or SIGTERM so that worker
+	// processes and MCP helpers are terminated and claims are released before
+	// the process exits.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
 	repoRoot, cfg, _, err := loadExecutionContext()
 	if err != nil {
 		_, _ = fmt.Fprintf(w, "Error: %s\n", err)
@@ -396,7 +461,7 @@ func doAutoResume(w, errw io.Writer) error {
 	go func() {
 		defer wg.Done()
 		defer close(ch)
-		report, resumeErr = engine.ResumeRun(context.Background(), engine.ResumeRequest{
+		report, resumeErr = engine.ResumeRun(ctx, engine.ResumeRequest{
 			RepoRoot: repoRoot,
 			RunID:    runID,
 			AdapterFactory: func(ticketPreference string) (runtime.Adapter, error) {
@@ -407,15 +472,9 @@ func doAutoResume(w, errw io.Writer) error {
 		})
 	}()
 
-	if tuiErr := runProgress(runID, ch, w); tuiErr != nil {
+	if tuiErr := runProgress(runID, ch, w, stop); tuiErr != nil {
 		_, _ = fmt.Fprintf(errw, "warning: TUI error: %v\n", tuiErr)
-		// Drain the channel so the engine goroutine can always complete its
-		// sends and call close(ch). Without this, a full buffer causes the
-		// engine goroutine to block on SendProgress, and wg.Wait() hangs.
-		go func() {
-			for range ch {
-			}
-		}()
+		drainProgress(ch)
 	}
 	// Wait for the engine goroutine to finish before reading report/resumeErr.
 	wg.Wait()

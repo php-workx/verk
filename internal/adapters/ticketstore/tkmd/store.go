@@ -12,7 +12,6 @@ import (
 	"strings"
 	"time"
 	"unicode"
-
 	"verk/internal/state"
 )
 
@@ -116,14 +115,7 @@ func ListReadyChildren(rootDir, parentID string, currentRunID ...string) ([]Tick
 		if err != nil {
 			return nil, err
 		}
-		if ticket.ID == parentID {
-			continue
-		}
-		isChild := parentOf(&ticket) == parentID
-		if !isChild {
-			_, isChild = epicDeps[ticket.ID]
-		}
-		if !isChild {
+		if !isChildOf(ticket, parentID, epicDeps) {
 			continue
 		}
 		if ticket.Status != StatusOpen && ticket.Status != StatusReady {
@@ -180,6 +172,97 @@ func parentOf(ticket *Ticket) string {
 	return parent
 }
 
+// ErrEpicCycle is returned when a cycle is detected in the epic child graph
+// (e.g. ticket A is both an ancestor and a descendant of itself).
+var ErrEpicCycle = errors.New("epic cycle detected")
+
+// DetectEpicCycle returns ErrEpicCycle if epicID already appears in ancestors,
+// indicating a circular epic-child relationship. Callers building the ancestors
+// set should add each epic they recurse into before calling sub-levels.
+func DetectEpicCycle(epicID string, ancestors map[string]struct{}) error {
+	if _, cycle := ancestors[epicID]; cycle {
+		return fmt.Errorf("%w: %q appears in its own descendant chain", ErrEpicCycle, epicID)
+	}
+	return nil
+}
+
+// HasChildren reports whether the ticket with the given ID has any children.
+// A child is a ticket whose parent field or deps reference the given ID.
+func HasChildren(rootDir, ticketID string) (bool, error) {
+	ticketsDir := resolveTicketsDir(rootDir)
+	paths, err := filepath.Glob(filepath.Join(ticketsDir, "*.md"))
+	if err != nil {
+		return false, fmt.Errorf("glob tickets: %w", err)
+	}
+	epicDeps, err := loadEpicChildren(ticketsDir, ticketID)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return false, fmt.Errorf("load children of %s: %w", ticketID, err)
+	}
+	for _, path := range paths {
+		ticket, err := LoadTicket(path)
+		if err != nil {
+			return false, err
+		}
+		if isChildOf(ticket, ticketID, epicDeps) {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// ListAllChildren returns all direct children of the ticket with the given ID,
+// regardless of their status. Used by the engine to discover the full hierarchy.
+// Returns an error if the parent ticket does not exist.
+func ListAllChildren(rootDir, parentID string) ([]Ticket, error) {
+	ticketsDir := resolveTicketsDir(rootDir)
+	parentPath := filepath.Join(ticketsDir, parentID+".md")
+	if _, err := os.Stat(parentPath); err != nil {
+		return nil, fmt.Errorf("load %s: %w", parentID, err)
+	}
+	epicDeps, err := loadEpicChildren(ticketsDir, parentID)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return nil, fmt.Errorf("load epic children for %s: %w", parentID, err)
+	}
+	paths, err := filepath.Glob(filepath.Join(ticketsDir, "*.md"))
+	if err != nil {
+		return nil, fmt.Errorf("glob tickets: %w", err)
+	}
+	sort.Strings(paths)
+	var children []Ticket
+	seen := make(map[string]struct{})
+	for _, path := range paths {
+		ticket, err := LoadTicket(path)
+		if err != nil {
+			return nil, err
+		}
+		if !isChildOf(ticket, parentID, epicDeps) {
+			continue
+		}
+		if _, ok := seen[ticket.ID]; ok {
+			continue
+		}
+		seen[ticket.ID] = struct{}{}
+		children = append(children, ticket)
+	}
+	return children, nil
+}
+
+// isChildOf reports whether ticket is a direct child of parentID based on
+// canonical child-membership rules: either the ticket's parent frontmatter
+// points to parentID, or the ticket's ID appears in parentID's epic deps set.
+// The parent ticket itself is never its own child. Peer tk links are
+// navigation aids and are intentionally not treated as child edges.
+func isChildOf(ticket Ticket, parentID string, epicDeps map[string]struct{}) bool {
+	if ticket.ID == parentID {
+		return false
+	}
+	if parentOf(&ticket) == parentID {
+		return true
+	}
+	_, ok := epicDeps[ticket.ID]
+	return ok
+}
+
 // extractHeadingTitle extracts the title from the first # heading in the body.
 func extractHeadingTitle(body string) string {
 	for _, line := range strings.Split(body, "\n") {
@@ -191,9 +274,9 @@ func extractHeadingTitle(body string) string {
 	return ""
 }
 
-// loadEpicChildren loads an epic ticket's deps and links lists as a set
-// for child discovery. Supports three tk conventions: deps (tk dep),
-// links (tk link), and parent field on children.
+// loadEpicChildren loads an epic ticket's deps list as a set for child
+// discovery. Only deps are considered as child edges; tk links are navigation
+// aids and must not be treated as child relationships.
 func loadEpicChildren(ticketsDir, epicID string) (map[string]struct{}, error) {
 	path := filepath.Join(ticketsDir, epicID+".md")
 	ticket, err := LoadTicket(path)
@@ -203,13 +286,6 @@ func loadEpicChildren(ticketsDir, epicID string) (map[string]struct{}, error) {
 	children := make(map[string]struct{})
 	for _, dep := range ticket.Deps {
 		children[dep] = struct{}{}
-	}
-	// Also check links — some projects use tk link instead of tk dep
-	if ticket.UnknownFrontmatter != nil {
-		links := asStringSlice(ticket.UnknownFrontmatter["links"])
-		for _, link := range links {
-			children[link] = struct{}{}
-		}
 	}
 	return children, nil
 }
@@ -417,7 +493,7 @@ func encodeFrontMatter(ticket *Ticket) string {
 	return b.String()
 }
 
-func assignField(ticket *Ticket, key string, value any, present bool) {
+func assignField(ticket *Ticket, key string, value any, present bool) { //nolint:unparam // present required by call-site convention, always true currently
 	if ticket.present == nil {
 		ticket.present = map[string]bool{}
 	}

@@ -3,7 +3,6 @@ package cli
 import (
 	"os"
 	"testing"
-
 	"verk/internal/state"
 )
 

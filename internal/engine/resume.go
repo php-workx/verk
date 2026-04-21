@@ -8,12 +8,12 @@ import (
 	"path/filepath"
 	"sync"
 	"time"
-
-	repoadapter "verk/internal/adapters/repo/git"
 	"verk/internal/adapters/runtime"
 	"verk/internal/adapters/ticketstore/tkmd"
 	"verk/internal/policy"
 	"verk/internal/state"
+
+	repoadapter "verk/internal/adapters/repo/git"
 )
 
 type ResumeRequest struct {
@@ -32,7 +32,7 @@ type ResumeReport struct {
 	ResumedTickets   []string          `json:"resumed_tickets,omitempty"`
 }
 
-func ResumeRun(ctx context.Context, req ResumeRequest) (ResumeReport, error) {
+func ResumeRun(ctx context.Context, req ResumeRequest) (ResumeReport, error) { //nolint:gocognit,cyclop // complex resume orchestration; refactor into sub-functions
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -194,6 +194,9 @@ func resumeExecutionAllowed(run state.RunArtifact, req ResumeRequest) bool {
 	if req.Adapter == nil && req.AdapterFactory == nil {
 		return false
 	}
+	if _, ok := pendingWaveVerificationID(run.ResumeCursor); ok {
+		return true
+	}
 	return run.Status == state.EpicRunStatusRunning || run.Status == state.EpicRunStatusBlocked
 }
 
@@ -235,8 +238,17 @@ func resumeTicketMode(ctx context.Context, req ResumeRequest, artifacts *runArti
 			}
 			plan.RunID = req.RunID
 		}
-		// Resume at implement phase (the furthest-back supported entry point)
-		plan.Phase = state.TicketPhaseImplement
+		// Resume as close as possible to the last persisted phase so
+		// pending verify/review/repair work continues correctly without
+		// losing provenance. Blocked tickets are intentionally moved back to
+		// implement so resume can unblock under new conditions.
+		if snapshot.CurrentPhase == state.TicketPhaseBlocked {
+			plan.Phase = state.TicketPhaseImplement
+		} else if snapshot.CurrentPhase != "" {
+			plan.Phase = snapshot.CurrentPhase
+		} else {
+			plan.Phase = state.TicketPhaseImplement
+		}
 
 		// Resolve adapter
 		adapter, err := resumeAdapter(req, plan)
@@ -284,7 +296,7 @@ func resumeTicketMode(ctx context.Context, req ResumeRequest, artifacts *runArti
 
 // resumeEpicMode re-enters the wave loop for an epic-mode run,
 // skipping already-completed waves.
-func resumeEpicMode(ctx context.Context, req ResumeRequest, artifacts *runArtifacts) ([]string, error) {
+func resumeEpicMode(ctx context.Context, req ResumeRequest, artifacts *runArtifacts) ([]string, error) { //nolint:gocognit,cyclop // complex resume orchestration; refactor into sub-functions
 	cfg := normalizeEpicConfig(req.Config)
 	repo, err := repoadapter.New(artifacts.RepoRoot)
 	if err != nil {
@@ -328,6 +340,7 @@ func resumeEpicMode(ctx context.Context, req ResumeRequest, artifacts *runArtifa
 
 	var allResumed []string
 	runPath := runJSONPath(artifacts.RepoRoot, req.RunID)
+	registrar := &subEpicRegistrar{run: &artifacts.Run, runPath: runPath}
 
 	for {
 		if err := ctx.Err(); err != nil {
@@ -422,7 +435,7 @@ func resumeEpicMode(ctx context.Context, req ResumeRequest, artifacts *runArtifa
 				defer wg.Done()
 				const maxCrashRetries = 2
 				for attempt := 0; attempt <= maxCrashRetries; attempt++ {
-					outcome, crashed := executeWithRecovery(ctx, epicReq, cfg, wave, ticketID)
+					outcome, crashed := executeWithRecovery(ctx, epicReq, cfg, wave, ticketID, 1, nil, registrar)
 					if !crashed {
 						outcomes[i] = outcome
 						return
@@ -497,12 +510,14 @@ func resumeEpicMode(ctx context.Context, req ResumeRequest, artifacts *runArtifa
 			return allResumed, err
 		}
 		closedCount := countClosedTickets(outcomes)
+		blockedIDs := collectBlockedTicketIDs(outcomes)
 		SendProgress(ctx, req.Progress, ProgressEvent{
-			Type:    EventWaveCompleted,
-			WaveID:  waveOrdinal,
-			Closed:  closedCount,
-			Total:   len(wave.TicketIDs),
-			Success: acceptedWave.Status == state.WaveStatusAccepted,
+			Type:           EventWaveCompleted,
+			WaveID:         waveOrdinal,
+			Closed:         closedCount,
+			Total:          len(wave.TicketIDs),
+			Success:        acceptedWave.Status == state.WaveStatusAccepted,
+			BlockedTickets: blockedIDs,
 		})
 		artifacts.Run.WaveIDs = append(artifacts.Run.WaveIDs, acceptedWave.WaveID)
 		artifacts.Run.UpdatedAt = time.Now().UTC()

@@ -3,7 +3,6 @@ package engine
 import (
 	"context"
 	"fmt"
-
 	"verk/internal/state"
 )
 
@@ -97,10 +96,11 @@ func ReopenTicket(ctx context.Context, req ReopenRequest) error {
 }
 
 func validateReopenTransition(from, to state.TicketPhase) error {
+	defaultTarget, ok := DefaultReopenTargetForPhase(from)
 	switch {
-	case from == state.TicketPhaseBlocked && (to == state.TicketPhaseImplement || to == state.TicketPhaseRepair):
+	case ok && to == defaultTarget:
 		return nil
-	case from == state.TicketPhaseClosed && to == state.TicketPhaseRepair:
+	case from == state.TicketPhaseBlocked && to == state.TicketPhaseRepair:
 		return nil
 	default:
 		return fmt.Errorf("reopen transition %s -> %s is not allowed", from, to)

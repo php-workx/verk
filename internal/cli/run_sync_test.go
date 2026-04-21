@@ -8,7 +8,6 @@ import (
 	"sync"
 	"testing"
 	"time"
-
 	"verk/internal/engine"
 )
 
@@ -129,6 +128,34 @@ func TestEngineGoroutineSync_SuccessPath(t *testing.T) {
 	}
 }
 
+// TestDrainProgress_UnblocksFullBuffer exercises the shared drainProgress
+// helper directly: it must consume events until the channel is closed so the
+// producer can always make progress even when the buffer is full. Without a
+// drain the producer would block on the (bufSize+1)th send and the goroutine
+// would leak.
+func TestDrainProgress_UnblocksFullBuffer(t *testing.T) {
+	const bufSize = 4
+	const eventCount = bufSize * 4
+	ch := make(chan engine.ProgressEvent, bufSize)
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		defer close(ch)
+		for i := 0; i < eventCount; i++ {
+			ch <- engine.ProgressEvent{Type: engine.EventTicketDetail, Detail: fmt.Sprintf("event-%d", i)}
+		}
+	}()
+
+	drainProgress(ch)
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("producer blocked — drainProgress did not consume events")
+	}
+}
+
 // TestDrainGoroutine_PreventsDeadlockOnEarlyTUIReturn exercises the exact
 // failure mode described in the acceptance criteria: runProgress returns early
 // (with an error) before close(ch) fires, leaving the progress channel
@@ -145,7 +172,7 @@ func TestDrainGoroutine_PreventsDeadlockOnEarlyTUIReturn(t *testing.T) {
 	// Inject a fake runProgress that returns an error immediately without
 	// draining ch, simulating a BubbleTea TUI that exits on a render error.
 	original := runProgress
-	runProgress = func(_ string, _ <-chan engine.ProgressEvent, _ io.Writer) error {
+	runProgress = func(_ string, _ <-chan engine.ProgressEvent, _ io.Writer, _ func()) error {
 		return errors.New("TUI exited early")
 	}
 	defer func() { runProgress = original }()
@@ -174,15 +201,13 @@ func TestDrainGoroutine_PreventsDeadlockOnEarlyTUIReturn(t *testing.T) {
 		runErr = nil
 	}()
 
-	// Mirror the production pattern from doRunTicket / doRunEpic / doAutoResume.
-	if tuiErr := runProgress("test-run", ch, io.Discard); tuiErr != nil {
-		// This is the fix under test: without this drain goroutine the engine
-		// goroutine blocks on SendProgress once the buffer is full, and
-		// wg.Wait() below would hang forever.
-		go func() {
-			for range ch {
-			}
-		}()
+	// Mirror the production pattern from doRunTicket / doRunEpic / doAutoResume:
+	// when the TUI returns early, call the shared drainProgress helper so the
+	// engine goroutine can complete its sends and close(ch) fires. Without it
+	// the engine blocks on SendProgress once the buffer is full and wg.Wait()
+	// below would hang forever.
+	if tuiErr := runProgress("test-run", ch, io.Discard, nil); tuiErr != nil {
+		drainProgress(ch)
 	}
 
 	// Assert wg.Wait() completes within 5 seconds. A deadlock would cause the

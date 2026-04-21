@@ -1,0 +1,146 @@
+version: "2"
+
+# golangci-lint v2 configuration for verk
+# Keep version in sync with tools.mod and CI
+
+run:
+  timeout: 3m
+
+linters:
+  enable:
+    # Type safety & correctness (Go's "mypy")
+    - staticcheck
+    - govet
+
+    # Bug detection
+    - errcheck
+    - bodyclose
+    - nilerr
+    - nilnil
+
+    # Style & consistency
+    - revive
+    - goconst
+    - unconvert
+    - unparam
+    - usestdlibvars
+
+    # Complexity
+    - gocognit
+    - cyclop
+
+    # Security
+    - gosec
+
+    # Code hygiene
+    - gocritic
+    - prealloc
+    - mirror
+    - nolintlint
+
+  settings:
+    gocognit:
+      # Start at 55 for existing codebase; tighten toward 30 over time
+      min-complexity: 55
+
+    cyclop:
+      # Start at 30 for existing codebase; tighten toward 22 over time
+      max-complexity: 30
+
+    goconst:
+      min-len: 3
+      min-occurrences: 3
+
+    revive:
+      rules:
+        - name: blank-imports
+        - name: context-as-argument
+        - name: dot-imports
+        - name: error-return
+        - name: error-strings
+        - name: error-naming
+        - name: exported
+        - name: increment-decrement
+        - name: var-naming
+        - name: range
+        - name: receiver-naming
+        - name: indent-error-flow
+        - name: empty-block
+        - name: superfluous-else
+        - name: unreachable-code
+        - name: unnecessary-stmt
+
+    gocritic:
+      enabled-tags:
+        - diagnostic
+        - style
+        - performance
+      disabled-checks:
+        - whyNoLint      # handled by nolintlint
+        - hugeParam      # too noisy for existing codebase; re-enable after refactoring
+        - rangeValCopy   # same — existing range-over-value patterns; re-enable after refactoring
+        - unnamedResult  # style preference; re-enable when API is stable
+        - appendCombine  # sometimes less readable; re-enable after audit
+        - emptyStringTest # style preference only
+        - builtinShadow   # min/max shadowing is common in CLI code
+        - ifElseChain     # style preference
+        - ptrToRefParam   # sometimes API convention requires pointer
+
+    nolintlint:
+      require-explanation: true
+      require-specific: true
+
+    gosec:
+      excludes:
+        - G104  # unhandled errors — errcheck covers this
+        - G115  # integer overflow uintptr->int — safe in verk's file-lock usage on 64-bit systems
+        - G204  # exec.Command with variable — verk shells out to CLI tools (claude, codex) by design
+        - G301  # dir perms 0755 — standard for runtime state directories
+        - G302  # file perms 0644 — standard for non-secret data files
+        - G304  # file inclusion via variable — verk constructs paths from config/repo root
+        - G306  # WriteFile 0644 — same as G302
+        - G401  # sha1 — used for non-cryptographic content-addressing (criterion evidence IDs)
+        - G505  # sha1 import — same as G401
+        - G702  # taint-analysis command injection — verk's runtime adapter pattern is intentional
+
+  exclusions:
+    generated: lax
+    presets:
+      - comments
+      - std-error-handling
+    rules:
+      # Relax style/complexity linters in test files
+      - path: _test\.go
+        linters:
+          - gocognit
+          - cyclop
+          - goconst
+          - unparam
+          - gocritic
+          - revive
+          - gosec
+      # Relax for e2e fixture code
+      - path: internal/e2e/
+        linters:
+          - gocognit
+          - cyclop
+          - goconst
+      # goconst is noisy with business-logic string literals; defer until constants are extracted
+      - path: internal/adapters/
+        linters:
+          - goconst
+      - path: internal/engine/
+        linters:
+          - goconst
+      # unparam is noisy with interface implementations where params are required by the interface
+      - path: internal/adapters/runtime/
+        linters:
+          - unparam
+
+
+formatters:
+  enable:
+    - gofumpt
+  settings:
+    gofumpt:
+      extra-rules: true

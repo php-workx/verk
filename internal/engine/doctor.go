@@ -8,7 +8,6 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
-
 	"verk/internal/adapters/repo/git"
 	"verk/internal/adapters/runtime/claude"
 	"verk/internal/adapters/runtime/codex"
@@ -46,12 +45,12 @@ func RunDoctor(repoRoot string) (DoctorReport, int, error) {
 	repo, err := git.New(repoRoot)
 	if err != nil {
 		report.Checks = append(report.Checks, DoctorCheck{Name: "repo_root", Status: "failed", Details: err.Error()})
-		return report, 2, nil
+		return report, 2, nil //nolint:nilerr // error captured in DoctorReport structure
 	}
 	root, err := repo.RepoRoot()
 	if err != nil {
 		report.Checks = append(report.Checks, DoctorCheck{Name: "repo_root", Status: "failed", Details: err.Error()})
-		return report, 2, nil
+		return report, 2, nil //nolint:nilerr // error captured in DoctorReport structure
 	}
 	report.RepoRoot = root
 	report.Checks = append(report.Checks, DoctorCheck{Name: "repo_root", Status: "passed", Details: root})
@@ -123,7 +122,7 @@ func RunDoctor(repoRoot string) (DoctorReport, int, error) {
 
 	switch {
 	case blocking:
-		return report, 2, nil
+		return report, 2, nil //nolint:nilerr,nolintlint // exit code 2; error captured in DoctorReport
 	case warnings:
 		return report, 1, nil
 	default:

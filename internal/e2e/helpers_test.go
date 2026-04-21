@@ -7,7 +7,6 @@ import (
 	"strings"
 	"testing"
 	"time"
-
 	"verk/internal/adapters/ticketstore/tkmd"
 	"verk/internal/engine"
 	"verk/internal/policy"

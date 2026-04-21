@@ -9,7 +9,6 @@ import (
 	"strings"
 	"testing"
 	"time"
-
 	"verk/internal/adapters/ticketstore/tkmd"
 	"verk/internal/cli"
 	"verk/internal/state"

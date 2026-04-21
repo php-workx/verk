@@ -10,7 +10,6 @@ import (
 	"strings"
 	"sync"
 	"time"
-
 	"verk/internal/adapters/repo/git"
 	"verk/internal/adapters/runtime"
 	"verk/internal/adapters/ticketstore/tkmd"
@@ -23,6 +22,125 @@ import (
 // external leases). Callers can use errors.Is(err, ErrEpicBlocked) to
 // distinguish this from hard failures.
 var ErrEpicBlocked = errors.New("epic run blocked")
+
+// BlockedTicket is a terminating ticket captured at the end of a blocked epic
+// run. It aggregates the minimum information a caller needs to render operator
+// guidance ("ticket X blocked because Y, retry with `verk reopen ...`") without
+// forcing the CLI to re-load snapshots from disk.
+type BlockedTicket struct {
+	// ID is the canonical ticket identifier.
+	ID string
+	// Title is the human-readable ticket title, empty when unavailable.
+	Title string
+	// Status is the ticket-store status at the moment the run stopped.
+	Status tkmd.Status
+	// Phase is the ticket run phase from the latest snapshot, when available.
+	Phase state.TicketPhase
+	// RetryPhase is the default phase this ticket may be reopened to. Empty
+	// means the ticket is not automatically retryable from its current phase.
+	RetryPhase state.TicketPhase
+	// Reason is the best available block reason. It prefers the worker-reported
+	// BlockReason from the ticket snapshot and falls back to a structural
+	// description (blocked, waiting on deps, …) when no snapshot reason exists.
+	Reason string
+}
+
+// DefaultReopenTargetForPhase returns the CLI's default reopen target for a
+// ticket phase. A false return means the phase is not automatically retryable.
+func DefaultReopenTargetForPhase(from state.TicketPhase) (state.TicketPhase, bool) {
+	switch from {
+	case state.TicketPhaseBlocked:
+		return state.TicketPhaseImplement, true
+	case state.TicketPhaseClosed:
+		return state.TicketPhaseRepair, true
+	default:
+		return "", false
+	}
+}
+
+// BlockedRunError is the error returned by RunEpic when a run terminates
+// without completing. It unwraps to ErrEpicBlocked so existing
+// errors.Is(err, ErrEpicBlocked) checks keep working, and it carries enough
+// structured detail for CLI callers to render actionable retry guidance.
+type BlockedRunError struct {
+	RunID          string
+	Status         state.EpicRunStatus
+	BlockedTickets []BlockedTicket
+	// Cause is the underlying engine error, if any (wave failure, acceptance
+	// error, verification error). Nil when the run simply ran out of ready
+	// tickets.
+	Cause error
+}
+
+// Error renders a compact single-line summary. The CLI prints a more detailed
+// multi-line version alongside this error; the summary is what shows up in
+// logs and when the error is printed by Cobra's default handler.
+func (e *BlockedRunError) Error() string {
+	if e == nil {
+		return ErrEpicBlocked.Error()
+	}
+	ids := make([]string, 0, len(e.BlockedTickets))
+	for _, t := range e.BlockedTickets {
+		ids = append(ids, t.ID)
+	}
+	switch {
+	case len(ids) > 0 && e.Cause != nil:
+		return fmt.Sprintf("%s: %s (blocked tickets: %s): %v", ErrEpicBlocked.Error(), e.Status, strings.Join(ids, ", "), e.Cause)
+	case len(ids) > 0:
+		return fmt.Sprintf("%s: %s (blocked tickets: %s)", ErrEpicBlocked.Error(), e.Status, strings.Join(ids, ", "))
+	case e.Cause != nil:
+		return fmt.Sprintf("%s: %s: %v", ErrEpicBlocked.Error(), e.Status, e.Cause)
+	default:
+		return fmt.Sprintf("%s: %s", ErrEpicBlocked.Error(), e.Status)
+	}
+}
+
+// Unwrap returns ErrEpicBlocked so errors.Is(err, ErrEpicBlocked) succeeds for
+// any BlockedRunError value. The underlying Cause is intentionally not exposed
+// via Unwrap: surfacing the sentinel is what existing callers rely on.
+func (e *BlockedRunError) Unwrap() error { return ErrEpicBlocked }
+
+// collectBlockedTickets builds a BlockedTicket list for the supplied children,
+// preferring the BlockReason stored in each ticket's run snapshot over the
+// structural fallback returned by describeNotReady. Closed tickets are skipped
+// so the result only contains the tickets responsible for the blocked state.
+// Snapshot read errors are silently ignored: in those cases the structural
+// description is used instead, so CLI output still names the ticket even when
+// its snapshot artifact is missing or malformed.
+func collectBlockedTickets(repoRoot, runID string, children []tkmd.Ticket) []BlockedTicket {
+	var out []BlockedTicket
+	for _, child := range children {
+		if child.Status == tkmd.StatusClosed {
+			continue
+		}
+		reason := describeNotReady(child)
+		phase := state.TicketPhase("")
+		if child.Status == tkmd.StatusBlocked {
+			phase = state.TicketPhaseBlocked
+		}
+		if runID != "" {
+			var snap TicketRunSnapshot
+			if err := loadTicketSnapshot(repoRoot, runID, child.ID, &snap); err == nil {
+				if snap.CurrentPhase != "" {
+					phase = snap.CurrentPhase
+				}
+				if trimmed := ticketStatusReason(snap); trimmed != "" {
+					reason = trimmed
+				}
+			}
+		}
+		retryPhase, _ := DefaultReopenTargetForPhase(phase)
+		out = append(out, BlockedTicket{
+			ID:         child.ID,
+			Title:      child.Title,
+			Status:     child.Status,
+			Phase:      phase,
+			RetryPhase: retryPhase,
+			Reason:     reason,
+		})
+	}
+	return out
+}
 
 type RunEpicRequest struct {
 	RepoRoot             string
@@ -43,7 +161,7 @@ type RunEpicResult struct {
 	Path  string
 }
 
-func RunEpic(ctx context.Context, req RunEpicRequest) (RunEpicResult, error) {
+func RunEpic(ctx context.Context, req RunEpicRequest) (RunEpicResult, error) { //nolint:gocognit,cyclop // complex orchestration loop; refactor into sub-functions
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -116,6 +234,7 @@ func RunEpic(ctx context.Context, req RunEpicRequest) (RunEpicResult, error) {
 	}
 
 	result := RunEpicResult{Run: run, Path: runPath}
+	registrar := &subEpicRegistrar{run: &result.Run, runPath: runPath}
 	waveOrdinal := 0
 
 	for {
@@ -175,7 +294,46 @@ func RunEpic(ctx context.Context, req RunEpicRequest) (RunEpicResult, error) {
 				return result, err
 			}
 			if status != state.EpicRunStatusCompleted {
-				return result, fmt.Errorf("%w: %s", ErrEpicBlocked, status)
+				emitBlockedEpicSummary(ctx, req.Progress, currentChildren)
+				return result, &BlockedRunError{
+					RunID:          req.RunID,
+					Status:         status,
+					BlockedTickets: collectBlockedTickets(req.RepoRoot, req.RunID, currentChildren),
+				}
+			}
+
+			// All child tickets closed — run the epic closure gate before marking
+			// the epic completed. Mark it pending in the cursor so a crash during
+			// the gate's repair loop is detectable on resume (the next run will
+			// find all children closed and re-enter the gate).
+			setPendingEpicGate(result.Run.ResumeCursor)
+			result.Run.UpdatedAt = time.Now().UTC()
+			if err := state.SaveJSONAtomic(runPath, result.Run); err != nil {
+				return result, err
+			}
+
+			allChangedFiles, changedErr := repo.ChangedFilesAgainst(baseCommit)
+			if changedErr != nil {
+				allChangedFiles = nil // non-fatal: reviewer still runs with empty file list
+			}
+			allChangedFiles = filterEngineOwnedFiles(allChangedFiles)
+
+			if gateErr := runEpicClosureGate(ctx, req, cfg, currentChildren, allChangedFiles); gateErr != nil {
+				result.Run.Status = state.EpicRunStatusBlocked
+				result.Run.CurrentPhase = state.TicketPhaseBlocked
+				result.Run.UpdatedAt = time.Now().UTC()
+				if saveErr := state.SaveJSONAtomic(runPath, result.Run); saveErr != nil {
+					return result, errors.Join(gateErr, fmt.Errorf("persist run state: %w", saveErr))
+				}
+				return result, gateErr
+			}
+
+			clearPendingEpicGate(result.Run.ResumeCursor)
+			result.Run.Status = state.EpicRunStatusCompleted
+			result.Run.CurrentPhase = state.TicketPhaseClosed
+			result.Run.UpdatedAt = time.Now().UTC()
+			if err := state.SaveJSONAtomic(runPath, result.Run); err != nil {
+				return result, err
 			}
 			return result, nil
 		}
@@ -228,7 +386,7 @@ func RunEpic(ctx context.Context, req RunEpicRequest) (RunEpicResult, error) {
 				defer wg.Done()
 				const maxCrashRetries = 2
 				for attempt := 0; attempt <= maxCrashRetries; attempt++ {
-					outcome, crashed := executeWithRecovery(ctx, req, cfg, wave, ticketID)
+					outcome, crashed := executeWithRecovery(ctx, req, cfg, wave, ticketID, 1, nil, registrar)
 					if !crashed {
 						outcomes[i] = outcome
 						return
@@ -274,6 +432,7 @@ func RunEpic(ctx context.Context, req RunEpicRequest) (RunEpicResult, error) {
 			return result, err
 		}
 
+		ticketDetails := buildWaveTicketDetails(req.RepoRoot, req.RunID, wave.TicketIDs, outcomes)
 		acceptedWave, acceptErr := AcceptWave(WaveAcceptanceRequest{
 			Wave:                 wave,
 			TicketPhases:         ticketPhases,
@@ -281,6 +440,7 @@ func RunEpic(ctx context.Context, req RunEpicRequest) (RunEpicResult, error) {
 			TicketScopes:         ticketScopes,
 			ClaimsReleased:       claimsReleased,
 			PersistenceSucceeded: true,
+			TicketDetails:        ticketDetails,
 		})
 		if waveFailed {
 			acceptedWave.Status = state.WaveStatusFailed
@@ -303,12 +463,16 @@ func RunEpic(ctx context.Context, req RunEpicRequest) (RunEpicResult, error) {
 			return result, err
 		}
 		closedCount := countClosedTickets(outcomes)
+		blockedIDs := collectBlockedTicketIDs(outcomes)
+		blockedDetails := waveBlockedTicketEvents(blockedIDs, ticketPhases, wave.TicketIDs, ticketDetails)
 		SendProgress(ctx, req.Progress, ProgressEvent{
-			Type:    EventWaveCompleted,
-			WaveID:  waveOrdinal,
-			Closed:  closedCount,
-			Total:   len(wave.TicketIDs),
-			Success: acceptedWave.Status == state.WaveStatusAccepted,
+			Type:                 EventWaveCompleted,
+			WaveID:               waveOrdinal,
+			Closed:               closedCount,
+			Total:                len(wave.TicketIDs),
+			Success:              acceptedWave.Status == state.WaveStatusAccepted,
+			BlockedTickets:       blockedIDs,
+			BlockedTicketDetails: blockedDetails,
 		})
 		result.Waves = append(result.Waves, acceptedWave)
 		result.Run.WaveIDs = append(result.Run.WaveIDs, acceptedWave.WaveID)
@@ -332,7 +496,20 @@ func RunEpic(ctx context.Context, req RunEpicRequest) (RunEpicResult, error) {
 			if err := state.SaveJSONAtomic(runPath, result.Run); err != nil {
 				return result, errors.Join(blockErr, fmt.Errorf("persist run state: %w", err))
 			}
-			return result, blockErr
+			// Wrap the wave failure in BlockedRunError so the CLI can render the
+			// same retry guidance it uses for the "no ready tickets" branch.
+			// Re-read the current ticket store so block reasons reflect the state
+			// written by each ticket's finalization defer.
+			blockedChildren, childErr := listEpicChildren(req.RepoRoot, req.RootTicketID)
+			if childErr != nil {
+				return result, blockErr
+			}
+			return result, &BlockedRunError{
+				RunID:          req.RunID,
+				Status:         state.EpicRunStatusBlocked,
+				BlockedTickets: collectBlockedTickets(req.RepoRoot, req.RunID, blockedChildren),
+				Cause:          blockErr,
+			}
 		}
 
 		// Run wave-level verification after all tickets merge. Mark pending in
@@ -384,59 +561,14 @@ func normalizeEpicConfig(cfg policy.Config) policy.Config {
 	if cfg.Scheduler.MaxConcurrency <= 0 {
 		cfg.Scheduler.MaxConcurrency = policy.DefaultConfig().Scheduler.MaxConcurrency
 	}
+	if cfg.Scheduler.MaxDepth <= 0 {
+		cfg.Scheduler.MaxDepth = policy.DefaultConfig().Scheduler.MaxDepth
+	}
 	return cfg
 }
 
 func listEpicChildren(repoRoot, parentID string) ([]tkmd.Ticket, error) {
-	// Load the epic ticket to get its deps/links list for child discovery.
-	epicPath := filepath.Join(repoRoot, ".tickets", parentID+".md")
-	epicTicket, err := tkmd.LoadTicket(epicPath)
-	if err != nil {
-		return nil, fmt.Errorf("load epic %s: %w", parentID, err)
-	}
-	epicChildren := make(map[string]struct{})
-	for _, dep := range epicTicket.Deps {
-		epicChildren[dep] = struct{}{}
-	}
-	if epicTicket.UnknownFrontmatter != nil {
-		if links, ok := epicTicket.UnknownFrontmatter["links"]; ok {
-			for _, link := range toStringSlice(links) {
-				epicChildren[link] = struct{}{}
-			}
-		}
-	}
-
-	paths, err := filepath.Glob(filepath.Join(repoRoot, ".tickets", "*.md"))
-	if err != nil {
-		return nil, err
-	}
-	sort.Strings(paths)
-
-	children := make([]tkmd.Ticket, 0, len(paths))
-	seen := make(map[string]struct{})
-	for _, path := range paths {
-		ticket, err := tkmd.LoadTicket(path)
-		if err != nil {
-			return nil, err
-		}
-		if ticket.ID == parentID {
-			continue
-		}
-		// Child if: has parent field, OR is in epic's deps list, OR is in epic's links list
-		isChild := ticketParent(&ticket) == parentID
-		if !isChild {
-			_, isChild = epicChildren[ticket.ID]
-		}
-		if !isChild {
-			continue
-		}
-		if _, ok := seen[ticket.ID]; ok {
-			continue
-		}
-		seen[ticket.ID] = struct{}{}
-		children = append(children, ticket)
-	}
-	return children, nil
+	return tkmd.ListAllChildren(repoRoot, parentID)
 }
 
 func ticketIDs(tickets []tkmd.Ticket) []string {
@@ -540,6 +672,65 @@ type waveTicketOutcome struct {
 	err      error
 }
 
+// subEpicRegistrar serializes run-metadata updates from concurrent sub-epic
+// goroutines. Multiple tickets in the same wave may have children and therefore
+// run their own mini-epic loops in parallel; this registrar coordinates their
+// writes to Run.WaveIDs, Run.TicketIDs, and the persisted run.json.
+type subEpicRegistrar struct {
+	mu      sync.Mutex
+	run     *state.RunArtifact
+	runPath string
+}
+
+// registerSubWave atomically appends subWaveID and descendantIDs to the shared
+// run artifact and persists it. This makes sub-wave and descendant-ticket
+// metadata durable before sub-wave execution begins, so resume can reconstruct
+// state after a crash mid-sub-wave.
+func (r *subEpicRegistrar) registerSubWave(subWaveID string, descendantIDs []string) error {
+	if r == nil {
+		return nil
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.run.WaveIDs = appendIfMissing(r.run.WaveIDs, subWaveID)
+	for _, id := range descendantIDs {
+		r.run.TicketIDs = appendIfMissing(r.run.TicketIDs, id)
+	}
+	r.run.UpdatedAt = time.Now().UTC()
+	return state.SaveJSONAtomic(r.runPath, *r.run)
+}
+
+// setPendingSubWaveVerification marks a sub-wave as pending verification in
+// the run's resume cursor and persists the run artifact. This matches the
+// top-level wave path so a crash mid-repair is recoverable via resume.
+func (r *subEpicRegistrar) setPendingSubWaveVerification(waveID string) error {
+	if r == nil {
+		return nil
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.run.ResumeCursor == nil {
+		r.run.ResumeCursor = map[string]any{}
+	}
+	setPendingWaveVerification(r.run.ResumeCursor, waveID)
+	r.run.UpdatedAt = time.Now().UTC()
+	return state.SaveJSONAtomic(r.runPath, *r.run)
+}
+
+// clearPendingSubWaveVerification clears the pending-verification marker and
+// persists the run artifact, matching the top-level wave path after a
+// successful verification loop.
+func (r *subEpicRegistrar) clearPendingSubWaveVerification() error {
+	if r == nil {
+		return nil
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	clearPendingWaveVerification(r.run.ResumeCursor)
+	r.run.UpdatedAt = time.Now().UTC()
+	return state.SaveJSONAtomic(r.runPath, *r.run)
+}
+
 // buildTicketScopes creates a map of ticket ID -> owned paths from a ticket list.
 // This is used for per-ticket scope validation during wave acceptance.
 func buildTicketScopes(tickets []tkmd.Ticket) map[string][]string {
@@ -550,7 +741,7 @@ func buildTicketScopes(tickets []tkmd.Ticket) map[string][]string {
 	return scopes
 }
 
-func executeWithRecovery(ctx context.Context, req RunEpicRequest, cfg policy.Config, wave state.WaveArtifact, ticketID string) (outcome waveTicketOutcome, crashed bool) {
+func executeWithRecovery(ctx context.Context, req RunEpicRequest, cfg policy.Config, wave state.WaveArtifact, ticketID string, depth int, ancestors map[string]struct{}, reg *subEpicRegistrar) (outcome waveTicketOutcome, crashed bool) {
 	defer func() {
 		if r := recover(); r != nil {
 			outcome = waveTicketOutcome{
@@ -561,31 +752,383 @@ func executeWithRecovery(ctx context.Context, req RunEpicRequest, cfg policy.Con
 			crashed = true
 		}
 	}()
-	return executeEpicTicket(ctx, req, cfg, wave, ticketID), false
+	return executeEpicTicket(ctx, req, cfg, wave, ticketID, depth, ancestors, reg), false
 }
 
-func executeEpicTicket(ctx context.Context, req RunEpicRequest, cfg policy.Config, wave state.WaveArtifact, ticketID string) waveTicketOutcome {
-	outcome := waveTicketOutcome{ticketID: ticketID, phase: state.TicketPhaseBlocked}
+// runChildWithRetry executes a single child ticket with crash-recovery retries.
+// It is called from a goroutine inside runSubEpic and returns the final outcome
+// for the child ticket.
+func runChildWithRetry(ctx context.Context, req RunEpicRequest, cfg policy.Config, subWave state.WaveArtifact, childID string, depth int, nextAncestors map[string]struct{}, reg *subEpicRegistrar) waveTicketOutcome {
+	const maxCrashRetries = 2
+	for attempt := 0; attempt <= maxCrashRetries; attempt++ {
+		childOutcome, crashed := executeWithRecovery(ctx, req, cfg, subWave, childID, depth+1, nextAncestors, reg)
+		if !crashed {
+			return childOutcome
+		}
+		SendProgress(ctx, req.Progress, ProgressEvent{
+			Type:     EventTicketDetail,
+			TicketID: childID,
+			Detail:   fmt.Sprintf("sub-ticket worker crashed (attempt %d/%d), retrying: %v", attempt+1, maxCrashRetries+1, childOutcome.err),
+		})
+		_ = tkmd.ReleaseClaim(req.RepoRoot, req.RunID, childID, "crash recovery")
+		if attempt == maxCrashRetries {
+			return waveTicketOutcome{ticketID: childID, phase: state.TicketPhaseBlocked}
+		}
+	}
+	return waveTicketOutcome{ticketID: childID, phase: state.TicketPhaseBlocked}
+}
+
+// resetOrphanedChildren resets any children left in_progress from a prior crashed run
+// back to open so they are eligible for rescheduling.
+func resetOrphanedChildren(repoRoot string, children []tkmd.Ticket) error {
+	for _, child := range children {
+		if child.Status == tkmd.StatusInProgress {
+			if err := updateTicketStoreStatus(repoRoot, child.ID, tkmd.StatusOpen); err != nil {
+				return fmt.Errorf("reset orphaned child %s: %w", child.ID, err)
+			}
+		}
+	}
+	return nil
+}
+
+// runSubEpic executes a mini epic loop for the children of a ticket.
+// It discovers children, runs them in waves (up to the configured concurrency),
+// and returns a waveTicketOutcome reflecting the aggregate result.
+// The parent ticket is not run here — the caller runs it after sub-tickets complete.
+// ancestors is the set of epic IDs already in the current call chain; it is used
+// to detect circular epic-child relationships and return a blocked outcome early.
+func runSubEpic(ctx context.Context, req RunEpicRequest, cfg policy.Config, parentTicketID string, parentWave state.WaveArtifact, depth int, ancestors map[string]struct{}, reg *subEpicRegistrar) waveTicketOutcome { //nolint:gocognit,cyclop // orchestration loop mirroring RunEpic; refactored hotspots live in helpers
+	outcome := waveTicketOutcome{ticketID: parentTicketID, phase: state.TicketPhaseBlocked}
+
+	// Cycle guard: if this ticket already appears in the ancestor chain we have
+	// a circular epic-child relationship. Return a blocked outcome immediately so
+	// the engine can record the state without recursing.
+	if err := tkmd.DetectEpicCycle(parentTicketID, ancestors); err != nil {
+		outcome.err = fmt.Errorf("runSubEpic blocked: %w", err)
+		return outcome
+	}
+
+	// Build the ancestors set for the next level: add the current ticket so that
+	// any descendant that references it is flagged as a cycle.
+	nextAncestors := make(map[string]struct{}, len(ancestors)+1)
+	for k := range ancestors {
+		nextAncestors[k] = struct{}{}
+	}
+	nextAncestors[parentTicketID] = struct{}{}
+
+	SendProgress(ctx, req.Progress, ProgressEvent{
+		Type:     EventTicketDetail,
+		TicketID: parentTicketID,
+		Detail:   fmt.Sprintf("running sub-tickets at depth %d", depth+1),
+	})
+
+	children, err := tkmd.ListAllChildren(req.RepoRoot, parentTicketID)
+	if err != nil {
+		outcome.err = fmt.Errorf("list children of %s: %w", parentTicketID, err)
+		return outcome
+	}
+	if len(children) == 0 {
+		// No children — nothing to do, let the parent run as a flat ticket.
+		outcome.phase = state.TicketPhaseClosed
+		return outcome
+	}
+
+	// Reset orphaned in_progress children from crashed prior runs.
+	if err := resetOrphanedChildren(req.RepoRoot, children); err != nil {
+		outcome.err = err
+		return outcome
+	}
+
+	// Reuse a single git.Repo handle across iterations to compute per-sub-wave
+	// baselines and changed file sets, mirroring the top-level RunEpic loop.
+	repo, err := git.New(req.RepoRoot)
+	if err != nil {
+		outcome.err = fmt.Errorf("open repo for sub-epic %s: %w", parentTicketID, err)
+		return outcome
+	}
+
+	// Run the mini wave loop until all children are closed or the sub-epic is blocked.
+	subWaveOrdinal := 0
+	for {
+		if err := ctx.Err(); err != nil {
+			outcome.err = err
+			return outcome
+		}
+
+		ready, err := tkmd.ListReadyChildren(req.RepoRoot, parentTicketID, req.RunID)
+		if err != nil {
+			outcome.err = fmt.Errorf("list ready children of %s: %w", parentTicketID, err)
+			return outcome
+		}
+		ticketScopes := buildTicketScopes(ready)
+		if len(ready) == 0 {
+			// Check completion status of all children.
+			currentChildren, err := tkmd.ListAllChildren(req.RepoRoot, parentTicketID)
+			if err != nil {
+				outcome.err = err
+				return outcome
+			}
+			status := epicCompletionStatus(currentChildren)
+			switch status {
+			case state.EpicRunStatusCompleted:
+				outcome.phase = state.TicketPhaseClosed
+			default:
+				outcome.phase = state.TicketPhaseBlocked
+			}
+			return outcome
+		}
+
+		subWave, err := BuildWave(ready, cfg.Scheduler.MaxConcurrency)
+		if err != nil {
+			outcome.err = fmt.Errorf("build sub-wave for %s: %w", parentTicketID, err)
+			return outcome
+		}
+		subWaveOrdinal++
+		subWaveID := fmt.Sprintf("sub-%s-wave-%d", parentTicketID, subWaveOrdinal)
+		subWave.WaveID = subWaveID
+		subWave.ParentTicketID = parentTicketID
+		subWave.Ordinal = subWaveOrdinal
+		subWave.Status = state.WaveStatusRunning
+		subWave.WaveBaseCommit = parentWave.WaveBaseCommit
+		subWave.StartedAt = time.Now().UTC()
+
+		if err := reg.registerSubWave(subWaveID, subWave.TicketIDs); err != nil {
+			outcome.err = fmt.Errorf("register sub-wave %s: %w", subWaveID, err)
+			return outcome
+		}
+
+		// Persist the sub-wave artifact to disk before executing, so resume can
+		// reconstruct state after a crash mid-sub-wave execution.
+		subWavePath := waveArtifactPath(req.RepoRoot, req.RunID, subWaveID)
+		if err := state.SaveJSONAtomic(subWavePath, subWave); err != nil {
+			outcome.err = fmt.Errorf("persist sub-wave %s: %w", subWaveID, err)
+			return outcome
+		}
+
+		// Capture the pre-wave changed-file baseline so changes introduced by
+		// this sub-wave can be isolated for per-ticket scope validation.
+		subWaveBaselineChangedFiles, err := repo.ChangedFilesAgainst(subWave.WaveBaseCommit)
+		if err != nil {
+			outcome.err = fmt.Errorf("baseline changed files for sub-wave %s: %w", subWaveID, err)
+			outcome.phase = state.TicketPhaseBlocked
+			return outcome
+		}
+		subWaveBaselineChangedFiles = filterEngineOwnedFiles(subWaveBaselineChangedFiles)
+
+		SendProgress(ctx, req.Progress, ProgressEvent{
+			Type:           EventWaveStarted,
+			WaveID:         subWaveOrdinal,
+			ParentTicketID: parentTicketID,
+			Tickets:        append([]string(nil), subWave.TicketIDs...),
+		})
+
+		outcomes := make([]waveTicketOutcome, len(subWave.TicketIDs))
+		var wg sync.WaitGroup
+		for i, childID := range subWave.TicketIDs {
+			wg.Add(1)
+			i := i
+			childID := childID
+			go func() {
+				defer wg.Done()
+				outcomes[i] = runChildWithRetry(ctx, req, cfg, subWave, childID, depth, nextAncestors, reg)
+			}()
+		}
+		wg.Wait()
+
+		ticketPhases := make([]state.TicketPhase, len(outcomes))
+		allClosed := true
+		waveFailed := false
+		var waveErr error
+		for i, o := range outcomes {
+			ticketPhases[i] = o.phase
+			if o.phase != state.TicketPhaseClosed {
+				allClosed = false
+			}
+			if o.err != nil {
+				waveFailed = true
+				if waveErr == nil {
+					waveErr = o.err
+				}
+			}
+		}
+
+		// Compute the files this sub-wave actually touched so per-ticket scope
+		// and baseline accounting mirror the top-level wave gates.
+		changedFiles, err := repo.ChangedFilesAgainst(subWave.WaveBaseCommit)
+		if err != nil {
+			outcome.err = fmt.Errorf("list changed files for sub-wave %s: %w", subWaveID, err)
+			outcome.phase = state.TicketPhaseBlocked
+			return outcome
+		}
+		changedFiles = filterEngineOwnedFiles(changedFiles)
+		changedFiles = subtractFiles(changedFiles, subWaveBaselineChangedFiles)
+
+		claimsReleased, err := waveClaimsReleased(req.RepoRoot, req.RunID, subWave.TicketIDs)
+		if err != nil {
+			outcome.err = fmt.Errorf("check claims released for sub-wave %s: %w", subWaveID, err)
+			outcome.phase = state.TicketPhaseBlocked
+			return outcome
+		}
+
+		subTicketDetails := buildWaveTicketDetails(req.RepoRoot, req.RunID, subWave.TicketIDs, outcomes)
+		acceptedSubWave, acceptErr := AcceptWave(WaveAcceptanceRequest{
+			Wave:                 subWave,
+			TicketPhases:         ticketPhases,
+			ChangedFiles:         changedFiles,
+			TicketScopes:         ticketScopes,
+			ClaimsReleased:       claimsReleased,
+			PersistenceSucceeded: true,
+			TicketDetails:        subTicketDetails,
+		})
+		if waveFailed {
+			acceptedSubWave.Status = state.WaveStatusFailed
+			if acceptedSubWave.Acceptance == nil {
+				acceptedSubWave.Acceptance = map[string]any{}
+			}
+			if waveErr != nil {
+				acceptedSubWave.Acceptance["crash_reason"] = waveErr.Error()
+			}
+		}
+		// The parent-ticket contract is that every child must close before the
+		// sub-wave is accepted. AcceptWave treats blocked tickets as a soft
+		// warning, so override to Failed when any child did not close.
+		if !allClosed && acceptedSubWave.Status == state.WaveStatusAccepted {
+			acceptedSubWave.Status = state.WaveStatusFailed
+		}
+		if acceptedSubWave.Acceptance == nil {
+			acceptedSubWave.Acceptance = map[string]any{}
+		}
+		acceptedSubWave.Acceptance["baseline_changed_files"] = append([]string(nil), subWaveBaselineChangedFiles...)
+		now := time.Now().UTC()
+		acceptedSubWave.UpdatedAt = now
+		if acceptedSubWave.FinishedAt.IsZero() {
+			acceptedSubWave.FinishedAt = now
+		}
+		if err := state.SaveJSONAtomic(subWavePath, acceptedSubWave); err != nil {
+			outcome.err = fmt.Errorf("persist sub-wave %s: %w", subWaveID, err)
+			outcome.phase = state.TicketPhaseBlocked
+			return outcome
+		}
+
+		subBlockedIDs := collectBlockedTicketIDs(outcomes)
+		subBlockedDetails := waveBlockedTicketEvents(subBlockedIDs, ticketPhases, subWave.TicketIDs, subTicketDetails)
+		SendProgress(ctx, req.Progress, ProgressEvent{
+			Type:                 EventWaveCompleted,
+			WaveID:               subWaveOrdinal,
+			ParentTicketID:       parentTicketID,
+			Closed:               countClosedTickets(outcomes),
+			Total:                len(outcomes),
+			Success:              acceptedSubWave.Status == state.WaveStatusAccepted,
+			BlockedTickets:       subBlockedIDs,
+			BlockedTicketDetails: subBlockedDetails,
+		})
+
+		if acceptErr != nil {
+			outcome.err = acceptErr
+			outcome.phase = state.TicketPhaseBlocked
+			return outcome
+		}
+		if waveFailed {
+			outcome.phase = state.TicketPhaseBlocked
+			if outcome.err == nil {
+				outcome.err = waveErr
+			}
+			return outcome
+		}
+		if !allClosed {
+			outcome.phase = state.TicketPhaseBlocked
+			return outcome
+		}
+
+		// All children closed and the sub-wave was accepted — run wave-level
+		// verification under the same pending-marker discipline as top-level
+		// waves so a crash mid-repair is recoverable on resume.
+		if acceptedSubWave.Status == state.WaveStatusAccepted {
+			if err := reg.setPendingSubWaveVerification(acceptedSubWave.WaveID); err != nil {
+				outcome.err = fmt.Errorf("mark sub-wave %s pending verification: %w", subWaveID, err)
+				outcome.phase = state.TicketPhaseBlocked
+				return outcome
+			}
+			if verifyErr := runWaveVerificationLoop(ctx, req, cfg, &acceptedSubWave, subWavePath, changedFiles); verifyErr != nil {
+				outcome.err = verifyErr
+				outcome.phase = state.TicketPhaseBlocked
+				return outcome
+			}
+			if err := reg.clearPendingSubWaveVerification(); err != nil {
+				outcome.err = fmt.Errorf("clear sub-wave %s pending verification: %w", subWaveID, err)
+				outcome.phase = state.TicketPhaseBlocked
+				return outcome
+			}
+		}
+	}
+}
+
+func executeEpicTicket(ctx context.Context, req RunEpicRequest, cfg policy.Config, wave state.WaveArtifact, ticketID string, depth int, ancestors map[string]struct{}, reg *subEpicRegistrar) waveTicketOutcome {
+	// Default to Implement rather than Blocked: a ticket we never even loaded
+	// has not "blocked" in any meaningful sense, and defaulting to Blocked
+	// causes the wave summary to lie about a ticket that errored before it
+	// had a chance to transition its own phase. Error paths that follow
+	// reset outcome.phase to whatever the ticket's snapshot actually records.
+	outcome := waveTicketOutcome{ticketID: ticketID, phase: state.TicketPhaseImplement}
 
 	ticket, err := loadEpicTicket(req.RepoRoot, ticketID)
 	if err != nil {
 		outcome.err = err
+		outcome.phase = snapshotPhaseOrImplement(req.RepoRoot, req.RunID, ticketID)
 		return outcome
 	}
+
+	// If this ticket has children and we haven't exceeded max depth, run the
+	// sub-tickets first (recursive mini-epic loop), then run the parent ticket.
+	// cfg has already been run through normalizeEpicConfig at the top of RunEpic,
+	// so cfg.Scheduler.MaxDepth is guaranteed positive here.
+	maxDepth := cfg.Scheduler.MaxDepth
+	hasChildren, err := tkmd.HasChildren(req.RepoRoot, ticketID)
+	if err != nil {
+		outcome.err = fmt.Errorf("check children of %s: %w", ticketID, err)
+		outcome.phase = snapshotPhaseOrImplement(req.RepoRoot, req.RunID, ticketID)
+		return outcome
+	}
+	if hasChildren && depth < maxDepth {
+		subOutcome := runSubEpic(ctx, req, cfg, ticketID, wave, depth, ancestors, reg)
+		if subOutcome.err != nil {
+			return subOutcome
+		}
+		// If sub-tickets didn't all close, the parent can't proceed.
+		// Persist the blocked state durably so the parent ticket is not eligible
+		// for rescheduling in a subsequent wave while the descendant remains
+		// unresolved. Without this, the outer run loop would find the parent
+		// still open/ready and schedule it again, creating a repeated-wave loop.
+		if subOutcome.phase != state.TicketPhaseClosed {
+			if updateErr := updateTicketStoreStatus(req.RepoRoot, ticketID, tkmd.StatusBlocked); updateErr != nil {
+				subOutcome.err = fmt.Errorf("persist blocked status for %s: %w", ticketID, updateErr)
+			}
+			return subOutcome
+		}
+		SendProgress(ctx, req.Progress, ProgressEvent{
+			Type:     EventTicketDetail,
+			TicketID: ticketID,
+			Detail:   fmt.Sprintf("sub-tickets completed at depth %d, running parent", depth+1),
+		})
+	}
+
 	plan, err := BuildPlanArtifact(ticket, cfg)
 	if err != nil {
 		outcome.err = err
+		outcome.phase = snapshotPhaseOrImplement(req.RepoRoot, req.RunID, ticketID)
 		return outcome
 	}
 	claim, err := tkmd.AcquireClaim(req.RepoRoot, req.RunID, ticket.ID, fmt.Sprintf("lease-%s-%s-%s", req.RunID, ticket.ID, wave.WaveID), wave.WaveID, 10*time.Minute, time.Now().UTC())
 	if err != nil {
 		outcome.err = err
+		outcome.phase = snapshotPhaseOrImplement(req.RepoRoot, req.RunID, ticketID)
 		return outcome
 	}
 	adapter, err := adapterForEpicTicket(req, plan)
 	if err != nil {
 		_ = tkmd.ReleaseClaim(req.RepoRoot, req.RunID, ticket.ID, claim.LeaseID, "runtime adapter selection failed")
 		outcome.err = err
+		outcome.phase = snapshotPhaseOrImplement(req.RepoRoot, req.RunID, ticketID)
 		return outcome
 	}
 
@@ -603,10 +1146,36 @@ func executeEpicTicket(ctx context.Context, req RunEpicRequest, cfg policy.Confi
 	})
 	if err != nil {
 		outcome.err = err
+		// RunTicket errored without transitioning its own phase to Blocked /
+		// Closed. Read the per-ticket snapshot so the wave summary reports
+		// where the ticket actually was (Implement / Verify / Review / …)
+		// rather than falsely claiming it's blocked. Missing snapshot ⇒
+		// Implement so the scheduler will pick it up on the next run.
+		outcome.phase = snapshotPhaseOrImplement(req.RepoRoot, req.RunID, ticketID)
 		return outcome
 	}
 	outcome.phase = ticketResult.Snapshot.CurrentPhase
 	return outcome
+}
+
+// snapshotPhaseOrImplement reads the persisted ticket snapshot and returns
+// its current phase. When no snapshot exists, or the snapshot could not be
+// loaded, it returns TicketPhaseImplement so the scheduler can legitimately
+// pick the ticket up on the next run. Errors are swallowed: this helper
+// feeds a wave-summary field, not a correctness-critical gate.
+//
+// Callers use this to avoid reporting a ticket as Blocked when its own state
+// machine never made that transition — the wave-default Blocked was wrong
+// because it made errored-mid-phase tickets look like "needs operator".
+func snapshotPhaseOrImplement(repoRoot, runID, ticketID string) state.TicketPhase {
+	var snap TicketRunSnapshot
+	if err := loadTicketSnapshot(repoRoot, runID, ticketID, &snap); err != nil {
+		return state.TicketPhaseImplement
+	}
+	if snap.CurrentPhase == "" {
+		return state.TicketPhaseImplement
+	}
+	return snap.CurrentPhase
 }
 
 func adapterForEpicTicket(req RunEpicRequest, plan state.PlanArtifact) (runtime.Adapter, error) {
@@ -640,14 +1209,6 @@ func subtractFiles(changed, baseline []string) []string {
 	return out
 }
 
-func ticketParent(ticket *tkmd.Ticket) string {
-	if ticket == nil || ticket.UnknownFrontmatter == nil {
-		return ""
-	}
-	parent, _ := ticket.UnknownFrontmatter["parent"].(string)
-	return parent
-}
-
 func describeNotReady(ticket tkmd.Ticket) string {
 	switch ticket.Status {
 	case tkmd.StatusClosed:
@@ -659,7 +1220,7 @@ func describeNotReady(ticket tkmd.Ticket) string {
 	}
 	// Status is open/ready — must be deps not resolved
 	if len(ticket.Deps) > 0 {
-		unresolved := make([]string, 0)
+		unresolved := make([]string, 0, len(ticket.Deps))
 		unresolved = append(unresolved, ticket.Deps...)
 		if len(unresolved) <= 3 {
 			return fmt.Sprintf("waiting on deps: %s", strings.Join(unresolved, ", "))
@@ -667,23 +1228,6 @@ func describeNotReady(ticket tkmd.Ticket) string {
 		return fmt.Sprintf("waiting on %d deps", len(unresolved))
 	}
 	return fmt.Sprintf("status=%s", string(ticket.Status))
-}
-
-func toStringSlice(value any) []string {
-	switch v := value.(type) {
-	case []string:
-		return v
-	case []any:
-		out := make([]string, 0, len(v))
-		for _, item := range v {
-			if s, ok := item.(string); ok {
-				out = append(out, s)
-			}
-		}
-		return out
-	default:
-		return nil
-	}
 }
 
 func countClosedTickets(outcomes []waveTicketOutcome) int {
@@ -694,4 +1238,118 @@ func countClosedTickets(outcomes []waveTicketOutcome) int {
 		}
 	}
 	return count
+}
+
+// collectBlockedTicketIDs returns the IDs of wave tickets that did not reach
+// TicketPhaseClosed, preserving the original wave ordering. Returns nil when
+// every ticket closed.
+func collectBlockedTicketIDs(outcomes []waveTicketOutcome) []string {
+	var blocked []string
+	for _, o := range outcomes {
+		if o.phase != state.TicketPhaseClosed {
+			blocked = append(blocked, o.ticketID)
+		}
+	}
+	return blocked
+}
+
+// buildWaveTicketDetails resolves the per-ticket BlockedTicketSummary fields
+// the wave needs to write a clear "ticket X blocked because Y" entry. It
+// reads each ticket snapshot for its block reason and falls back to phase-
+// based defaults when the snapshot is missing or empty. The returned map is
+// keyed by ticket ID; tickets that closed normally are still recorded so
+// AcceptWave can pick up titles for any later "blocked" surfacing.
+func buildWaveTicketDetails(repoRoot, runID string, ticketIDs []string, outcomes []waveTicketOutcome) map[string]WaveTicketDetail {
+	details := make(map[string]WaveTicketDetail, len(ticketIDs))
+	outcomeByID := make(map[string]waveTicketOutcome, len(outcomes))
+	for _, o := range outcomes {
+		outcomeByID[o.ticketID] = o
+	}
+	for _, id := range ticketIDs {
+		detail := WaveTicketDetail{}
+		// Prefer the worker- or engine-recorded BlockReason from the
+		// per-ticket snapshot, which captures both worker-side
+		// needs_context strings and engine-side non-convergent reasons.
+		var snap TicketRunSnapshot
+		if err := loadTicketSnapshot(repoRoot, runID, id, &snap); err == nil {
+			if reason := ticketStatusReason(snap); reason != "" {
+				detail.BlockReason = reason
+			}
+		}
+		// Fall back to the wave-level outcome error when the ticket never
+		// got to persist its own block reason (e.g. reviewer adapter returned
+		// an unexpected error before transitionTo(Blocked)). Without this
+		// the wave summary collapses those tickets into the generic
+		// "transitioned to blocked phase without an explicit reason" string.
+		if detail.BlockReason == "" {
+			if o, ok := outcomeByID[id]; ok && o.err != nil {
+				detail.BlockReason = o.err.Error()
+			}
+		}
+		// Match the snapshot's title via the ticket store if we can.
+		if t, err := loadEpicTicket(repoRoot, id); err == nil {
+			detail.Title = t.Title
+		}
+		// A canonical non-convergent escalation always requires operator
+		// input — verk's automated retry loop has already given up.
+		if strings.Contains(detail.BlockReason, string(state.EscalationNonConvergentVerification)) ||
+			strings.Contains(detail.BlockReason, string(state.EscalationNonConvergentReview)) {
+			detail.RequiresOperator = true
+		}
+		// Outcomes track in-memory phases — anything stuck in a non-terminal
+		// phase is still safe for `verk run` to pick up automatically.
+		if o, ok := outcomeByID[id]; ok && o.phase != state.TicketPhaseClosed && o.phase != state.TicketPhaseBlocked {
+			detail.CanRetryAutomatically = true
+		}
+		details[id] = detail
+	}
+	return details
+}
+
+// waveBlockedTicketEvents builds the BlockedTicketDetails slice carried on
+// EventWaveCompleted progress events. The slice mirrors the wave-level
+// blocked_ticket_details acceptance entry so downstream consumers (TUI, log
+// scrapers, automation) can render explicit per-ticket explanations without
+// re-reading the wave artifact from disk.
+func waveBlockedTicketEvents(blockedIDs []string, ticketPhases []state.TicketPhase, ticketIDs []string, details map[string]WaveTicketDetail) []BlockedTicketSummary {
+	if len(blockedIDs) == 0 {
+		return nil
+	}
+	phaseByID := make(map[string]state.TicketPhase, len(ticketIDs))
+	for i, id := range ticketIDs {
+		if i >= len(ticketPhases) {
+			break
+		}
+		phaseByID[id] = ticketPhases[i]
+	}
+	out := make([]BlockedTicketSummary, 0, len(blockedIDs))
+	for _, id := range blockedIDs {
+		out = append(out, buildBlockedTicketSummary(id, phaseByID[id], details[id]))
+	}
+	return out
+}
+
+// emitBlockedEpicSummary emits a single progress event summarising the blocked
+// or waiting tickets that prevented the epic from completing. Per-ticket
+// EventTicketDetail lines still describe each child individually; this
+// additional one-line summary makes the terminating state visible at a glance
+// even when those per-ticket lines have scrolled off the activity log.
+func emitBlockedEpicSummary(ctx context.Context, ch chan<- ProgressEvent, children []tkmd.Ticket) {
+	if ch == nil {
+		return
+	}
+	var parts []string
+	for _, child := range children {
+		if child.Status == tkmd.StatusClosed {
+			continue
+		}
+		parts = append(parts, fmt.Sprintf("%s (%s)", child.ID, describeNotReady(child)))
+	}
+	if len(parts) == 0 {
+		return
+	}
+	SendProgress(ctx, ch, ProgressEvent{
+		Type:   EventTicketDetail,
+		Detail: fmt.Sprintf("epic blocked — %d ticket(s) not closed: %s", len(parts), strings.Join(parts, ", ")),
+	})
 }

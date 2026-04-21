@@ -6,11 +6,11 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
-
 	"verk/internal/adapters/runtime"
-	runtimefake "verk/internal/adapters/runtime/fake"
 	"verk/internal/policy"
 	"verk/internal/state"
+
+	runtimefake "verk/internal/adapters/runtime/fake"
 )
 
 var waveTestStart = time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
@@ -289,5 +289,355 @@ func TestPendingWaveVerificationCursor_NilCursor(t *testing.T) {
 	_, ok := pendingWaveVerificationID(nil)
 	if ok {
 		t.Error("expected false for nil cursor")
+	}
+}
+
+// TestWaveDerivation_UnionOfChangedFiles_CoversMultipleGoPackages asserts
+// that the wave-level derivation draws checks from the union of files
+// changed across all tickets in the wave. When two tickets touch different
+// Go packages, the derived checks must include a `go test` entry for each
+// package so the wave gate catches regressions in either side.
+func TestWaveDerivation_UnionOfChangedFiles_CoversMultipleGoPackages(t *testing.T) {
+	wave := state.WaveArtifact{
+		ArtifactMeta: state.ArtifactMeta{RunID: "run-test"},
+		WaveID:       "wave-42",
+		TicketIDs:    []string{"ver-a", "ver-b"},
+	}
+	changed := []string{
+		"internal/foo/one.go", // from ver-a
+		"internal/bar/two.go", // from ver-b
+	}
+	plan := waveDerivationPlan(wave, changed)
+	derivation := DeriveChecks(DeriveChecksInput{
+		Plan:         plan,
+		ChangedFiles: changed,
+	})
+	derived := promoteDerivedToWave(derivation.Checks, wave.WaveID)
+
+	foo, okFoo := findCheck(derived, "go test ./internal/foo")
+	if !okFoo {
+		t.Fatalf("expected go test ./internal/foo in wave-scoped derivation; got %#v", derived)
+	}
+	bar, okBar := findCheck(derived, "go test ./internal/bar")
+	if !okBar {
+		t.Fatalf("expected go test ./internal/bar in wave-scoped derivation; got %#v", derived)
+	}
+
+	for name, c := range map[string]state.ValidationCheck{"foo": foo, "bar": bar} {
+		if c.Scope != state.ValidationScopeWave {
+			t.Errorf("%s: expected wave scope, got %q", name, c.Scope)
+		}
+		if c.WaveID != "wave-42" {
+			t.Errorf("%s: expected WaveID wave-42, got %q", name, c.WaveID)
+		}
+		if c.TicketID != "" {
+			t.Errorf("%s: expected empty TicketID on wave-scoped check, got %q", name, c.TicketID)
+		}
+		if c.Advisory {
+			t.Errorf("%s: expected wave-scoped derived checks to be required (not advisory)", name)
+		}
+	}
+}
+
+// TestRunWaveVerificationLoop_RecordsValidationCoverage verifies that a
+// successful first-try wave verification records the full declared-check
+// coverage on the persisted wave artifact so downstream tooling can see
+// what ran without re-reading stdout paths.
+func TestRunWaveVerificationLoop_RecordsValidationCoverage(t *testing.T) {
+	repoRoot, wavePath, wave := makeWaveVerifyFixture(t)
+	adapter := runtimefake.New(nil, nil)
+	cfg := policy.DefaultConfig()
+	cfg.Verification.QualityCommands = []policy.QualityCommand{qualityCmd("true")}
+
+	if err := runWaveVerificationLoop(context.Background(), makeEpicReq(repoRoot, adapter), cfg, wave, wavePath, nil); err != nil {
+		t.Fatalf("expected nil error, got: %v", err)
+	}
+	if wave.ValidationCoverage == nil {
+		t.Fatal("expected validation coverage to be populated on the wave artifact")
+	}
+	cov := wave.ValidationCoverage
+	if cov.Scope != state.ValidationScopeWave {
+		t.Errorf("expected wave scope, got %q", cov.Scope)
+	}
+	if cov.WaveID != "wave-1" {
+		t.Errorf("expected WaveID=wave-1, got %q", cov.WaveID)
+	}
+	if len(cov.DeclaredChecks) == 0 {
+		t.Error("expected declared checks recorded on coverage artifact")
+	}
+	if len(cov.ExecutedChecks) == 0 {
+		t.Error("expected at least one executed check on coverage artifact")
+	}
+	if !cov.Closable {
+		t.Error("expected coverage.Closable=true when all checks passed on first try")
+	}
+
+	// Reload from disk to confirm persistence.
+	var reloaded state.WaveArtifact
+	if err := state.LoadJSON(wavePath, &reloaded); err != nil {
+		t.Fatalf("reload wave: %v", err)
+	}
+	if reloaded.ValidationCoverage == nil {
+		t.Fatal("expected validation coverage to persist to disk")
+	}
+	if reloaded.ValidationCoverage.WaveID != "wave-1" {
+		t.Errorf("reloaded coverage WaveID=%q, want wave-1", reloaded.ValidationCoverage.WaveID)
+	}
+}
+
+// TestRunWaveVerificationLoop_ExhaustedBudget_PreservesHistory asserts AC7:
+// when wave repair attempts hit the configured limit, the wave artifact
+// must record the RepairLimit, surface the unresolved check as a blocker,
+// and preserve the per-cycle RepairRefs so operators can inspect the
+// repair history when deciding whether to raise the budget.
+func TestRunWaveVerificationLoop_ExhaustedBudget_PreservesHistory(t *testing.T) {
+	repoRoot, wavePath, wave := makeWaveVerifyFixture(t)
+	artifactPath := filepath.Join(repoRoot, "worker-result.json")
+	if err := os.WriteFile(artifactPath, []byte("{}"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	adapter := runtimefake.New([]runtime.WorkerResult{
+		validWorkerResult("wave-repair-wave-1-1", artifactPath),
+		validWorkerResult("wave-repair-wave-1-2", artifactPath),
+	}, nil)
+
+	cfg := policy.DefaultConfig()
+	cfg.Verification.QualityCommands = []policy.QualityCommand{qualityCmd("false")}
+	cfg.Policy.MaxWaveRepairCycles = 2
+
+	err := runWaveVerificationLoop(context.Background(), makeEpicReq(repoRoot, adapter), cfg, wave, wavePath, nil)
+	if err == nil {
+		t.Fatal("expected error after exhausting repair cycles, got nil")
+	}
+
+	cov := wave.ValidationCoverage
+	if cov == nil {
+		t.Fatal("expected validation coverage to be populated on the wave artifact")
+	}
+	if cov.Closable {
+		t.Error("expected coverage.Closable=false after exhausting repair budget")
+	}
+	if cov.RepairLimit == nil {
+		t.Fatal("expected RepairLimit to be recorded when budget is exhausted")
+	}
+	if cov.RepairLimit.Name != "max_wave_repair_cycles" {
+		t.Errorf("expected RepairLimit.Name=max_wave_repair_cycles, got %q", cov.RepairLimit.Name)
+	}
+	if cov.RepairLimit.Limit != 2 || cov.RepairLimit.Reached != 2 {
+		t.Errorf("expected RepairLimit limit=2 reached=2, got limit=%d reached=%d", cov.RepairLimit.Limit, cov.RepairLimit.Reached)
+	}
+	if cov.BlockReason == "" {
+		t.Error("expected non-empty BlockReason when wave remains blocked")
+	}
+	if len(cov.UnresolvedBlockers) == 0 {
+		t.Error("expected UnresolvedBlockers to include the still-failing check(s)")
+	}
+	// History: we expect at least one repair ref per cycle the engine ran.
+	var cycle1, cycle2 bool
+	for _, ref := range cov.RepairRefs {
+		switch ref.CycleID {
+		case "wave-1-cycle-1":
+			cycle1 = true
+		case "wave-1-cycle-2":
+			cycle2 = true
+		}
+	}
+	if !cycle1 || !cycle2 {
+		t.Errorf("expected repair refs to preserve per-cycle history (cycle-1=%v cycle-2=%v); refs=%#v", cycle1, cycle2, cov.RepairRefs)
+	}
+	// Wave.Acceptance mirrors should still expose the cycle ids so legacy
+	// dashboards keep working.
+	ids, ok := wave.Acceptance["wave_repair_cycle_ids"].([]string)
+	if !ok || len(ids) != 2 {
+		t.Errorf("expected Acceptance[wave_repair_cycle_ids]=[]string of length 2, got %T=%v", wave.Acceptance["wave_repair_cycle_ids"], wave.Acceptance["wave_repair_cycle_ids"])
+	}
+}
+
+// TestRunWaveVerificationLoop_RepairDisabled_RecordsBlockerWithHistory
+// asserts that when MaxWaveRepairCycles is zero, the wave artifact
+// records a repair-limit explanation and a blocker reason so operators
+// understand why no repair was attempted.
+func TestRunWaveVerificationLoop_RepairDisabled_RecordsBlockerWithHistory(t *testing.T) {
+	repoRoot, wavePath, wave := makeWaveVerifyFixture(t)
+	adapter := runtimefake.New(nil, nil)
+	cfg := policy.DefaultConfig()
+	cfg.Verification.QualityCommands = []policy.QualityCommand{qualityCmd("false")}
+	cfg.Policy.MaxWaveRepairCycles = 0
+
+	err := runWaveVerificationLoop(context.Background(), makeEpicReq(repoRoot, adapter), cfg, wave, wavePath, nil)
+	if err == nil {
+		t.Fatal("expected error when repair is disabled and checks fail")
+	}
+	cov := wave.ValidationCoverage
+	if cov == nil {
+		t.Fatal("expected coverage to be populated even when repair is disabled")
+	}
+	if cov.RepairLimit == nil || cov.RepairLimit.Limit != 0 {
+		t.Errorf("expected RepairLimit with Limit=0, got %#v", cov.RepairLimit)
+	}
+	if cov.BlockReason == "" {
+		t.Error("expected BlockReason when wave is blocked")
+	}
+	if len(cov.UnresolvedBlockers) == 0 {
+		t.Error("expected UnresolvedBlockers when wave checks fail without repair")
+	}
+}
+
+// TestWaveDerivation_DocsWave_DerivesStaleWordingCheck verifies TC2:
+// a wave that touches markdown files and has stale-wording terms configured
+// derives a stale-wording check so the wave gate can detect cross-file
+// inconsistencies without re-implementing the docs ticket.
+func TestWaveDerivation_DocsWave_DerivesStaleWordingCheck(t *testing.T) {
+	wave := state.WaveArtifact{
+		ArtifactMeta: state.ArtifactMeta{RunID: "run-test"},
+		WaveID:       "wave-42",
+		TicketIDs:    []string{"ver-docs"},
+	}
+	changed := []string{"docs/api-guide.md"}
+	staleTerms := []string{"OldTerm", "DeprecatedLabel"}
+
+	plan := waveDerivationPlan(wave, changed)
+	// Confirm the plan title signals documentation work so the heuristic fires.
+	if !anyMarkdownFile(changed) {
+		t.Fatal("test setup: changed must include a markdown file")
+	}
+
+	derivation := DeriveChecks(DeriveChecksInput{
+		Plan:              plan,
+		ChangedFiles:      changed,
+		StaleWordingTerms: staleTerms,
+	})
+	derived := promoteDerivedToWave(derivation.Checks, wave.WaveID)
+
+	// A stale-wording grep check must be present.
+	staleCheck, ok := findCheck(derived, "OldTerm")
+	if !ok {
+		t.Fatalf("expected stale-wording grep check for docs-touching wave; got checks=%#v skipped=%#v",
+			derived, derivation.Skipped)
+	}
+
+	// All wave-promoted derived checks must be required (non-advisory) and
+	// wave-scoped so they gate the wave rather than silently advising.
+	for _, c := range derived {
+		if c.Advisory {
+			t.Errorf("wave-scoped derived check %q must not be advisory", c.ID)
+		}
+		if c.Scope != state.ValidationScopeWave {
+			t.Errorf("wave-scoped derived check %q has scope %q, want wave", c.ID, c.Scope)
+		}
+		if c.WaveID != "wave-42" {
+			t.Errorf("wave-scoped derived check %q has WaveID %q, want wave-42", c.ID, c.WaveID)
+		}
+		if c.TicketID != "" {
+			t.Errorf("wave-scoped derived check %q has TicketID %q, want empty", c.ID, c.TicketID)
+		}
+	}
+
+	// The stale-wording command should contain the supplied terms.
+	if staleCheck.Command == "" {
+		t.Error("stale-wording check must have a non-empty command")
+	}
+}
+
+// TestResumePendingWaveVerification_AlreadyPassed_ClearsCursorWithoutRerun
+// verifies TC5: when the pending wave already passed, resumePendingWaveVerification
+// must clear the cursor marker and return without re-running the verification loop.
+// This prevents duplicating work that completed before a process crash.
+func TestResumePendingWaveVerification_AlreadyPassed_ClearsCursorWithoutRerun(t *testing.T) {
+	repoRoot, wavePath, wave := makeWaveVerifyFixture(t)
+
+	// Mark wave as already verified.
+	wave.Acceptance["wave_verification_passed"] = true
+	if err := state.SaveJSONAtomic(wavePath, wave); err != nil {
+		t.Fatal(err)
+	}
+
+	runPath := filepath.Join(repoRoot, ".verk", "runs", "run-test", "run.json")
+	run := state.RunArtifact{
+		ArtifactMeta: state.ArtifactMeta{RunID: "run-test"},
+		Status:       state.EpicRunStatusRunning,
+	}
+	if err := state.SaveJSONAtomic(runPath, run); err != nil {
+		t.Fatal(err)
+	}
+
+	cursor := map[string]any{}
+	setPendingWaveVerification(cursor, "wave-1")
+
+	// Use a failing command — if the loop re-runs, it would return an error
+	// (MaxWaveRepairCycles=0 + failing cmd → immediate error).
+	adapter := runtimefake.New(nil, nil)
+	cfg := policy.DefaultConfig()
+	cfg.Verification.QualityCommands = []policy.QualityCommand{qualityCmd("false")}
+	cfg.Policy.MaxWaveRepairCycles = 0
+
+	err := resumePendingWaveVerification(context.Background(), makeEpicReq(repoRoot, adapter), cfg, cursor, runPath, &run)
+	if err != nil {
+		t.Fatalf("expected nil error for already-passed wave, got: %v", err)
+	}
+
+	// Cursor must be cleared so the next resume does not repeat the check.
+	if _, ok := pendingWaveVerificationID(cursor); ok {
+		t.Error("expected pending wave verification marker to be cleared")
+	}
+
+	// No worker must have been invoked — the loop was skipped entirely.
+	if len(adapter.WorkerRequests()) != 0 {
+		t.Errorf("expected no worker calls when wave already verified, got %d", len(adapter.WorkerRequests()))
+	}
+}
+
+// TestResumePendingWaveVerification_NotPassedYet_RerunsAndClearsOnSuccess
+// verifies TC5: when resume finds a pending wave that has not been verified
+// yet, it must re-run the verification loop and clear the marker once the
+// loop completes successfully. This ensures verification continues after a
+// crash without duplicating already-closed tickets.
+func TestResumePendingWaveVerification_NotPassedYet_RerunsAndClearsOnSuccess(t *testing.T) {
+	repoRoot, wavePath, wave := makeWaveVerifyFixture(t)
+
+	// Wave not yet verified — no wave_verification_passed key in Acceptance.
+	if err := state.SaveJSONAtomic(wavePath, wave); err != nil {
+		t.Fatal(err)
+	}
+
+	runPath := filepath.Join(repoRoot, ".verk", "runs", "run-test", "run.json")
+	run := state.RunArtifact{
+		ArtifactMeta: state.ArtifactMeta{RunID: "run-test"},
+		Status:       state.EpicRunStatusRunning,
+	}
+	if err := state.SaveJSONAtomic(runPath, run); err != nil {
+		t.Fatal(err)
+	}
+
+	cursor := map[string]any{}
+	setPendingWaveVerification(cursor, "wave-1")
+
+	adapter := runtimefake.New(nil, nil)
+	cfg := policy.DefaultConfig()
+	cfg.Verification.QualityCommands = []policy.QualityCommand{qualityCmd("true")}
+
+	err := resumePendingWaveVerification(context.Background(), makeEpicReq(repoRoot, adapter), cfg, cursor, runPath, &run)
+	if err != nil {
+		t.Fatalf("expected nil error when verification passes, got: %v", err)
+	}
+
+	// Cursor must be cleared after successful verification.
+	if _, ok := pendingWaveVerificationID(cursor); ok {
+		t.Error("expected pending wave verification marker to be cleared after successful loop")
+	}
+
+	// No repair worker should have been invoked since the check passed.
+	if len(adapter.WorkerRequests()) != 0 {
+		t.Errorf("expected no worker calls when quality command passes, got %d", len(adapter.WorkerRequests()))
+	}
+
+	// Wave artifact on disk must reflect the successful verification pass.
+	var reloadedWave state.WaveArtifact
+	if err := state.LoadJSON(wavePath, &reloadedWave); err != nil {
+		t.Fatalf("reload wave artifact: %v", err)
+	}
+	if reloadedWave.Acceptance["wave_verification_passed"] != true {
+		t.Errorf("expected wave_verification_passed=true after re-run, got %v",
+			reloadedWave.Acceptance["wave_verification_passed"])
 	}
 }

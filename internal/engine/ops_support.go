@@ -7,7 +7,6 @@ import (
 	"path/filepath"
 	"sort"
 	"time"
-
 	"verk/internal/adapters/repo/git"
 	"verk/internal/adapters/ticketstore/tkmd"
 	"verk/internal/state"
@@ -197,7 +196,7 @@ func loadOptionalClaim(path string) (*state.ClaimArtifact, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return nil, nil
+			return nil, nil //nolint:nilnil // not-found: nil value + nil error = "no data, no problem"
 		}
 		return nil, err
 	}
@@ -210,7 +209,7 @@ func loadOptionalClaim(path string) (*state.ClaimArtifact, error) {
 
 func loadTicketSnapshot(repoRoot, runID, ticketID string, target *TicketRunSnapshot) error {
 	if err := state.LoadJSON(ticketSnapshotPath(repoRoot, runID, ticketID), target); err == nil {
-		return nil
+		return hydrateTicketSnapshotArtifacts(repoRoot, runID, ticketID, target)
 	} else if !os.IsNotExist(extractReadErr(err)) {
 		return err
 	}
@@ -220,6 +219,68 @@ func loadTicketSnapshot(repoRoot, runID, ticketID string, target *TicketRunSnaps
 		return err
 	}
 	*target = derived
+	return nil
+}
+
+func hydrateTicketSnapshotArtifacts(repoRoot, runID, ticketID string, snapshot *TicketRunSnapshot) error {
+	if snapshot == nil {
+		return nil
+	}
+	if snapshot.Implementation == nil {
+		var implementation state.ImplementationArtifact
+		if err := state.LoadJSON(implementationArtifactPath(repoRoot, runID, ticketID), &implementation); err == nil {
+			snapshot.Implementation = &implementation
+		} else if !os.IsNotExist(extractReadErr(err)) {
+			return err
+		}
+	}
+	if snapshot.Verification == nil {
+		var verification state.VerificationArtifact
+		if err := state.LoadJSON(verificationArtifactPath(repoRoot, runID, ticketID), &verification); err == nil {
+			snapshot.Verification = &verification
+		} else if !os.IsNotExist(extractReadErr(err)) {
+			return err
+		}
+	}
+	if snapshot.Review == nil {
+		var review state.ReviewFindingsArtifact
+		if err := state.LoadJSON(reviewArtifactPath(repoRoot, runID, ticketID), &review); err == nil {
+			snapshot.Review = &review
+		} else if !os.IsNotExist(extractReadErr(err)) {
+			return err
+		}
+	}
+	if snapshot.Closeout == nil {
+		var closeout state.CloseoutArtifact
+		if err := state.LoadJSON(closeoutArtifactPath(repoRoot, runID, ticketID), &closeout); err == nil {
+			snapshot.Closeout = &closeout
+		} else if !os.IsNotExist(extractReadErr(err)) {
+			return err
+		}
+	}
+	if len(snapshot.RepairCycles) == 0 {
+		cyclePaths, err := filepath.Glob(repairCycleArtifactGlob(repoRoot, runID, ticketID))
+		if err != nil {
+			return err
+		}
+		sort.Strings(cyclePaths)
+		for _, path := range cyclePaths {
+			var cycle state.RepairCycleArtifact
+			if err := state.LoadJSON(path, &cycle); err != nil {
+				return err
+			}
+			snapshot.RepairCycles = append(snapshot.RepairCycles, cycle)
+		}
+	}
+	if snapshot.Implementation != nil && snapshot.ImplementationAttempts == 0 {
+		snapshot.ImplementationAttempts = snapshot.Implementation.Attempt
+	}
+	if snapshot.Verification != nil && snapshot.VerificationAttempts == 0 {
+		snapshot.VerificationAttempts = snapshot.Verification.Attempt
+	}
+	if snapshot.Review != nil && snapshot.ReviewAttempts == 0 {
+		snapshot.ReviewAttempts = snapshot.Review.Attempt
+	}
 	return nil
 }
 
@@ -233,41 +294,8 @@ func deriveTicketSnapshot(repoRoot, runID, ticketID string) (TicketRunSnapshot, 
 		},
 		TicketID: ticketID,
 	}
-	var implementation state.ImplementationArtifact
-	if err := state.LoadJSON(implementationArtifactPath(repoRoot, runID, ticketID), &implementation); err == nil {
-		snapshot.Implementation = &implementation
-	} else if !os.IsNotExist(extractReadErr(err)) {
+	if err := hydrateTicketSnapshotArtifacts(repoRoot, runID, ticketID, &snapshot); err != nil {
 		return TicketRunSnapshot{}, err
-	}
-	var verification state.VerificationArtifact
-	if err := state.LoadJSON(verificationArtifactPath(repoRoot, runID, ticketID), &verification); err == nil {
-		snapshot.Verification = &verification
-	} else if !os.IsNotExist(extractReadErr(err)) {
-		return TicketRunSnapshot{}, err
-	}
-	var review state.ReviewFindingsArtifact
-	if err := state.LoadJSON(reviewArtifactPath(repoRoot, runID, ticketID), &review); err == nil {
-		snapshot.Review = &review
-	} else if !os.IsNotExist(extractReadErr(err)) {
-		return TicketRunSnapshot{}, err
-	}
-	var closeout state.CloseoutArtifact
-	if err := state.LoadJSON(closeoutArtifactPath(repoRoot, runID, ticketID), &closeout); err == nil {
-		snapshot.Closeout = &closeout
-	} else if !os.IsNotExist(extractReadErr(err)) {
-		return TicketRunSnapshot{}, err
-	}
-	cyclePaths, err := filepath.Glob(repairCycleArtifactGlob(repoRoot, runID, ticketID))
-	if err != nil {
-		return TicketRunSnapshot{}, err
-	}
-	sort.Strings(cyclePaths)
-	for _, path := range cyclePaths {
-		var cycle state.RepairCycleArtifact
-		if err := state.LoadJSON(path, &cycle); err != nil {
-			return TicketRunSnapshot{}, err
-		}
-		snapshot.RepairCycles = append(snapshot.RepairCycles, cycle)
 	}
 	if snapshot.Implementation != nil {
 		snapshot.ImplementationAttempts = snapshot.Implementation.Attempt

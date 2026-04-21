@@ -1,6 +1,6 @@
 # verk v1 Sub-Agent Persona Reviews
 
-Review target: `specs/initial_v1.md`
+Review target: `docs/plans/done/initial_v1.md`
 
 Each section below is the output of a fresh-context sub-agent using only the technical plan and that persona's own prompt.
 

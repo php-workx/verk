@@ -4,12 +4,11 @@ import (
 	"fmt"
 	"strings"
 	"time"
+	"verk/internal/engine"
+	"verk/internal/state"
 
 	"charm.land/bubbles/v2/spinner"
 	tea "charm.land/bubbletea/v2"
-
-	"verk/internal/engine"
-	"verk/internal/state"
 )
 
 // doneMsg signals the progress channel has been closed.
@@ -32,33 +31,55 @@ type ticketLine struct {
 
 // waveState tracks a wave.
 type waveState struct {
-	id      int
-	tickets []string
-	closed  int
-	total   int
-	done    bool
-	ok      bool
+	id             int
+	parentTicketID string
+	tickets        []string
+	closed         int
+	total          int
+	done           bool
+	// ok is true when the engine accepted the wave, which can include an
+	// "accepted with warnings" state where some tickets did not close.
+	ok             bool
+	blockedIDs     []string
+	blockedDetails []engine.BlockedTicketSummary
 }
 
 // Model is the Bubble Tea model for verk run progress.
 type Model struct {
-	runID     string
-	ch        <-chan engine.ProgressEvent
-	tickets   map[string]*ticketLine
-	waves     []waveState
-	details   []string // rolling activity log (last 3)
-	done      bool
-	spinner   spinner.Model
-	startTime time.Time
+	runID           string
+	ch              <-chan engine.ProgressEvent
+	onCancel        func()
+	tickets         map[string]*ticketLine
+	waves           []waveState
+	details         []string // rolling activity log (last 3)
+	done            bool
+	cancelRequested bool
+	spinner         spinner.Model
+	startTime       time.Time
+	width           int
 }
+
+const (
+	defaultViewWidth  = 100
+	compactTitleWidth = 26
+	minTitleWidth     = 20
+	ticketIDWidth     = 10
+)
 
 // NewRunModel creates a new run progress model.
 func NewRunModel(runID string, ch <-chan engine.ProgressEvent) Model {
+	return NewRunModelWithCancel(runID, ch, nil)
+}
+
+// NewRunModelWithCancel creates a run progress model that invokes onCancel
+// when the operator presses a cancellation key in the TUI.
+func NewRunModelWithCancel(runID string, ch <-chan engine.ProgressEvent, onCancel func()) Model {
 	s := spinner.New()
 	s.Spinner = spinner.Dot
 	return Model{
 		runID:     runID,
 		ch:        ch,
+		onCancel:  onCancel,
 		tickets:   make(map[string]*ticketLine),
 		startTime: time.Now(),
 		spinner:   s,
@@ -76,6 +97,20 @@ func (m Model) Init() tea.Cmd {
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
+		m.width = msg.Width
+		return m, nil
+
+	case tea.KeyPressMsg:
+		if isCancelKey(msg) {
+			if !m.cancelRequested {
+				m.cancelRequested = true
+				m.addDetail("cancellation requested; stopping workers")
+				if m.onCancel != nil {
+					m.onCancel()
+				}
+			}
+			return m, nil
+		}
 		return m, nil
 
 	case engine.ProgressEvent:
@@ -104,10 +139,20 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 func (m *Model) handleEvent(evt engine.ProgressEvent) tea.Cmd {
 	switch evt.Type {
 	case engine.EventWaveStarted:
+		// Guard against duplicate wave entries. A duplicate can arise if the
+		// engine emits a second EventWaveStarted for an already-registered wave
+		// (e.g. due to resume or a race in sub-wave progress delivery). Without
+		// this guard the TUI would render duplicate wave headers.
+		for _, w := range m.waves {
+			if w.id == evt.WaveID && w.parentTicketID == evt.ParentTicketID {
+				return nil // already registered; skip
+			}
+		}
 		m.waves = append(m.waves, waveState{
-			id:      evt.WaveID,
-			tickets: evt.Tickets,
-			total:   len(evt.Tickets),
+			id:             evt.WaveID,
+			parentTicketID: evt.ParentTicketID,
+			tickets:        evt.Tickets,
+			total:          len(evt.Tickets),
 		})
 		for _, id := range evt.Tickets {
 			if _, exists := m.tickets[id]; !exists {
@@ -116,11 +161,18 @@ func (m *Model) handleEvent(evt engine.ProgressEvent) tea.Cmd {
 		}
 
 	case engine.EventWaveCompleted:
-		if len(m.waves) > 0 {
-			w := &m.waves[len(m.waves)-1]
+		// Match by wave ID and parent ticket ID rather than always taking the
+		// last wave: concurrent sub-waves may complete in any order.
+		w := m.findWave(evt.WaveID, evt.ParentTicketID)
+		if w != nil {
 			w.closed = evt.Closed
 			w.done = true
 			w.ok = evt.Success
+			w.blockedIDs = append([]string(nil), evt.BlockedTickets...)
+			// Preserve the structured blocked-ticket explanations so the
+			// wave summary can show phase / reason / retry routing per
+			// ticket rather than collapsing the blockers to a bare list.
+			w.blockedDetails = append([]engine.BlockedTicketSummary(nil), evt.BlockedTicketDetails...)
 		}
 
 	case engine.EventTicketPhaseChanged:
@@ -148,11 +200,57 @@ func (m *Model) handleEvent(evt engine.ProgressEvent) tea.Cmd {
 		tl.active = evt.Detail
 		m.addDetail(fmt.Sprintf("%s: %s", evt.TicketID, evt.Detail))
 
+	case engine.EventRepairCycleStarted:
+		// Log to the rolling activity window so the operator sees which checks
+		// triggered the repair without cluttering the wave summary line.
+		if len(evt.CheckIDs) > 0 {
+			m.addDetail(fmt.Sprintf("repair cycle %d/%d: %s",
+				evt.RepairCycle, evt.MaxRepairCycles, strings.Join(evt.CheckIDs, ", ")))
+		} else {
+			m.addDetail(fmt.Sprintf("repair cycle %d/%d started", evt.RepairCycle, evt.MaxRepairCycles))
+		}
+
+	case engine.EventRepairCycleSucceeded:
+		m.addDetail(fmt.Sprintf("repair cycle %d: repaired ✓", evt.RepairCycle))
+
+	case engine.EventRepairCycleExhausted:
+		// Show in the activity log so the operator sees it immediately even
+		// before the blocked-wave summary appears.
+		if len(evt.CheckIDs) > 0 {
+			m.addDetail(fmt.Sprintf("repair exhausted after %d cycle(s): %s — manual follow-up required",
+				evt.RepairCycle, strings.Join(evt.CheckIDs, ", ")))
+		} else {
+			m.addDetail(fmt.Sprintf("repair exhausted after %d cycle(s) — manual follow-up required",
+				evt.RepairCycle))
+		}
+
 	case engine.EventRunCompleted:
 		m.done = true
 		return tea.Quit
 	}
 	return nil
+}
+
+// findWave returns a pointer to the waveState with the given id and
+// parentTicketID, or nil when no matching wave exists. The returned pointer
+// is into the m.waves slice and remains valid as long as the slice is not
+// reallocated, so callers must not hold it across Update calls.
+func (m *Model) findWave(id int, parentTicketID string) *waveState {
+	for i := range m.waves {
+		if m.waves[i].id == id && m.waves[i].parentTicketID == parentTicketID {
+			return &m.waves[i]
+		}
+	}
+	return nil
+}
+
+func isCancelKey(msg tea.KeyPressMsg) bool {
+	switch msg.String() {
+	case "ctrl+c", "ctrl+x":
+		return true
+	default:
+		return false
+	}
 }
 
 func (m *Model) ensureTicket(id, title string) *ticketLine {
@@ -206,18 +304,34 @@ func (m Model) View() tea.View {
 func (m Model) renderWave(b *strings.Builder, w *waveState, isCurrent bool) {
 	// Wave header
 	if w.done {
-		mark := styleWaveSummaryOK.Render("✓")
-		if !w.ok {
+		// Three-way mark: green ✓ when every ticket closed, yellow ⚠ when the
+		// wave was accepted but some tickets remain not-closed (soft blocked,
+		// needs-context, etc.), red ✗ when the wave hard-failed.
+		var mark string
+		switch {
+		case !w.ok:
 			mark = styleWaveSummaryFail.Render("✗")
+		case len(w.blockedIDs) > 0:
+			mark = styleWaveSummaryPartial.Render("⚠")
+		default:
+			mark = styleWaveSummaryOK.Render("✓")
 		}
-		summary := fmt.Sprintf("  Wave %d  %d/%d closed %s", w.id, w.closed, w.total, mark)
+		summary := fmt.Sprintf("  %s  %d/%d closed %s", waveLabel(w), w.closed, w.total, mark)
+		if len(w.blockedIDs) > 0 {
+			summary += " — blocked: " + strings.Join(w.blockedIDs, ", ")
+		}
 		if !isCurrent {
 			b.WriteString(styleDivider.Render(summary) + "\n")
-			return // Collapsed — don't show ticket lines for past waves
+			// Past waves collapse to one line, but any blocked tickets stay
+			// visible with their phase/reason/retry so the summary never
+			// silently swallows work that still needs attention.
+			renderBlockedTicketDetails(b, w.blockedDetails)
+			return
 		}
 		b.WriteString(styleWaveTitle.Render(summary) + "\n")
+		renderBlockedTicketDetails(b, w.blockedDetails)
 	} else {
-		b.WriteString(styleWaveTitle.Render(fmt.Sprintf("  Wave %d", w.id)) + "\n")
+		b.WriteString(styleWaveTitle.Render(fmt.Sprintf("  %s", waveLabel(w))) + "\n")
 	}
 	divider := strings.Repeat("─", 62)
 	b.WriteString("  " + styleDivider.Render(divider) + "\n")
@@ -233,38 +347,61 @@ func (m Model) renderWave(b *strings.Builder, w *waveState, isCurrent bool) {
 	b.WriteString("\n")
 }
 
+// renderBlockedTicketDetails emits one line per blocked/skipped ticket with
+// its phase, block reason, and retry routing so wave summaries never hide
+// a blocked ticket behind a "3/4 closed" tally. Details are no-ops when the
+// wave has none.
+func renderBlockedTicketDetails(b *strings.Builder, details []engine.BlockedTicketSummary) {
+	if len(details) == 0 {
+		return
+	}
+	for _, d := range details {
+		phase := string(d.Phase)
+		if phase == "" {
+			phase = "unknown"
+		}
+		reason := d.BlockReason
+		if reason == "" {
+			reason = "no block reason recorded"
+		}
+		var retry string
+		switch {
+		case d.RequiresOperator:
+			retry = "requires operator"
+		case d.CanRetryAutomatically:
+			retry = "retry: verk run"
+		default:
+			retry = "manual follow-up"
+		}
+		line := fmt.Sprintf("    - %s [%s] %s (%s)", d.TicketID, phase, reason, retry)
+		b.WriteString(styleDetailDim.Render(line) + "\n")
+	}
+}
+
+func waveLabel(w *waveState) string {
+	if w.parentTicketID != "" {
+		return fmt.Sprintf("Sub-wave %d for %s", w.id, w.parentTicketID)
+	}
+	return fmt.Sprintf("Wave %d", w.id)
+}
+
 func (m Model) renderTicket(b *strings.Builder, tl *ticketLine) {
-	// ID
-	id := styleTicketID.Render(fmt.Sprintf("  %-10s", tl.id))
+	id := styleTicketID.Render(formatTicketID(tl.id))
+	elapsedPlain := m.renderElapsedPlain(tl)
+	elapsed := styleElapsed.Render(elapsedPlain)
 
-	// Title (truncated)
-	title := ""
-	if tl.title != "" {
-		t := tl.title
-		if len(t) > 26 {
-			t = t[:23] + "..."
-		}
-		title = styleTicketTitle.Render(fmt.Sprintf("%-26s", t))
-	} else {
-		title = strings.Repeat(" ", 26)
+	if tl.active != "" && !tl.done {
+		titleBudget := m.viewWidth() - len(ticketContinuationIndent()) - len(elapsedPlain)
+		titleBudget = max(titleBudget, minTitleWidth)
+		title := styleTicketTitle.Render(truncateString(tl.title, titleBudget))
+		b.WriteString(id + " " + title + elapsed + "\n")
+		b.WriteString(ticketContinuationIndent() + m.renderPhaseChain(tl) + "\n")
+		b.WriteString(ticketContinuationIndent() + m.renderActiveDetail(tl) + "\n")
+		return
 	}
 
-	// Phase chain + active state
-	chain := m.renderPhaseChain(tl)
-
-	// Elapsed time — frozen for done tickets, live for active
-	elapsed := ""
-	if !tl.startedAt.IsZero() {
-		var dur time.Duration
-		if tl.done && !tl.finishedAt.IsZero() {
-			dur = tl.finishedAt.Sub(tl.startedAt)
-		} else {
-			dur = time.Since(tl.startedAt)
-		}
-		elapsed = styleElapsed.Render(fmt.Sprintf(" (%s)", formatDuration(dur)))
-	}
-
-	b.WriteString(id + " " + title + " " + chain + elapsed + "\n")
+	title := styleTicketTitle.Render(fmt.Sprintf("%-*s", compactTitleWidth, truncateString(tl.title, compactTitleWidth)))
+	b.WriteString(id + " " + title + " " + m.renderPhaseChain(tl) + elapsed + "\n")
 }
 
 func (m Model) renderPhaseChain(tl *ticketLine) string {
@@ -286,16 +423,54 @@ func (m Model) renderPhaseChain(tl *ticketLine) string {
 
 	chain := strings.Join(parts, styleDivider.Render(" → "))
 
-	// Show active operation with spinner
-	if tl.active != "" && !tl.done {
-		active := tl.active
-		if len(active) > 30 {
-			active = active[:27] + "..."
-		}
-		chain += " " + m.spinner.View() + " " + styleActive.Render(active)
-	}
-
 	return chain
+}
+
+func (m Model) renderActiveDetail(tl *ticketLine) string {
+	if tl.active == "" || tl.done {
+		return ""
+	}
+	budget := m.viewWidth() - len(ticketContinuationIndent()) - len(m.spinner.View()) - 2
+	budget = max(budget, minTitleWidth)
+	return m.spinner.View() + "  " + styleActive.Render(truncateString(tl.active, budget))
+}
+
+func (m Model) renderElapsedPlain(tl *ticketLine) string {
+	if tl.startedAt.IsZero() {
+		return ""
+	}
+	var dur time.Duration
+	if tl.done && !tl.finishedAt.IsZero() {
+		dur = tl.finishedAt.Sub(tl.startedAt)
+	} else {
+		dur = time.Since(tl.startedAt)
+	}
+	return fmt.Sprintf(" (%s)", formatDuration(dur))
+}
+
+func (m Model) viewWidth() int {
+	if m.width > 0 {
+		return m.width
+	}
+	return defaultViewWidth
+}
+
+func formatTicketID(id string) string {
+	return fmt.Sprintf("  %-*s", ticketIDWidth, id)
+}
+
+func ticketContinuationIndent() string {
+	return strings.Repeat(" ", len(formatTicketID(""))+1)
+}
+
+func truncateString(s string, maxLen int) string {
+	if maxLen <= 0 || len(s) <= maxLen {
+		return s
+	}
+	if maxLen <= 3 {
+		return s[:maxLen]
+	}
+	return s[:maxLen-3] + "..."
 }
 
 func formatDuration(d time.Duration) string {

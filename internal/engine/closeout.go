@@ -6,7 +6,6 @@ import (
 	"sort"
 	"strings"
 	"time"
-
 	"verk/internal/adapters/runtime"
 	"verk/internal/adapters/ticketstore/tkmd"
 	"verk/internal/state"
@@ -65,7 +64,7 @@ func normalizeReviewFinding(f any) (state.ReviewFinding, bool) {
 	case runtime.ReviewFinding:
 		finding := state.ReviewFinding{
 			ID:              v.ID,
-			Severity:        state.Severity(v.Severity),
+			Severity:        v.Severity,
 			Title:           v.Title,
 			Body:            v.Body,
 			File:            v.File,
@@ -158,6 +157,15 @@ func BuildCloseoutArtifact(args ...any) (state.CloseoutArtifact, error) {
 		return state.CloseoutArtifact{}, err
 	}
 
+	coverage := closeoutValidationCoverage(req, gates, failedGate)
+	blockReason := ""
+	unresolvedCheckID := ""
+	if !closable {
+		blockReason = closeoutBlockReason(gates, failedGate, coverage)
+		if coverage != nil && len(coverage.UnresolvedBlockers) > 0 {
+			unresolvedCheckID = coverage.UnresolvedBlockers[0].CheckID
+		}
+	}
 	return state.CloseoutArtifact{
 		ArtifactMeta: state.ArtifactMeta{
 			SchemaVersion: artifactSchemaVersion,
@@ -165,13 +173,100 @@ func BuildCloseoutArtifact(args ...any) (state.CloseoutArtifact, error) {
 			CreatedAt:     stateTime(),
 			UpdatedAt:     stateTime(),
 		},
-		TicketID:          req.ticket.ID,
-		CriteriaEvidence:  criteriaEvidence,
-		RequiredArtifacts: append([]string(nil), req.requiredArtifacts...),
-		GateResults:       gates,
-		Closable:          closable,
-		FailedGate:        failedGate,
+		TicketID:           req.ticket.ID,
+		CriteriaEvidence:   criteriaEvidence,
+		RequiredArtifacts:  append([]string(nil), req.requiredArtifacts...),
+		GateResults:        gates,
+		Closable:           closable,
+		FailedGate:         failedGate,
+		ValidationCoverage: coverage,
+		UnresolvedCheckID:  unresolvedCheckID,
+		BlockReason:        blockReason,
 	}, nil
+}
+
+// closeoutValidationCoverage extracts the ValidationCoverageArtifact that
+// best describes the ticket's closure state. It prefers the coverage
+// already attached to the verification artifact so the history of
+// declared + derived + quality executions is preserved; if verification
+// did not record coverage (older artifact or never ran) it synthesises a
+// placeholder from plan + review + no executions so closeout still
+// reports *something* about the gates that ran.
+func closeoutValidationCoverage(req closeoutRequest, gates map[string]state.GateResult, failedGate string) *state.ValidationCoverageArtifact {
+	if req.verification != nil && req.verification.ValidationCoverage != nil {
+		copy := *req.verification.ValidationCoverage
+		// Reflect closeout-level closure decision in the returned coverage
+		// so downstream consumers don't need to reconcile the two.
+		if failedGate == "" {
+			copy.Closable = true
+			if copy.ClosureReason == "" {
+				copy.ClosureReason = "closeout gates all passed"
+			}
+		} else {
+			copy.Closable = false
+			if copy.BlockReason == "" {
+				if gate, ok := gates[failedGate]; ok && gate.Reason != "" {
+					copy.BlockReason = gate.Reason
+				} else {
+					copy.BlockReason = "closeout gate " + failedGate + " failed"
+				}
+			}
+		}
+		return &copy
+	}
+	// Fallback placeholder so the closeout artifact still exposes a
+	// coverage slot for UI/resume code. This keeps the shape predictable
+	// for downstream consumers that always expect coverage to be present.
+	placeholder := state.ValidationCoverageArtifact{
+		ArtifactMeta: state.ArtifactMeta{
+			SchemaVersion: artifactSchemaVersion,
+			RunID:         req.plan.RunID,
+			CreatedAt:     stateTime(),
+			UpdatedAt:     stateTime(),
+		},
+		Scope:    state.ValidationScopeTicket,
+		TicketID: req.ticket.ID,
+	}
+	placeholder.DeclaredChecks = buildDeclaredChecks(req.plan)
+	if req.review != nil {
+		addReviewBlockers(&placeholder, req.review, req.plan.EffectiveReviewThreshold)
+	}
+	if failedGate == "" {
+		placeholder.Closable = true
+		placeholder.ClosureReason = "closeout gates all passed"
+	} else {
+		placeholder.Closable = false
+		if gate, ok := gates[failedGate]; ok {
+			placeholder.BlockReason = gate.Reason
+		} else {
+			placeholder.BlockReason = "closeout gate " + failedGate + " failed"
+		}
+	}
+	return &placeholder
+}
+
+// closeoutBlockReason picks a human-readable block reason for a
+// non-closable closeout artifact. Preference order: explicit
+// coverage.BlockReason -> first unresolved blocker -> gate.Reason ->
+// generic fallback based on failedGate.
+func closeoutBlockReason(gates map[string]state.GateResult, failedGate string, coverage *state.ValidationCoverageArtifact) string {
+	if coverage != nil {
+		if strings.TrimSpace(coverage.BlockReason) != "" {
+			return coverage.BlockReason
+		}
+		if len(coverage.UnresolvedBlockers) > 0 {
+			if reason := strings.TrimSpace(coverage.UnresolvedBlockers[0].Reason); reason != "" {
+				return reason
+			}
+		}
+	}
+	if failedGate != "" {
+		if gate, ok := gates[failedGate]; ok && strings.TrimSpace(gate.Reason) != "" {
+			return gate.Reason
+		}
+		return "closeout gate " + failedGate + " failed"
+	}
+	return "closeout could not confirm closure"
 }
 
 func parseCloseoutRequest(args ...any) (closeoutRequest, error) {
@@ -252,7 +347,7 @@ func deriveGateResults(req closeoutRequest) (map[string]state.GateResult, error)
 			Status: gateFailed,
 			Reason: err.Error(),
 		}
-		return gates, nil
+		return gates, nil //nolint:nilerr // gate failure encoded in gates map, not Go error
 	}
 
 	if err := validateCriteriaEvidence(req, currentRunID); err != nil {
@@ -261,7 +356,7 @@ func deriveGateResults(req closeoutRequest) (map[string]state.GateResult, error)
 			Reason:        err.Error(),
 			ArtifactPaths: evidenceArtifactRefs(req.criteriaEvidence),
 		}
-		return gates, nil
+		return gates, nil //nolint:nilerr // gate failure encoded in gates map, not Go error
 	}
 
 	if err := validateVerification(req); err != nil {
@@ -270,7 +365,7 @@ func deriveGateResults(req closeoutRequest) (map[string]state.GateResult, error)
 			Reason:        err.Error(),
 			ArtifactPaths: verificationArtifactPaths(req.verification),
 		}
-		return gates, nil
+		return gates, nil //nolint:nilerr // gate failure encoded in gates map, not Go error
 	}
 
 	if err := validateRequiredArtifacts(req); err != nil {
@@ -279,27 +374,27 @@ func deriveGateResults(req closeoutRequest) (map[string]state.GateResult, error)
 			Reason:        err.Error(),
 			ArtifactPaths: append([]string(nil), req.requiredArtifacts...),
 		}
-		return gates, nil
+		return gates, nil //nolint:nilerr // gate failure encoded in gates map, not Go error
 	}
 
-	if result, err := validateReview(req); err != nil {
+	result, err := validateReview(req)
+	if err != nil {
 		gates[gateReview] = state.GateResult{
 			Status:        gateFailed,
 			Reason:        err.Error(),
 			FindingIDs:    reviewFindingIDs(req.review),
 			ArtifactPaths: reviewArtifactPaths(req.review),
 		}
-		return gates, nil
-	} else {
-		gates[gateReview] = result
+		return gates, nil //nolint:nilerr // gate failure encoded in gates map, not Go error
 	}
+	gates[gateReview] = result
 
 	if err := validateDeclaredChecks(req); err != nil {
 		gates[gateDeclaredChecks] = state.GateResult{
 			Status: gateFailed,
 			Reason: err.Error(),
 		}
-		return gates, nil
+		return gates, nil //nolint:nilerr // gate failure encoded in gates map, not Go error
 	}
 
 	return gates, nil
@@ -326,7 +421,7 @@ func validateArtifactIntegrity(req closeoutRequest, currentRunID string) error {
 			return fmt.Errorf("review artifact run %q does not match current run %q", req.review.RunID, currentRunID)
 		}
 		for _, finding := range req.review.Findings {
-			if err := validateReviewFinding(finding); err != nil {
+			if err := validateReviewFinding(finding, req.plan.EffectiveReviewThreshold); err != nil {
 				return err
 			}
 		}
@@ -344,7 +439,7 @@ func validateArtifactIntegrity(req closeoutRequest, currentRunID string) error {
 		if req.verification.RunID != "" && currentRunID != "" && req.verification.RunID != currentRunID {
 			return fmt.Errorf("verification artifact run %q does not match current run %q", req.verification.RunID, currentRunID)
 		}
-		if req.verification.Passed != derivedVerificationPassed(req.verification.Results) {
+		if req.verification.Passed != verificationArtifactPassed(req.verification) {
 			return fmt.Errorf("verification artifact passed flag contradicts derived verification outcome")
 		}
 	}
@@ -419,7 +514,7 @@ func validateVerification(req closeoutRequest) error {
 	if req.verification.TicketID != req.ticket.ID {
 		return fmt.Errorf("verification artifact ticket %q does not match ticket %q", req.verification.TicketID, req.ticket.ID)
 	}
-	if !derivedVerificationPassed(req.verification.Results) {
+	if !verificationArtifactPassed(req.verification) {
 		return fmt.Errorf("verification artifact did not pass")
 	}
 	return nil
@@ -498,13 +593,60 @@ func validateDeclaredChecks(req closeoutRequest) error {
 	if req.verification == nil {
 		return fmt.Errorf("declared checks require verification artifacts")
 	}
-	if !derivedVerificationPassed(req.verification.Results) {
+	if !verificationArtifactPassed(req.verification) {
 		return fmt.Errorf("declared checks failed because verification did not pass")
 	}
 	return nil
 }
 
-func validateReviewFinding(f state.ReviewFinding) error {
+func verificationArtifactPassed(verification *state.VerificationArtifact) bool {
+	if verification == nil {
+		return false
+	}
+	if verification.ValidationCoverage == nil {
+		return derivedVerificationPassed(verification.Results)
+	}
+	return requiredValidationCoveragePassed(*verification.ValidationCoverage)
+}
+
+func requiredValidationCoveragePassed(coverage state.ValidationCoverageArtifact) bool {
+	latest := make(map[string]state.ValidationCheckExecution, len(coverage.ExecutedChecks))
+	for _, execution := range coverage.ExecutedChecks {
+		if execution.CheckID == "" {
+			continue
+		}
+		current, found := latest[execution.CheckID]
+		if !found || current.FinishedAt.IsZero() || execution.FinishedAt.After(current.FinishedAt) {
+			latest[execution.CheckID] = execution
+		}
+	}
+	if len(latest) == 0 {
+		return false
+	}
+	// Verification.Passed is derived from check executions only. Coverage
+	// blockers may also represent review findings, which are gated separately.
+	for checkID, execution := range latest {
+		check, found := coverage.CheckByID(checkID)
+		if found && check.Advisory {
+			continue
+		}
+		switch execution.Result {
+		case state.ValidationCheckResultPassed, state.ValidationCheckResultRepaired:
+			continue
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// validateReviewFinding validates a review finding from a persisted artifact.
+// Blocking findings (at or above the configured threshold) must have a non-empty
+// file and a positive line number so repair workers have precise location context.
+// Non-blocking findings may omit file/line (speculative/informational findings are
+// allowed without precise location), but a non-empty file that is whitespace-only
+// is always rejected as a programming error.
+func validateReviewFinding(f state.ReviewFinding, threshold state.Severity) error {
 	if f.ID == "" {
 		return fmt.Errorf("review finding missing id")
 	}
@@ -517,11 +659,17 @@ func validateReviewFinding(f state.ReviewFinding) error {
 	if strings.TrimSpace(f.Body) == "" {
 		return fmt.Errorf("review finding %q missing body", f.ID)
 	}
-	if strings.TrimSpace(f.File) == "" {
-		return fmt.Errorf("review finding %q missing file", f.ID)
-	}
-	if f.Line <= 0 {
-		return fmt.Errorf("review finding %q missing line", f.ID)
+	// Blocking findings require precise file and line so repair workers can act.
+	// Non-blocking findings may omit these fields (speculative/informational).
+	if ReviewFindingBlocks(f, threshold) {
+		if strings.TrimSpace(f.File) == "" {
+			return fmt.Errorf("review finding %q missing file", f.ID)
+		}
+		if f.Line <= 0 {
+			return fmt.Errorf("review finding %q missing line", f.ID)
+		}
+	} else if f.File != "" && strings.TrimSpace(f.File) == "" {
+		return fmt.Errorf("review finding %q has whitespace-only file", f.ID)
 	}
 	switch f.Disposition {
 	case "open", "resolved":

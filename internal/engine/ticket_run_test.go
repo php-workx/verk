@@ -7,12 +7,12 @@ import (
 	"strings"
 	"testing"
 	"time"
-
 	"verk/internal/adapters/runtime"
-	runtimefake "verk/internal/adapters/runtime/fake"
 	"verk/internal/adapters/ticketstore/tkmd"
 	"verk/internal/policy"
 	"verk/internal/state"
+
+	runtimefake "verk/internal/adapters/runtime/fake"
 )
 
 func TestRunTicket_HappyPath(t *testing.T) {
@@ -33,6 +33,8 @@ func TestRunTicket_HappyPath(t *testing.T) {
 				LeaseID:            claim.LeaseID,
 				StartedAt:          started,
 				FinishedAt:         finished,
+				TokenUsage:         &state.RuntimeTokenUsage{InputTokens: 100, CachedInputTokens: 60, OutputTokens: 20, TotalTokens: 120},
+				ActivityStats:      &state.RuntimeActivityStats{EventCount: 5, CommandCount: 2, AgentMessageCount: 1},
 				ResultArtifactPath: filepath.Join(repoRoot, "worker.json"),
 			},
 		},
@@ -45,6 +47,8 @@ func TestRunTicket_HappyPath(t *testing.T) {
 				FinishedAt:         finished.Add(2 * time.Second),
 				ReviewStatus:       runtime.ReviewStatusPassed,
 				Summary:            "clean",
+				TokenUsage:         &state.RuntimeTokenUsage{InputTokens: 200, CachedInputTokens: 150, OutputTokens: 30, TotalTokens: 230},
+				ActivityStats:      &state.RuntimeActivityStats{EventCount: 4, CommandCount: 1, AgentMessageCount: 1},
 				ResultArtifactPath: filepath.Join(repoRoot, "review.json"),
 			},
 		},
@@ -70,6 +74,12 @@ func TestRunTicket_HappyPath(t *testing.T) {
 	}
 	if result.Snapshot.BlockReason != "" {
 		t.Fatalf("expected no block reason, got %q", result.Snapshot.BlockReason)
+	}
+	if got := result.Snapshot.Implementation; got == nil || got.TokenUsage == nil || got.TokenUsage.InputTokens != 100 || got.ActivityStats == nil || got.ActivityStats.CommandCount != 2 {
+		t.Fatalf("expected implementation runtime telemetry to persist, got %#v", got)
+	}
+	if got := result.Snapshot.Review; got == nil || got.StartedAt.IsZero() || got.FinishedAt.IsZero() || got.TokenUsage == nil || got.TokenUsage.InputTokens != 200 || got.ActivityStats == nil || got.ActivityStats.CommandCount != 1 || len(got.Artifacts) != 1 {
+		t.Fatalf("expected review timing and runtime telemetry to persist, got %#v", got)
 	}
 
 	snapshotPath := filepath.Join(repoRoot, ".verk", "runs", "run-happy", "tickets", ticket.ID, "ticket-run.json")
@@ -1338,5 +1348,915 @@ func TestTicketRunState_snapshotPreservesRestoredCreatedAt(t *testing.T) {
 
 	if !snap.CreatedAt.Equal(fixedCreatedAt) {
 		t.Errorf("expected CreatedAt %v, got %v", fixedCreatedAt, snap.CreatedAt)
+	}
+}
+
+func TestRenderReviewInstructions_RequestsOwnerRiskAndValidationEvidence(t *testing.T) {
+	plan := state.PlanArtifact{
+		TicketID:                 "VER-42",
+		Title:                    "Sample ticket",
+		Description:              "Some description.",
+		AcceptanceCriteria:       []string{"does the right thing"},
+		EffectiveReviewThreshold: "P2",
+	}
+
+	out := renderReviewInstructions(plan, 1)
+
+	for _, phrase := range []string{
+		"brutally honest external review",
+		"owning ticket",
+		"severity",
+		"`VER-42`",
+		"concrete risk",
+		"missing validation or test evidence",
+		"auto-repaired",
+	} {
+		if !strings.Contains(out, phrase) {
+			t.Fatalf("expected review instructions to contain %q:\n%s", phrase, out)
+		}
+	}
+}
+
+// TestRenderRepairInstructions_IncludesFindingAndContext verifies the repair
+// worker prompt carries the specific review finding plus enough surrounding
+// context (acceptance criteria, changed files, prior verification summary) for
+// the worker to address the finding without rerunning the whole ticket blindly
+// (ver-amsh AC3).
+func TestRenderRepairInstructions_IncludesFindingAndContext(t *testing.T) {
+	st := &ticketRunState{
+		req: RunTicketRequest{
+			Plan: state.PlanArtifact{
+				TicketID:                 "ver-repair-ctx",
+				Title:                    "repair context",
+				Description:              "Original ticket description about docs.",
+				AcceptanceCriteria:       []string{"docs read correctly"},
+				TestCases:                []string{"docs do not contradict each other"},
+				OwnedPaths:               []string{"docs"},
+				EffectiveReviewThreshold: state.SeverityP2,
+			},
+		},
+		repairCycles: []state.RepairCycleArtifact{{
+			TicketID:          "ver-repair-ctx",
+			Cycle:             1,
+			TriggerFindingIDs: []string{"finding-42"},
+			Status:            "repair_pending",
+			Scope:             state.ValidationScopeTicket,
+		}},
+		review: &state.ReviewFindingsArtifact{
+			TicketID: "ver-repair-ctx",
+			Findings: []state.ReviewFinding{{
+				ID:          "finding-42",
+				Severity:    state.SeverityP2,
+				Title:       "docs contradiction",
+				Body:        "README claims X but CONTRIBUTING claims Y.",
+				File:        "docs/README.md",
+				Line:        12,
+				Disposition: "open",
+			}},
+			EffectiveReviewThreshold: state.SeverityP2,
+		},
+		implementation: &state.ImplementationArtifact{
+			TicketID:     "ver-repair-ctx",
+			ChangedFiles: []string{"docs/README.md", "docs/CONTRIBUTING.md"},
+		},
+		verification: &state.VerificationArtifact{
+			TicketID: "ver-repair-ctx",
+			Attempt:  2,
+			Passed:   true,
+			Results: []state.VerificationResult{
+				{Command: "markdownlint docs", Passed: true},
+			},
+		},
+	}
+
+	out := renderRepairInstructions(st)
+
+	for _, phrase := range []string{
+		"**Ticket ID:** ver-repair-ctx",
+		"**Repair Cycle:** 1",
+		"finding-42",
+		"docs contradiction",
+		"docs/README.md:12",
+		"Original Ticket Description",
+		"Original ticket description about docs.",
+		"Acceptance Criteria",
+		"docs read correctly",
+		"Test Cases",
+		"docs do not contradict each other",
+		"Changed Files So Far",
+		"docs/README.md",
+		"docs/CONTRIBUTING.md",
+		"Prior Verification",
+		"Do not regress",
+	} {
+		if !strings.Contains(out, phrase) {
+			t.Fatalf("expected repair instructions to contain %q:\n%s", phrase, out)
+		}
+	}
+}
+
+// TestRunTicket_ReviewFindingRepairedClosesTicket exercises ver-amsh AC1+AC2:
+// a medium-severity review finding must trigger a repair cycle, and once the
+// repair worker addresses it and the follow-up review passes, the ticket
+// closes with a repair artifact that references the triggering finding id.
+func TestRunTicket_ReviewFindingRepairedClosesTicket(t *testing.T) {
+	repoRoot := t.TempDir()
+	cfg := policy.DefaultConfig()
+	ticket := testTicket("ver-review-repair")
+	plan, claim := testPlanAndClaim(t, repoRoot, ticket, cfg, "run-review-repair", "lease-review-repair", []string{`true`})
+
+	started, finished := testRunTimes()
+	blockingFinding := runtime.ReviewFinding{
+		ID:          "finding-77",
+		Severity:    runtime.SeverityP2,
+		Title:       "docs contradict each other",
+		Body:        "README and CONTRIBUTING disagree about bootstrap command.",
+		File:        "docs/README.md",
+		Line:        22,
+		Disposition: runtime.ReviewDispositionOpen,
+	}
+	adapter := runtimefake.New(
+		[]runtime.WorkerResult{
+			{
+				Status:             runtime.WorkerStatusDone,
+				RetryClass:         runtime.RetryClassTerminal,
+				LeaseID:            claim.LeaseID,
+				StartedAt:          started,
+				FinishedAt:         finished,
+				ResultArtifactPath: filepath.Join(repoRoot, "worker-1.json"),
+			},
+			// Repair worker run after the blocking finding lands.
+			{
+				Status:             runtime.WorkerStatusDone,
+				RetryClass:         runtime.RetryClassTerminal,
+				LeaseID:            claim.LeaseID,
+				StartedAt:          finished.Add(5 * time.Second),
+				FinishedAt:         finished.Add(6 * time.Second),
+				ResultArtifactPath: filepath.Join(repoRoot, "worker-repair.json"),
+			},
+		},
+		[]runtime.ReviewResult{
+			{
+				Status:             runtime.WorkerStatusDone,
+				RetryClass:         runtime.RetryClassTerminal,
+				LeaseID:            claim.LeaseID,
+				StartedAt:          finished.Add(2 * time.Second),
+				FinishedAt:         finished.Add(3 * time.Second),
+				ReviewStatus:       runtime.ReviewStatusFindings,
+				Summary:            "needs docs repair",
+				Findings:           []runtime.ReviewFinding{blockingFinding},
+				ResultArtifactPath: filepath.Join(repoRoot, "review-1.json"),
+			},
+			// After repair, review passes cleanly.
+			{
+				Status:             runtime.WorkerStatusDone,
+				RetryClass:         runtime.RetryClassTerminal,
+				LeaseID:            claim.LeaseID,
+				StartedAt:          finished.Add(7 * time.Second),
+				FinishedAt:         finished.Add(8 * time.Second),
+				ReviewStatus:       runtime.ReviewStatusPassed,
+				Summary:            "clean after repair",
+				ResultArtifactPath: filepath.Join(repoRoot, "review-2.json"),
+			},
+		},
+	)
+
+	result, err := RunTicket(context.Background(), RunTicketRequest{
+		RepoRoot: repoRoot,
+		RunID:    "run-review-repair",
+		Ticket:   ticket,
+		Plan:     plan,
+		Claim:    claim,
+		Adapter:  adapter,
+		Config:   cfg,
+	})
+	if err != nil {
+		t.Fatalf("RunTicket returned error: %v", err)
+	}
+	if result.Snapshot.CurrentPhase != state.TicketPhaseClosed {
+		t.Fatalf("expected closed phase after successful repair, got %q (block=%q)",
+			result.Snapshot.CurrentPhase, result.Snapshot.BlockReason)
+	}
+	if len(result.Snapshot.RepairCycles) != 1 {
+		t.Fatalf("expected 1 repair cycle, got %d", len(result.Snapshot.RepairCycles))
+	}
+	cycle := result.Snapshot.RepairCycles[0]
+	if len(cycle.TriggerFindingIDs) != 1 || cycle.TriggerFindingIDs[0] != "finding-77" {
+		t.Fatalf("expected repair cycle to reference finding-77, got %#v", cycle.TriggerFindingIDs)
+	}
+	if cycle.Status != "completed" {
+		t.Fatalf("expected completed repair cycle after passing review, got %q", cycle.Status)
+	}
+	if result.Snapshot.ReviewAttempts != 2 {
+		t.Fatalf("expected 2 review attempts (initial + post-repair), got %d", result.Snapshot.ReviewAttempts)
+	}
+	if len(adapter.WorkerRequests()) != 2 {
+		t.Fatalf("expected 2 worker requests (implement + repair), got %d", len(adapter.WorkerRequests()))
+	}
+	// The repair worker's prompt must include the triggering finding id so
+	// the worker can act on it without rerunning the whole ticket.
+	repairPrompt := adapter.WorkerRequests()[1].Instructions
+	if !strings.Contains(repairPrompt, "finding-77") {
+		t.Fatalf("expected repair worker prompt to reference finding id, got:\n%s", repairPrompt)
+	}
+	if !strings.Contains(repairPrompt, "docs contradict each other") {
+		t.Fatalf("expected repair worker prompt to include the finding title, got:\n%s", repairPrompt)
+	}
+}
+
+// TestRunTicket_ExhaustedReviewRepairBlocksWithActionableReason exercises
+// ver-amsh AC1+AC5: when a finding survives repair cycles past the policy
+// budget, the ticket must transition to blocked with a reason that cites the
+// canonical non-convergent prefix, the unresolved finding id, and a suggested
+// next action (operator input) so the blocker is actionable.
+func TestRunTicket_ExhaustedReviewRepairBlocksWithActionableReason(t *testing.T) {
+	repoRoot := t.TempDir()
+	cfg := policy.DefaultConfig()
+	cfg.Policy.MaxRepairCycles = 1
+	ticket := testTicket("ver-review-exhaust")
+	plan, claim := testPlanAndClaim(t, repoRoot, ticket, cfg, "run-review-exhaust", "lease-review-exhaust", []string{`true`})
+
+	started, finished := testRunTimes()
+	persistent := runtime.ReviewFinding{
+		ID:          "finding-stuck",
+		Severity:    runtime.SeverityP1,
+		Title:       "high severity cannot be repaired",
+		Body:        "requires operator decision about schema migration.",
+		File:        "internal/engine/example.go",
+		Line:        10,
+		Disposition: runtime.ReviewDispositionOpen,
+	}
+	adapter := runtimefake.New(
+		[]runtime.WorkerResult{
+			{
+				Status:             runtime.WorkerStatusDone,
+				RetryClass:         runtime.RetryClassTerminal,
+				LeaseID:            claim.LeaseID,
+				StartedAt:          started,
+				FinishedAt:         finished,
+				ResultArtifactPath: filepath.Join(repoRoot, "worker-1.json"),
+			},
+			{
+				Status:             runtime.WorkerStatusDone,
+				RetryClass:         runtime.RetryClassTerminal,
+				LeaseID:            claim.LeaseID,
+				StartedAt:          finished.Add(3 * time.Second),
+				FinishedAt:         finished.Add(4 * time.Second),
+				ResultArtifactPath: filepath.Join(repoRoot, "worker-2.json"),
+			},
+		},
+		[]runtime.ReviewResult{
+			{
+				Status:             runtime.WorkerStatusDone,
+				RetryClass:         runtime.RetryClassTerminal,
+				LeaseID:            claim.LeaseID,
+				StartedAt:          finished.Add(5 * time.Second),
+				FinishedAt:         finished.Add(6 * time.Second),
+				ReviewStatus:       runtime.ReviewStatusFindings,
+				Summary:            "needs repair",
+				Findings:           []runtime.ReviewFinding{persistent},
+				ResultArtifactPath: filepath.Join(repoRoot, "review-1.json"),
+			},
+			{
+				Status:             runtime.WorkerStatusDone,
+				RetryClass:         runtime.RetryClassTerminal,
+				LeaseID:            claim.LeaseID,
+				StartedAt:          finished.Add(7 * time.Second),
+				FinishedAt:         finished.Add(8 * time.Second),
+				ReviewStatus:       runtime.ReviewStatusFindings,
+				Summary:            "still blocked",
+				Findings:           []runtime.ReviewFinding{persistent},
+				ResultArtifactPath: filepath.Join(repoRoot, "review-2.json"),
+			},
+		},
+	)
+
+	result, err := RunTicket(context.Background(), RunTicketRequest{
+		RepoRoot: repoRoot,
+		RunID:    "run-review-exhaust",
+		Ticket:   ticket,
+		Plan:     plan,
+		Claim:    claim,
+		Adapter:  adapter,
+		Config:   cfg,
+	})
+	if err != nil {
+		t.Fatalf("RunTicket returned error: %v", err)
+	}
+	if result.Snapshot.CurrentPhase != state.TicketPhaseBlocked {
+		t.Fatalf("expected blocked phase after repair budget exhausted, got %q", result.Snapshot.CurrentPhase)
+	}
+	for _, phrase := range []string{
+		string(state.EscalationNonConvergentReview),
+		"repair limit reached",
+		"finding-stuck",
+		"operator input required",
+	} {
+		if !strings.Contains(result.Snapshot.BlockReason, phrase) {
+			t.Fatalf("expected block reason to contain %q, got %q", phrase, result.Snapshot.BlockReason)
+		}
+	}
+	if len(result.Snapshot.RepairCycles) != 2 {
+		t.Fatalf("expected 2 repair cycles, got %d", len(result.Snapshot.RepairCycles))
+	}
+	last := result.Snapshot.RepairCycles[len(result.Snapshot.RepairCycles)-1]
+	if last.Status != "blocked" {
+		t.Fatalf("expected last repair cycle to be blocked, got %q", last.Status)
+	}
+	if last.PolicyLimitReached == nil {
+		t.Fatalf("expected PolicyLimitReached to be set on exhausted repair cycle")
+	}
+	if last.PolicyLimitReached.Name != "max_repair_cycles" {
+		t.Fatalf("expected max_repair_cycles limit name, got %q", last.PolicyLimitReached.Name)
+	}
+	if len(last.TriggerFindingIDs) != 1 || last.TriggerFindingIDs[0] != "finding-stuck" {
+		t.Fatalf("expected last cycle to reference finding-stuck, got %#v", last.TriggerFindingIDs)
+	}
+}
+
+// TestRunTicket_LowSeverityFindingDoesNotBlock exercises ver-amsh AC1+AC4:
+// a reviewer finding whose severity is below the configured threshold must
+// not trigger a repair cycle and must not prevent closure. The finding still
+// round-trips through the review artifact so it stays visible to operators.
+func TestRunTicket_LowSeverityFindingDoesNotBlock(t *testing.T) {
+	repoRoot := t.TempDir()
+	cfg := policy.DefaultConfig() // default threshold is P2
+	ticket := testTicket("ver-low-sev")
+	plan, claim := testPlanAndClaim(t, repoRoot, ticket, cfg, "run-low-sev", "lease-low-sev", []string{`true`})
+
+	started, finished := testRunTimes()
+	lowFinding := runtime.ReviewFinding{
+		ID:          "finding-nit",
+		Severity:    runtime.SeverityP3,
+		Title:       "minor style nit",
+		Body:        "consider renaming `foo` to something more descriptive.",
+		File:        "internal/example.go",
+		Line:        5,
+		Disposition: runtime.ReviewDispositionOpen,
+	}
+	adapter := runtimefake.New(
+		[]runtime.WorkerResult{
+			{
+				Status:             runtime.WorkerStatusDone,
+				RetryClass:         runtime.RetryClassTerminal,
+				LeaseID:            claim.LeaseID,
+				StartedAt:          started,
+				FinishedAt:         finished,
+				ResultArtifactPath: filepath.Join(repoRoot, "worker.json"),
+			},
+		},
+		[]runtime.ReviewResult{
+			{
+				Status:             runtime.WorkerStatusDone,
+				RetryClass:         runtime.RetryClassTerminal,
+				LeaseID:            claim.LeaseID,
+				StartedAt:          finished.Add(time.Second),
+				FinishedAt:         finished.Add(2 * time.Second),
+				ReviewStatus:       runtime.ReviewStatusPassed, // below-threshold → derived status is passed
+				Summary:            "only style nits remain",
+				Findings:           []runtime.ReviewFinding{lowFinding},
+				ResultArtifactPath: filepath.Join(repoRoot, "review.json"),
+			},
+		},
+	)
+
+	result, err := RunTicket(context.Background(), RunTicketRequest{
+		RepoRoot: repoRoot,
+		RunID:    "run-low-sev",
+		Ticket:   ticket,
+		Plan:     plan,
+		Claim:    claim,
+		Adapter:  adapter,
+		Config:   cfg,
+	})
+	if err != nil {
+		t.Fatalf("RunTicket returned error: %v", err)
+	}
+	if result.Snapshot.CurrentPhase != state.TicketPhaseClosed {
+		t.Fatalf("expected closed phase with below-threshold finding, got %q (block=%q)",
+			result.Snapshot.CurrentPhase, result.Snapshot.BlockReason)
+	}
+	if len(result.Snapshot.RepairCycles) != 0 {
+		t.Fatalf("expected no repair cycles for below-threshold finding, got %d", len(result.Snapshot.RepairCycles))
+	}
+	if result.Snapshot.Review == nil {
+		t.Fatalf("expected review artifact on snapshot")
+	}
+	if len(result.Snapshot.Review.Findings) != 1 || result.Snapshot.Review.Findings[0].ID != "finding-nit" {
+		t.Fatalf("expected finding-nit recorded on review artifact, got %#v", result.Snapshot.Review.Findings)
+	}
+	if !result.Snapshot.Review.Passed {
+		t.Fatalf("expected review.Passed=true for below-threshold finding, got false")
+	}
+	if len(result.Snapshot.Review.BlockingFindings) != 0 {
+		t.Fatalf("expected no blocking findings, got %#v", result.Snapshot.Review.BlockingFindings)
+	}
+}
+
+// TestBuildReviewRepairBlockReason_IncludesFindingIDsAndNextAction guards the
+// canonical shape of the review-repair exhaustion block reason. Operators rely
+// on this string to know which findings stalled the ticket and what to do next
+// (ver-amsh AC2+AC5).
+func TestBuildReviewRepairBlockReason_IncludesFindingIDsAndNextAction(t *testing.T) {
+	reason := buildReviewRepairBlockReason(3, []string{"finding-1", "finding-2"})
+	for _, phrase := range []string{
+		string(state.EscalationNonConvergentReview),
+		"repair limit reached after 3 cycle(s)",
+		"finding-1",
+		"finding-2",
+		"operator input required",
+	} {
+		if !strings.Contains(reason, phrase) {
+			t.Fatalf("expected reason to contain %q, got %q", phrase, reason)
+		}
+	}
+}
+
+// TestBuildReviewRepairBlockReason_EmptyFindingIDs verifies the helper still
+// emits an actionable suggestion when the engine could not attribute the
+// exhaustion to specific finding ids (AC5).
+func TestBuildReviewRepairBlockReason_EmptyFindingIDs(t *testing.T) {
+	reason := buildReviewRepairBlockReason(2, nil)
+	if !strings.Contains(reason, "operator input required") {
+		t.Fatalf("expected operator-input next-action even without finding ids, got %q", reason)
+	}
+	if strings.Contains(reason, "unresolved findings:") {
+		t.Fatalf("expected no unresolved-findings tail when list is empty, got %q", reason)
+	}
+}
+
+// TestRunTicket_WorkerRequestIncludesRoleProfile covers ver-laq2 test case 6:
+// the engine must forward the configured role profile fields (runtime, model,
+// reasoning) to the adapter via WorkerRequest and ReviewRequest so that CLI
+// adapters can pass them to their underlying tools. The implementation and
+// review artifacts must also record the profile so runs are auditable.
+func TestRunTicket_WorkerRequestIncludesRoleProfile(t *testing.T) {
+	repoRoot := t.TempDir()
+	cfg := policy.DefaultConfig()
+	// DefaultConfig sets Worker={claude/sonnet/high}, Reviewer={claude/opus/xhigh}.
+	ticket := testTicket("ver-role-profile")
+	plan, claim := testPlanAndClaim(t, repoRoot, ticket, cfg, "run-role-profile", "lease-role-profile", []string{`true`})
+
+	started, finished := testRunTimes()
+	adapter := runtimefake.New(
+		[]runtime.WorkerResult{
+			{
+				Status:             runtime.WorkerStatusDone,
+				RetryClass:         runtime.RetryClassTerminal,
+				LeaseID:            claim.LeaseID,
+				StartedAt:          started,
+				FinishedAt:         finished,
+				ResultArtifactPath: filepath.Join(repoRoot, "worker.json"),
+			},
+		},
+		[]runtime.ReviewResult{
+			{
+				Status:             runtime.WorkerStatusDone,
+				RetryClass:         runtime.RetryClassTerminal,
+				LeaseID:            claim.LeaseID,
+				StartedAt:          finished.Add(time.Second),
+				FinishedAt:         finished.Add(2 * time.Second),
+				ReviewStatus:       runtime.ReviewStatusPassed,
+				Summary:            "clean",
+				ResultArtifactPath: filepath.Join(repoRoot, "review.json"),
+			},
+		},
+	)
+
+	result, err := RunTicket(context.Background(), RunTicketRequest{
+		RepoRoot: repoRoot,
+		RunID:    "run-role-profile",
+		Ticket:   ticket,
+		Plan:     plan,
+		Claim:    claim,
+		Adapter:  adapter,
+		Config:   cfg,
+	})
+	if err != nil {
+		t.Fatalf("RunTicket returned error: %v", err)
+	}
+	if result.Snapshot.CurrentPhase != state.TicketPhaseClosed {
+		t.Fatalf("expected closed phase, got %q", result.Snapshot.CurrentPhase)
+	}
+
+	// Verify the worker request carried the configured worker profile.
+	workerReqs := adapter.WorkerRequests()
+	if len(workerReqs) != 1 {
+		t.Fatalf("expected 1 worker request, got %d", len(workerReqs))
+	}
+	if got := workerReqs[0].Runtime; got != "claude" {
+		t.Errorf("worker request: want Runtime %q, got %q", "claude", got)
+	}
+	if got := workerReqs[0].Model; got != "sonnet" {
+		t.Errorf("worker request: want Model %q, got %q", "sonnet", got)
+	}
+	if got := workerReqs[0].Reasoning; got != "high" {
+		t.Errorf("worker request: want Reasoning %q, got %q", "high", got)
+	}
+	if got := workerReqs[0].FallbackReason; got != "" {
+		t.Errorf("worker request: expected empty FallbackReason on primary attempt, got %q", got)
+	}
+
+	// Verify the reviewer request carried the configured reviewer profile.
+	reviewReqs := adapter.ReviewRequests()
+	if len(reviewReqs) != 1 {
+		t.Fatalf("expected 1 review request, got %d", len(reviewReqs))
+	}
+	if got := reviewReqs[0].Runtime; got != "claude" {
+		t.Errorf("review request: want Runtime %q, got %q", "claude", got)
+	}
+	if got := reviewReqs[0].Model; got != "opus" {
+		t.Errorf("review request: want Model %q, got %q", "opus", got)
+	}
+	if got := reviewReqs[0].Reasoning; got != "xhigh" {
+		t.Errorf("review request: want Reasoning %q, got %q", "xhigh", got)
+	}
+	if got := reviewReqs[0].FallbackReason; got != "" {
+		t.Errorf("review request: expected empty FallbackReason on primary attempt, got %q", got)
+	}
+
+	// Verify the implementation artifact records the worker profile.
+	impl := result.Snapshot.Implementation
+	if impl == nil {
+		t.Fatal("expected implementation artifact, got nil")
+	}
+	if impl.Runtime != "claude" {
+		t.Errorf("implementation artifact: want Runtime %q, got %q", "claude", impl.Runtime)
+	}
+	if impl.Model != "sonnet" {
+		t.Errorf("implementation artifact: want Model %q, got %q", "sonnet", impl.Model)
+	}
+	if impl.Reasoning != "high" {
+		t.Errorf("implementation artifact: want Reasoning %q, got %q", "high", impl.Reasoning)
+	}
+	if impl.FallbackReason != "" {
+		t.Errorf("implementation artifact: expected empty FallbackReason, got %q", impl.FallbackReason)
+	}
+
+	// Verify the review artifact records the reviewer profile.
+	rev := result.Snapshot.Review
+	if rev == nil {
+		t.Fatal("expected review artifact, got nil")
+	}
+	if rev.ReviewerRuntime != "claude" {
+		t.Errorf("review artifact: want ReviewerRuntime %q, got %q", "claude", rev.ReviewerRuntime)
+	}
+	if rev.ReviewerModel != "opus" {
+		t.Errorf("review artifact: want ReviewerModel %q, got %q", "opus", rev.ReviewerModel)
+	}
+	if rev.ReviewerReasoning != "xhigh" {
+		t.Errorf("review artifact: want ReviewerReasoning %q, got %q", "xhigh", rev.ReviewerReasoning)
+	}
+	if rev.FallbackReason != "" {
+		t.Errorf("review artifact: expected empty FallbackReason, got %q", rev.FallbackReason)
+	}
+}
+
+// TestRunTicket_FallbackProfileUsedOnRetry covers ver-laq2 test case 9:
+// when the primary worker profile returns a retryable failure the retry must
+// switch to the configured WorkerFallback profile, and the implementation
+// artifact must record the fallback model/reasoning/fallback_reason so the
+// audit trail is accurate even when the primary profile was not the one that
+// ultimately produced the result.
+func TestRunTicket_FallbackProfileUsedOnRetry(t *testing.T) {
+	repoRoot := t.TempDir()
+	cfg := policy.DefaultConfig()
+	cfg.Runtime.WorkerFallback = policy.RoleProfile{
+		Runtime:   "claude",
+		Model:     "haiku",
+		Reasoning: "low",
+	}
+	ticket := testTicket("ver-fallback-retry")
+	plan, claim := testPlanAndClaim(t, repoRoot, ticket, cfg, "run-fallback-retry", "lease-fallback-retry", []string{`true`})
+
+	started, finished := testRunTimes()
+	adapter := runtimefake.New(
+		[]runtime.WorkerResult{
+			// First attempt uses the primary profile and returns retryable.
+			{
+				Status:             runtime.WorkerStatusBlocked,
+				RetryClass:         runtime.RetryClassRetryable,
+				LeaseID:            claim.LeaseID,
+				StartedAt:          started,
+				FinishedAt:         finished,
+				ResultArtifactPath: filepath.Join(repoRoot, "worker-1.json"),
+			},
+			// Second attempt (fallback) succeeds.
+			{
+				Status:             runtime.WorkerStatusDone,
+				RetryClass:         runtime.RetryClassTerminal,
+				LeaseID:            claim.LeaseID,
+				StartedAt:          finished.Add(time.Second),
+				FinishedAt:         finished.Add(2 * time.Second),
+				ResultArtifactPath: filepath.Join(repoRoot, "worker-2.json"),
+			},
+		},
+		[]runtime.ReviewResult{
+			{
+				Status:             runtime.WorkerStatusDone,
+				RetryClass:         runtime.RetryClassTerminal,
+				LeaseID:            claim.LeaseID,
+				StartedAt:          finished.Add(3 * time.Second),
+				FinishedAt:         finished.Add(4 * time.Second),
+				ReviewStatus:       runtime.ReviewStatusPassed,
+				Summary:            "clean",
+				ResultArtifactPath: filepath.Join(repoRoot, "review.json"),
+			},
+		},
+	)
+
+	result, err := RunTicket(context.Background(), RunTicketRequest{
+		RepoRoot: repoRoot,
+		RunID:    "run-fallback-retry",
+		Ticket:   ticket,
+		Plan:     plan,
+		Claim:    claim,
+		Adapter:  adapter,
+		Config:   cfg,
+	})
+	if err != nil {
+		t.Fatalf("RunTicket returned error: %v", err)
+	}
+	if result.Snapshot.CurrentPhase != state.TicketPhaseClosed {
+		t.Fatalf("expected closed phase, got %q", result.Snapshot.CurrentPhase)
+	}
+
+	workerReqs := adapter.WorkerRequests()
+	if len(workerReqs) != 2 {
+		t.Fatalf("expected 2 worker requests (primary + fallback retry), got %d", len(workerReqs))
+	}
+
+	// First request must use the primary (sonnet) profile with no fallback reason.
+	if got := workerReqs[0].Model; got != "sonnet" {
+		t.Errorf("attempt 1: want primary Model %q, got %q", "sonnet", got)
+	}
+	if got := workerReqs[0].FallbackReason; got != "" {
+		t.Errorf("attempt 1: expected empty FallbackReason on primary attempt, got %q", got)
+	}
+
+	// Second request must use the fallback (haiku) profile with a non-empty fallback reason.
+	if got := workerReqs[1].Model; got != "haiku" {
+		t.Errorf("attempt 2: want fallback Model %q, got %q", "haiku", got)
+	}
+	if got := workerReqs[1].Reasoning; got != "low" {
+		t.Errorf("attempt 2: want fallback Reasoning %q, got %q", "low", got)
+	}
+	if got := workerReqs[1].FallbackReason; got == "" {
+		t.Error("attempt 2: expected non-empty FallbackReason on fallback attempt")
+	}
+
+	// The implementation artifact must reflect the fallback profile that
+	// produced the successful result, not the primary profile.
+	impl := result.Snapshot.Implementation
+	if impl == nil {
+		t.Fatal("expected implementation artifact, got nil")
+	}
+	if impl.Model != "haiku" {
+		t.Errorf("implementation artifact: want fallback Model %q, got %q", "haiku", impl.Model)
+	}
+	if impl.Reasoning != "low" {
+		t.Errorf("implementation artifact: want fallback Reasoning %q, got %q", "low", impl.Reasoning)
+	}
+	if impl.FallbackReason == "" {
+		t.Error("implementation artifact: expected non-empty FallbackReason when fallback was used")
+	}
+}
+
+// TestRunTicket_VerifyBudgetExhaustedBlocks verifies that when the
+// MaxImplementationAttempts limit is reached after repeated verification
+// failures, the ticket transitions to blocked with a clear reason that cites
+// the non-convergent verification prefix and the number of attempts.
+// This is an end-to-end regression test for AC5 (ticket ver-1qru): the
+// ticket must block with a clear reason only after repair budget is exhausted.
+func TestRunTicket_VerifyBudgetExhaustedBlocks(t *testing.T) {
+	repoRoot := t.TempDir()
+	cfg := policy.DefaultConfig()
+	cfg.Policy.MaxImplementationAttempts = 2
+	ticket := testTicket("ver-verify-budget")
+	// Use a command that always fails so verification never passes.
+	plan, claim := testPlanAndClaim(t, repoRoot, ticket, cfg, "run-verify-budget", "lease-verify-budget", []string{`false`})
+
+	started, finished := testRunTimes()
+	adapter := runtimefake.New(
+		[]runtime.WorkerResult{
+			{
+				Status:             runtime.WorkerStatusDone,
+				RetryClass:         runtime.RetryClassTerminal,
+				LeaseID:            claim.LeaseID,
+				StartedAt:          started,
+				FinishedAt:         finished,
+				ResultArtifactPath: filepath.Join(repoRoot, "worker-1.json"),
+			},
+			{
+				Status:             runtime.WorkerStatusDone,
+				RetryClass:         runtime.RetryClassTerminal,
+				LeaseID:            claim.LeaseID,
+				StartedAt:          finished.Add(3 * time.Second),
+				FinishedAt:         finished.Add(4 * time.Second),
+				ResultArtifactPath: filepath.Join(repoRoot, "worker-2.json"),
+			},
+		},
+		nil, // verification never passes, no review reached
+	)
+
+	result, err := RunTicket(context.Background(), RunTicketRequest{
+		RepoRoot: repoRoot,
+		RunID:    "run-verify-budget",
+		Ticket:   ticket,
+		Plan:     plan,
+		Claim:    claim,
+		Adapter:  adapter,
+		Config:   cfg,
+	})
+	if err != nil {
+		t.Fatalf("RunTicket returned error: %v", err)
+	}
+
+	// AC5: the ticket must block, not close.
+	if result.Snapshot.CurrentPhase != state.TicketPhaseBlocked {
+		t.Fatalf("expected blocked phase after budget exhausted, got %q", result.Snapshot.CurrentPhase)
+	}
+	// AC5: block reason must be clear and cite the canonical non-convergent prefix.
+	if !strings.Contains(result.Snapshot.BlockReason, string(state.EscalationNonConvergentVerification)) {
+		t.Fatalf("expected non-convergent verification prefix in block reason, got %q", result.Snapshot.BlockReason)
+	}
+	if !strings.Contains(result.Snapshot.BlockReason, "2 attempt") {
+		t.Fatalf("expected attempt count in block reason, got %q", result.Snapshot.BlockReason)
+	}
+	// AC7: repair limit must be persisted in the coverage artifact.
+	if result.Snapshot.Verification == nil {
+		t.Fatal("expected verification artifact to be present")
+	}
+	if result.Snapshot.Verification.ValidationCoverage == nil {
+		t.Fatal("expected validation coverage to be present on verification artifact")
+	}
+	limit := result.Snapshot.Verification.ValidationCoverage.RepairLimit
+	if limit == nil {
+		t.Fatal("expected ValidationRepairLimit to be recorded on coverage after budget exhaustion")
+	}
+	if limit.Name != "max_implementation_attempts" {
+		t.Fatalf("expected repair limit name max_implementation_attempts, got %q", limit.Name)
+	}
+	if limit.Limit != 2 || limit.Reached != 2 {
+		t.Fatalf("expected limit=2 reached=2, got limit=%d reached=%d", limit.Limit, limit.Reached)
+	}
+	// AC6: existing behavior compatible — 2 worker requests, 0 review requests.
+	if len(adapter.WorkerRequests()) != 2 {
+		t.Fatalf("expected 2 worker requests, got %d", len(adapter.WorkerRequests()))
+	}
+	if len(adapter.ReviewRequests()) != 0 {
+		t.Fatalf("expected 0 review requests (verify never passed), got %d", len(adapter.ReviewRequests()))
+	}
+}
+
+// TestBuildImplementPhaseInstructions_FirstAttemptUnchanged verifies that the
+// first attempt (no repair cycles) returns the same instructions as
+// renderImplementInstructions so the existing behavior is preserved (AC6).
+func TestBuildImplementPhaseInstructions_FirstAttemptUnchanged(t *testing.T) {
+	plan := state.PlanArtifact{
+		ArtifactMeta:             state.ArtifactMeta{RunID: "run-first"},
+		TicketID:                 "ver-first",
+		Title:                    "Test ticket",
+		Description:              "Description here.",
+		AcceptanceCriteria:       []string{"criterion one"},
+		ValidationCommands:       []string{"go test ./..."},
+		EffectiveReviewThreshold: state.SeverityP2,
+	}
+	st := &ticketRunState{
+		req:          RunTicketRequest{Plan: plan},
+		currentPhase: state.TicketPhaseImplement,
+	}
+
+	got := buildImplementPhaseInstructions(st, 1)
+	want := renderImplementInstructions(plan, state.TicketPhaseImplement, 1)
+	if got != want {
+		t.Fatalf("expected first-attempt instructions to be identical to renderImplementInstructions output")
+	}
+}
+
+// TestBuildImplementPhaseInstructions_RetryIncludesVerificationRepairContext
+// verifies that when a retry is triggered by failing verification checks, the
+// implement instructions include the prior verification summary and the
+// specific failing check details. This ensures the worker gets focused repair
+// context rather than a generic retry note (AC2, AC3 for ticket ver-1qru).
+func TestBuildImplementPhaseInstructions_RetryIncludesVerificationRepairContext(t *testing.T) {
+	plan := state.PlanArtifact{
+		ArtifactMeta:             state.ArtifactMeta{RunID: "run-repair-ctx"},
+		TicketID:                 "ver-repair-ctx",
+		EffectiveReviewThreshold: state.SeverityP2,
+	}
+
+	const failingCheckID = "check-derived-ruff"
+	const failingCmd = "ruff check src/app.py"
+
+	verification := &state.VerificationArtifact{
+		ArtifactMeta: state.ArtifactMeta{RunID: "run-repair-ctx"},
+		TicketID:     "ver-repair-ctx",
+		Attempt:      1,
+		Passed:       false,
+		Results: []state.VerificationResult{
+			{Command: failingCmd, ExitCode: 1, Passed: false},
+		},
+		ValidationCoverage: &state.ValidationCoverageArtifact{
+			ArtifactMeta: state.ArtifactMeta{RunID: "run-repair-ctx"},
+			Scope:        state.ValidationScopeTicket,
+			TicketID:     "ver-repair-ctx",
+			DerivedChecks: []state.ValidationCheck{{
+				ID:           failingCheckID,
+				Scope:        state.ValidationScopeTicket,
+				Source:       state.ValidationCheckSourceDerived,
+				Command:      failingCmd,
+				Reason:       "ruff check for changed Python files",
+				MatchedFiles: []string{"src/app.py"},
+				TicketID:     "ver-repair-ctx",
+				Advisory:     true,
+			}},
+			ExecutedChecks: []state.ValidationCheckExecution{{
+				CheckID:  failingCheckID,
+				Result:   state.ValidationCheckResultFailed,
+				ExitCode: 1,
+				Attempt:  1,
+			}},
+		},
+	}
+
+	repairCycle := state.RepairCycleArtifact{
+		TicketID:        "ver-repair-ctx",
+		Cycle:           1,
+		TriggerCheckIDs: []string{failingCheckID},
+		Status:          "repair_pending",
+		Scope:           state.ValidationScopeTicket,
+	}
+
+	st := &ticketRunState{
+		req: RunTicketRequest{
+			Plan: plan,
+		},
+		currentPhase: state.TicketPhaseImplement,
+		verification: verification,
+		repairCycles: []state.RepairCycleArtifact{repairCycle},
+		implementation: &state.ImplementationArtifact{
+			TicketID:     "ver-repair-ctx",
+			ChangedFiles: []string{"src/app.py"},
+		},
+	}
+
+	instructions := buildImplementPhaseInstructions(st, 2)
+
+	// The retry instructions must mention the failing command.
+	if !strings.Contains(instructions, failingCmd) {
+		t.Fatalf("expected retry instructions to include failing command %q, got:\n%s", failingCmd, instructions)
+	}
+	// The instructions must reference the matched file that triggered the check.
+	if !strings.Contains(instructions, "src/app.py") {
+		t.Fatalf("expected retry instructions to include matched file, got:\n%s", instructions)
+	}
+	// The instructions must include a "Checks to Fix" or similar section.
+	if !strings.Contains(instructions, "Checks to Fix") {
+		t.Fatalf("expected 'Checks to Fix' section in retry instructions, got:\n%s", instructions)
+	}
+	// Prior verification summary must be present (shows which commands failed).
+	if !strings.Contains(instructions, "Prior Verification") {
+		t.Fatalf("expected 'Prior Verification' section in retry instructions, got:\n%s", instructions)
+	}
+	// Changed files section must be present.
+	if !strings.Contains(instructions, "Changed Files") {
+		t.Fatalf("expected 'Changed Files' section in retry instructions, got:\n%s", instructions)
+	}
+	// The base attempt number must still be present.
+	if !strings.Contains(instructions, "Attempt:") {
+		t.Fatalf("expected 'Attempt:' field in retry instructions, got:\n%s", instructions)
+	}
+}
+
+// TestBuildImplementPhaseInstructions_RetryWithoutVerificationCyclesUnchanged
+// verifies that a retry with NO verification repair cycles returns the same
+// output as the base renderImplementInstructions. This covers the case where
+// a retry is needed but not triggered by failing derived/declared checks
+// (e.g. a worker crash retry before any verification ran).
+func TestBuildImplementPhaseInstructions_RetryWithoutVerificationCyclesUnchanged(t *testing.T) {
+	plan := state.PlanArtifact{
+		ArtifactMeta:             state.ArtifactMeta{RunID: "run-no-cycles"},
+		TicketID:                 "ver-no-cycles",
+		EffectiveReviewThreshold: state.SeverityP2,
+	}
+	st := &ticketRunState{
+		req:          RunTicketRequest{Plan: plan},
+		currentPhase: state.TicketPhaseImplement,
+		repairCycles: []state.RepairCycleArtifact{
+			// Only review-triggered cycle (TriggerFindingIDs), no check IDs.
+			{
+				TicketID:          "ver-no-cycles",
+				Cycle:             1,
+				TriggerFindingIDs: []string{"finding-1"},
+				Status:            "completed",
+			},
+		},
+	}
+
+	got := buildImplementPhaseInstructions(st, 2)
+	want := renderImplementInstructions(plan, state.TicketPhaseImplement, 2)
+	if got != want {
+		t.Fatalf("expected retry with only review cycles to return base instructions unchanged")
 	}
 }

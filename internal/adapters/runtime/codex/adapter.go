@@ -1,6 +1,7 @@
 package codex
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/sha256"
@@ -12,8 +13,8 @@ import (
 	"os/exec"
 	"strings"
 	"time"
-
 	"verk/internal/adapters/runtime"
+	"verk/internal/state"
 )
 
 const (
@@ -115,6 +116,7 @@ func (a *Adapter) RunWorker(ctx context.Context, req runtime.WorkerRequest) (run
 		StartedAt:      startedAt,
 		FinishedAt:     finishedAt,
 	}
+	result.TokenUsage, result.ActivityStats = extractCodexTelemetry(execResult.stdout)
 
 	result.StdoutPath, err = writeBytesArtifact(runtimeName+"-worker-stdout", execResult.stdout)
 	if err != nil {
@@ -188,6 +190,7 @@ func (a *Adapter) RunReviewer(ctx context.Context, req runtime.ReviewRequest) (r
 		Summary:        extractReviewSummary(reviewBlock, blockFound),
 		Findings:       findings,
 	}
+	normalized.TokenUsage, normalized.ActivityStats = extractCodexTelemetry(execResult.stdout)
 
 	if err := checkReviewStatusContradiction(reviewBlock, blockFound, normalized.ReviewStatus); err != nil {
 		return runtime.ReviewResult{}, err
@@ -230,6 +233,59 @@ func (a *Adapter) RunReviewer(ctx context.Context, req runtime.ReviewRequest) (r
 	return normalized, nil
 }
 
+func extractCodexTelemetry(stdout []byte) (*state.RuntimeTokenUsage, *state.RuntimeActivityStats) {
+	scanner := bufio.NewScanner(bytes.NewReader(stdout))
+	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	stats := &state.RuntimeActivityStats{}
+	usage := &state.RuntimeTokenUsage{}
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+		var event struct {
+			Type string `json:"type"`
+			Item struct {
+				Type string `json:"type"`
+			} `json:"item"`
+			Usage struct {
+				InputTokens       int64 `json:"input_tokens"`
+				CachedInputTokens int64 `json:"cached_input_tokens"`
+				OutputTokens      int64 `json:"output_tokens"`
+				TotalTokens       int64 `json:"total_tokens"`
+			} `json:"usage"`
+		}
+		if err := json.Unmarshal([]byte(line), &event); err != nil || event.Type == "" {
+			continue
+		}
+		stats.EventCount++
+		if event.Type == "item.completed" {
+			switch event.Item.Type {
+			case "command_execution":
+				stats.CommandCount++
+			case "agent_message":
+				stats.AgentMessageCount++
+			}
+		}
+		if event.Type == "turn.completed" {
+			usage.InputTokens += event.Usage.InputTokens
+			usage.CachedInputTokens += event.Usage.CachedInputTokens
+			usage.OutputTokens += event.Usage.OutputTokens
+			usage.TotalTokens += event.Usage.TotalTokens
+		}
+	}
+	if usage.TotalTokens == 0 && (usage.InputTokens != 0 || usage.OutputTokens != 0) {
+		usage.TotalTokens = usage.InputTokens + usage.OutputTokens
+	}
+	if usage.InputTokens == 0 && usage.CachedInputTokens == 0 && usage.OutputTokens == 0 && usage.TotalTokens == 0 {
+		usage = nil
+	}
+	if stats.EventCount == 0 {
+		stats = nil
+	}
+	return usage, stats
+}
+
 func (a *Adapter) binary() string {
 	if strings.TrimSpace(a.Command) == "" {
 		return defaultBinary
@@ -256,14 +312,21 @@ func validateReviewRequest(req runtime.ReviewRequest) error {
 
 // buildWorkerArgs constructs CLI args for `codex exec`.
 // Codex takes the prompt as a positional argument and writes output to stdout.
+//
+// Role profile mapping: Codex CLI supports `--model <name>` for model
+// selection and `-c model_reasoning_effort=<level>` for reasoning effort.
+// Both are appended only when the role profile set them, so configs that
+// omit either field fall back to Codex's built-in defaults.
 func buildWorkerArgs(req runtime.WorkerRequest, prompt string) []string {
 	args := []string{
 		"exec",
 		"--json",
 		"--full-auto",
 	}
+	args = appendModelArgs(args, req.Model)
+	args = appendReasoningArgs(args, req.Reasoning)
 	if req.WorktreePath != "" {
-		args = append(args, "--cwd", req.WorktreePath)
+		args = append(args, "-C", req.WorktreePath)
 	}
 	args = append(args, prompt)
 	return args
@@ -271,13 +334,40 @@ func buildWorkerArgs(req runtime.WorkerRequest, prompt string) []string {
 
 // buildReviewArgs constructs CLI args for `codex exec` in review mode.
 func buildReviewArgs(req runtime.ReviewRequest, prompt string) []string {
-	args := []string{
+	args := make([]string, 0, 8)
+	args = append(args,
 		"exec",
 		"--json",
 		"--full-auto",
-	}
+	)
+	args = appendModelArgs(args, req.Model)
+	args = appendReasoningArgs(args, req.Reasoning)
 	args = append(args, prompt)
 	return args
+}
+
+// appendModelArgs adds `--model <name>` to a Codex args list when the role
+// profile selected a model. Trimmed empty values are skipped so a missing
+// profile does not override Codex's own default.
+func appendModelArgs(args []string, model string) []string {
+	model = strings.TrimSpace(model)
+	if model == "" {
+		return args
+	}
+	return append(args, "--model", model)
+}
+
+// appendReasoningArgs adds `-c model_reasoning_effort=<level>` to a Codex
+// args list when the role profile selected a reasoning level. The value is
+// quoted via a key=value tuple as Codex expects; unsupported levels are
+// rejected by the Codex CLI itself, surfacing as a non-zero exit that the
+// worker/review pipeline classifies via standard stderr handling.
+func appendReasoningArgs(args []string, reasoning string) []string {
+	reasoning = strings.TrimSpace(reasoning)
+	if reasoning == "" {
+		return args
+	}
+	return append(args, "-c", "model_reasoning_effort="+reasoning)
 }
 
 // --- Status derivation from verk protocol blocks ---
@@ -581,18 +671,28 @@ func defaultRunCommand(ctx context.Context, binary string, args []string, stdin 
 		ctx, cancel = context.WithTimeout(ctx, timeout)
 		defer cancel()
 	}
+	binary, err := runtime.ValidatedExecutable(binary)
+	if err != nil {
+		return commandResult{}, err
+	}
+	// Runtime executable is validated above, and exec.Command does not invoke a
+	// shell; arguments are passed as argv entries.
+	// nosemgrep: go.lang.security.audit.dangerous-exec-command.dangerous-exec-command
 	cmd := exec.CommandContext(ctx, binary, args...)
 	if len(stdin) > 0 {
 		cmd.Stdin = bytes.NewReader(stdin)
 	}
 	cmd.Env = env
+	// Put the subprocess in its own process group so that MCP helper processes
+	// spawned by the worker are also killed when the context is cancelled.
+	setupProcessGroup(cmd)
 
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 
-	err := cmd.Run()
+	err = cmd.Run()
 	result := commandResult{
 		stdout: stdout.Bytes(),
 		stderr: stderr.Bytes(),

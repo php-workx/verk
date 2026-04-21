@@ -2,7 +2,6 @@ package runtime_test
 
 import (
 	"testing"
-
 	"verk/internal/adapters/runtime"
 )
 
