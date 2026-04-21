@@ -44,8 +44,9 @@ func drainProgress(ch <-chan engine.ProgressEvent) {
 // saveJSONAtomic is used both for the initial run.json persistence in
 // doRunTicket and for the final state update in finalizeRun.
 var (
-	saveJSONAtomic func(string, any) error         = state.SaveJSONAtomic
-	saveTicket     func(string, tkmd.Ticket) error = tkmd.SaveTicket
+	saveJSONAtomic func(string, any) error                                                        = state.SaveJSONAtomic
+	saveTicket     func(string, tkmd.Ticket) error                                                = tkmd.SaveTicket
+	runTicket      func(context.Context, engine.RunTicketRequest) (engine.RunTicketResult, error) = engine.RunTicket
 )
 
 // finalizeRun persists ticket and run state after the engine finishes, then
@@ -144,7 +145,14 @@ func initRunCmd(root *cobra.Command) {
 	root.AddCommand(runCmd)
 }
 
-func doRunTicket(w, errw io.Writer, ticketID string) (string, error) {
+func doRunTicket(w, errw io.Writer, ticketID string) (runID string, err error) {
+	emitRunID := true
+	defer func() {
+		if emitRunID && runID != "" {
+			_, _ = fmt.Fprintf(w, "run_id=%s\n", runID)
+		}
+	}()
+
 	// Cancel engine execution on SIGINT (Ctrl-C) or SIGTERM so that worker
 	// processes and MCP helpers are terminated and claims are released before
 	// the process exits.  stop() removes the signal handler when the function
@@ -166,7 +174,7 @@ func doRunTicket(w, errw io.Writer, ticketID string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	runID := newRunID(ticketID)
+	runID = newRunID(ticketID)
 	plan, err := engine.BuildPlanArtifact(ticket, cfg)
 	if err != nil {
 		return "", err
@@ -174,8 +182,6 @@ func doRunTicket(w, errw io.Writer, ticketID string) (string, error) {
 	plan.RunID = runID
 	plan.CreatedAt = time.Now().UTC()
 	plan.UpdatedAt = plan.CreatedAt
-
-	_, _ = fmt.Fprintf(w, "run_id=%s\n", runID)
 
 	lock, err := engine.AcquireRunLock(repoRoot, runID)
 	if err != nil {
@@ -254,7 +260,7 @@ func doRunTicket(w, errw io.Writer, ticketID string) (string, error) {
 	go func() {
 		defer wg.Done()
 		defer close(ch)
-		result, runErr = engine.RunTicket(ctx, engine.RunTicketRequest{
+		result, runErr = runTicket(ctx, engine.RunTicketRequest{
 			RepoRoot:   repoRoot,
 			RunID:      runID,
 			Ticket:     ticket,
@@ -299,6 +305,7 @@ func doRunTicket(w, errw io.Writer, ticketID string) (string, error) {
 		ticket,
 		run,
 	); err != nil {
+		emitRunID = false
 		return runID, err
 	}
 	return runID, nil
