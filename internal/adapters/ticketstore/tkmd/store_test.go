@@ -181,6 +181,33 @@ func TestUsesCanonicalReadinessPredicate(t *testing.T) {
 	}
 }
 
+func TestClaimAllowsReady_RejectsPathTraversalTicketID(t *testing.T) {
+	dir := t.TempDir()
+	ticketsDir := filepath.Join(dir, ".tickets")
+	if err := os.MkdirAll(filepath.Join(ticketsDir, ".claims"), 0o755); err != nil {
+		t.Fatalf("mkdir .claims: %v", err)
+	}
+
+	maliciousIDs := []string{
+		"../escape",
+		"..",
+		".",
+		"ticket/evil",
+		"ticket\\evil",
+		"/tmp/hijack",
+		"foo/../bar",
+	}
+
+	for _, ticketID := range maliciousIDs {
+		t.Run(ticketID, func(t *testing.T) {
+			_, err := claimAllowsReady(ticketsDir, ticketID, "run-current")
+			if err == nil {
+				t.Fatalf("expected ticket id %q to be rejected", ticketID)
+			}
+		})
+	}
+}
+
 func TestLoadEpicChildrenMalformed(t *testing.T) {
 	dir := t.TempDir()
 	// A frontmatter line without a colon causes splitKeyValue to return an error.
@@ -194,8 +221,42 @@ func TestLoadEpicChildrenMalformed(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected non-nil error for malformed epic, got nil")
 	}
-	// children is nil on error — acceptable per spec
-	_ = children
+	if len(children) != 0 {
+		t.Fatalf("expected zero children on parse failure, got %d", len(children))
+	}
+}
+
+func TestListReadyChildren_PropagatesMalformedEpicError(t *testing.T) {
+	dir := t.TempDir()
+	ticketsDir := filepath.Join(dir, ".tickets")
+	if err := os.MkdirAll(ticketsDir, 0o755); err != nil {
+		t.Fatalf("mkdir .tickets: %v", err)
+	}
+
+	epicPath := filepath.Join(ticketsDir, "epic-bad.md")
+	malformed := "---\nno_colon_here\n---\nEpic body.\n"
+	if err := os.WriteFile(epicPath, []byte(malformed), 0o644); err != nil {
+		t.Fatalf("write malformed epic: %v", err)
+	}
+	childPath := filepath.Join(ticketsDir, "child-1.md")
+	child := strings.Join([]string{
+		"---",
+		"id: child-1",
+		"parent: epic-bad",
+		"status: open",
+		"---",
+		"",
+		"Child body.",
+		"",
+	}, "\n")
+	if err := os.WriteFile(childPath, []byte(child), 0o644); err != nil {
+		t.Fatalf("write child ticket: %v", err)
+	}
+
+	children, err := ListReadyChildren(dir, "epic-bad")
+	if err == nil {
+		t.Fatalf("expected error from ListReadyChildren for malformed epic, got nil and children=%v", children)
+	}
 }
 
 func TestLoadEpicChildrenValid(t *testing.T) {

@@ -270,6 +270,78 @@ func TestAcquireClaim_RejectsPathTraversalIdentifiers(t *testing.T) {
 	}
 }
 
+func TestRenewClaim_RejectsPathTraversalIdentifiers(t *testing.T) {
+	dir := t.TempDir()
+
+	maliciousIDs := []struct {
+		name     string
+		runID    string
+		ticketID string
+	}{
+		{"dotdot in runID", "../escape", "ticket-1"},
+		{"dotdot in ticketID", "run-a", "../escape"},
+		{"slash in runID", "run/evil", "ticket-1"},
+		{"slash in ticketID", "run-a", "ticket/evil"},
+		{"backslash in runID", "run\\evil", "ticket-1"},
+		{"backslash in ticketID", "run-a", "ticket\\evil"},
+		{"absolute runID", "/etc/passwd", "ticket-1"},
+		{"absolute ticketID", "run-a", "/etc/passwd"},
+		{"dotdot with slash in runID", "../../etc", "ticket-1"},
+		{"dotdot with slash in ticketID", "run-a", "../../etc"},
+		{"embedded dotdot in runID", "foo/../bar", "ticket-1"},
+		{"embedded dotdot in ticketID", "run-a", "foo/../bar"},
+		{"single dot runID", ".", "ticket-1"},
+		{"single dot ticketID", "run-a", "."},
+		{"double dot runID", "..", "ticket-1"},
+		{"double dot ticketID", "run-a", ".."},
+	}
+
+	for _, tc := range maliciousIDs {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := RenewClaim(dir, tc.runID, tc.ticketID, "lease-x", 10*time.Minute)
+			if err == nil {
+				t.Fatalf("expected renew to be rejected for %s", tc.name)
+			}
+		})
+	}
+}
+
+func TestReleaseClaim_RejectsPathTraversalIdentifiers(t *testing.T) {
+	dir := t.TempDir()
+
+	maliciousIDs := []struct {
+		name     string
+		runID    string
+		ticketID string
+	}{
+		{"dotdot in runID", "../escape", "ticket-1"},
+		{"dotdot in ticketID", "run-a", "../escape"},
+		{"slash in runID", "run/evil", "ticket-1"},
+		{"slash in ticketID", "run-a", "ticket/evil"},
+		{"backslash in runID", "run\\evil", "ticket-1"},
+		{"backslash in ticketID", "run-a", "ticket\\evil"},
+		{"absolute runID", "/etc/passwd", "ticket-1"},
+		{"absolute ticketID", "run-a", "/etc/passwd"},
+		{"dotdot with slash in runID", "../../etc", "ticket-1"},
+		{"dotdot with slash in ticketID", "run-a", "../../etc"},
+		{"embedded dotdot in runID", "foo/../bar", "ticket-1"},
+		{"embedded dotdot in ticketID", "run-a", "foo/../bar"},
+		{"single dot runID", ".", "ticket-1"},
+		{"single dot ticketID", "run-a", "."},
+		{"double dot runID", "..", "ticket-1"},
+		{"double dot ticketID", "run-a", ".."},
+	}
+
+	for _, tc := range maliciousIDs {
+		t.Run(tc.name, func(t *testing.T) {
+			err := ReleaseClaim(dir, tc.runID, tc.ticketID, "lease-x", "test")
+			if err == nil {
+				t.Fatalf("expected release to be rejected for %s", tc.name)
+			}
+		})
+	}
+}
+
 func TestClaimPaths_PreservesValidIdentifiers(t *testing.T) {
 	dir := t.TempDir()
 
@@ -295,7 +367,22 @@ func TestClaimPaths_PreservesValidIdentifiers(t *testing.T) {
 			if livePath == "" || durablePath == "" {
 				t.Fatal("expected non-empty paths")
 			}
+			liveRoot := filepath.Join(filepath.Clean(dir), ".tickets", ".claims")
+			durableRoot := filepath.Join(filepath.Clean(dir), ".verk", "runs", tc.runID, "claims")
+			assertPathWithin(t, livePath, liveRoot)
+			assertPathWithin(t, durablePath, durableRoot)
 		})
+	}
+}
+
+func assertPathWithin(t *testing.T, child, parent string) {
+	t.Helper()
+	rel, err := filepath.Rel(filepath.Clean(parent), filepath.Clean(child))
+	if err != nil {
+		t.Fatalf("resolve relative path from %q to %q: %v", parent, child, err)
+	}
+	if rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		t.Fatalf("path %q is not within base %q (rel=%q)", child, parent, rel)
 	}
 }
 
@@ -364,10 +451,12 @@ func TestRenewClaim_DurableWriteFailure_LiveRestored(t *testing.T) {
 // before the other) and do not trigger the race detector.
 func TestConcurrent_AcquireAndRenew_NoRace(t *testing.T) {
 	dir := t.TempDir()
-
-	acquired, err := AcquireClaim(dir, "run-a", "ticket-1", "lease-a", 30*time.Minute)
+	livePath, _, err := claimPaths(dir, "run-a", "ticket-1")
 	if err != nil {
-		t.Fatalf("AcquireClaim setup: %v", err)
+		t.Fatalf("claimPaths: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(livePath), 0o755); err != nil {
+		t.Fatalf("prepare claim lock directory: %v", err)
 	}
 
 	start := make(chan struct{})
@@ -377,32 +466,72 @@ func TestConcurrent_AcquireAndRenew_NoRace(t *testing.T) {
 	var wg sync.WaitGroup
 	wg.Add(2)
 
-	// Goroutine 1: renew the existing claim held by run-a.
+	// Goroutine 1: attempt to renew the claim for run-a.
 	go func() {
 		defer wg.Done()
 		<-start
-		_, err := RenewClaim(dir, "run-a", "ticket-1", acquired.LeaseID, 30*time.Minute)
+		_, err := RenewClaim(dir, "run-a", "ticket-1", "lease-a", 30*time.Minute)
 		renewErr <- err
 	}()
 
-	// Goroutine 2: attempt to acquire the same ticket for run-b.
-	// run-a still holds an active claim, so this must fail.
+	// Goroutine 2: attempt to acquire the same ticket for run-a.
+	// One of two serial outcomes is valid:
+	//   - acquire then renew: both succeed
+	//   - renew then acquire: acquire succeeds, renew fails as not-found
 	go func() {
 		defer wg.Done()
 		<-start
-		_, err := AcquireClaim(dir, "run-b", "ticket-1", "lease-b", 30*time.Minute)
+		_, err := AcquireClaim(dir, "run-a", "ticket-1", "lease-a", 30*time.Minute)
 		acquireErr <- err
 	}()
 
 	close(start)
 	wg.Wait()
 
-	// Renew must succeed; acquire must fail because run-a still holds the claim.
-	if err := <-renewErr; err != nil {
-		t.Errorf("RenewClaim failed unexpectedly: %v", err)
+	reqAcquireErr := <-acquireErr
+	reqRenewErr := <-renewErr
+
+	_, durablePath, err := claimPaths(dir, "run-a", "ticket-1")
+	if err != nil {
+		t.Fatalf("claimPaths: %v", err)
 	}
-	if err := <-acquireErr; err == nil {
-		t.Error("AcquireClaim by run-b succeeded while run-a still holds claim")
+	live, err := loadClaimArtifact(livePath)
+	if err != nil {
+		t.Fatalf("load live claim: %v", err)
+	}
+	durable, err := loadClaimArtifact(durablePath)
+	if err != nil {
+		t.Fatalf("load durable claim: %v", err)
+	}
+
+	if reqAcquireErr != nil {
+		t.Fatalf("Acquire should never lose when both operations race from no-claim state: %v", reqAcquireErr)
+	}
+
+	switch {
+	case reqRenewErr == nil:
+		if live == nil || durable == nil {
+			t.Fatal("expected both claim files to exist after acquire-then-renew")
+		}
+		if live.State != "active" || durable.State != "active" {
+			t.Fatalf("expected active state in both files after acquire-then-renew, got live=%q durable=%q", live.State, durable.State)
+		}
+		if live.LeaseID != "lease-a" || durable.LeaseID != "lease-a" {
+			t.Fatalf("expected lease-id to remain lease-a, got live=%q durable=%q", live.LeaseID, durable.LeaseID)
+		}
+	case reqRenewErr != nil && strings.Contains(reqRenewErr.Error(), "not found for renewal"):
+		if live == nil || durable == nil {
+			t.Fatal("expected active claim file for successful acquire")
+		}
+		if live.State != "active" || durable.State != "active" {
+			t.Fatalf("expected both claim files to be active after renew-before-acquire, got live=%q durable=%q", live.State, durable.State)
+		}
+	default:
+		t.Fatalf("expected acquire-then-renew or renew-then-acquire, got acquireErr=%v renewErr=%v", reqAcquireErr, reqRenewErr)
+	}
+
+	if reqRenewErr != nil && !strings.Contains(reqRenewErr.Error(), "not found for renewal") {
+		t.Fatalf("unexpected RenewClaim failure: %v", reqRenewErr)
 	}
 }
 
@@ -411,10 +540,12 @@ func TestConcurrent_AcquireAndRenew_NoRace(t *testing.T) {
 // and do not trigger the race detector.
 func TestConcurrent_AcquireAndRelease_NoRace(t *testing.T) {
 	dir := t.TempDir()
-
-	acquired, err := AcquireClaim(dir, "run-a", "ticket-1", "lease-a", 30*time.Minute)
+	livePath, _, err := claimPaths(dir, "run-a", "ticket-1")
 	if err != nil {
-		t.Fatalf("AcquireClaim setup: %v", err)
+		t.Fatalf("claimPaths: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(livePath), 0o755); err != nil {
+		t.Fatalf("prepare claim lock directory: %v", err)
 	}
 
 	start := make(chan struct{})
@@ -424,18 +555,21 @@ func TestConcurrent_AcquireAndRelease_NoRace(t *testing.T) {
 	var wg sync.WaitGroup
 	wg.Add(2)
 
-	// Goroutine 1: release the claim held by run-a.
+	// Goroutine 1: attempt to release the claim for run-a.
 	go func() {
 		defer wg.Done()
 		<-start
-		releaseErr <- ReleaseClaim(dir, "run-a", "ticket-1", acquired.LeaseID, "completed")
+		releaseErr <- ReleaseClaim(dir, "run-a", "ticket-1", "lease-a", "completed")
 	}()
 
-	// Goroutine 2: attempt to acquire the same ticket for run-b.
+	// Goroutine 2: attempt to acquire the same ticket for run-a.
+	// Valid serial outcomes are:
+	//   - acquire then release: both succeed, durable is released and live is gone
+	//   - release then acquire: acquire succeeds, release fails with not-found
 	go func() {
 		defer wg.Done()
 		<-start
-		_, err := AcquireClaim(dir, "run-b", "ticket-1", "lease-b", 30*time.Minute)
+		_, err := AcquireClaim(dir, "run-a", "ticket-1", "lease-a", 30*time.Minute)
 		acquireErr <- err
 	}()
 
@@ -445,16 +579,54 @@ func TestConcurrent_AcquireAndRelease_NoRace(t *testing.T) {
 	rErr := <-releaseErr
 	aErr := <-acquireErr
 
-	// Valid outcomes (one serialises before the other):
-	//   - Release wins: rErr==nil; acquire sees a free slot: aErr==nil.
-	//   - Acquire-check wins: aErr!=nil (active claim blocks it); release still succeeds: rErr==nil.
-	// The only invalid outcome is both failing simultaneously.
-	if rErr != nil {
-		t.Errorf("ReleaseClaim failed unexpectedly: %v", rErr)
+	_, durablePath, err := claimPaths(dir, "run-a", "ticket-1")
+	if err != nil {
+		t.Fatalf("claimPaths: %v", err)
 	}
-	// aErr is allowed to be non-nil when the lock ordering puts the acquire
-	// check before the release completes.
-	_ = aErr
+	live, err := loadClaimArtifact(livePath)
+	if err != nil {
+		t.Fatalf("load live claim: %v", err)
+	}
+	durable, err := loadClaimArtifact(durablePath)
+	if err != nil {
+		t.Fatalf("load durable claim: %v", err)
+	}
+
+	if aErr != nil {
+		t.Fatalf("Acquire should succeed in both serial orders: %v", aErr)
+	}
+
+	if rErr == nil {
+		if durable == nil {
+			t.Fatal("expected durable claim after successful release")
+		}
+		if durable.State != "released" {
+			t.Fatalf("expected released durable state, got %q", durable.State)
+		}
+		if durable.ReleaseReason != "completed" {
+			t.Fatalf("expected release reason completed, got %q", durable.ReleaseReason)
+		}
+		if live != nil {
+			t.Fatalf("expected live claim removed after successful release")
+		}
+		return
+	}
+
+	if !strings.Contains(rErr.Error(), "not found for release") {
+		t.Fatalf("expected release to report not-found when raced first, got: %v", rErr)
+	}
+	if live == nil || durable == nil {
+		t.Fatal("expected both claim files after acquire")
+	}
+	if live.State != "active" {
+		t.Fatalf("expected active live claim when acquire precedes release, got %q", live.State)
+	}
+	if durable.State != "active" {
+		t.Fatalf("expected active durable claim when acquire precedes release, got %q", durable.State)
+	}
+	if durable.LeaseID != "lease-a" {
+		t.Fatalf("expected durable lease-a, got %q", durable.LeaseID)
+	}
 }
 
 // TestRenewClaim_DurableAndRestoreFailure_ErrorMentionsBoth verifies that when

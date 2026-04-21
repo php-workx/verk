@@ -357,6 +357,12 @@ func parseAcquireClaimRequest(rootDir string, args ...any) (acquireClaimRequest,
 	}
 	req.runID = runID
 	req.ticketID = ticketID
+	if err := validateClaimIdentifier(req.runID, "run_id"); err != nil {
+		return req, err
+	}
+	if err := validateClaimIdentifier(req.ticketID, "ticket_id"); err != nil {
+		return req, err
+	}
 
 	nextString := 2
 	for _, arg := range args[2:] {
@@ -422,6 +428,12 @@ func parseRenewClaimRequest(rootDir string, args ...any) (renewClaimRequest, err
 	}
 	req.runID = runID
 	req.ticketID = ticketID
+	if err := validateClaimIdentifier(req.runID, "run_id"); err != nil {
+		return req, err
+	}
+	if err := validateClaimIdentifier(req.ticketID, "ticket_id"); err != nil {
+		return req, err
+	}
 
 	if leaseID, ok := args[2].(string); ok && leaseID != "" {
 		req.leaseID = leaseID
@@ -468,6 +480,12 @@ func parseReleaseClaimRequest(rootDir string, args ...any) (releaseClaimRequest,
 	}
 	req.runID = runID
 	req.ticketID = ticketID
+	if err := validateClaimIdentifier(req.runID, "run_id"); err != nil {
+		return req, err
+	}
+	if err := validateClaimIdentifier(req.ticketID, "ticket_id"); err != nil {
+		return req, err
+	}
 
 	switch len(args) - 2 {
 	case 0:
@@ -528,9 +546,33 @@ func claimPaths(rootDir, runID, ticketID string) (string, string, error) {
 	}
 	repoRoot := resolveRepoRoot(rootDir)
 	ticketsDir := resolveTicketsDir(rootDir)
-	livePath := filepath.Join(ticketsDir, ".claims", ticketID+".json")
-	durablePath := filepath.Join(repoRoot, ".verk", "runs", runID, "claims", "claim-"+ticketID+".json")
+	liveDir := filepath.Join(ticketsDir, ".claims")
+	durableDir := filepath.Join(repoRoot, ".verk", "runs", runID, "claims")
+	livePath := filepath.Join(liveDir, ticketID+".json")
+	durablePath := filepath.Join(durableDir, "claim-"+ticketID+".json")
+	if err := assertPathUnderBase(livePath, liveDir); err != nil {
+		return "", "", err
+	}
+	if err := assertPathUnderBase(durablePath, durableDir); err != nil {
+		return "", "", err
+	}
 	return livePath, durablePath, nil
+}
+
+func assertPathUnderBase(target, base string) error {
+	cleanTarget := filepath.Clean(target)
+	cleanBase := filepath.Clean(base)
+	rel, err := filepath.Rel(cleanBase, cleanTarget)
+	if err != nil {
+		return fmt.Errorf("claim path resolution failed: %w", err)
+	}
+	if rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return fmt.Errorf("claim path escapes base directory")
+	}
+	if strings.HasPrefix(rel, "..") {
+		return fmt.Errorf("claim path escapes base directory")
+	}
+	return nil
 }
 
 // validateClaimIdentifier rejects identifiers that could escape the intended
