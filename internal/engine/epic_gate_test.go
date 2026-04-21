@@ -511,6 +511,115 @@ func TestCollectEpicVerificationOutput_CapsLargeArtifacts(t *testing.T) {
 	}
 }
 
+func TestEpicDerivedCheckMissingResultBlocks(t *testing.T) {
+	check := state.ValidationCheck{
+		ID:      "derived-missing",
+		Command: "markdownlint docs",
+		Reason:  "epic docs lint",
+	}
+	derivedChecks := []state.ValidationCheck{check}
+	derivedResults := map[string]verifycommand.CommandResult{}
+
+	if epicChecksAllPassed(nil, derivedChecks, derivedResults) {
+		t.Fatalf("expected missing derived check result to fail epic checks")
+	}
+
+	findings := collectEpicCheckFailureFindings(nil, derivedChecks, derivedResults)
+	if len(findings) != 1 {
+		t.Fatalf("expected one missing-check finding, got %#v", findings)
+	}
+	if !strings.Contains(findings[0].Title, "did not run") {
+		t.Fatalf("expected did-not-run finding, got %#v", findings[0])
+	}
+
+	coverage := newEpicValidationCoverage("run-1", "epic-1", nil, nil, derivedChecks)
+	recordEpicCheckExecutions(coverage, "epic-1", nil, derivedChecks, derivedResults, 1)
+	if len(coverage.ExecutedChecks) != 1 {
+		t.Fatalf("expected missing derived check execution to be recorded, got %#v", coverage.ExecutedChecks)
+	}
+	if coverage.ExecutedChecks[0].Result != state.ValidationCheckResultFailed {
+		t.Fatalf("expected missing execution to be failed, got %q", coverage.ExecutedChecks[0].Result)
+	}
+	if !strings.Contains(coverage.ExecutedChecks[0].FailureSummary, "did not run") {
+		t.Fatalf("expected failure summary to mention did not run, got %q", coverage.ExecutedChecks[0].FailureSummary)
+	}
+
+	output := collectEpicVerificationOutput(nil, derivedChecks, derivedResults)
+	if !strings.Contains(output, "did not run") {
+		t.Fatalf("expected missing derived check in output, got %q", output)
+	}
+}
+
+func TestMergeEpicFindingsUpsertsAndReopens(t *testing.T) {
+	existing := []state.EpicClosureFinding{{
+		ID:       "finding-1",
+		Source:   "epic_reviewer",
+		Title:    "old title",
+		Resolved: true,
+	}}
+	fresh := []state.EpicClosureFinding{{
+		ID:     "finding-1",
+		Source: "epic_reviewer",
+		Title:  "new title",
+		Body:   "fresh body",
+	}}
+
+	merged := mergeEpicFindings(existing, fresh)
+
+	if len(merged) != 1 {
+		t.Fatalf("expected upsert to keep one finding, got %#v", merged)
+	}
+	if merged[0].Resolved {
+		t.Fatalf("expected reappearing finding to be unresolved")
+	}
+	if merged[0].Title != "new title" || merged[0].Body != "fresh body" {
+		t.Fatalf("expected finding fields to refresh, got %#v", merged[0])
+	}
+}
+
+func TestEpicCloseBlockedOnlyRecordsRepairLimitWhenProvided(t *testing.T) {
+	artifact := state.EpicClosureArtifact{}
+	coverage := &state.ValidationCoverageArtifact{}
+
+	epicCloseBlocked(&artifact, coverage, "worker failed", nil)
+	if artifact.RepairLimit != nil || coverage.RepairLimit != nil {
+		t.Fatalf("did not expect repair limit for non-exhaustion block, artifact=%#v coverage=%#v", artifact.RepairLimit, coverage.RepairLimit)
+	}
+
+	limit := epicRepairLimit(2, 2, "epic repair exhausted after 2 cycle(s)")
+	epicCloseBlocked(&artifact, coverage, "still failing", limit)
+	if artifact.RepairLimit == nil || coverage.RepairLimit == nil {
+		t.Fatalf("expected repair limit when explicitly provided")
+	}
+	if artifact.RepairLimit.Limit != 2 || artifact.RepairLimit.Reached != 2 {
+		t.Fatalf("unexpected repair limit: %#v", artifact.RepairLimit)
+	}
+}
+
+func TestEpicCloseSuccessClearsInProgressBlockReason(t *testing.T) {
+	artifact := state.EpicClosureArtifact{
+		Closable:    false,
+		BlockReason: "in-progress: initial checks running",
+		RepairLimit: epicRepairLimit(1, 1,
+			"stale limit"),
+	}
+	coverage := &state.ValidationCoverageArtifact{
+		Closable:    false,
+		BlockReason: "in-progress",
+		RepairLimit: epicRepairLimit(1, 1,
+			"stale limit"),
+	}
+
+	epicCloseSuccess(&artifact, coverage, 0)
+
+	if !artifact.Closable || artifact.BlockReason != "" || artifact.RepairLimit != nil {
+		t.Fatalf("expected successful artifact to be closable and clear block metadata, got %#v", artifact)
+	}
+	if !coverage.Closable || coverage.BlockReason != "" || coverage.RepairLimit != nil {
+		t.Fatalf("expected successful coverage to clear block metadata, got %#v", coverage)
+	}
+}
+
 // staleWordingRepairAdapter is a test double that rewrites a target doc file
 // when the repair worker is called, simulating a real worker fixing stale
 // wording in documentation. The reviewer always returns the pre-configured

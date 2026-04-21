@@ -75,6 +75,8 @@ func runEpicClosureGate(
 		BroadCommands:   epicBroadCommandLines(cfg.Verification.EpicClosureCommands),
 		ReviewerRuntime: reviewProfile.Runtime,
 		ReviewerModel:   reviewProfile.Model,
+		Closable:        false,
+		BlockReason:     "in-progress: initial checks running",
 	}
 
 	// --- Derive epic-scope checks (stale wording across doc paths). ---
@@ -161,7 +163,7 @@ func runEpicClosureGate(
 
 	if reviewErr != nil {
 		blockReason := buildEpicBlockReason(checksAllPassed, artifact.Findings, reviewErr)
-		epicCloseBlocked(&artifact, coverage, blockReason, 0, "epic reviewer failed before repair")
+		epicCloseBlocked(&artifact, coverage, blockReason, nil)
 		artifact.UpdatedAt = stateTime()
 		if saveErr := saveEpicClosureArtifact(artifactPath, artifact, "persist reviewer error block"); saveErr != nil {
 			return saveErr
@@ -176,7 +178,7 @@ func runEpicClosureGate(
 	// --- Handle repair-disabled case. ---
 	if cfg.Policy.MaxEpicRepairCycles == 0 {
 		blockReason := buildEpicBlockReason(checksAllPassed, artifact.Findings, reviewErr)
-		epicCloseBlocked(&artifact, coverage, blockReason, 0, "epic repair disabled by policy.max_epic_repair_cycles=0")
+		epicCloseBlocked(&artifact, coverage, blockReason, nil)
 		artifact.UpdatedAt = stateTime()
 		if saveErr := saveEpicClosureArtifact(artifactPath, artifact, "persist repair-disabled block"); saveErr != nil {
 			return saveErr
@@ -238,7 +240,7 @@ func runEpicClosureGate(
 			artifact.Cycles[cycleIdx].FinishedAt = stateTime()
 			artifact.Cycles[cycleIdx].RepairNotes = repairErr.Error()
 			blockReason := fmt.Sprintf("epic repair cycle %d worker failed: %v", cycle, repairErr)
-			epicCloseBlocked(&artifact, coverage, blockReason, cycle, blockReason)
+			epicCloseBlocked(&artifact, coverage, blockReason, nil)
 			artifact.UpdatedAt = stateTime()
 			if saveErr := saveEpicClosureArtifact(artifactPath, artifact, fmt.Sprintf("persist repair cycle %d failure", cycle)); saveErr != nil {
 				return saveErr
@@ -287,7 +289,7 @@ func runEpicClosureGate(
 		if reviewErr != nil {
 			artifact.Cycles[cycleIdx].Status = "review_failed"
 			blockReason := buildEpicBlockReason(checksAllPassed, artifact.Findings, reviewErr)
-			epicCloseBlocked(&artifact, coverage, blockReason, cycle, blockReason)
+			epicCloseBlocked(&artifact, coverage, blockReason, nil)
 			artifact.UpdatedAt = stateTime()
 			if saveErr := saveEpicClosureArtifact(artifactPath, artifact, fmt.Sprintf("persist cycle %d reviewer error block", cycle)); saveErr != nil {
 				return saveErr
@@ -322,7 +324,7 @@ func runEpicClosureGate(
 	// --- Exhausted repair budget. ---
 	blockReason := buildEpicBlockReason(checksAllPassed, artifact.Findings, reviewErr)
 	limitReason := fmt.Sprintf("epic repair exhausted after %d cycle(s)", cfg.Policy.MaxEpicRepairCycles)
-	epicCloseBlocked(&artifact, coverage, blockReason, cfg.Policy.MaxEpicRepairCycles, limitReason)
+	epicCloseBlocked(&artifact, coverage, blockReason, epicRepairLimit(cfg.Policy.MaxEpicRepairCycles, cfg.Policy.MaxEpicRepairCycles, limitReason))
 	artifact.UpdatedAt = stateTime()
 	if saveErr := saveEpicClosureArtifact(artifactPath, artifact, "persist repair-exhausted block"); saveErr != nil {
 		return saveErr
@@ -340,6 +342,8 @@ func runEpicClosureGate(
 // epicCloseSuccess marks the artifact and coverage as closable.
 func epicCloseSuccess(artifact *state.EpicClosureArtifact, coverage *state.ValidationCoverageArtifact, cycles int) {
 	artifact.Closable = true
+	artifact.BlockReason = ""
+	artifact.RepairLimit = nil
 	if cycles == 0 {
 		artifact.ClosureReason = "all epic-level checks passed and reviewer found no blocking gaps"
 	} else {
@@ -349,6 +353,8 @@ func epicCloseSuccess(artifact *state.EpicClosureArtifact, coverage *state.Valid
 		coverage.Closable = true
 		coverage.UpdatedAt = stateTime()
 		coverage.ClosureReason = artifact.ClosureReason
+		coverage.BlockReason = ""
+		coverage.RepairLimit = nil
 	}
 }
 
@@ -365,30 +371,34 @@ func epicCloseBlocked(
 	artifact *state.EpicClosureArtifact,
 	coverage *state.ValidationCoverageArtifact,
 	blockReason string,
-	cycles int,
-	limitReason string,
+	repairLimit *state.ValidationRepairLimit,
 ) {
 	artifact.Closable = false
 	artifact.BlockReason = blockReason
-	if cycles > 0 && limitReason != "" {
-		limit := &state.ValidationRepairLimit{
-			Name:      "max_epic_repair_cycles",
-			Limit:     cycles,
-			Reached:   cycles,
-			Reason:    limitReason,
-			PolicyRef: "policy.max_epic_repair_cycles",
-		}
-		artifact.RepairLimit = limit
-		if coverage != nil {
-			coverage.RepairLimit = limit
-		}
+	artifact.RepairLimit = nil
+	if repairLimit != nil {
+		limit := *repairLimit
+		artifact.RepairLimit = &limit
 	}
 	if coverage != nil {
 		coverage.Closable = false
 		coverage.UpdatedAt = stateTime()
-		if coverage.BlockReason == "" {
-			coverage.BlockReason = blockReason
+		coverage.RepairLimit = nil
+		if repairLimit != nil {
+			limit := *repairLimit
+			coverage.RepairLimit = &limit
 		}
+		coverage.BlockReason = blockReason
+	}
+}
+
+func epicRepairLimit(limit, reached int, reason string) *state.ValidationRepairLimit {
+	return &state.ValidationRepairLimit{
+		Name:      "max_epic_repair_cycles",
+		Limit:     limit,
+		Reached:   reached,
+		Reason:    reason,
+		PolicyRef: "policy.max_epic_repair_cycles",
 	}
 }
 
@@ -465,6 +475,12 @@ func recordEpicCheckExecutions(
 	for _, c := range derivedChecks {
 		r, ok := derivedResults[c.ID]
 		if !ok {
+			coverage.ExecutedChecks = append(coverage.ExecutedChecks, state.ValidationCheckExecution{
+				CheckID:        c.ID,
+				Result:         state.ValidationCheckResultFailed,
+				FailureSummary: fmt.Sprintf("derived check `%s` did not run", c.Command),
+				Attempt:        cycle,
+			})
 			continue
 		}
 		coverage.ExecutedChecks = append(coverage.ExecutedChecks, state.ValidationCheckExecution{
@@ -543,7 +559,7 @@ func epicChecksAllPassed(
 	for _, c := range derivedChecks {
 		r, ok := derivedResults[c.ID]
 		if !ok {
-			continue
+			return false
 		}
 		if r.TimedOut || r.ExitCode != 0 {
 			return false
@@ -793,12 +809,16 @@ func collectEpicVerificationOutput(
 ) string {
 	all := make([]verifycommand.CommandResult, 0, len(broadResults)+len(derivedChecks))
 	all = append(all, broadResults...)
+	var b strings.Builder
 	for _, c := range derivedChecks {
 		if r, ok := derivedResults[c.ID]; ok {
 			all = append(all, r)
+			continue
+		}
+		if b.Len() < epicGateOutputLimit {
+			fmt.Fprintf(&b, "$ %s\n(did not run: missing derived check execution)\n", c.Command)
 		}
 	}
-	var b strings.Builder
 	for _, r := range all {
 		if r.ExitCode == 0 && !r.TimedOut {
 			continue
@@ -920,7 +940,18 @@ func collectEpicCheckFailureFindings(
 	}
 	for _, c := range derivedChecks {
 		r, ok := derivedResults[c.ID]
-		if !ok || (r.ExitCode == 0 && !r.TimedOut) {
+		if !ok {
+			out = append(out, state.EpicClosureFinding{
+				ID:                 epicCheckFindingID("derived_check", c.ID),
+				Source:             "derived_check",
+				Title:              fmt.Sprintf("derived check did not run: %s", c.Reason),
+				Body:               fmt.Sprintf("Derived check `%s` did not run; no execution result was recorded.", c.Command),
+				AutoRepairPossible: true,
+				NextAction:         "route to epic repair worker",
+			})
+			continue
+		}
+		if r.ExitCode == 0 && !r.TimedOut {
 			continue
 		}
 		id := epicCheckFindingID("derived_check", c.ID)
@@ -940,27 +971,29 @@ func collectEpicCheckFailureFindings(
 	return out
 }
 
-// mergeEpicFindings merges fresh findings into existing, deduplicating by ID.
+// mergeEpicFindings merges fresh findings into existing, upserting by ID.
 func mergeEpicFindings(existing, fresh []state.EpicClosureFinding) []state.EpicClosureFinding {
 	if len(fresh) == 0 {
 		return existing
 	}
-	seen := make(map[string]struct{}, len(existing))
-	for _, f := range existing {
+	byID := make(map[string]int, len(existing))
+	for i, f := range existing {
 		if f.ID != "" {
-			seen[f.ID] = struct{}{}
+			byID[f.ID] = i
 		}
 	}
 	out := append([]state.EpicClosureFinding(nil), existing...)
 	for _, f := range fresh {
+		f.Resolved = false
 		if f.ID == "" {
 			out = append(out, f)
 			continue
 		}
-		if _, ok := seen[f.ID]; ok {
+		if idx, ok := byID[f.ID]; ok {
+			out[idx] = f
 			continue
 		}
-		seen[f.ID] = struct{}{}
+		byID[f.ID] = len(out)
 		out = append(out, f)
 	}
 	return out
