@@ -29,8 +29,14 @@ dev: check sonar
 
 # --- Static analysis ---
 
+# Cache pinned Go tool dependencies before checks that parse tool output. This
+# keeps cold CI runners from treating `go: downloading ...` diagnostics as
+# formatter diffs.
+tools-ready:
+    go mod download -modfile=tools.mod
+
 # Check formatting via golangci-lint gofumpt (detect-only, no auto-fix)
-format-check:
+format-check: tools-ready
     @test -z "$({{go_tool}} golangci-lint fmt --diff 2>&1)" || (echo "gofumpt: unformatted files" && {{go_tool}} golangci-lint fmt --diff 2>&1 && exit 1)
 
 # Go vet
@@ -42,7 +48,7 @@ lint:
     {{go_tool}} golangci-lint run --fix
 
 # Verify lint with golangci-lint
-lint-check:
+lint-check: tools-ready
     {{go_tool}} golangci-lint run
 
 # Lint GitHub Actions workflows
@@ -176,7 +182,7 @@ install-hooks:
 # Cache required development tools (pinned in tools.mod)
 install-dev:
     @echo "Caching Go tool dependencies from tools.mod..."
-    go mod download -modfile=tools.mod
+    just tools-ready
     @echo "Done! Development tools are available through go tool -modfile=tools.mod."
 
 # Remove build artifacts (refuses to delete runs if any run lock is held)

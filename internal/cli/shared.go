@@ -21,6 +21,11 @@ import (
 	"github.com/spf13/cobra"
 )
 
+const (
+	runtimeNameClaude = "claude"
+	runtimeNameCodex  = "codex"
+)
+
 func loadExecutionContext() (string, policy.Config, *repoadapter.Repo, error) {
 	repo, err := repoadapter.New(".")
 	if err != nil {
@@ -41,9 +46,9 @@ func loadExecutionContext() (string, policy.Config, *repoadapter.Repo, error) {
 
 func runtimeAdapterFor(ticketPreference, defaultRuntime string) (runtime.Adapter, error) {
 	switch normalizeRuntime(ticketPreference, defaultRuntime) {
-	case "codex":
+	case runtimeNameCodex:
 		return codex.New(), nil
-	case "claude":
+	case runtimeNameClaude:
 		return claude.New(), nil
 	default:
 		return nil, fmt.Errorf("unsupported runtime %q", normalizeRuntime(ticketPreference, defaultRuntime))
@@ -51,13 +56,13 @@ func runtimeAdapterFor(ticketPreference, defaultRuntime string) (runtime.Adapter
 }
 
 func normalizeRuntime(ticketPreference, defaultRuntime string) string {
-	for _, candidate := range []string{ticketPreference, defaultRuntime, "codex"} {
+	for _, candidate := range []string{ticketPreference, defaultRuntime, runtimeNameCodex} {
 		candidate = strings.TrimSpace(strings.ToLower(candidate))
 		if candidate != "" {
 			return candidate
 		}
 	}
-	return "codex"
+	return runtimeNameCodex
 }
 
 func newRunID(ticketID string) string {
