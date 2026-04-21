@@ -2,7 +2,10 @@ package cli
 
 import (
 	"bytes"
+	"errors"
+	"io"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"verk/internal/policy"
@@ -86,7 +89,52 @@ func TestInitCmd_RepeatedRunShowsAndPreservesExistingRuntimeProfilesOnBlankInput
 	}
 }
 
+type errReader struct {
+	data []byte
+	err  error
+	pos  int
+}
+
+func (r *errReader) Read(p []byte) (int, error) {
+	if r.pos >= len(r.data) {
+		if r.err == nil {
+			return 0, io.EOF
+		}
+		return 0, r.err
+	}
+	n := copy(p, r.data[r.pos:])
+	r.pos += n
+	return n, nil
+}
+
+func TestInitCmd_FailingScannerPreventsConfigWrite(t *testing.T) {
+	dir := t.TempDir()
+	initCLITestRepo(t, dir)
+
+	reader := &errReader{data: []byte("\n"), err: io.ErrUnexpectedEOF}
+	stdout, stderr, err := runInitInDirWithReader(t, dir, reader)
+	if err == nil {
+		t.Fatalf("expected init to fail on read error")
+	}
+	if !strings.Contains(err.Error(), "read input:") {
+		t.Fatalf("expected read input error, got: %v\nstdout:\n%s\nstderr:\n%s", err, stdout, stderr)
+	}
+	if !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Fatalf("expected wrapped scanner read error, got: %v\nstdout:\n%s\nstderr:\n%s", err, stdout, stderr)
+	}
+	if _, statErr := os.Stat(filepath.Join(dir, ".verk", "config.yaml")); !os.IsNotExist(statErr) {
+		if statErr == nil {
+			t.Fatalf("expected config file to not be written after scanner error")
+		}
+		t.Fatalf("unexpected stat error: %v\nstdout:\n%s\nstderr:\n%s", statErr, stdout, stderr)
+	}
+}
+
 func runInitInDir(t *testing.T, dir, stdin string) (string, string, error) {
+	return runInitInDirWithReader(t, dir, strings.NewReader(stdin))
+}
+
+func runInitInDirWithReader(t *testing.T, dir string, stdin io.Reader) (string, string, error) {
 	t.Helper()
 	originalWD, err := os.Getwd()
 	if err != nil {
@@ -105,7 +153,7 @@ func runInitInDir(t *testing.T, dir, stdin string) (string, string, error) {
 	var stderr bytes.Buffer
 	root := newRootCmd()
 	root.SetArgs([]string{"init"})
-	root.SetIn(strings.NewReader(stdin))
+	root.SetIn(stdin)
 	root.SetOut(&stdout)
 	root.SetErr(&stderr)
 	err = root.Execute()

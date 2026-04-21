@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 	"verk/internal/engine"
+	"verk/internal/state"
 )
 
 // TestEngineGoroutineSync_NoRaceOnEarlyTUIReturn validates the synchronization
@@ -228,5 +229,39 @@ func TestDrainGoroutine_PreventsDeadlockOnEarlyTUIReturn(t *testing.T) {
 	}
 	if runErr != nil {
 		t.Errorf("expected nil runErr, got %v", runErr)
+	}
+}
+
+// TestEngineGoroutineSync_ResumeReportPath checks that resume report and error
+// state are still visible after an early TUI return when the shared variables
+// are written after the last progress event has been sent.
+func TestEngineGoroutineSync_ResumeReportPath(t *testing.T) {
+	ch := make(chan engine.ProgressEvent, 4)
+
+	var report engine.ResumeReport
+	var resumeErr error
+	var wg sync.WaitGroup
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		defer close(ch)
+		ch <- engine.ProgressEvent{Type: engine.EventRunCompleted, Detail: "resuming"}
+		time.Sleep(10 * time.Millisecond)
+		report = engine.ResumeReport{Run: state.RunArtifact{Status: state.EpicRunStatusCompleted}}
+		resumeErr = errors.New("resume finished")
+	}()
+
+	// Fake TUI returns after consuming one event, simulating an early exit.
+	<-ch
+
+	// Ensure producer goroutine has committed final shared state before reads.
+	wg.Wait()
+
+	if report.Run.Status != state.EpicRunStatusCompleted {
+		t.Fatalf("expected report status=%q, got %q", state.EpicRunStatusCompleted, report.Run.Status)
+	}
+	if resumeErr == nil || resumeErr.Error() != "resume finished" {
+		t.Fatalf("expected resumeErr=%q, got %v", "resume finished", resumeErr)
 	}
 }

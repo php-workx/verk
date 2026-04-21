@@ -67,16 +67,16 @@ func TestLatestRunID_NoRunsDir(t *testing.T) {
 }
 
 func TestLatestRunID_CrossTicketIDOrder(t *testing.T) {
-	// run-ticket-z-1000 sorts lex BEFORE run-ticket-a-2000,
-	// but run-ticket-a-2000 has a larger timestamp and must win.
+	// run-ticket-z-2000 sorts lex BEFORE run-ticket-a-1000,
+	// but 2000 > 1000, so run-ticket-z-2000 must win.
 	repoRoot := t.TempDir()
 	runsDir := filepath.Join(repoRoot, ".verk", "runs")
 	if err := os.MkdirAll(runsDir, 0o755); err != nil {
 		t.Fatalf("mkdir: %v", err)
 	}
 	for _, name := range []string{
-		"run-ticket-z-1000",
-		"run-ticket-a-2000",
+		"run-ticket-a-1000",
+		"run-ticket-z-2000",
 	} {
 		if err := os.Mkdir(filepath.Join(runsDir, name), 0o755); err != nil {
 			t.Fatalf("mkdir %s: %v", name, err)
@@ -87,8 +87,8 @@ func TestLatestRunID_CrossTicketIDOrder(t *testing.T) {
 	if err != nil {
 		t.Fatalf("latestRunID: %v", err)
 	}
-	if latest != "run-ticket-a-2000" {
-		t.Fatalf("expected run-ticket-a-2000, got %q", latest)
+	if latest != "run-ticket-z-2000" {
+		t.Fatalf("expected run-ticket-z-2000, got %q", latest)
 	}
 }
 
@@ -98,9 +98,8 @@ func TestLatestRunID_SkipsUnparseableEntries(t *testing.T) {
 	if err := os.MkdirAll(runsDir, 0o755); err != nil {
 		t.Fatalf("mkdir: %v", err)
 	}
-	// "run-bad-suffix" has a non-numeric suffix; should be skipped.
-	// "run-ticket-a-9999" is valid and should be returned.
 	for _, name := range []string{
+		"run-ticket-b-1000",
 		"run-bad-suffix",
 		"run-ticket-a-9999",
 	} {

@@ -94,10 +94,10 @@ func TestDoRunTicket_CurrentPointerNotSetOnSaveFailure(t *testing.T) {
 }
 
 // TestDoRunEpic_CurrentPointerClearedOnEngineFailure verifies the fix for
-// doRunEpic: when engine.RunEpic returns an error, writeCurrentRunID("") must
-// be called to clear the pointer that was set before the goroutine launched.
-// If not cleared, .verk/current keeps pointing at a run whose run.json may
-// never have been written.
+// doRunEpic: when engine.RunEpic returns an error before it can successfully
+// persist the initial run artifact, writeCurrentRunID should not be called.
+// If .verk/current still changes, it must either point to a valid run artifact
+// (not exercised here) or remain empty/unchanged.
 func TestDoRunEpic_CurrentPointerClearedOnEngineFailure(t *testing.T) {
 	dir := t.TempDir()
 	initCLITestRepo(t, dir)
@@ -120,8 +120,8 @@ func TestDoRunEpic_CurrentPointerClearedOnEngineFailure(t *testing.T) {
 		t.Fatal("expected doRunEpic to return a non-empty runID even on failure")
 	}
 
-	// .verk/current must be cleared (empty) after the engine failure so that
-	// downstream commands don't resolve to a run without a valid run.json.
+	// .verk/current must not be set to the new run ID after this early engine
+	// failure because the run.json artifact was never persisted.
 	currentPath := filepath.Join(dir, ".verk", "current")
 	data, readErr := os.ReadFile(currentPath)
 	if readErr != nil {

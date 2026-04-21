@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
@@ -165,57 +166,39 @@ func runCLIFromDir(t *testing.T, dir string, args ...string) (string, string, in
 	return string(stdoutRes.data), string(stderrRes.data), code
 }
 
-// TestRunCLIFromDir_LargeOutput_NoDeadlock verifies that the goroutine-based
-// pipe draining in runCLIFromDir does not deadlock when more than 64KB is
-// written to stdout or stderr before ExecuteArgs returns.
+// TestRunCLIFromDir_LargeOutput_NoDeadlock verifies that pipe draining in
+// runCLIFromDir captures full stdout for large outputs that exceed default pipe
+// capacity.
 func TestRunCLIFromDir_LargeOutput_NoDeadlock(t *testing.T) {
-	const size = 128 * 1024 // 128KB — well above the old 64KB fixed buffer
+	repoRoot := t.TempDir()
+	writeCLIRepo(t, repoRoot)
 
-	// Directly exercise the goroutine+io.ReadAll mechanism used by runCLIFromDir.
-	stdoutR, stdoutW, err := os.Pipe()
-	if err != nil {
-		t.Fatalf("os.Pipe (stdout): %v", err)
-	}
-	stderrR, stderrW, err := os.Pipe()
-	if err != nil {
-		t.Fatalf("os.Pipe (stderr): %v", err)
-	}
+	const (
+		largeRunID  = "run-large-output"
+		largeCount  = 1200
+		idSuffixLen = 72
+	)
 
-	type result struct{ data []byte }
-	stdoutCh := make(chan result, 1)
-	stderrCh := make(chan result, 1)
-
-	go func() {
-		data, _ := io.ReadAll(stdoutR)
-		stdoutCh <- result{data}
-	}()
-	go func() {
-		data, _ := io.ReadAll(stderrR)
-		stderrCh <- result{data}
-	}()
-
-	// Write >64KB to both streams before closing.
-	large := make([]byte, size)
-	if _, err := stdoutW.Write(large); err != nil {
-		t.Fatalf("stdoutW.Write: %v", err)
-	}
-	if _, err := stderrW.Write(large); err != nil {
-		t.Fatalf("stderrW.Write: %v", err)
+	ticketIDs := make([]string, 0, largeCount)
+	for i := 0; i < largeCount; i++ {
+		ticketIDs = append(ticketIDs, fmt.Sprintf("ticket-%04d-%s", i, strings.Repeat("x", idSuffixLen)))
 	}
 
-	_ = stdoutW.Close()
-	_ = stderrW.Close()
+	writeJSONFixture(t, filepath.Join(repoRoot, ".verk", "runs", largeRunID, "run.json"), state.RunArtifact{
+		ArtifactMeta: state.ArtifactMeta{SchemaVersion: 1, RunID: largeRunID},
+		Mode:         "ticket",
+		RootTicketID: ticketIDs[0],
+		Status:       state.EpicRunStatusRunning,
+		CurrentPhase: state.TicketPhaseImplement,
+		TicketIDs:    ticketIDs,
+	})
 
-	stdoutRes := <-stdoutCh
-	_ = stdoutR.Close()
-	stderrRes := <-stderrCh
-	_ = stderrR.Close()
-
-	if got := len(stdoutRes.data); got != size {
-		t.Errorf("stdout: expected %d bytes, got %d", size, got)
+	stdout, stderr, code := runCLIFromDir(t, repoRoot, "status", largeRunID)
+	if code != 0 {
+		t.Fatalf("status %s failed: code=%d stderr=%s", largeRunID, code, stderr)
 	}
-	if got := len(stderrRes.data); got != size {
-		t.Errorf("stderr: expected %d bytes, got %d", size, got)
+	if got, want := len(stdout), 64*1024; got <= want {
+		t.Fatalf("expected status output > %d bytes, got %d", want, got)
 	}
 }
 

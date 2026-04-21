@@ -342,9 +342,6 @@ func doRunEpic(w, errw io.Writer, ticketID string) (string, error) {
 	runID := newRunID(ticketID)
 
 	_, _ = fmt.Fprintf(w, "run_id=%s\n", runID)
-	if wErr := writeCurrentRunID(repoRoot, runID); wErr != nil {
-		_, _ = fmt.Fprintf(errw, "warning: could not write current run: %v\n", wErr)
-	}
 
 	// Run engine with progress channel
 	ch := make(chan engine.ProgressEvent, 64)
@@ -378,12 +375,6 @@ func doRunEpic(w, errw io.Writer, ticketID string) (string, error) {
 	wg.Wait()
 
 	if runErr != nil {
-		// Clear the current-run pointer so downstream commands don't resolve to
-		// a run whose run.json may never have been written by the engine.
-		if clearErr := writeCurrentRunID(repoRoot, ""); clearErr != nil {
-			_, _ = fmt.Fprintf(errw, "warning: could not clear current run: %v\n", clearErr)
-		}
-
 		// If the run ended in a structured blocked state, hand off to the
 		// blocked-run handler so the operator sees which tickets are blocked
 		// and how to retry them. For interactive terminals the handler may
@@ -402,6 +393,13 @@ func doRunEpic(w, errw io.Writer, ticketID string) (string, error) {
 			}
 		}
 		return runID, runErr
+	}
+
+	// The epic run artifact has been persisted by engine.RunEpic before it can
+	// return here. Write the current-run pointer after that point so .verk/current
+	// never points at a run without run.json on disk.
+	if wErr := writeCurrentRunID(repoRoot, runID); wErr != nil {
+		_, _ = fmt.Fprintf(errw, "warning: could not write current run: %v\n", wErr)
 	}
 
 	_, _ = fmt.Fprintf(w, "status=%s phase=%s\n", result.Run.Status, result.Run.CurrentPhase)

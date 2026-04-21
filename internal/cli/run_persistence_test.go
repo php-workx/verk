@@ -2,12 +2,92 @@ package cli
 
 import (
 	"bytes"
+	"context"
 	"errors"
+	"io"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"verk/internal/adapters/ticketstore/tkmd"
+	"verk/internal/engine"
 	"verk/internal/state"
 )
+
+// TestDoRunTicket_FinalSaveFailure injects a stubbed engine execution and a
+// failing final SaveJSONAtomic call so doRunTicket returns the wrapped error and
+// never prints the success status line.
+func TestDoRunTicket_FinalSaveFailure(t *testing.T) {
+	dir := t.TempDir()
+	initCLITestRepo(t, dir)
+
+	ticketsDir := filepath.Join(dir, ".tickets")
+	if err := os.MkdirAll(ticketsDir, 0o755); err != nil {
+		t.Fatalf("mkdir .tickets: %v", err)
+	}
+	ticket := tkmd.Ticket{
+		ID:     "ver-final-save",
+		Title:  "Final persistence failure test",
+		Status: tkmd.StatusReady,
+	}
+	if err := tkmd.SaveTicket(filepath.Join(ticketsDir, "ver-final-save.md"), ticket); err != nil {
+		t.Fatalf("save ticket: %v", err)
+	}
+
+	origRunTicket := runTicket
+	origRunProgress := runProgress
+	origSaveJSONAtomic := saveJSONAtomic
+	origSaveTicket := saveTicket
+	defer func() {
+		runTicket = origRunTicket
+		runProgress = origRunProgress
+		saveJSONAtomic = origSaveJSONAtomic
+		saveTicket = origSaveTicket
+	}()
+
+	runTicket = func(_ context.Context, _ engine.RunTicketRequest) (engine.RunTicketResult, error) {
+		return engine.RunTicketResult{Snapshot: engine.TicketRunSnapshot{CurrentPhase: state.TicketPhaseClosed}}, nil
+	}
+	runProgress = func(_ string, ch <-chan engine.ProgressEvent, _ io.Writer, _ func()) error {
+		for range ch {
+		}
+		return nil
+	}
+	saveTicket = func(_ string, _ tkmd.Ticket) error { return nil }
+
+	errDiskFull := errors.New("disk full")
+	callCount := 0
+	saveJSONAtomic = func(_ string, _ any) error {
+		callCount++
+		if callCount == 2 { // Fail only the final persistence after the engine completes.
+			return errDiskFull
+		}
+		return nil
+	}
+
+	t.Chdir(dir)
+
+	var stdout, stderr bytes.Buffer
+	runID, err := doRunTicket(&stdout, &stderr, "ver-final-save")
+	if err == nil {
+		t.Fatal("expected doRunTicket to return an error")
+	}
+	if !strings.Contains(err.Error(), "persist run state") {
+		t.Fatalf("expected wrapped persist error, got %v", err)
+	}
+	if !errors.Is(err, errDiskFull) {
+		t.Fatalf("expected underlying disk full error, got %v", err)
+	}
+	if runID == "" {
+		t.Fatal("expected non-empty runID even on persistence failure")
+	}
+	if stdout.Len() > 0 {
+		t.Fatalf("expected no success output on stdout, got %q", stdout.String())
+	}
+	if callCount != 2 {
+		t.Fatalf("expected SaveJSONAtomic to be called twice, saw %d", callCount)
+	}
+}
 
 // TestFinalizeRun_SaveJSONAtomicFailure verifies that when SaveJSONAtomic fails,
 // finalizeRun returns a wrapped error ("persist run state: ...") and does NOT
