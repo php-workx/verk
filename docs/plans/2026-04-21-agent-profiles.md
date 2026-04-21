@@ -260,7 +260,7 @@ Write failing tests first:
 - `internal/adapters/ticketstore/tkmd/profile.go` (new)
 - `internal/adapters/ticketstore/tkmd/profile_test.go` (new)
 
-Implement `DetectProfile(ticket Ticket) string` with the priority-ordered matcher. Detection is pure function — no I/O, no LLM, no file reads beyond what the ticket struct already contains.
+Implement `DetectProfile(ticket Ticket) Profile` with the priority-ordered matcher. Detection returns one of the enum-like constants (`ProfileSecurity`, `ProfileContract`, `ProfileFrontend`, `ProfileBackend`) and is a pure function — no I/O, no LLM, no file reads beyond what the ticket struct already contains.
 
 Write failing tests first:
 - Ticket with tag `security` → `security-engineer`
@@ -293,15 +293,15 @@ Write failing tests first:
 - `internal/adapters/runtime/profiles/` (new directory with one `.md` per profile)
 - `internal/adapters/runtime/standards.go` (extend `BuildWorkerPrompt` or add `BuildProfilePrompt`)
 
-Embed rationalization tables per profile as `.md` files alongside the existing `standards/*.md` pattern. Add `BuildProfilePrompt(profile string) string` returning the role framing sentence + rationalization tables for that profile. Return empty string for unknown profiles (graceful degradation — worker still runs without profile framing).
+Embed rationalization tables per profile as `.md` files alongside the existing `standards/*.md` pattern. Add `BuildProfilePrompt(profile Profile) string` returning the role framing sentence + rationalization tables for that profile. Return empty string for unknown profiles (graceful degradation — worker still runs without profile framing).
 
-Modify `BuildWorkerPrompt` to accept profile and prepend the profile block before ticket content.
+Modify `BuildWorkerPrompt` to accept a `Profile` and insert the profile block after ticket content and before the standards section. If rationalizations are rendered separately from the profile block, keep ticket content first, then rationalizations, then the profile block, then standards; do not prepend profile material before ticket content.
 
 Write failing tests first:
 - `BuildProfilePrompt("security-engineer")` contains "security" and "credential"
 - `BuildProfilePrompt("contract-engineer")` contains "exit code" and "public surface"
 - `BuildProfilePrompt("unknown-role")` returns `""`
-- `BuildWorkerPrompt` with profile → profile block appears before ticket content in output
+- `BuildWorkerPrompt` with profile → ticket content appears before rationalizations/profile block, and the profile block appears before standards in output
 
 ---
 
