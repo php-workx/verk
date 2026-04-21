@@ -27,8 +27,8 @@ verification:
   quality_commands:
     - path: ""
       run:
-        - just format-check
-        - just lint-check
+        - just format
+        - just lint
         - just build-check
   wave_commands:
     - path: ""

@@ -74,8 +74,9 @@ type RuntimeConfig struct {
 }
 
 // QualityCommand describes a set of shell commands to run from an optional
-// subdirectory. For ticket-level quality_commands these should stay lightweight
-// and check-only, such as formatting, linting, and type checking.
+// subdirectory. Ticket-level quality_commands should stay lightweight. They may
+// use auto-fixing format/lint targets so worker verification can repair simple
+// hygiene issues before deciding a ticket needs a repair pass.
 //
 // Path is relative to the repo root; leave empty to run from the repo root.
 // Run lists the shell commands to execute sequentially.
@@ -84,7 +85,7 @@ type RuntimeConfig struct {
 //
 //	quality_commands:
 //	  - path: "."
-//	    run: ["just lint-check"]
+//	    run: ["just format", "just lint", "just build-check"]
 //	  - path: "packages/api"
 //	    run: ["cargo clippy -- -D warnings", "cargo test"]
 type QualityCommand struct {

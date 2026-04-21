@@ -57,27 +57,12 @@ func DetectProjectTooling(dir string) []DetectedTooling {
 
 	probes := []probe{
 		{
-			file: "Justfile",
-			commands: func(dir string) []string {
-				// Prefer project-level CI target; fall back to check or lint.
-				for _, target := range []string{"ci", "check", "lint", "test"} {
-					if justTargetExists(dir, target) {
-						return []string{"just " + target}
-					}
-				}
-				return []string{"just --list"}
-			},
+			file:     "Justfile",
+			commands: suggestedJustQualityCommands,
 		},
 		{
-			file: "justfile", // lowercase variant
-			commands: func(dir string) []string {
-				for _, target := range []string{"ci", "check", "lint", "test"} {
-					if justTargetExists(dir, target) {
-						return []string{"just " + target}
-					}
-				}
-				return []string{"just --list"}
-			},
+			file:     "justfile", // lowercase variant
+			commands: suggestedJustQualityCommands,
 		},
 		{
 			file: "Makefile",
@@ -137,6 +122,24 @@ func DetectProjectTooling(dir string) []DetectedTooling {
 		})
 	}
 	return results
+}
+
+func suggestedJustQualityCommands(dir string) []string {
+	var commands []string
+	for _, target := range []string{"format", "lint", "build-check"} {
+		if justTargetExists(dir, target) {
+			commands = append(commands, "just "+target)
+		}
+	}
+	if len(commands) > 0 {
+		return commands
+	}
+	for _, target := range []string{"autofix", "ci", "check", "lint-check", "test"} {
+		if justTargetExists(dir, target) {
+			return []string{"just " + target}
+		}
+	}
+	return []string{"just --list"}
 }
 
 // justTargetExists returns true when `just --list` output contains the named target.
