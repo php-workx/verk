@@ -607,6 +607,158 @@ func TestRunTicket_ScopeCheckBlocksWhenOwnedPathsEmpty(t *testing.T) {
 	}
 }
 
+func TestRunTicket_ScopeMissingThenReopensToProceed(t *testing.T) {
+	repoRoot := t.TempDir()
+	cfg := policy.DefaultConfig()
+
+	runID := "run-scope-reopen"
+	ticketID := "ver-scope-reopen"
+	ticket := testTicket(ticketID)
+
+	// First run: no OwnedPaths set, so single-ticket scope check should block.
+	firstPlan, firstClaim := testPlanAndClaim(t, repoRoot, ticket, cfg, runID, "lease-scope-reopen-empty", []string{`true`})
+
+	started, finished := testRunTimes()
+	firstAdapter := runtimefake.New(
+		[]runtime.WorkerResult{
+			{
+				Status:             runtime.WorkerStatusDone,
+				RetryClass:         runtime.RetryClassTerminal,
+				LeaseID:            firstClaim.LeaseID,
+				StartedAt:          started,
+				FinishedAt:         finished,
+				ResultArtifactPath: filepath.Join(repoRoot, "worker-empty.json"),
+			},
+		},
+		nil,
+	)
+
+	blockedResult, err := RunTicket(context.Background(), RunTicketRequest{
+		RepoRoot:           repoRoot,
+		RunID:              runID,
+		Ticket:             ticket,
+		Plan:               firstPlan,
+		Claim:              firstClaim,
+		Adapter:            firstAdapter,
+		Config:             cfg,
+		EnforceSingleScope: true,
+	})
+	if err != nil {
+		t.Fatalf("first RunTicket returned error: %v", err)
+	}
+	if blockedResult.Snapshot.CurrentPhase != state.TicketPhaseBlocked {
+		t.Fatalf("expected blocked phase on first run, got %q", blockedResult.Snapshot.CurrentPhase)
+	}
+	if !strings.Contains(blockedResult.Snapshot.BlockReason, "single-ticket scope violation") {
+		t.Fatalf("expected scope violation block reason, got %q", blockedResult.Snapshot.BlockReason)
+	}
+
+	// Simulate reopen flow artifacts that would normally exist in an epic run.
+	writeOpRunFixture(t, repoRoot, runID, state.RunArtifact{
+		ArtifactMeta: state.ArtifactMeta{SchemaVersion: 1, RunID: runID},
+		Mode:         "epic",
+		RootTicketID: "epic-1",
+		Status:       state.EpicRunStatusBlocked,
+		CurrentPhase: state.TicketPhaseBlocked,
+		TicketIDs:    []string{ticketID},
+		WaveIDs:      []string{"wave-1"},
+	})
+	writeWaveFixture(t, repoRoot, runID, state.WaveArtifact{
+		ArtifactMeta: state.ArtifactMeta{SchemaVersion: 1, RunID: runID},
+		WaveID:       "wave-1",
+		Ordinal:      1,
+		Status:       state.WaveStatusFailed,
+		TicketIDs:    []string{ticketID},
+	})
+	writeTicketRunFixture(t, repoRoot, runID, blockedResult.Snapshot)
+	writePlanFixture(t, repoRoot, runID, firstPlan)
+	writeTicketMarkdownFixture(t, repoRoot, tkmd.Ticket{
+		ID:                 ticketID,
+		Title:              ticket.Title,
+		Status:             tkmd.StatusBlocked,
+		OwnedPaths:         nil,
+		UnknownFrontmatter: map[string]any{"type": "task"},
+	})
+
+	// Operator adds scope declarations and reopens the ticket.
+	if err := ReopenTicket(context.Background(), ReopenRequest{
+		RepoRoot: repoRoot,
+		RunID:    runID,
+		TicketID: ticketID,
+		ToPhase:  state.TicketPhaseImplement,
+	}); err != nil {
+		t.Fatalf("ReopenTicket returned error: %v", err)
+	}
+
+	reopenedTicket, err := tkmd.LoadTicket(ticketMarkdownPath(repoRoot, ticketID))
+	if err != nil {
+		t.Fatalf("load reopened ticket: %v", err)
+	}
+	if reopenedTicket.Status != tkmd.StatusOpen {
+		t.Fatalf("expected ticket status to become open after reopen, got %q", reopenedTicket.Status)
+	}
+	reopenedTicket.OwnedPaths = []string{"internal/engine"}
+	if err := tkmd.SaveTicket(filepath.Join(repoRoot, ".tickets", ticketID+".md"), reopenedTicket); err != nil {
+		t.Fatalf("save reopened ticket: %v", err)
+	}
+
+	reopenedPlan, reopenedClaim := testPlanAndClaim(
+		t,
+		repoRoot,
+		reopenedTicket,
+		cfg,
+		runID,
+		"lease-scope-reopen-scope",
+		[]string{`true`},
+	)
+
+	started, finished = testRunTimes()
+	reopenedAdapter := runtimefake.New(
+		[]runtime.WorkerResult{
+			{
+				Status:             runtime.WorkerStatusDone,
+				RetryClass:         runtime.RetryClassTerminal,
+				LeaseID:            reopenedClaim.LeaseID,
+				StartedAt:          started,
+				FinishedAt:         finished,
+				ResultArtifactPath: filepath.Join(repoRoot, "worker-scope.json"),
+			},
+		},
+		[]runtime.ReviewResult{
+			{
+				Status:             runtime.WorkerStatusDone,
+				RetryClass:         runtime.RetryClassTerminal,
+				LeaseID:            reopenedClaim.LeaseID,
+				StartedAt:          finished.Add(time.Second),
+				FinishedAt:         finished.Add(2 * time.Second),
+				ReviewStatus:       runtime.ReviewStatusPassed,
+				Summary:            "clean",
+				ResultArtifactPath: filepath.Join(repoRoot, "review-scope.json"),
+			},
+		},
+	)
+
+	reopenedResult, err := RunTicket(context.Background(), RunTicketRequest{
+		RepoRoot:           repoRoot,
+		RunID:              runID,
+		Ticket:             reopenedTicket,
+		Plan:               reopenedPlan,
+		Claim:              reopenedClaim,
+		Adapter:            reopenedAdapter,
+		Config:             cfg,
+		EnforceSingleScope: true,
+	})
+	if err != nil {
+		t.Fatalf("second RunTicket returned error: %v", err)
+	}
+	if reopenedResult.Snapshot.CurrentPhase != state.TicketPhaseClosed {
+		t.Fatalf("expected ticket to proceed to closed, got %q", reopenedResult.Snapshot.CurrentPhase)
+	}
+	if reopenedResult.Snapshot.BlockReason != "" {
+		t.Fatalf("expected no block reason after scope is declared, got %q", reopenedResult.Snapshot.BlockReason)
+	}
+}
+
 func TestRunTicket_WorkerBlockReasonRoundTrips(t *testing.T) {
 	repoRoot := t.TempDir()
 	cfg := policy.DefaultConfig()
@@ -1334,15 +1486,36 @@ func TestTicketRunState_snapshotPreservesCreatedAt(t *testing.T) {
 }
 
 func TestTicketRunState_snapshotPreservesRestoredCreatedAt(t *testing.T) {
+	repoRoot := t.TempDir()
+	runID := "run-snapshot-restore"
+	ticketID := "ver-snapshot-restore"
 	fixedCreatedAt := time.Date(2025, 1, 15, 10, 30, 0, 0, time.UTC)
+	fixture := TicketRunSnapshot{
+		ArtifactMeta: state.ArtifactMeta{
+			SchemaVersion: artifactSchemaVersion,
+			RunID:         runID,
+			CreatedAt:     fixedCreatedAt,
+			UpdatedAt:     fixedCreatedAt,
+		},
+		TicketID:     ticketID,
+		CurrentPhase: state.TicketPhaseImplement,
+	}
+	if err := state.SaveJSONAtomic(ticketSnapshotPath(repoRoot, runID, ticketID), fixture); err != nil {
+		t.Fatalf("seed ticket snapshot: %v", err)
+	}
+
+	var loaded TicketRunSnapshot
+	if err := loadTicketSnapshot(repoRoot, runID, ticketID, &loaded); err != nil {
+		t.Fatalf("load persisted ticket snapshot: %v", err)
+	}
 
 	st := &ticketRunState{
 		req: RunTicketRequest{
-			RunID:  "run-snapshot-restore",
-			Ticket: tkmd.Ticket{ID: "ver-snapshot-restore"},
+			RunID:  runID,
+			Ticket: tkmd.Ticket{ID: ticketID},
 		},
-		createdAt: fixedCreatedAt,
 	}
+	st.createdAt = loaded.CreatedAt
 
 	snap := st.snapshot()
 

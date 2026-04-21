@@ -257,10 +257,13 @@ func TestResumeRun_ClosedPhase_NonClosable_BecomesBlocked(t *testing.T) {
 	if snapshot.CurrentPhase != state.TicketPhaseBlocked {
 		t.Fatalf("expected Blocked phase, got %q", snapshot.CurrentPhase)
 	}
-	if snapshot.BlockReason == "" {
-		t.Fatal("expected BlockReason to be set, got empty string")
+	if snapshot.Closeout == nil {
+		t.Fatalf("expected closeout to be repaired, got %#v", snapshot.Closeout)
 	}
-	if snapshot.Closeout == nil || snapshot.Closeout.Closable {
+	if snapshot.BlockReason != snapshot.Closeout.FailedGate {
+		t.Fatalf("expected BlockReason %q, got %q", snapshot.Closeout.FailedGate, snapshot.BlockReason)
+	}
+	if snapshot.Closeout.Closable {
 		t.Fatalf("expected non-closable closeout, got %#v", snapshot.Closeout)
 	}
 }
@@ -344,6 +347,9 @@ func TestResumeRun_ClosedPhase_Closable_StaysClosed(t *testing.T) {
 	if snapshot.BlockReason != "" {
 		t.Fatalf("expected BlockReason cleared, got %q", snapshot.BlockReason)
 	}
+	if snapshot.Closeout == nil {
+		t.Fatalf("expected repaired closeout, got %#v", snapshot.Closeout)
+	}
 	if snapshot.Closeout == nil || !snapshot.Closeout.Closable {
 		t.Fatalf("expected closable closeout, got %#v", snapshot.Closeout)
 	}
@@ -423,6 +429,9 @@ func TestResumeRun_CloseoutPhase_Closable_BecomesClosed(t *testing.T) {
 	}
 	if snapshot.CurrentPhase != state.TicketPhaseClosed {
 		t.Fatalf("expected Closed phase, got %q", snapshot.CurrentPhase)
+	}
+	if snapshot.BlockReason != "" {
+		t.Fatalf("expected BlockReason cleared, got %q", snapshot.BlockReason)
 	}
 	if snapshot.Closeout == nil || !snapshot.Closeout.Closable {
 		t.Fatalf("expected closable closeout, got %#v", snapshot.Closeout)

@@ -203,6 +203,26 @@ func TestAcceptWave_ScopeViolationIsFatal(t *testing.T) {
 	}
 }
 
+func TestCollectBlockedTicketsKeepsBlockedStatusRetryableWithoutSnapshot(t *testing.T) {
+	repoRoot := t.TempDir()
+	child := tkmd.Ticket{
+		ID:     "ticket-blocked",
+		Title:  "Blocked ticket",
+		Status: tkmd.StatusBlocked,
+	}
+
+	blocked := collectBlockedTickets(repoRoot, "run-without-snapshot", []tkmd.Ticket{child})
+	if len(blocked) != 1 {
+		t.Fatalf("expected one blocked ticket, got %d", len(blocked))
+	}
+	if blocked[0].Phase != state.TicketPhaseBlocked {
+		t.Fatalf("expected blocked phase, got %q", blocked[0].Phase)
+	}
+	if blocked[0].RetryPhase != state.TicketPhaseImplement {
+		t.Fatalf("expected implement retry phase, got %q", blocked[0].RetryPhase)
+	}
+}
+
 func TestRunEpicSchedulesOpenAndReadyTickets(t *testing.T) {
 	repoRoot := t.TempDir()
 	baseCommit := initEpicRepo(t, repoRoot)

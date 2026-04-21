@@ -81,7 +81,8 @@ func ResumeRun(ctx context.Context, req ResumeRequest) (ResumeReport, error) { /
 		if repaired {
 			recovered = append(recovered, ticketID)
 		}
-		if snapshot.Closeout == nil && (snapshot.CurrentPhase == state.TicketPhaseCloseout || snapshot.CurrentPhase == state.TicketPhaseClosed) {
+		sourcePhase := snapshot.CurrentPhase
+		if snapshot.Closeout == nil && (sourcePhase == state.TicketPhaseCloseout || sourcePhase == state.TicketPhaseClosed) {
 			plan, ok := artifacts.Plans[ticketID]
 			if !ok {
 				return ResumeReport{}, fmt.Errorf("resume requires plan artifact for ticket %s", ticketID)
@@ -99,7 +100,8 @@ func ResumeRun(ctx context.Context, req ResumeRequest) (ResumeReport, error) { /
 			}
 			snapshot.Closeout = &closeout
 			snapshot.UpdatedAt = stateTime()
-			if snapshot.CurrentPhase == state.TicketPhaseCloseout || snapshot.CurrentPhase == state.TicketPhaseClosed {
+			switch sourcePhase {
+			case state.TicketPhaseCloseout, state.TicketPhaseClosed:
 				if closeout.Closable {
 					snapshot.CurrentPhase = state.TicketPhaseClosed
 					snapshot.BlockReason = ""

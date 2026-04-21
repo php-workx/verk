@@ -129,7 +129,11 @@ func collectBlockedTickets(repoRoot, runID string, children []tkmd.Ticket) []Blo
 				}
 			}
 		}
-		retryPhase, _ := DefaultReopenTargetForPhase(phase)
+		retryPhase, retryable := DefaultReopenTargetForPhase(phase)
+		if !retryable && child.Status == tkmd.StatusBlocked {
+			phase = state.TicketPhaseBlocked
+			retryPhase = state.TicketPhaseImplement
+		}
 		out = append(out, BlockedTicket{
 			ID:         child.ID,
 			Title:      child.Title,
