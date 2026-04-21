@@ -46,7 +46,7 @@ Order: **S1 → (S2 + S3 parallel) → S5 → (S7 + S8 parallel)**.
 ### What stays unchanged
 
 - The `verk` binary, CLI, and engine-mode orchestration.
-- Contracts in `specs/initial_v1.md`: state machine, artifacts, gates, derived pass/fail, lease semantics, scope enforcement.
+- Contracts in `docs/plans/done/initial_v1.md`: state machine, artifacts, gates, derived pass/fail, lease semantics, scope enforcement.
 - The `.verk/runs/<run-id>/` artifact layout. Skill-mode writes the same artifacts via the same engine code paths.
 
 ### What this plan does not address
@@ -390,7 +390,7 @@ When a skill-mode run is active, sub-agents receive a hard edit guard instructin
 
 - Daemon writes `.verk/runs/<run-id>/freeze.json` at orchestration start: `{run_id, ticket_id, allowed_paths, active, started_at}`.
 - Sub-agent prompts include a `## Hard Edit Guard` section listing allowed paths with the instruction: "any edit outside this set must stop immediately and return `status: blocked` with reason `scope_escape_attempt`."
-- Post-implementation, engine reconciles actual changed files against `allowed_paths` (existing behavior from `specs/initial_v1.md`). Auto-freeze catches attempts at prompt time; scope reconciliation catches what slipped through.
+- Post-implementation, engine reconciles actual changed files against `allowed_paths` (existing behavior from `docs/plans/done/initial_v1.md`). Auto-freeze catches attempts at prompt time; scope reconciliation catches what slipped through.
 
 ### Not a new enforcement layer
 

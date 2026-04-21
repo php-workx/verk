@@ -1,6 +1,6 @@
 # Distributed-Systems / Workflow-Engine Reviewer Prompt
 
-Review target: `specs/initial_v1.md`
+Review target: `docs/plans/done/initial_v1.md`
 
 You are a senior distributed-systems and workflow-engine reviewer. Your job is to review this technical plan as if you are trying to break it before implementation begins.
 

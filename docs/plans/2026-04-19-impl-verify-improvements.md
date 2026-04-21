@@ -31,7 +31,7 @@ Recommended order: **P2 → P3 → P1 → P4 → P5 → P6 → P7**. Weeks 1 = d
 
 ## Context and Boundaries
 
-### What verk does (per `specs/initial_v1.md`)
+### What verk does (per `docs/plans/done/initial_v1.md`)
 
 Deterministic ticket execution. Workers are ephemeral, the engine is the only orchestrator. Reviews are one fresh-context independent reviewer per ticket. Closeout is gate-typed with derived pass/fail. Waves serialize by declared `owned_paths` conflict.
 
@@ -1299,17 +1299,17 @@ Estimated savings: Anthropic prompt caching publishes up to ~90% cost reduction 
 
 ### Config Precedence (G7 note)
 
-Every policy field introduced by P1–P7 follows verk's existing precedence order (per `specs/initial_v1.md § Config contract`):
+Every policy field introduced by P1–P7 follows verk's existing precedence order (per `docs/plans/done/initial_v1.md § Config contract`):
 
 1. CLI flags
 2. `.verk/config.yaml`
 3. engine defaults
 
-Schema validation enforced at `verk doctor` (must pass before any run) and engine startup (terminal error on malformed config). Full schema for each new section lives under `specs/initial_v1.md` schema-addendum section added in the same PR as each P.
+Schema validation enforced at `verk doctor` (must pass before any run) and engine startup (terminal error on malformed config). Full schema for each new section lives under `docs/plans/done/initial_v1.md` schema-addendum section added in the same PR as each P.
 
 ### Forward-compatible schema versioning (per SR-15)
 
-Global rule added to `specs/initial_v1.md § State mutation model`:
+Global rule added to `docs/plans/done/initial_v1.md § State mutation model`:
 
 - Any artifact with `schema_version` greater than the engine's known max for its type is a **terminal load error** with message `engine too old for artifact version X; upgrade engine or use a compatible binary`. Never silent downgrade. Never guess-parse.
 - `verk doctor` surfaces this as a blocking error (exit 2) with the offending artifact path.
@@ -1388,7 +1388,7 @@ These are **in-plan and non-optional** but lower priority than P1–P7. They can
 
 **Work items:**
 
-- For every P, add a schema section to `specs/initial_v1.md` (or a linked addendum document) documenting: field name, type, default, allowed values, precedence position.
+- For every P, add a schema section to `docs/plans/done/initial_v1.md` (or a linked addendum document) documenting: field name, type, default, allowed values, precedence position.
 - Extend `internal/policy/config.go` JSON/YAML tags + validation for every new field.
 - `verk doctor` gains validation for the full policy tree; invalid config is exit code 2 with a typed error listing offending fields.
 - Engine startup refuses to run with invalid config.
