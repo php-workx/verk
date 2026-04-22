@@ -35,6 +35,7 @@ or ticket first, then update this file.
 | Verk as skill | Planned | [2026-04-19-verk-as-skill-cross-agent.md](2026-04-19-verk-as-skill-cross-agent.md) | no active epic found in this index pass | Claude Code skill-mode foundation for verk primitives and artifact-compatible execution. |
 | Skill host portability | Blocked | [2026-04-19-verk-skill-host-portability.md](2026-04-19-verk-skill-host-portability.md) | no active epic found in this index pass | Extend skill-mode support beyond Claude Code after the v1 skill surface is available. |
 | Ticket quality pre-run gate | Planned | [2026-04-21-ticket-quality-gate.md](2026-04-21-ticket-quality-gate.md) | no active epic found in this index pass | Needed before `verk run`: deterministic ticket lint, planner-role review, traceability checks, and safe auto-repair for underspecified tickets. |
+| Ticket state machine outcomes | Active / Planned | [2026-04-22-ticket-state-machine.md](2026-04-22-ticket-state-machine.md) | no dedicated epic yet | Separate retryable failures, operator decisions, and true blockers so `blocked` becomes a last-resort state instead of a generic stop reason. |
 | Memory learning loop | Planned | [2026-04-21-memory-learning-loop.md](2026-04-21-memory-learning-loop.md) | no active epic found in this index pass | Repo-local escaped-defect memory, human-reviewed lesson promotion, and advisory feedback into ticket quality review. |
 | Anti-rationalization catalog | Planned | [Rationalizations.md](Rationalizations.md) | none | Detailed spec for P3 (impl-verify-improvements). Full catalog of 91 named rationalizations + verk-specific additions, with injection point mapping per worker phase. |
 | Agent profiles | Planned | [2026-04-21-agent-profiles.md](2026-04-21-agent-profiles.md) | none | Role-based worker profiles (security-engineer, contract-engineer, frontend-engineer, backend-engineer). Project-agnostic detection, `profile` frontmatter field, pre-run validation, rationalization injection per profile, and prompt placement. Full implementation of P3. |
@@ -49,11 +50,14 @@ new escaped defect changes the risk profile.
 1. Land reviewer-scope correctness: prioritize
    [2026-04-20-per-worker-review-diffs.md](2026-04-20-per-worker-review-diffs.md),
    then [worker-isolation.md](worker-isolation.md).
-2. Implement the deterministic and planner-reviewed ticket quality gate from
+2. Land the ticket state-machine outcome model from
+   [2026-04-22-ticket-state-machine.md](2026-04-22-ticket-state-machine.md), because
+   retry/decision/block semantics affect every run failure path.
+3. Implement the deterministic and planner-reviewed ticket quality gate from
    [2026-04-21-ticket-quality-gate.md](2026-04-21-ticket-quality-gate.md).
-3. Add the advisory memory and learning loop from
+4. Add the advisory memory and learning loop from
    [2026-04-21-memory-learning-loop.md](2026-04-21-memory-learning-loop.md).
-4. Revisit benchmarking, skill packaging, and host portability after the core
+5. Revisit benchmarking, skill packaging, and host portability after the core
    run, review-scope, and quality gates are stable.
 
 ### Parallel Work Guidance
@@ -65,6 +69,8 @@ Safe parallel tracks:
   epic orchestration.
 - Deterministic ticket-quality evaluator and inspection CLI, before wiring it
   into `verk run`.
+- Ticket state-machine artifact additions, while CLI interaction and scheduler
+  behavior remain serialized with other execution changes.
 - Memory loop storage and CLI skeleton, while keeping it advisory until ticket
   quality finding codes are stable.
 
