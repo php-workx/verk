@@ -49,6 +49,7 @@ type TicketRunSnapshot struct {
 	state.ArtifactMeta
 	TicketID               string                        `json:"ticket_id"`
 	CurrentPhase           state.TicketPhase             `json:"current_phase"`
+	Outcome                state.TicketOutcome           `json:"outcome,omitempty"`
 	BlockReason            string                        `json:"block_reason,omitempty"`
 	ImplementationAttempts int                           `json:"implementation_attempts"`
 	VerificationAttempts   int                           `json:"verification_attempts"`
@@ -1423,6 +1424,7 @@ func (st *ticketRunState) snapshot() TicketRunSnapshot {
 		},
 		TicketID:               st.req.Ticket.ID,
 		CurrentPhase:           st.currentPhase,
+		Outcome:                ticketOutcomeForPhase(st.currentPhase),
 		BlockReason:            st.blockReason,
 		ImplementationAttempts: st.implementationAttempts,
 		VerificationAttempts:   st.verificationAttempts,
@@ -1436,6 +1438,17 @@ func (st *ticketRunState) snapshot() TicketRunSnapshot {
 		snapshot.RepairCycles = append([]state.RepairCycleArtifact(nil), st.repairCycles...)
 	}
 	return snapshot
+}
+
+func ticketOutcomeForPhase(phase state.TicketPhase) state.TicketOutcome {
+	switch phase {
+	case state.TicketPhaseClosed:
+		return state.TicketOutcomeClosed
+	case state.TicketPhaseBlocked:
+		return state.TicketOutcomeBlocked
+	default:
+		return ""
+	}
 }
 
 func (st *ticketRunState) releaseClaim() error {

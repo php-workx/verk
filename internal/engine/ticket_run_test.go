@@ -69,6 +69,9 @@ func TestRunTicket_HappyPath(t *testing.T) {
 	if result.Snapshot.CurrentPhase != state.TicketPhaseClosed {
 		t.Fatalf("expected closed phase, got %q", result.Snapshot.CurrentPhase)
 	}
+	if result.Snapshot.Outcome != state.TicketOutcomeClosed {
+		t.Fatalf("expected closed outcome, got %q", result.Snapshot.Outcome)
+	}
 	if result.Snapshot.Closeout == nil || !result.Snapshot.Closeout.Closable {
 		t.Fatalf("expected closable closeout, got %#v", result.Snapshot.Closeout)
 	}
@@ -85,6 +88,13 @@ func TestRunTicket_HappyPath(t *testing.T) {
 	snapshotPath := filepath.Join(repoRoot, ".verk", "runs", "run-happy", "tickets", ticket.ID, "ticket-run.json")
 	if _, err := os.Stat(snapshotPath); err != nil {
 		t.Fatalf("expected snapshot file to exist: %v", err)
+	}
+	var persistedSnapshot TicketRunSnapshot
+	if err := state.LoadJSON(snapshotPath, &persistedSnapshot); err != nil {
+		t.Fatalf("load persisted snapshot: %v", err)
+	}
+	if persistedSnapshot.Outcome != state.TicketOutcomeClosed {
+		t.Fatalf("expected persisted closed outcome, got %q", persistedSnapshot.Outcome)
 	}
 
 	durableClaimPath := filepath.Join(repoRoot, ".verk", "runs", "run-happy", "claims", "claim-"+ticket.ID+".json")
@@ -1661,6 +1671,35 @@ func TestTicketRunState_snapshotPreservesCreatedAt(t *testing.T) {
 	}
 	if !snap2.UpdatedAt.After(snap1.UpdatedAt) {
 		t.Errorf("expected UpdatedAt to advance between snapshots: first=%v second=%v", snap1.UpdatedAt, snap2.UpdatedAt)
+	}
+}
+
+func TestTicketRunState_snapshotOutcome(t *testing.T) {
+	cases := []struct {
+		name  string
+		phase state.TicketPhase
+		want  state.TicketOutcome
+	}{
+		{name: "active", phase: state.TicketPhaseVerify, want: ""},
+		{name: "closed", phase: state.TicketPhaseClosed, want: state.TicketOutcomeClosed},
+		{name: "legacy_blocked", phase: state.TicketPhaseBlocked, want: state.TicketOutcomeBlocked},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			st := &ticketRunState{
+				req: RunTicketRequest{
+					RunID:  "run-snapshot-outcome",
+					Ticket: tkmd.Ticket{ID: "ver-snapshot-outcome"},
+				},
+				currentPhase: tc.phase,
+			}
+
+			snap := st.snapshot()
+			if snap.Outcome != tc.want {
+				t.Fatalf("expected outcome %q for phase %q, got %q", tc.want, tc.phase, snap.Outcome)
+			}
+		})
 	}
 }
 

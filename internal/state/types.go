@@ -4,6 +4,7 @@ import "time"
 
 type (
 	TicketPhase   string
+	TicketOutcome string
 	EpicRunStatus string
 	WaveStatus    string
 	RetryClass    string
@@ -19,6 +20,14 @@ const (
 	TicketPhaseCloseout  TicketPhase = "closeout"
 	TicketPhaseClosed    TicketPhase = "closed"
 	TicketPhaseBlocked   TicketPhase = "blocked"
+)
+
+const (
+	TicketOutcomeClosed          TicketOutcome = "closed"
+	TicketOutcomeFailedRetryable TicketOutcome = "failed_retryable"
+	TicketOutcomeNeedsDecision   TicketOutcome = "needs_decision"
+	TicketOutcomeBlocked         TicketOutcome = "blocked"
+	TicketOutcomeCancelled       TicketOutcome = "cancelled"
 )
 
 const (
