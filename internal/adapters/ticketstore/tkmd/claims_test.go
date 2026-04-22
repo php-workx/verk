@@ -388,6 +388,14 @@ func TestClaimPaths_RejectsSymlinkEscapingBase(t *testing.T) {
 		setup func(t *testing.T, dir string)
 	}{
 		{
+			name: "tickets dir ancestor symlink",
+			setup: func(t *testing.T, dir string) {
+				t.Helper()
+				outside := t.TempDir()
+				createSymlinkOrSkip(t, outside, filepath.Join(dir, ".tickets"))
+			},
+		},
+		{
 			name: "live claim dir symlink",
 			setup: func(t *testing.T, dir string) {
 				t.Helper()
@@ -399,9 +407,38 @@ func TestClaimPaths_RejectsSymlinkEscapingBase(t *testing.T) {
 				if err := os.MkdirAll(outside, 0o755); err != nil {
 					t.Fatalf("mkdir outside dir: %v", err)
 				}
-				if err := os.Symlink(outside, filepath.Join(ticketsDir, ".claims")); err != nil {
-					t.Skipf("symlink not supported: %v", err)
+				createSymlinkOrSkip(t, outside, filepath.Join(ticketsDir, ".claims"))
+			},
+		},
+		{
+			name: "verk dir ancestor symlink",
+			setup: func(t *testing.T, dir string) {
+				t.Helper()
+				if err := os.MkdirAll(filepath.Join(dir, ".tickets"), 0o755); err != nil {
+					t.Fatalf("mkdir tickets dir: %v", err)
 				}
+				outside := t.TempDir()
+				if err := os.MkdirAll(filepath.Join(outside, "runs", "run-a"), 0o755); err != nil {
+					t.Fatalf("mkdir outside run dir: %v", err)
+				}
+				createSymlinkOrSkip(t, outside, filepath.Join(dir, ".verk"))
+			},
+		},
+		{
+			name: "verk runs dir ancestor symlink",
+			setup: func(t *testing.T, dir string) {
+				t.Helper()
+				if err := os.MkdirAll(filepath.Join(dir, ".tickets"), 0o755); err != nil {
+					t.Fatalf("mkdir tickets dir: %v", err)
+				}
+				if err := os.MkdirAll(filepath.Join(dir, ".verk"), 0o755); err != nil {
+					t.Fatalf("mkdir verk dir: %v", err)
+				}
+				outside := t.TempDir()
+				if err := os.MkdirAll(filepath.Join(outside, "run-a"), 0o755); err != nil {
+					t.Fatalf("mkdir outside run dir: %v", err)
+				}
+				createSymlinkOrSkip(t, outside, filepath.Join(dir, ".verk", "runs"))
 			},
 		},
 		{
@@ -416,9 +453,7 @@ func TestClaimPaths_RejectsSymlinkEscapingBase(t *testing.T) {
 				if err := os.MkdirAll(outside, 0o755); err != nil {
 					t.Fatalf("mkdir outside dir: %v", err)
 				}
-				if err := os.Symlink(outside, filepath.Join(durableParent, "claims")); err != nil {
-					t.Skipf("symlink not supported: %v", err)
-				}
+				createSymlinkOrSkip(t, outside, filepath.Join(durableParent, "claims"))
 			},
 		},
 	}
@@ -435,6 +470,13 @@ func TestClaimPaths_RejectsSymlinkEscapingBase(t *testing.T) {
 				t.Fatalf("expected escape error, got %v", err)
 			}
 		})
+	}
+}
+
+func createSymlinkOrSkip(t *testing.T, target, link string) {
+	t.Helper()
+	if err := os.Symlink(target, link); err != nil {
+		t.Skipf("symlink not supported: %v", err)
 	}
 }
 

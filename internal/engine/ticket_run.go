@@ -19,7 +19,11 @@ import (
 	verifycommand "verk/internal/adapters/verify/command"
 )
 
-const maxRuntimeRetryAttempts = 2
+const (
+	maxRuntimeRetryAttempts        = 2
+	minClaimRenewalInterval        = 25 * time.Millisecond
+	immediateClaimRenewalThreshold = 3 * minClaimRenewalInterval
+)
 
 var (
 	errRuntimeExecutionBlocked = errors.New("runtime execution blocked")
@@ -716,7 +720,19 @@ func advisoryFailingCheckIDs(coverage state.ValidationCoverageArtifact) []string
 		latest[exec.CheckID] = exec.Result
 	}
 
-	out := make([]string, 0)
+	advisoryFailures := 0
+	for id, result := range latest {
+		if result != state.ValidationCheckResultFailed {
+			continue
+		}
+		check, ok := checks[id]
+		if !ok || !check.Advisory {
+			continue
+		}
+		advisoryFailures++
+	}
+
+	out := make([]string, 0, advisoryFailures)
 	for id, result := range latest {
 		if result != state.ValidationCheckResultFailed {
 			continue
@@ -1218,8 +1234,8 @@ func (st *ticketRunState) startClaimRenewal(ctx context.Context) (context.Contex
 		remaining = ttl
 	}
 	interval := remaining / 3
-	if interval < 25*time.Millisecond {
-		interval = 25 * time.Millisecond
+	if interval < minClaimRenewalInterval {
+		interval = minClaimRenewalInterval
 	}
 
 	renewCtx, cancel := context.WithCancel(ctx)
@@ -1239,7 +1255,7 @@ func (st *ticketRunState) startClaimRenewal(ctx context.Context) (context.Contex
 			}
 			return true
 		}
-		if knownRemaining && remaining <= 3*25*time.Millisecond {
+		if knownRemaining && remaining <= immediateClaimRenewalThreshold {
 			if !renew() {
 				return
 			}
