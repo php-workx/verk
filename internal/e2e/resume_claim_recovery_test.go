@@ -53,13 +53,14 @@ func TestResumeBlocksOnLiveDurableClaimDivergence(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("save ticket-run: %v", err)
 	}
+	now := time.Now().UTC()
 	live := state.ClaimArtifact{
 		ArtifactMeta: state.ArtifactMeta{SchemaVersion: 1, RunID: runID},
 		TicketID:     ticket.ID,
 		OwnerRunID:   runID,
 		LeaseID:      "lease-live",
-		LeasedAt:     testTime(),
-		ExpiresAt:    testTime().Add(10 * time.Minute),
+		LeasedAt:     now,
+		ExpiresAt:    now.Add(10 * time.Minute),
 		State:        "active",
 	}
 	durable := live

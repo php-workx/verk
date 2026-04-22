@@ -450,7 +450,10 @@ func TestRunTicket_RenewsClaimDuringLongRunningWorker(t *testing.T) {
 	cfg := policy.DefaultConfig()
 	ticket := testTicket("ver-claim-renewal")
 	plan, claim := testPlanAndClaim(t, repoRoot, ticket, cfg, "run-claim-renewal", "lease-claim-renewal", []string{`true`})
-	claim.ExpiresAt = claim.LeasedAt.Add(500 * time.Millisecond)
+	now := time.Now().UTC()
+	claim.LeasedAt = now
+	claim.ExpiresAt = now.Add(500 * time.Millisecond)
+	durableClaimPath := seedClaimSnapshots(t, repoRoot, "run-claim-renewal", ticket.ID, claim)
 
 	adapter := &sleepyRuntimeAdapter{
 		workerDelay: 250 * time.Millisecond,
@@ -490,13 +493,74 @@ func TestRunTicket_RenewsClaimDuringLongRunningWorker(t *testing.T) {
 		t.Fatal("expected run result path to be populated")
 	}
 
-	durableClaimPath := filepath.Join(repoRoot, ".verk", "runs", "run-claim-renewal", "claims", "claim-"+ticket.ID+".json")
 	var durableClaim state.ClaimArtifact
 	if err := state.LoadJSON(durableClaimPath, &durableClaim); err != nil {
 		t.Fatalf("load durable claim: %v", err)
 	}
 	if !durableClaim.ExpiresAt.After(claim.ExpiresAt) {
 		t.Fatalf("expected durable claim expiry to be renewed past %s, got %s", claim.ExpiresAt, durableClaim.ExpiresAt)
+	}
+}
+
+func TestRunTicket_RenewsFromLiveClaimWhenRequestClaimIsStale(t *testing.T) {
+	repoRoot := t.TempDir()
+	cfg := policy.DefaultConfig()
+	ticket := testTicket("ver-live-renewal")
+	plan, requestClaim := testPlanAndClaim(t, repoRoot, ticket, cfg, "run-live-renewal", "lease-live-renewal", []string{`true`})
+
+	now := time.Now().UTC()
+	requestClaim.LeasedAt = now
+	requestClaim.ExpiresAt = now.Add(1500 * time.Millisecond)
+
+	liveClaim := requestClaim
+	liveClaim.ExpiresAt = now.Add(250 * time.Millisecond)
+	durableClaimPath := seedClaimSnapshots(t, repoRoot, "run-live-renewal", ticket.ID, liveClaim)
+
+	adapter := &sleepyRuntimeAdapter{
+		reviewDelay: 700 * time.Millisecond,
+		workerResult: runtime.WorkerResult{
+			Status:             runtime.WorkerStatusDone,
+			RetryClass:         runtime.RetryClassTerminal,
+			LeaseID:            requestClaim.LeaseID,
+			StartedAt:          testRunTime(),
+			FinishedAt:         testRunTime().Add(time.Second),
+			ResultArtifactPath: filepath.Join(repoRoot, "worker.json"),
+		},
+		reviewResult: runtime.ReviewResult{
+			Status:             runtime.WorkerStatusDone,
+			RetryClass:         runtime.RetryClassTerminal,
+			LeaseID:            requestClaim.LeaseID,
+			StartedAt:          testRunTime().Add(2 * time.Second),
+			FinishedAt:         testRunTime().Add(3 * time.Second),
+			ReviewStatus:       runtime.ReviewStatusPassed,
+			Summary:            "clean",
+			ResultArtifactPath: filepath.Join(repoRoot, "review.json"),
+		},
+	}
+
+	result, err := RunTicket(context.Background(), RunTicketRequest{
+		RepoRoot: repoRoot,
+		RunID:    "run-live-renewal",
+		Ticket:   ticket,
+		Plan:     plan,
+		Claim:    requestClaim,
+		Adapter:  adapter,
+		Config:   cfg,
+	})
+	if err != nil {
+		t.Fatalf("RunTicket returned error: %v", err)
+	}
+	if result.Snapshot.CurrentPhase != state.TicketPhaseClosed {
+		t.Fatalf("expected closed phase, got %q", result.Snapshot.CurrentPhase)
+	}
+
+	var durableClaim state.ClaimArtifact
+	if err := state.LoadJSON(durableClaimPath, &durableClaim); err != nil {
+		t.Fatalf("load durable claim: %v", err)
+	}
+	if !durableClaim.ExpiresAt.After(requestClaim.ExpiresAt) {
+		t.Fatalf("expected live near-expiry claim to be renewed past stale request expiry %s, got %s",
+			requestClaim.ExpiresAt.Format(time.RFC3339Nano), durableClaim.ExpiresAt.Format(time.RFC3339Nano))
 	}
 }
 
@@ -993,11 +1057,23 @@ func testPlanAndClaim(t *testing.T, repoRoot string, ticket tkmd.Ticket, cfg pol
 	}
 	plan.ValidationCommands = append([]string(nil), verificationCommands...)
 
-	claim, err := tkmd.AcquireClaim(repoRoot, runID, ticket.ID, leaseID, 10*time.Minute, testRunTime())
+	claim, err := tkmd.AcquireClaim(repoRoot, runID, ticket.ID, leaseID, 10*time.Minute, time.Now().UTC())
 	if err != nil {
 		t.Fatalf("AcquireClaim: %v", err)
 	}
 	return plan, claim
+}
+
+func seedClaimSnapshots(t *testing.T, repoRoot, runID, ticketID string, claim state.ClaimArtifact) string {
+	t.Helper()
+	if err := state.SaveJSONAtomic(liveClaimPath(repoRoot, ticketID), claim); err != nil {
+		t.Fatalf("seed live claim: %v", err)
+	}
+	durableClaimPath := filepath.Join(repoRoot, ".verk", "runs", runID, "claims", "claim-"+ticketID+".json")
+	if err := state.SaveJSONAtomic(durableClaimPath, claim); err != nil {
+		t.Fatalf("seed durable claim: %v", err)
+	}
+	return durableClaimPath
 }
 
 type sleepyRuntimeAdapter struct {
@@ -1224,7 +1300,7 @@ func TestCollectChangedFiles_ReturnsErrorOnInvalidBaseCommit(t *testing.T) {
 	}
 }
 
-func TestRemainingTTL_ComputesFromNow(t *testing.T) {
+func TestCurrentClaimRemainingTTL_FallsBackToRequestClaim(t *testing.T) {
 	now := time.Now().UTC()
 	st := &ticketRunState{
 		req: RunTicketRequest{
@@ -1240,24 +1316,28 @@ func TestRemainingTTL_ComputesFromNow(t *testing.T) {
 		t.Fatalf("expected claimTTL to be 30m (original full TTL), got %v", ttl)
 	}
 
-	remaining := st.remainingTTL()
-	// remainingTTL should be approximately 20m, not 30m
+	remaining, known := st.currentClaimRemainingTTL()
+	if !known {
+		t.Fatal("expected request claim expiry to provide known remaining TTL")
+	}
+	// currentClaimRemainingTTL should be approximately 20m, not 30m.
 	if remaining >= 30*time.Minute {
-		t.Fatalf("expected remainingTTL < 30m (should be ~20m), got %v", remaining)
+		t.Fatalf("expected current remaining TTL < 30m (should be ~20m), got %v", remaining)
 	}
 	if remaining < 15*time.Minute {
-		t.Fatalf("expected remainingTTL > 15m (should be ~20m), got %v", remaining)
+		t.Fatalf("expected current remaining TTL > 15m (should be ~20m), got %v", remaining)
 	}
 }
 
-func TestRemainingTTL_ZeroExpiresAt(t *testing.T) {
+func TestCurrentClaimRemainingTTL_ZeroExpiresAt(t *testing.T) {
 	st := &ticketRunState{
 		req: RunTicketRequest{
 			Claim: state.ClaimArtifact{},
 		},
 	}
-	if st.remainingTTL() != 0 {
-		t.Fatalf("expected 0 remainingTTL for zero ExpiresAt, got %v", st.remainingTTL())
+	remaining, known := st.currentClaimRemainingTTL()
+	if known {
+		t.Fatalf("expected unknown remaining TTL for zero ExpiresAt, got %v", remaining)
 	}
 }
 
@@ -1485,7 +1565,7 @@ func TestRunTicket_ReleasesClaimOnStartupFailure(t *testing.T) {
 
 // TestRunTicket_RenewsResumedClaimBeforeExpiry verifies that a resumed claim
 // whose LeasedAt was long ago but ExpiresAt is imminent gets renewed before it
-// expires (ver-exae). The renewal cadence must use remainingTTL(), not
+// expires (ver-exae). The renewal cadence must use current remaining TTL, not
 // claimTTL(), so a claim with a 30-minute total TTL acquired 29m55s ago
 // schedules its first renewal within seconds instead of waiting 10 minutes.
 func TestRunTicket_RenewsResumedClaimBeforeExpiry(t *testing.T) {
@@ -1512,8 +1592,8 @@ func TestRunTicket_RenewsResumedClaimBeforeExpiry(t *testing.T) {
 	}
 
 	// Worker completes in 250ms — within the 500ms expiry window. With the old
-	// cadence (claimTTL/3 ≈ 10min) renewal would never fire. With the fix
-	// (remainingTTL/3 ≈ 167ms) renewal fires well before expiry.
+	// cadence (claimTTL/3 ~= 10min) renewal would never fire. With the fix
+	// (current remaining TTL/3 ~= 167ms) renewal fires well before expiry.
 	adapter := &sleepyRuntimeAdapter{
 		workerDelay: 250 * time.Millisecond,
 		workerResult: runtime.WorkerResult{

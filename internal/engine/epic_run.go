@@ -114,10 +114,7 @@ func collectBlockedTickets(repoRoot, runID string, children []tkmd.Ticket) []Blo
 			continue
 		}
 		reason := describeNotReady(child)
-		phase := state.TicketPhase("")
-		if child.Status == tkmd.StatusBlocked {
-			phase = state.TicketPhaseBlocked
-		}
+		phase := state.TicketPhaseIntake
 		if runID != "" {
 			var snap TicketRunSnapshot
 			if err := loadTicketSnapshot(repoRoot, runID, child.ID, &snap); err == nil {
@@ -129,11 +126,7 @@ func collectBlockedTickets(repoRoot, runID string, children []tkmd.Ticket) []Blo
 				}
 			}
 		}
-		retryPhase, retryable := DefaultReopenTargetForPhase(phase)
-		if !retryable && child.Status == tkmd.StatusBlocked {
-			phase = state.TicketPhaseBlocked
-			retryPhase = state.TicketPhaseImplement
-		}
+		retryPhase, _ := DefaultReopenTargetForPhase(phase)
 		out = append(out, BlockedTicket{
 			ID:         child.ID,
 			Title:      child.Title,

@@ -1210,9 +1210,9 @@ func (st *ticketRunState) startClaimRenewal(ctx context.Context) (context.Contex
 	if ttl <= 0 {
 		ttl = 30 * time.Minute
 	}
-	remaining := st.remainingTTL()
-	if remaining <= 0 {
-		remaining = 30 * time.Minute
+	remaining, knownRemaining := st.currentClaimRemainingTTL()
+	if !knownRemaining {
+		remaining = ttl
 	}
 	interval := remaining / 3
 	if interval < 25*time.Millisecond {
@@ -1225,6 +1225,23 @@ func (st *ticketRunState) startClaimRenewal(ctx context.Context) (context.Contex
 
 	go func() {
 		defer close(done)
+		renew := func() bool {
+			if _, err := tkmd.RenewClaim(st.repoRoot, st.req.RunID, st.req.Ticket.ID, st.req.Claim.LeaseID, ttl, time.Now().UTC()); err != nil {
+				select {
+				case errCh <- err:
+				default:
+				}
+				cancel()
+				return false
+			}
+			return true
+		}
+		if knownRemaining && remaining <= 3*25*time.Millisecond {
+			if !renew() {
+				return
+			}
+		}
+
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
 
@@ -1233,12 +1250,7 @@ func (st *ticketRunState) startClaimRenewal(ctx context.Context) (context.Contex
 			case <-renewCtx.Done():
 				return
 			case <-ticker.C:
-				if _, err := tkmd.RenewClaim(st.repoRoot, st.req.RunID, st.req.Ticket.ID, st.req.Claim.LeaseID, ttl, time.Now().UTC()); err != nil {
-					select {
-					case errCh <- err:
-					default:
-					}
-					cancel()
+				if !renew() {
 					return
 				}
 			}
@@ -1269,18 +1281,21 @@ func (st *ticketRunState) claimTTL() time.Duration {
 	return ttl
 }
 
-// remainingTTL computes the time remaining until the claim expires,
-// used for scheduling renewal intervals. Unlike claimTTL which returns
-// the original full TTL, this reflects the actual remaining time.
-func (st *ticketRunState) remainingTTL() time.Duration {
-	if st.req.Claim.ExpiresAt.IsZero() {
-		return 0
+// currentClaimRemainingTTL computes the time left on the active live claim.
+// The request claim can become stale across long tickets with multiple worker
+// and reviewer phases, while the live claim is updated by every successful
+// renewal. Scheduling from the live expiry prevents later phases from waiting
+// past the actual lease deadline.
+func (st *ticketRunState) currentClaimRemainingTTL() (time.Duration, bool) {
+	if live, err := loadOptionalClaim(liveClaimPath(st.repoRoot, st.req.Ticket.ID)); err == nil && live != nil {
+		if live.OwnerRunID == st.req.RunID && live.LeaseID == st.req.Claim.LeaseID && live.State != "released" && !live.ExpiresAt.IsZero() {
+			return live.ExpiresAt.Sub(time.Now().UTC()), true
+		}
 	}
-	remaining := st.req.Claim.ExpiresAt.Sub(time.Now().UTC())
-	if remaining <= 0 {
-		return 0
+	if !st.req.Claim.ExpiresAt.IsZero() {
+		return st.req.Claim.ExpiresAt.Sub(time.Now().UTC()), true
 	}
-	return remaining
+	return 0, false
 }
 
 func shouldRetryRuntimeError(err error) bool {
