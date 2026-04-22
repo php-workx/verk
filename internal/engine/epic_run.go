@@ -114,10 +114,7 @@ func collectBlockedTickets(repoRoot, runID string, children []tkmd.Ticket) []Blo
 			continue
 		}
 		reason := describeNotReady(child)
-		phase := state.TicketPhase("")
-		if child.Status == tkmd.StatusBlocked {
-			phase = state.TicketPhaseBlocked
-		}
+		phase := state.TicketPhaseIntake
 		if runID != "" {
 			var snap TicketRunSnapshot
 			if err := loadTicketSnapshot(repoRoot, runID, child.ID, &snap); err == nil {

@@ -69,6 +69,9 @@ func TestRunTicket_HappyPath(t *testing.T) {
 	if result.Snapshot.CurrentPhase != state.TicketPhaseClosed {
 		t.Fatalf("expected closed phase, got %q", result.Snapshot.CurrentPhase)
 	}
+	if result.Snapshot.Outcome != state.TicketOutcomeClosed {
+		t.Fatalf("expected closed outcome, got %q", result.Snapshot.Outcome)
+	}
 	if result.Snapshot.Closeout == nil || !result.Snapshot.Closeout.Closable {
 		t.Fatalf("expected closable closeout, got %#v", result.Snapshot.Closeout)
 	}
@@ -85,6 +88,13 @@ func TestRunTicket_HappyPath(t *testing.T) {
 	snapshotPath := filepath.Join(repoRoot, ".verk", "runs", "run-happy", "tickets", ticket.ID, "ticket-run.json")
 	if _, err := os.Stat(snapshotPath); err != nil {
 		t.Fatalf("expected snapshot file to exist: %v", err)
+	}
+	var persistedSnapshot TicketRunSnapshot
+	if err := state.LoadJSON(snapshotPath, &persistedSnapshot); err != nil {
+		t.Fatalf("load persisted snapshot: %v", err)
+	}
+	if persistedSnapshot.Outcome != state.TicketOutcomeClosed {
+		t.Fatalf("expected persisted closed outcome, got %q", persistedSnapshot.Outcome)
 	}
 
 	durableClaimPath := filepath.Join(repoRoot, ".verk", "runs", "run-happy", "claims", "claim-"+ticket.ID+".json")
@@ -109,6 +119,128 @@ func TestRunTicket_HappyPath(t *testing.T) {
 	}
 	if got := adapter.ReviewRequests()[0].ExecutionConfig; got.WorkerTimeoutMinutes != 7 || got.ReviewerTimeoutMinutes != 9 || len(got.AuthEnvVars) != 1 || got.AuthEnvVars[0] != "VERK_API_KEY" {
 		t.Fatalf("unexpected review execution config: %#v", got)
+	}
+}
+
+func TestExecuteVerification_AdvisoryDerivedFailureTriggersBestEffortRepair(t *testing.T) {
+	repoRoot := t.TempDir()
+	installFailingRuff(t)
+
+	cfg := policy.DefaultConfig()
+	cfg.Policy.MaxImplementationAttempts = 3
+
+	stubToolSignals(t, ToolSignals{HasRuff: true})
+
+	st := newVerificationTestState(t, "run-advisory-repair", "ver-advisory-repair", cfg, 1)
+	st.repoRoot = repoRoot
+	st.implementation = &state.ImplementationArtifact{
+		ChangedFiles: []string{"tests/test_smoke.py"},
+	}
+
+	blocked, err := st.executeVerification(context.Background(), repoRoot)
+	if err != nil {
+		t.Fatalf("executeVerification: %v", err)
+	}
+	if blocked {
+		t.Fatalf("expected advisory-only derived failure not to block")
+	}
+	if st.currentPhase != state.TicketPhaseImplement {
+		t.Fatalf("expected best-effort advisory repair to return to implement phase, got %q", st.currentPhase)
+	}
+	if len(st.repairCycles) != 1 {
+		t.Fatalf("expected one best-effort repair cycle, got %d", len(st.repairCycles))
+	}
+	if len(st.repairCycles[0].TriggerCheckIDs) != 1 {
+		t.Fatalf("expected one triggering advisory check id, got %#v", st.repairCycles[0].TriggerCheckIDs)
+	}
+	if st.verification == nil || st.verification.ValidationCoverage == nil {
+		t.Fatalf("expected verification coverage to be recorded")
+	}
+	if !st.verification.Passed {
+		t.Fatalf("expected advisory-only failure to keep verification artifact passed")
+	}
+	if len(st.verification.ValidationCoverage.UnresolvedBlockers) != 0 {
+		t.Fatalf("expected no unresolved blockers for advisory-only failure, got %#v", st.verification.ValidationCoverage.UnresolvedBlockers)
+	}
+}
+
+func TestAdvisoryFailingCheckIDs_DeclaredCheckWinsIDCollision(t *testing.T) {
+	coverage := state.ValidationCoverageArtifact{
+		DeclaredChecks: []state.ValidationCheck{{
+			ID:       "same-id",
+			Command:  "just check",
+			Advisory: false,
+		}},
+		DerivedChecks: []state.ValidationCheck{{
+			ID:       "same-id",
+			Command:  "just check",
+			Advisory: true,
+		}},
+		ExecutedChecks: []state.ValidationCheckExecution{{
+			CheckID: "same-id",
+			Result:  state.ValidationCheckResultFailed,
+		}},
+	}
+
+	if got := advisoryFailingCheckIDs(coverage); len(got) != 0 {
+		t.Fatalf("declared check should override advisory derived collision, got %#v", got)
+	}
+}
+
+func TestExecuteVerification_AdvisoryDerivedFailureDoesNotBlockAfterRepairBudget(t *testing.T) {
+	repoRoot := t.TempDir()
+	installFailingRuff(t)
+
+	cfg := policy.DefaultConfig()
+	cfg.Policy.MaxImplementationAttempts = 1
+
+	stubToolSignals(t, ToolSignals{HasRuff: true})
+
+	st := newVerificationTestState(t, "run-advisory-budget", "ver-advisory-budget", cfg, 1)
+	st.repoRoot = repoRoot
+	st.implementation = &state.ImplementationArtifact{
+		ChangedFiles: []string{"tests/test_smoke.py"},
+	}
+
+	blocked, err := st.executeVerification(context.Background(), repoRoot)
+	if err != nil {
+		t.Fatalf("executeVerification: %v", err)
+	}
+	if blocked {
+		t.Fatalf("expected advisory-only derived failure not to block after repair budget")
+	}
+	if st.currentPhase != state.TicketPhaseReview {
+		t.Fatalf("expected advisory-only failure to continue to review after budget, got %q", st.currentPhase)
+	}
+	if len(st.repairCycles) != 0 {
+		t.Fatalf("expected no extra advisory repair cycle after budget, got %d", len(st.repairCycles))
+	}
+	if st.blockReason != "" {
+		t.Fatalf("expected no block reason for advisory-only failure, got %q", st.blockReason)
+	}
+	if st.verification == nil || !st.verification.Passed {
+		t.Fatalf("expected advisory-only failure to keep verification artifact passed")
+	}
+}
+
+func installFailingRuff(t *testing.T) {
+	t.Helper()
+	binDir := t.TempDir()
+	ruffPath := filepath.Join(binDir, "ruff")
+	if err := os.WriteFile(ruffPath, []byte("#!/bin/sh\nexit 1\n"), 0o755); err != nil {
+		t.Fatalf("write fake ruff: %v", err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+}
+
+func stubToolSignals(t *testing.T, signals ToolSignals) {
+	t.Helper()
+	originalToolSignals := toolSignalsProvider
+	t.Cleanup(func() {
+		toolSignalsProvider = originalToolSignals
+	})
+	toolSignalsProvider = func(string) ToolSignals {
+		return signals
 	}
 }
 
@@ -351,7 +483,10 @@ func TestRunTicket_RenewsClaimDuringLongRunningWorker(t *testing.T) {
 	cfg := policy.DefaultConfig()
 	ticket := testTicket("ver-claim-renewal")
 	plan, claim := testPlanAndClaim(t, repoRoot, ticket, cfg, "run-claim-renewal", "lease-claim-renewal", []string{`true`})
-	claim.ExpiresAt = claim.LeasedAt.Add(500 * time.Millisecond)
+	now := time.Now().UTC()
+	claim.LeasedAt = now
+	claim.ExpiresAt = now.Add(500 * time.Millisecond)
+	durableClaimPath := seedClaimSnapshots(t, repoRoot, "run-claim-renewal", ticket.ID, claim)
 
 	adapter := &sleepyRuntimeAdapter{
 		workerDelay: 250 * time.Millisecond,
@@ -391,13 +526,74 @@ func TestRunTicket_RenewsClaimDuringLongRunningWorker(t *testing.T) {
 		t.Fatal("expected run result path to be populated")
 	}
 
-	durableClaimPath := filepath.Join(repoRoot, ".verk", "runs", "run-claim-renewal", "claims", "claim-"+ticket.ID+".json")
 	var durableClaim state.ClaimArtifact
 	if err := state.LoadJSON(durableClaimPath, &durableClaim); err != nil {
 		t.Fatalf("load durable claim: %v", err)
 	}
 	if !durableClaim.ExpiresAt.After(claim.ExpiresAt) {
 		t.Fatalf("expected durable claim expiry to be renewed past %s, got %s", claim.ExpiresAt, durableClaim.ExpiresAt)
+	}
+}
+
+func TestRunTicket_RenewsFromLiveClaimWhenRequestClaimIsStale(t *testing.T) {
+	repoRoot := t.TempDir()
+	cfg := policy.DefaultConfig()
+	ticket := testTicket("ver-live-renewal")
+	plan, requestClaim := testPlanAndClaim(t, repoRoot, ticket, cfg, "run-live-renewal", "lease-live-renewal", []string{`true`})
+
+	now := time.Now().UTC()
+	requestClaim.LeasedAt = now
+	requestClaim.ExpiresAt = now.Add(3 * time.Second)
+
+	liveClaim := requestClaim
+	liveClaim.ExpiresAt = now.Add(900 * time.Millisecond)
+	durableClaimPath := seedClaimSnapshots(t, repoRoot, "run-live-renewal", ticket.ID, liveClaim)
+
+	adapter := &sleepyRuntimeAdapter{
+		reviewDelay: 1300 * time.Millisecond,
+		workerResult: runtime.WorkerResult{
+			Status:             runtime.WorkerStatusDone,
+			RetryClass:         runtime.RetryClassTerminal,
+			LeaseID:            requestClaim.LeaseID,
+			StartedAt:          testRunTime(),
+			FinishedAt:         testRunTime().Add(time.Second),
+			ResultArtifactPath: filepath.Join(repoRoot, "worker.json"),
+		},
+		reviewResult: runtime.ReviewResult{
+			Status:             runtime.WorkerStatusDone,
+			RetryClass:         runtime.RetryClassTerminal,
+			LeaseID:            requestClaim.LeaseID,
+			StartedAt:          testRunTime().Add(2 * time.Second),
+			FinishedAt:         testRunTime().Add(3 * time.Second),
+			ReviewStatus:       runtime.ReviewStatusPassed,
+			Summary:            "clean",
+			ResultArtifactPath: filepath.Join(repoRoot, "review.json"),
+		},
+	}
+
+	result, err := RunTicket(context.Background(), RunTicketRequest{
+		RepoRoot: repoRoot,
+		RunID:    "run-live-renewal",
+		Ticket:   ticket,
+		Plan:     plan,
+		Claim:    requestClaim,
+		Adapter:  adapter,
+		Config:   cfg,
+	})
+	if err != nil {
+		t.Fatalf("RunTicket returned error: %v", err)
+	}
+	if result.Snapshot.CurrentPhase != state.TicketPhaseClosed {
+		t.Fatalf("expected closed phase, got %q", result.Snapshot.CurrentPhase)
+	}
+
+	var durableClaim state.ClaimArtifact
+	if err := state.LoadJSON(durableClaimPath, &durableClaim); err != nil {
+		t.Fatalf("load durable claim: %v", err)
+	}
+	if !durableClaim.ExpiresAt.After(requestClaim.ExpiresAt) {
+		t.Fatalf("expected live near-expiry claim to be renewed past stale request expiry %s, got %s",
+			requestClaim.ExpiresAt.Format(time.RFC3339Nano), durableClaim.ExpiresAt.Format(time.RFC3339Nano))
 	}
 }
 
@@ -607,6 +803,158 @@ func TestRunTicket_ScopeCheckBlocksWhenOwnedPathsEmpty(t *testing.T) {
 	}
 }
 
+func TestRunTicket_ScopeMissingThenReopensToProceed(t *testing.T) {
+	repoRoot := t.TempDir()
+	cfg := policy.DefaultConfig()
+
+	runID := "run-scope-reopen"
+	ticketID := "ver-scope-reopen"
+	ticket := testTicket(ticketID)
+
+	// First run: no OwnedPaths set, so single-ticket scope check should block.
+	firstPlan, firstClaim := testPlanAndClaim(t, repoRoot, ticket, cfg, runID, "lease-scope-reopen-empty", []string{`true`})
+
+	started, finished := testRunTimes()
+	firstAdapter := runtimefake.New(
+		[]runtime.WorkerResult{
+			{
+				Status:             runtime.WorkerStatusDone,
+				RetryClass:         runtime.RetryClassTerminal,
+				LeaseID:            firstClaim.LeaseID,
+				StartedAt:          started,
+				FinishedAt:         finished,
+				ResultArtifactPath: filepath.Join(repoRoot, "worker-empty.json"),
+			},
+		},
+		nil,
+	)
+
+	blockedResult, err := RunTicket(context.Background(), RunTicketRequest{
+		RepoRoot:           repoRoot,
+		RunID:              runID,
+		Ticket:             ticket,
+		Plan:               firstPlan,
+		Claim:              firstClaim,
+		Adapter:            firstAdapter,
+		Config:             cfg,
+		EnforceSingleScope: true,
+	})
+	if err != nil {
+		t.Fatalf("first RunTicket returned error: %v", err)
+	}
+	if blockedResult.Snapshot.CurrentPhase != state.TicketPhaseBlocked {
+		t.Fatalf("expected blocked phase on first run, got %q", blockedResult.Snapshot.CurrentPhase)
+	}
+	if !strings.Contains(blockedResult.Snapshot.BlockReason, "single-ticket scope violation") {
+		t.Fatalf("expected scope violation block reason, got %q", blockedResult.Snapshot.BlockReason)
+	}
+
+	// Simulate reopen flow artifacts that would normally exist in an epic run.
+	writeOpRunFixture(t, repoRoot, runID, state.RunArtifact{
+		ArtifactMeta: state.ArtifactMeta{SchemaVersion: 1, RunID: runID},
+		Mode:         "epic",
+		RootTicketID: "epic-1",
+		Status:       state.EpicRunStatusBlocked,
+		CurrentPhase: state.TicketPhaseBlocked,
+		TicketIDs:    []string{ticketID},
+		WaveIDs:      []string{"wave-1"},
+	})
+	writeWaveFixture(t, repoRoot, runID, state.WaveArtifact{
+		ArtifactMeta: state.ArtifactMeta{SchemaVersion: 1, RunID: runID},
+		WaveID:       "wave-1",
+		Ordinal:      1,
+		Status:       state.WaveStatusFailed,
+		TicketIDs:    []string{ticketID},
+	})
+	writeTicketRunFixture(t, repoRoot, runID, blockedResult.Snapshot)
+	writePlanFixture(t, repoRoot, runID, firstPlan)
+	writeTicketMarkdownFixture(t, repoRoot, tkmd.Ticket{
+		ID:                 ticketID,
+		Title:              ticket.Title,
+		Status:             tkmd.StatusBlocked,
+		OwnedPaths:         nil,
+		UnknownFrontmatter: map[string]any{"type": "task"},
+	})
+
+	// Operator adds scope declarations and reopens the ticket.
+	if err := ReopenTicket(context.Background(), ReopenRequest{
+		RepoRoot: repoRoot,
+		RunID:    runID,
+		TicketID: ticketID,
+		ToPhase:  state.TicketPhaseImplement,
+	}); err != nil {
+		t.Fatalf("ReopenTicket returned error: %v", err)
+	}
+
+	reopenedTicket, err := tkmd.LoadTicket(ticketMarkdownPath(repoRoot, ticketID))
+	if err != nil {
+		t.Fatalf("load reopened ticket: %v", err)
+	}
+	if reopenedTicket.Status != tkmd.StatusOpen {
+		t.Fatalf("expected ticket status to become open after reopen, got %q", reopenedTicket.Status)
+	}
+	reopenedTicket.OwnedPaths = []string{"internal/engine"}
+	if err := tkmd.SaveTicket(filepath.Join(repoRoot, ".tickets", ticketID+".md"), reopenedTicket); err != nil {
+		t.Fatalf("save reopened ticket: %v", err)
+	}
+
+	reopenedPlan, reopenedClaim := testPlanAndClaim(
+		t,
+		repoRoot,
+		reopenedTicket,
+		cfg,
+		runID,
+		"lease-scope-reopen-scope",
+		[]string{`true`},
+	)
+
+	started, finished = testRunTimes()
+	reopenedAdapter := runtimefake.New(
+		[]runtime.WorkerResult{
+			{
+				Status:             runtime.WorkerStatusDone,
+				RetryClass:         runtime.RetryClassTerminal,
+				LeaseID:            reopenedClaim.LeaseID,
+				StartedAt:          started,
+				FinishedAt:         finished,
+				ResultArtifactPath: filepath.Join(repoRoot, "worker-scope.json"),
+			},
+		},
+		[]runtime.ReviewResult{
+			{
+				Status:             runtime.WorkerStatusDone,
+				RetryClass:         runtime.RetryClassTerminal,
+				LeaseID:            reopenedClaim.LeaseID,
+				StartedAt:          finished.Add(time.Second),
+				FinishedAt:         finished.Add(2 * time.Second),
+				ReviewStatus:       runtime.ReviewStatusPassed,
+				Summary:            "clean",
+				ResultArtifactPath: filepath.Join(repoRoot, "review-scope.json"),
+			},
+		},
+	)
+
+	reopenedResult, err := RunTicket(context.Background(), RunTicketRequest{
+		RepoRoot:           repoRoot,
+		RunID:              runID,
+		Ticket:             reopenedTicket,
+		Plan:               reopenedPlan,
+		Claim:              reopenedClaim,
+		Adapter:            reopenedAdapter,
+		Config:             cfg,
+		EnforceSingleScope: true,
+	})
+	if err != nil {
+		t.Fatalf("second RunTicket returned error: %v", err)
+	}
+	if reopenedResult.Snapshot.CurrentPhase != state.TicketPhaseClosed {
+		t.Fatalf("expected ticket to proceed to closed, got %q", reopenedResult.Snapshot.CurrentPhase)
+	}
+	if reopenedResult.Snapshot.BlockReason != "" {
+		t.Fatalf("expected no block reason after scope is declared, got %q", reopenedResult.Snapshot.BlockReason)
+	}
+}
+
 func TestRunTicket_WorkerBlockReasonRoundTrips(t *testing.T) {
 	repoRoot := t.TempDir()
 	cfg := policy.DefaultConfig()
@@ -742,11 +1090,23 @@ func testPlanAndClaim(t *testing.T, repoRoot string, ticket tkmd.Ticket, cfg pol
 	}
 	plan.ValidationCommands = append([]string(nil), verificationCommands...)
 
-	claim, err := tkmd.AcquireClaim(repoRoot, runID, ticket.ID, leaseID, 10*time.Minute, testRunTime())
+	claim, err := tkmd.AcquireClaim(repoRoot, runID, ticket.ID, leaseID, 10*time.Minute, time.Now().UTC())
 	if err != nil {
 		t.Fatalf("AcquireClaim: %v", err)
 	}
 	return plan, claim
+}
+
+func seedClaimSnapshots(t *testing.T, repoRoot, runID, ticketID string, claim state.ClaimArtifact) string {
+	t.Helper()
+	if err := state.SaveJSONAtomic(liveClaimPath(repoRoot, ticketID), claim); err != nil {
+		t.Fatalf("seed live claim: %v", err)
+	}
+	durableClaimPath := filepath.Join(repoRoot, ".verk", "runs", runID, "claims", "claim-"+ticketID+".json")
+	if err := state.SaveJSONAtomic(durableClaimPath, claim); err != nil {
+		t.Fatalf("seed durable claim: %v", err)
+	}
+	return durableClaimPath
 }
 
 type sleepyRuntimeAdapter struct {
@@ -973,7 +1333,7 @@ func TestCollectChangedFiles_ReturnsErrorOnInvalidBaseCommit(t *testing.T) {
 	}
 }
 
-func TestRemainingTTL_ComputesFromNow(t *testing.T) {
+func TestCurrentClaimRemainingTTL_FallsBackToRequestClaim(t *testing.T) {
 	now := time.Now().UTC()
 	st := &ticketRunState{
 		req: RunTicketRequest{
@@ -989,24 +1349,28 @@ func TestRemainingTTL_ComputesFromNow(t *testing.T) {
 		t.Fatalf("expected claimTTL to be 30m (original full TTL), got %v", ttl)
 	}
 
-	remaining := st.remainingTTL()
-	// remainingTTL should be approximately 20m, not 30m
+	remaining, known := st.currentClaimRemainingTTL()
+	if !known {
+		t.Fatal("expected request claim expiry to provide known remaining TTL")
+	}
+	// currentClaimRemainingTTL should be approximately 20m, not 30m.
 	if remaining >= 30*time.Minute {
-		t.Fatalf("expected remainingTTL < 30m (should be ~20m), got %v", remaining)
+		t.Fatalf("expected current remaining TTL < 30m (should be ~20m), got %v", remaining)
 	}
 	if remaining < 15*time.Minute {
-		t.Fatalf("expected remainingTTL > 15m (should be ~20m), got %v", remaining)
+		t.Fatalf("expected current remaining TTL > 15m (should be ~20m), got %v", remaining)
 	}
 }
 
-func TestRemainingTTL_ZeroExpiresAt(t *testing.T) {
+func TestCurrentClaimRemainingTTL_ZeroExpiresAt(t *testing.T) {
 	st := &ticketRunState{
 		req: RunTicketRequest{
 			Claim: state.ClaimArtifact{},
 		},
 	}
-	if st.remainingTTL() != 0 {
-		t.Fatalf("expected 0 remainingTTL for zero ExpiresAt, got %v", st.remainingTTL())
+	remaining, known := st.currentClaimRemainingTTL()
+	if known {
+		t.Fatalf("expected unknown remaining TTL for zero ExpiresAt, got %v", remaining)
 	}
 }
 
@@ -1234,7 +1598,7 @@ func TestRunTicket_ReleasesClaimOnStartupFailure(t *testing.T) {
 
 // TestRunTicket_RenewsResumedClaimBeforeExpiry verifies that a resumed claim
 // whose LeasedAt was long ago but ExpiresAt is imminent gets renewed before it
-// expires (ver-exae). The renewal cadence must use remainingTTL(), not
+// expires (ver-exae). The renewal cadence must use current remaining TTL, not
 // claimTTL(), so a claim with a 30-minute total TTL acquired 29m55s ago
 // schedules its first renewal within seconds instead of waiting 10 minutes.
 func TestRunTicket_RenewsResumedClaimBeforeExpiry(t *testing.T) {
@@ -1261,8 +1625,8 @@ func TestRunTicket_RenewsResumedClaimBeforeExpiry(t *testing.T) {
 	}
 
 	// Worker completes in 250ms — within the 500ms expiry window. With the old
-	// cadence (claimTTL/3 ≈ 10min) renewal would never fire. With the fix
-	// (remainingTTL/3 ≈ 167ms) renewal fires well before expiry.
+	// cadence (claimTTL/3 ~= 10min) renewal would never fire. With the fix
+	// (current remaining TTL/3 ~= 167ms) renewal fires well before expiry.
 	adapter := &sleepyRuntimeAdapter{
 		workerDelay: 250 * time.Millisecond,
 		workerResult: runtime.WorkerResult{
@@ -1333,16 +1697,66 @@ func TestTicketRunState_snapshotPreservesCreatedAt(t *testing.T) {
 	}
 }
 
+func TestTicketRunState_snapshotOutcome(t *testing.T) {
+	cases := []struct {
+		name  string
+		phase state.TicketPhase
+		want  state.TicketOutcome
+	}{
+		{name: "active", phase: state.TicketPhaseVerify, want: ""},
+		{name: "closed", phase: state.TicketPhaseClosed, want: state.TicketOutcomeClosed},
+		{name: "legacy_blocked", phase: state.TicketPhaseBlocked, want: state.TicketOutcomeBlocked},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			st := &ticketRunState{
+				req: RunTicketRequest{
+					RunID:  "run-snapshot-outcome",
+					Ticket: tkmd.Ticket{ID: "ver-snapshot-outcome"},
+				},
+				currentPhase: tc.phase,
+			}
+
+			snap := st.snapshot()
+			if snap.Outcome != tc.want {
+				t.Fatalf("expected outcome %q for phase %q, got %q", tc.want, tc.phase, snap.Outcome)
+			}
+		})
+	}
+}
+
 func TestTicketRunState_snapshotPreservesRestoredCreatedAt(t *testing.T) {
+	repoRoot := t.TempDir()
+	runID := "run-snapshot-restore"
+	ticketID := "ver-snapshot-restore"
 	fixedCreatedAt := time.Date(2025, 1, 15, 10, 30, 0, 0, time.UTC)
+	fixture := TicketRunSnapshot{
+		ArtifactMeta: state.ArtifactMeta{
+			SchemaVersion: artifactSchemaVersion,
+			RunID:         runID,
+			CreatedAt:     fixedCreatedAt,
+			UpdatedAt:     fixedCreatedAt,
+		},
+		TicketID:     ticketID,
+		CurrentPhase: state.TicketPhaseImplement,
+	}
+	if err := state.SaveJSONAtomic(ticketSnapshotPath(repoRoot, runID, ticketID), fixture); err != nil {
+		t.Fatalf("seed ticket snapshot: %v", err)
+	}
+
+	var loaded TicketRunSnapshot
+	if err := loadTicketSnapshot(repoRoot, runID, ticketID, &loaded); err != nil {
+		t.Fatalf("load persisted ticket snapshot: %v", err)
+	}
 
 	st := &ticketRunState{
 		req: RunTicketRequest{
-			RunID:  "run-snapshot-restore",
-			Ticket: tkmd.Ticket{ID: "ver-snapshot-restore"},
+			RunID:  runID,
+			Ticket: tkmd.Ticket{ID: ticketID},
 		},
-		createdAt: fixedCreatedAt,
 	}
+	st.createdAt = loaded.CreatedAt
 
 	snap := st.snapshot()
 

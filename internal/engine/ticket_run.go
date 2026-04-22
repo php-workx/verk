@@ -19,7 +19,11 @@ import (
 	verifycommand "verk/internal/adapters/verify/command"
 )
 
-const maxRuntimeRetryAttempts = 2
+const (
+	maxRuntimeRetryAttempts        = 2
+	minClaimRenewalInterval        = 25 * time.Millisecond
+	immediateClaimRenewalThreshold = 3 * minClaimRenewalInterval
+)
 
 var (
 	errRuntimeExecutionBlocked = errors.New("runtime execution blocked")
@@ -49,6 +53,7 @@ type TicketRunSnapshot struct {
 	state.ArtifactMeta
 	TicketID               string                        `json:"ticket_id"`
 	CurrentPhase           state.TicketPhase             `json:"current_phase"`
+	Outcome                state.TicketOutcome           `json:"outcome,omitempty"`
 	BlockReason            string                        `json:"block_reason,omitempty"`
 	ImplementationAttempts int                           `json:"implementation_attempts"`
 	VerificationAttempts   int                           `json:"verification_attempts"`
@@ -560,6 +565,20 @@ func (st *ticketRunState) executeVerification(ctx context.Context, repoRoot stri
 	if err := st.persist(); err != nil {
 		return false, err
 	}
+	if verifyPassed {
+		advisoryFailingIDs := verificationAdvisoryFailingCheckIDs(st.verification)
+		if len(advisoryFailingIDs) > 0 && st.implementationAttempts < st.cfg.Policy.MaxImplementationAttempts {
+			appendVerificationRepairCycle(st, advisoryFailingIDs)
+			st.progressDetail(fmt.Sprintf("advisory checks failed; best-effort repair: %s", strings.Join(advisoryFailingIDs, ", ")))
+			if err := st.transitionTo(state.TicketPhaseImplement); err != nil {
+				return false, err
+			}
+			if err := st.persist(); err != nil {
+				return false, err
+			}
+			return false, nil
+		}
+	}
 	if !verifyPassed {
 		if err := handleVerificationFailure(st, *verifyArtifact); err != nil {
 			return false, err
@@ -673,6 +692,59 @@ func verificationFailingCheckIDs(verification *state.VerificationArtifact) []str
 		return nil
 	}
 	return failingCheckIDs(*verification.ValidationCoverage)
+}
+
+// verificationAdvisoryFailingCheckIDs returns failed check ids whose
+// ValidationCheck is explicitly advisory. These failures are safe to route
+// through best-effort repair, but they must not become blockers on their own.
+func verificationAdvisoryFailingCheckIDs(verification *state.VerificationArtifact) []string {
+	if verification == nil || verification.ValidationCoverage == nil {
+		return nil
+	}
+	return advisoryFailingCheckIDs(*verification.ValidationCoverage)
+}
+
+func advisoryFailingCheckIDs(coverage state.ValidationCoverageArtifact) []string {
+	checks := make(map[string]state.ValidationCheck, len(coverage.DeclaredChecks)+len(coverage.DerivedChecks))
+	for _, check := range coverage.DerivedChecks {
+		checks[check.ID] = check
+	}
+	// Declared checks intentionally override derived checks on ID collisions:
+	// ticket-authored validation must not be downgraded by an advisory derived duplicate.
+	for _, check := range coverage.DeclaredChecks {
+		checks[check.ID] = check
+	}
+
+	latest := make(map[string]state.ValidationCheckResult, len(coverage.ExecutedChecks))
+	for _, exec := range coverage.ExecutedChecks {
+		latest[exec.CheckID] = exec.Result
+	}
+
+	advisoryFailures := 0
+	for id, result := range latest {
+		if result != state.ValidationCheckResultFailed {
+			continue
+		}
+		check, ok := checks[id]
+		if !ok || !check.Advisory {
+			continue
+		}
+		advisoryFailures++
+	}
+
+	out := make([]string, 0, advisoryFailures)
+	for id, result := range latest {
+		if result != state.ValidationCheckResultFailed {
+			continue
+		}
+		check, ok := checks[id]
+		if !ok || !check.Advisory {
+			continue
+		}
+		out = append(out, id)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // buildVerificationBlockReason composes a clear block reason for a
@@ -1157,13 +1229,13 @@ func (st *ticketRunState) startClaimRenewal(ctx context.Context) (context.Contex
 	if ttl <= 0 {
 		ttl = 30 * time.Minute
 	}
-	remaining := st.remainingTTL()
-	if remaining <= 0 {
-		remaining = 30 * time.Minute
+	remaining, knownRemaining := st.currentClaimRemainingTTL()
+	if !knownRemaining {
+		remaining = ttl
 	}
 	interval := remaining / 3
-	if interval < 25*time.Millisecond {
-		interval = 25 * time.Millisecond
+	if interval < minClaimRenewalInterval {
+		interval = minClaimRenewalInterval
 	}
 
 	renewCtx, cancel := context.WithCancel(ctx)
@@ -1172,6 +1244,23 @@ func (st *ticketRunState) startClaimRenewal(ctx context.Context) (context.Contex
 
 	go func() {
 		defer close(done)
+		renew := func() bool {
+			if _, err := tkmd.RenewClaim(st.repoRoot, st.req.RunID, st.req.Ticket.ID, st.req.Claim.LeaseID, ttl, time.Now().UTC()); err != nil {
+				select {
+				case errCh <- err:
+				default:
+				}
+				cancel()
+				return false
+			}
+			return true
+		}
+		if knownRemaining && remaining <= immediateClaimRenewalThreshold {
+			if !renew() {
+				return
+			}
+		}
+
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
 
@@ -1180,12 +1269,7 @@ func (st *ticketRunState) startClaimRenewal(ctx context.Context) (context.Contex
 			case <-renewCtx.Done():
 				return
 			case <-ticker.C:
-				if _, err := tkmd.RenewClaim(st.repoRoot, st.req.RunID, st.req.Ticket.ID, st.req.Claim.LeaseID, ttl, time.Now().UTC()); err != nil {
-					select {
-					case errCh <- err:
-					default:
-					}
-					cancel()
+				if !renew() {
 					return
 				}
 			}
@@ -1216,18 +1300,21 @@ func (st *ticketRunState) claimTTL() time.Duration {
 	return ttl
 }
 
-// remainingTTL computes the time remaining until the claim expires,
-// used for scheduling renewal intervals. Unlike claimTTL which returns
-// the original full TTL, this reflects the actual remaining time.
-func (st *ticketRunState) remainingTTL() time.Duration {
-	if st.req.Claim.ExpiresAt.IsZero() {
-		return 0
+// currentClaimRemainingTTL computes the time left on the active live claim.
+// The request claim can become stale across long tickets with multiple worker
+// and reviewer phases, while the live claim is updated by every successful
+// renewal. Scheduling from the live expiry prevents later phases from waiting
+// past the actual lease deadline.
+func (st *ticketRunState) currentClaimRemainingTTL() (time.Duration, bool) {
+	if live, err := loadOptionalClaim(liveClaimPath(st.repoRoot, st.req.Ticket.ID)); err == nil && live != nil {
+		if live.OwnerRunID == st.req.RunID && live.LeaseID == st.req.Claim.LeaseID && live.State != "released" && !live.ExpiresAt.IsZero() {
+			return live.ExpiresAt.Sub(time.Now().UTC()), true
+		}
 	}
-	remaining := st.req.Claim.ExpiresAt.Sub(time.Now().UTC())
-	if remaining <= 0 {
-		return 0
+	if !st.req.Claim.ExpiresAt.IsZero() {
+		return st.req.Claim.ExpiresAt.Sub(time.Now().UTC()), true
 	}
-	return remaining
+	return 0, false
 }
 
 func shouldRetryRuntimeError(err error) bool {
@@ -1355,6 +1442,7 @@ func (st *ticketRunState) snapshot() TicketRunSnapshot {
 		},
 		TicketID:               st.req.Ticket.ID,
 		CurrentPhase:           st.currentPhase,
+		Outcome:                ticketOutcomeForPhase(st.currentPhase),
 		BlockReason:            st.blockReason,
 		ImplementationAttempts: st.implementationAttempts,
 		VerificationAttempts:   st.verificationAttempts,
@@ -1368,6 +1456,23 @@ func (st *ticketRunState) snapshot() TicketRunSnapshot {
 		snapshot.RepairCycles = append([]state.RepairCycleArtifact(nil), st.repairCycles...)
 	}
 	return snapshot
+}
+
+// ticketOutcomeForPhase intentionally maps only legacy terminal phases:
+// state.TicketPhaseClosed -> state.TicketOutcomeClosed and
+// state.TicketPhaseBlocked -> state.TicketOutcomeBlocked. More specific
+// outcomes such as state.TicketOutcomeFailedRetryable,
+// state.TicketOutcomeNeedsDecision, and state.TicketOutcomeCancelled are
+// deferred to follow-up state-machine work.
+func ticketOutcomeForPhase(phase state.TicketPhase) state.TicketOutcome {
+	switch phase {
+	case state.TicketPhaseClosed:
+		return state.TicketOutcomeClosed
+	case state.TicketPhaseBlocked:
+		return state.TicketOutcomeBlocked
+	default:
+		return ""
+	}
 }
 
 func (st *ticketRunState) releaseClaim() error {

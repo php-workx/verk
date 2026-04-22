@@ -328,10 +328,7 @@ func DeriveVerificationPassed(results []CommandResult) bool {
 var defaultEnvAllowlist = []string{
 	"CI",
 	"HOME",
-	"LOGNAME",
 	"PATH",
-	"TERM",
-	"USER",
 }
 
 // verificationEnv builds a deterministic environment for verification commands

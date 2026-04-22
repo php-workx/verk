@@ -39,13 +39,32 @@ func drainProgress(ch <-chan engine.ProgressEvent) {
 	}()
 }
 
+func writeCurrentRunIDIfArtifactExists(repoRoot, runID string, errw io.Writer) bool {
+	if runID == "" {
+		return false
+	}
+	runPath := filepath.Join(repoRoot, ".verk", "runs", runID, "run.json")
+	if _, err := os.Stat(runPath); err != nil {
+		if !os.IsNotExist(err) {
+			_, _ = fmt.Fprintf(errw, "warning: could not inspect run artifact: %v\n", err)
+		}
+		return false
+	}
+	if wErr := writeCurrentRunID(repoRoot, runID); wErr != nil {
+		_, _ = fmt.Fprintf(errw, "warning: could not write current run: %v\n", wErr)
+		return false
+	}
+	return true
+}
+
 // saveJSONAtomic and saveTicket are package-level variables so tests can inject
 // fake implementations to exercise error paths without a real filesystem.
 // saveJSONAtomic is used both for the initial run.json persistence in
 // doRunTicket and for the final state update in finalizeRun.
 var (
-	saveJSONAtomic func(string, any) error         = state.SaveJSONAtomic
-	saveTicket     func(string, tkmd.Ticket) error = tkmd.SaveTicket
+	saveJSONAtomic func(string, any) error                                                        = state.SaveJSONAtomic
+	saveTicket     func(string, tkmd.Ticket) error                                                = tkmd.SaveTicket
+	runTicket      func(context.Context, engine.RunTicketRequest) (engine.RunTicketResult, error) = engine.RunTicket
 )
 
 // finalizeRun persists ticket and run state after the engine finishes, then
@@ -144,7 +163,14 @@ func initRunCmd(root *cobra.Command) {
 	root.AddCommand(runCmd)
 }
 
-func doRunTicket(w, errw io.Writer, ticketID string) (string, error) {
+func doRunTicket(w, errw io.Writer, ticketID string) (runID string, err error) {
+	emitRunID := true
+	defer func() {
+		if emitRunID && runID != "" {
+			_, _ = fmt.Fprintf(w, "run_id=%s\n", runID)
+		}
+	}()
+
 	// Cancel engine execution on SIGINT (Ctrl-C) or SIGTERM so that worker
 	// processes and MCP helpers are terminated and claims are released before
 	// the process exits.  stop() removes the signal handler when the function
@@ -166,7 +192,7 @@ func doRunTicket(w, errw io.Writer, ticketID string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	runID := newRunID(ticketID)
+	runID = newRunID(ticketID)
 	plan, err := engine.BuildPlanArtifact(ticket, cfg)
 	if err != nil {
 		return "", err
@@ -174,8 +200,6 @@ func doRunTicket(w, errw io.Writer, ticketID string) (string, error) {
 	plan.RunID = runID
 	plan.CreatedAt = time.Now().UTC()
 	plan.UpdatedAt = plan.CreatedAt
-
-	_, _ = fmt.Fprintf(w, "run_id=%s\n", runID)
 
 	lock, err := engine.AcquireRunLock(repoRoot, runID)
 	if err != nil {
@@ -232,15 +256,9 @@ func doRunTicket(w, errw io.Writer, ticketID string) (string, error) {
 	if err := saveJSONAtomic(filepath.Join(repoRoot, ".verk", "runs", runID, "run.json"), run); err != nil {
 		return runID, err
 	}
-	// Write the current-run pointer only after run.json is on disk.  An early
-	// return above (lock, claim, adapter, git, or this save) leaves the pointer
-	// untouched so subsequent commands never resolve to a run without an artifact.
-	if wErr := writeCurrentRunID(repoRoot, runID); wErr != nil {
-		_, _ = fmt.Fprintf(errw, "warning: could not write current run: %v\n", wErr)
-	}
 
 	ticket.Status = tkmd.StatusInProgress
-	if err := tkmd.SaveTicket(filepath.Join(repoRoot, ".tickets", ticketID+".md"), ticket); err != nil {
+	if err := saveTicket(filepath.Join(repoRoot, ".tickets", ticketID+".md"), ticket); err != nil {
 		return runID, err
 	}
 
@@ -254,7 +272,7 @@ func doRunTicket(w, errw io.Writer, ticketID string) (string, error) {
 	go func() {
 		defer wg.Done()
 		defer close(ch)
-		result, runErr = engine.RunTicket(ctx, engine.RunTicketRequest{
+		result, runErr = runTicket(ctx, engine.RunTicketRequest{
 			RepoRoot:   repoRoot,
 			RunID:      runID,
 			Ticket:     ticket,
@@ -299,7 +317,13 @@ func doRunTicket(w, errw io.Writer, ticketID string) (string, error) {
 		ticket,
 		run,
 	); err != nil {
+		emitRunID = false
 		return runID, err
+	}
+	// Publish the current-run pointer only after the run is durably resumable:
+	// initial run.json, ticket state, engine result, and final run.json all exist.
+	if wErr := writeCurrentRunID(repoRoot, runID); wErr != nil {
+		_, _ = fmt.Fprintf(errw, "warning: could not write current run: %v\n", wErr)
 	}
 	return runID, nil
 }
@@ -335,9 +359,6 @@ func doRunEpic(w, errw io.Writer, ticketID string) (string, error) {
 	runID := newRunID(ticketID)
 
 	_, _ = fmt.Fprintf(w, "run_id=%s\n", runID)
-	if wErr := writeCurrentRunID(repoRoot, runID); wErr != nil {
-		_, _ = fmt.Fprintf(errw, "warning: could not write current run: %v\n", wErr)
-	}
 
 	// Run engine with progress channel
 	ch := make(chan engine.ProgressEvent, 64)
@@ -370,13 +391,11 @@ func doRunEpic(w, errw io.Writer, ticketID string) (string, error) {
 	// Wait for the engine goroutine to finish before reading result/runErr.
 	wg.Wait()
 
-	if runErr != nil {
-		// Clear the current-run pointer so downstream commands don't resolve to
-		// a run whose run.json may never have been written by the engine.
-		if clearErr := writeCurrentRunID(repoRoot, ""); clearErr != nil {
-			_, _ = fmt.Fprintf(errw, "warning: could not clear current run: %v\n", clearErr)
-		}
+	// If engine.RunEpic persisted run.json, make it resumable even when the
+	// terminal result is a blocked run that the operator does not retry now.
+	currentRunWritten := writeCurrentRunIDIfArtifactExists(repoRoot, runID, errw)
 
+	if runErr != nil {
 		// If the run ended in a structured blocked state, hand off to the
 		// blocked-run handler so the operator sees which tickets are blocked
 		// and how to retry them. For interactive terminals the handler may
@@ -395,6 +414,15 @@ func doRunEpic(w, errw io.Writer, ticketID string) (string, error) {
 			}
 		}
 		return runID, runErr
+	}
+
+	if !currentRunWritten {
+		// The epic run artifact has been persisted by engine.RunEpic before it
+		// can return successfully. Write the current-run pointer after that point
+		// so .verk/current never points at a run without run.json on disk.
+		if wErr := writeCurrentRunID(repoRoot, runID); wErr != nil {
+			_, _ = fmt.Fprintf(errw, "warning: could not write current run: %v\n", wErr)
+		}
 	}
 
 	_, _ = fmt.Fprintf(w, "status=%s phase=%s\n", result.Run.Status, result.Run.CurrentPhase)

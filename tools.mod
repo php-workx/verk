@@ -1,3 +1,5 @@
+replace verk => .
+
 module verk/tools
 
 go 1.26

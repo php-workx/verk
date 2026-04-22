@@ -93,12 +93,51 @@ func TestDoRunTicket_CurrentPointerNotSetOnSaveFailure(t *testing.T) {
 	// If the file doesn't exist, that's the correct outcome too.
 }
 
-// TestDoRunEpic_CurrentPointerClearedOnEngineFailure verifies the fix for
-// doRunEpic: when engine.RunEpic returns an error, writeCurrentRunID("") must
-// be called to clear the pointer that was set before the goroutine launched.
-// If not cleared, .verk/current keeps pointing at a run whose run.json may
-// never have been written.
-func TestDoRunEpic_CurrentPointerClearedOnEngineFailure(t *testing.T) {
+func TestDoRunTicket_CurrentPointerNotSetOnTicketSaveFailure(t *testing.T) {
+	dir := t.TempDir()
+	initCLITestRepo(t, dir)
+
+	ticketsDir := filepath.Join(dir, ".tickets")
+	if err := os.MkdirAll(ticketsDir, 0o755); err != nil {
+		t.Fatalf("mkdir .tickets: %v", err)
+	}
+	ticket := tkmd.Ticket{
+		ID:     "ver-ticket-save",
+		Title:  "Ticket save failure test",
+		Status: tkmd.StatusReady,
+	}
+	if err := tkmd.SaveTicket(filepath.Join(ticketsDir, "ver-ticket-save.md"), ticket); err != nil {
+		t.Fatalf("save ticket: %v", err)
+	}
+
+	origSaveTicket := saveTicket
+	defer func() { saveTicket = origSaveTicket }()
+	saveTicket = func(_ string, _ tkmd.Ticket) error {
+		return errors.New("injected ticket save error")
+	}
+
+	t.Chdir(dir)
+
+	var stdout, stderr bytes.Buffer
+	runID, err := doRunTicket(&stdout, &stderr, "ver-ticket-save")
+	if err == nil {
+		t.Fatal("expected error from injected ticket save failure, got nil")
+	}
+	if runID == "" {
+		t.Fatal("expected doRunTicket to return a non-empty runID even on failure")
+	}
+
+	currentPath := filepath.Join(dir, ".verk", "current")
+	data, readErr := os.ReadFile(currentPath)
+	if readErr == nil && strings.TrimSpace(string(data)) == runID {
+		t.Errorf(".verk/current = %q after ticket save failure; pointer must not advance", runID)
+	}
+}
+
+// TestDoRunEpic_DoesNotAdvanceCurrentOnEngineFailure verifies that doRunEpic
+// does not advance .verk/current to a new runID when engine.RunEpic returns an
+// error before it can successfully persist the initial run artifact.
+func TestDoRunEpic_DoesNotAdvanceCurrentOnEngineFailure(t *testing.T) {
 	dir := t.TempDir()
 	initCLITestRepo(t, dir)
 	// Intentionally do NOT create the epic ticket file.
@@ -120,8 +159,8 @@ func TestDoRunEpic_CurrentPointerClearedOnEngineFailure(t *testing.T) {
 		t.Fatal("expected doRunEpic to return a non-empty runID even on failure")
 	}
 
-	// .verk/current must be cleared (empty) after the engine failure so that
-	// downstream commands don't resolve to a run without a valid run.json.
+	// .verk/current must not be set to the new run ID after this early engine
+	// failure because the run.json artifact was never persisted.
 	currentPath := filepath.Join(dir, ".verk", "current")
 	data, readErr := os.ReadFile(currentPath)
 	if readErr != nil {
@@ -131,7 +170,61 @@ func TestDoRunEpic_CurrentPointerClearedOnEngineFailure(t *testing.T) {
 	}
 	got := strings.TrimSpace(string(data))
 	if got == runID {
-		t.Errorf(".verk/current = %q after engine failure; pointer must be cleared "+
+		t.Errorf(".verk/current = %q after engine failure; pointer must not advance "+
 			"(got non-empty runID pointing at potentially missing run.json)", runID)
+	}
+}
+
+func TestDoRunEpic_CurrentPointerSetForPersistedBlockedRun(t *testing.T) {
+	dir := t.TempDir()
+	initCLITestRepo(t, dir)
+
+	ticketsDir := filepath.Join(dir, ".tickets")
+	if err := os.MkdirAll(ticketsDir, 0o755); err != nil {
+		t.Fatalf("mkdir .tickets: %v", err)
+	}
+	epic := tkmd.Ticket{
+		ID:     "ver-current-epic",
+		Title:  "Current pointer epic",
+		Status: tkmd.StatusReady,
+		UnknownFrontmatter: map[string]any{
+			"type": "epic",
+		},
+	}
+	child := tkmd.Ticket{
+		ID:     "ver-current-child",
+		Title:  "Blocked child",
+		Status: tkmd.StatusBlocked,
+		UnknownFrontmatter: map[string]any{
+			"parent": epic.ID,
+			"type":   "task",
+		},
+	}
+	if err := tkmd.SaveTicket(filepath.Join(ticketsDir, epic.ID+".md"), epic); err != nil {
+		t.Fatalf("save epic: %v", err)
+	}
+	if err := tkmd.SaveTicket(filepath.Join(ticketsDir, child.ID+".md"), child); err != nil {
+		t.Fatalf("save child: %v", err)
+	}
+
+	t.Chdir(dir)
+
+	var stdout, stderr bytes.Buffer
+	runID, err := doRunEpic(&stdout, &stderr, epic.ID)
+	if err == nil {
+		t.Fatal("expected blocked epic error, got nil")
+	}
+	if runID == "" {
+		t.Fatal("expected doRunEpic to return a non-empty runID")
+	}
+	if _, statErr := os.Stat(filepath.Join(dir, ".verk", "runs", runID, "run.json")); statErr != nil {
+		t.Fatalf("expected persisted run artifact: %v", statErr)
+	}
+	data, readErr := os.ReadFile(filepath.Join(dir, ".verk", "current"))
+	if readErr != nil {
+		t.Fatalf("read .verk/current: %v", readErr)
+	}
+	if got := strings.TrimSpace(string(data)); got != runID {
+		t.Fatalf("expected .verk/current=%q for blocked persisted run, got %q", runID, got)
 	}
 }

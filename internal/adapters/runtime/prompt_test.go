@@ -24,6 +24,56 @@ func TestParseResultBlock_DirectJSON(t *testing.T) {
 	}
 }
 
+func TestParseResultBlock_ValidatesAndNormalizesAllParsePaths(t *testing.T) {
+	tests := []struct {
+		name       string
+		input      string
+		wantFound  bool
+		wantStatus string
+	}{
+		{
+			name:       "direct JSON normalizes synonym",
+			input:      `{"status":"completed","completion_code":"ok"}`,
+			wantFound:  true,
+			wantStatus: "done",
+		},
+		{
+			name:       "sentinel normalizes hyphenated status",
+			input:      `VERK_RESULT:{"status":"done-with-concerns","completion_code":"ok"}`,
+			wantFound:  true,
+			wantStatus: "done_with_concerns",
+		},
+		{
+			name:       "last JSON normalizes spaced status",
+			input:      "Result follows:\n{\"status\":\"needs more context\",\"block_reason\":\"missing repo\"}",
+			wantFound:  true,
+			wantStatus: "needs_context",
+		},
+		{
+			name:      "direct JSON rejects invalid status",
+			input:     `{"status":"finished","completion_code":"ok"}`,
+			wantFound: false,
+		},
+		{
+			name:      "last JSON rejects invalid status",
+			input:     "Result follows:\n{\"status\":\"finished\",\"completion_code\":\"ok\"}",
+			wantFound: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			block, found := ParseResultBlock(tt.input)
+			if found != tt.wantFound {
+				t.Fatalf("found=%v, want %v", found, tt.wantFound)
+			}
+			if found && block.Status != tt.wantStatus {
+				t.Fatalf("status=%q, want %q", block.Status, tt.wantStatus)
+			}
+		})
+	}
+}
+
 func TestParseResultBlock_SentinelLine(t *testing.T) {
 	text := `Some extra prose the AI shouldn't have written.
 VERK_RESULT:{"status":"done","completion_code":"ok"}`
@@ -119,6 +169,56 @@ func TestParseReviewBlock_Passed(t *testing.T) {
 	}
 	if len(block.Findings) != 0 {
 		t.Fatalf("expected no findings, got %d", len(block.Findings))
+	}
+}
+
+func TestParseReviewBlock_ValidatesAndNormalizesAllParsePaths(t *testing.T) {
+	tests := []struct {
+		name       string
+		input      string
+		wantFound  bool
+		wantStatus string
+	}{
+		{
+			name:       "direct JSON normalizes case",
+			input:      `{"review_status":"PASSED","summary":"all good","findings":[]}`,
+			wantFound:  true,
+			wantStatus: "passed",
+		},
+		{
+			name:       "sentinel accepts findings",
+			input:      `VERK_REVIEW:{"review_status":"findings","summary":"needs work","findings":[]}`,
+			wantFound:  true,
+			wantStatus: "findings",
+		},
+		{
+			name:       "last JSON normalizes spaces",
+			input:      "Review follows:\n{\"review_status\":\" Passed \",\"summary\":\"ok\",\"findings\":[]}",
+			wantFound:  true,
+			wantStatus: "passed",
+		},
+		{
+			name:      "direct JSON rejects invalid status",
+			input:     `{"review_status":"clean","summary":"ok","findings":[]}`,
+			wantFound: false,
+		},
+		{
+			name:      "last JSON rejects invalid status",
+			input:     "Review follows:\n{\"review_status\":\"clean\",\"summary\":\"ok\",\"findings\":[]}",
+			wantFound: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			block, found := ParseReviewBlock(tt.input)
+			if found != tt.wantFound {
+				t.Fatalf("found=%v, want %v", found, tt.wantFound)
+			}
+			if found && block.ReviewStatus != tt.wantStatus {
+				t.Fatalf("review_status=%q, want %q", block.ReviewStatus, tt.wantStatus)
+			}
+		})
 	}
 }
 

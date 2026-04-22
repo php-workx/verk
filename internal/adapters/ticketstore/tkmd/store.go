@@ -278,12 +278,12 @@ func extractHeadingTitle(body string) string {
 // discovery. Only deps are considered as child edges; tk links are navigation
 // aids and must not be treated as child relationships.
 func loadEpicChildren(ticketsDir, epicID string) (map[string]struct{}, error) {
+	children := make(map[string]struct{})
 	path := filepath.Join(ticketsDir, epicID+".md")
 	ticket, err := LoadTicket(path)
 	if err != nil {
-		return nil, err
+		return children, err
 	}
-	children := make(map[string]struct{})
 	for _, dep := range ticket.Deps {
 		children[dep] = struct{}{}
 	}
@@ -311,6 +311,9 @@ func depsClosed(ticketsDir string, deps []string) (bool, error) {
 }
 
 func claimAllowsReady(ticketsDir, ticketID, currentRunID string) (bool, error) {
+	if err := validateClaimIdentifier(ticketID, "ticket_id"); err != nil {
+		return false, err
+	}
 	claimPath := filepath.Join(ticketsDir, ".claims", ticketID+".json")
 	data, err := os.ReadFile(claimPath)
 	if err != nil {

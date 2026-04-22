@@ -7,6 +7,8 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
+	goruntime "runtime"
 	"strings"
 	"testing"
 	"time"
@@ -17,12 +19,69 @@ import (
 // When _CLAUDE_TEST_WRITE_HUGE_LINE=1, it writes a 2MB line to stdout so that
 // bufio.Scanner (1MB max) returns bufio.ErrTooLong — enabling a real scanner
 // error test without external tooling.
+// When _CLAUDE_TEST_STREAM_JSON_OUTPUT=1, it writes minimal stream-json lines and
+// exits normally.
+// When _CLAUDE_TEST_WRITE_HUGE_SLEEP_MS is set, the helper pauses after writing
+// the large line, which allows tests to confirm that the parent kills the child
+// instead of waiting for normal completion.
 func TestMain(m *testing.M) {
+	if marker := os.Getenv("_CLAUDE_TEST_GRANDCHILD_MARKER"); marker != "" {
+		time.Sleep(300 * time.Millisecond)
+		_ = os.WriteFile(marker, []byte("grandchild-survived"), 0o644)
+		os.Exit(0)
+	}
 	if os.Getenv("_CLAUDE_TEST_WRITE_HUGE_LINE") == "1" {
+		if marker := os.Getenv("_CLAUDE_TEST_SPAWN_GRANDCHILD_MARKER"); marker != "" {
+			cmd := exec.Command(os.Args[0], "-test.run=^$")
+			cmd.Env = claudeTestEnvWithout(
+				"_CLAUDE_TEST_WRITE_HUGE_LINE",
+				"_CLAUDE_TEST_WRITE_HUGE_LINE_PREFIX",
+				"_CLAUDE_TEST_WRITE_HUGE_SLEEP_MS",
+				"_CLAUDE_TEST_EXIT_MARKER",
+				"_CLAUDE_TEST_SPAWN_GRANDCHILD_MARKER",
+			)
+			cmd.Env = append(cmd.Env, "_CLAUDE_TEST_GRANDCHILD_MARKER="+marker)
+			_ = cmd.Start()
+			time.Sleep(100 * time.Millisecond)
+		}
+		if os.Getenv("_CLAUDE_TEST_WRITE_HUGE_LINE_PREFIX") == "1" {
+			_, _ = fmt.Fprintln(os.Stdout, `{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Read","input":{"file_path":"/tmp/test.txt"}}]}}`)
+		}
 		_, _ = fmt.Fprintln(os.Stdout, strings.Repeat("x", 2*1024*1024))
+		if delay := os.Getenv("_CLAUDE_TEST_WRITE_HUGE_SLEEP_MS"); delay == "1" {
+			time.Sleep(2 * time.Second)
+		}
+		if marker := os.Getenv("_CLAUDE_TEST_EXIT_MARKER"); marker != "" {
+			_ = os.WriteFile(marker, []byte("normal-exit"), 0o644)
+		}
+		os.Exit(0)
+	}
+	if os.Getenv("_CLAUDE_TEST_STREAM_JSON_OUTPUT") == "1" {
+		_, _ = fmt.Fprintln(os.Stdout, `{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Read","input":{"file_path":"/tmp/test.txt"}}]}}`)
+		_, _ = fmt.Fprintln(os.Stdout, `{"type":"result","is_error":false,"subtype":"success","result":"{\"status\":\"done\"}","duration_ms":5,"num_turns":1}`)
+		_, _ = fmt.Fprintln(os.Stderr, "streaming stderr")
 		os.Exit(0)
 	}
 	os.Exit(m.Run())
+}
+
+func claudeTestEnvWithout(keys ...string) []string {
+	blocked := make(map[string]struct{}, len(keys))
+	for _, key := range keys {
+		blocked[key] = struct{}{}
+	}
+	env := os.Environ()
+	filtered := env[:0]
+	for _, value := range env {
+		key, _, ok := strings.Cut(value, "=")
+		if ok {
+			if _, remove := blocked[key]; remove {
+				continue
+			}
+		}
+		filtered = append(filtered, value)
+	}
+	return filtered
 }
 
 // mockCLIOutput builds a JSON response matching `claude -p --output-format json`.
@@ -500,11 +559,84 @@ func TestBuildReviewArgs_IncludesModelWhenSet(t *testing.T) {
 // cmd.Wait().  The subprocess is this test binary itself, re-invoked with
 // _CLAUDE_TEST_WRITE_HUGE_LINE=1 (handled by TestMain above).
 func TestRunStreamingCommand_ScannerError(t *testing.T) {
-	env := append(os.Environ(), "_CLAUDE_TEST_WRITE_HUGE_LINE=1")
+	marker, err := os.CreateTemp("", "claude-stream-scan-marker-*")
+	if err != nil {
+		t.Fatalf("create temp marker: %v", err)
+	}
+	defer os.Remove(marker.Name())
+
+	// Ensure marker is absent unless the child exits cleanly.
+	_ = marker.Close()
+	_ = os.Remove(marker.Name())
+
+	env := append(os.Environ(),
+		"_CLAUDE_TEST_WRITE_HUGE_LINE=1",
+		"_CLAUDE_TEST_WRITE_HUGE_LINE_PREFIX=1",
+		"_CLAUDE_TEST_WRITE_HUGE_SLEEP_MS=1",
+		"_CLAUDE_TEST_EXIT_MARKER="+marker.Name(),
+	)
+	start := time.Now()
 	result, err := defaultRunStreamingCommand(
 		context.Background(),
 		os.Args[0],
 		[]string{"-test.run=^$"}, // no tests match; TestMain writes the huge line then exits
+		nil,
+		env,
+		10*time.Second,
+		nil,
+	)
+	elapsed := time.Since(start)
+	if err == nil {
+		t.Fatal("expected scanner error, got nil")
+	}
+	if !errors.Is(err, bufio.ErrTooLong) {
+		t.Fatalf("expected error wrapping bufio.ErrTooLong, got: %v", err)
+	}
+	if elapsed > 1500*time.Millisecond {
+		t.Fatalf("scan error path should return quickly to avoid deadlock; took %s", elapsed)
+	}
+	if _, statErr := os.Stat(marker.Name()); statErr == nil {
+		t.Fatalf("expected marker to remain absent when process is killed")
+	} else if !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("expected marker to remain absent when process is killed: %v", statErr)
+	}
+	// The oversized token should still preserve already-read output for debugging.
+	if len(result.stdout) == 0 {
+		t.Fatalf("expected partial stdout to be preserved after scan error")
+	}
+	if len(result.stderr) != 0 {
+		t.Fatalf("unexpected stderr from helper process: %q", string(result.stderr))
+	}
+	_ = result.stdout
+	_ = result.stderr
+}
+
+func TestRunStreamingCommand_ScannerErrorKillsProcessGroup(t *testing.T) {
+	if !claudeTestSupportsProcessGroupKill() {
+		t.Skip("process-group cancellation is only supported on Unix platforms")
+	}
+
+	marker, err := os.CreateTemp("", "claude-stream-grandchild-marker-*")
+	if err != nil {
+		t.Fatalf("create temp marker: %v", err)
+	}
+	markerPath := marker.Name()
+	if err := marker.Close(); err != nil {
+		t.Fatalf("close marker: %v", err)
+	}
+	if err := os.Remove(markerPath); err != nil {
+		t.Fatalf("remove marker: %v", err)
+	}
+
+	env := append(os.Environ(),
+		"_CLAUDE_TEST_WRITE_HUGE_LINE=1",
+		"_CLAUDE_TEST_WRITE_HUGE_SLEEP_MS=1",
+		"_CLAUDE_TEST_SPAWN_GRANDCHILD_MARKER="+markerPath,
+	)
+	_, err = defaultRunStreamingCommand(
+		context.Background(),
+		os.Args[0],
+		[]string{"-test.run=^$"},
 		nil,
 		env,
 		10*time.Second,
@@ -516,8 +648,62 @@ func TestRunStreamingCommand_ScannerError(t *testing.T) {
 	if !errors.Is(err, bufio.ErrTooLong) {
 		t.Fatalf("expected error wrapping bufio.ErrTooLong, got: %v", err)
 	}
-	// Partial output may be empty (the oversized token was never delivered) but
-	// the result must not be nil and stderr is accessible for debugging.
-	_ = result.stdout
-	_ = result.stderr
+
+	time.Sleep(800 * time.Millisecond)
+	if _, statErr := os.Stat(markerPath); statErr == nil {
+		t.Fatalf("expected process-group kill to terminate grandchild before marker write")
+	} else if !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("expected marker to remain absent when process group is killed: %v", statErr)
+	}
+}
+
+func claudeTestSupportsProcessGroupKill() bool {
+	switch goruntime.GOOS {
+	case "aix", "android", "darwin", "dragonfly", "freebsd", "hurd", "illumos", "ios", "linux", "netbsd", "openbsd", "solaris":
+		return true
+	default:
+		return false
+	}
+}
+
+func TestRunStreamingCommand_NormalCompletion_SelfBinary(t *testing.T) {
+	var sawProgress bool
+	env := append(os.Environ(), "_CLAUDE_TEST_STREAM_JSON_OUTPUT=1")
+	result, err := defaultRunStreamingCommand(
+		context.Background(),
+		os.Args[0],
+		[]string{"-test.run=^$"}, // no tests match; TestMain writes stream-json and exits
+		nil,
+		env,
+		10*time.Second,
+		func(msg string) {
+			sawProgress = true
+			if msg == "" {
+				t.Fatalf("expected non-empty progress message")
+			}
+		},
+	)
+	if err != nil {
+		t.Fatalf("expected normal completion, got error: %v", err)
+	}
+	if result.exitCode != 0 {
+		t.Fatalf("expected exitCode 0, got %d", result.exitCode)
+	}
+	if len(result.stdout) == 0 {
+		t.Fatalf("expected result stdout to be present")
+	}
+	if string(result.stderr) != "streaming stderr\n" {
+		t.Fatalf("unexpected stderr capture: %q", string(result.stderr))
+	}
+	if !sawProgress {
+		t.Fatalf("expected onProgress callback for assistant tool_use event")
+	}
+
+	var cliOut runtime.CLIOutputJSON
+	if err := json.Unmarshal(result.stdout, &cliOut); err != nil {
+		t.Fatalf("result stdout should be cli json: %v", err)
+	}
+	if cliOut.Type != "result" || cliOut.Subtype != "success" || cliOut.Result != `{"status":"done"}` {
+		t.Fatalf("unexpected cli output: %#v", cliOut)
+	}
 }

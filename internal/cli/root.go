@@ -73,7 +73,7 @@ func ExecuteArgs(args []string, stdout, stderr *os.File) int {
 	root.SetOut(stdout)
 	root.SetErr(stderr)
 	root.SetArgs(args)
-	if err := root.Execute(); err != nil {
+	if _, err := root.ExecuteC(); err != nil {
 		_, _ = fmt.Fprintln(stderr, err)
 		var exitErr interface{ ExitCode() int }
 		if errors.As(err, &exitErr) {

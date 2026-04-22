@@ -298,6 +298,110 @@ func TestReviewFindingBlocks(t *testing.T) {
 	}
 }
 
+func TestNormalizeReviewFinding(t *testing.T) {
+	now := fixedTime()
+	cases := []struct {
+		name      string
+		finding   state.ReviewFinding
+		threshold state.Severity
+		wantOpen  bool
+		wantBlock bool
+	}{
+		{
+			name: "expired waiver is treated as open and blocks",
+			finding: state.ReviewFinding{
+				ID:              "f-1",
+				Severity:        state.SeverityP1,
+				Disposition:     "waived",
+				Title:           "expired waiver",
+				Body:            "waiver has expired",
+				File:            "internal/engine/closeout.go",
+				Line:            10,
+				WaivedBy:        "reviewer",
+				WaivedAt:        now,
+				WaiverReason:    "accepted risk",
+				WaiverExpiresAt: now.Add(-24 * time.Hour),
+			},
+			threshold: state.SeverityP1,
+			wantOpen:  true,
+			wantBlock: true,
+		},
+		{
+			name: "future waiver stays waived and does not block",
+			finding: state.ReviewFinding{
+				ID:              "f-2",
+				Severity:        state.SeverityP1,
+				Disposition:     "waived",
+				Title:           "future waiver",
+				Body:            "waiver has not expired",
+				File:            "internal/engine/closeout.go",
+				Line:            10,
+				WaivedBy:        "reviewer",
+				WaivedAt:        now,
+				WaiverReason:    "accepted risk",
+				WaiverExpiresAt: time.Now().Add(24 * time.Hour),
+			},
+			threshold: state.SeverityP1,
+			wantOpen:  false,
+			wantBlock: false,
+		},
+		{
+			name: "waiver without expiry is unchanged and does not block",
+			finding: state.ReviewFinding{
+				ID:              "f-3",
+				Severity:        state.SeverityP1,
+				Disposition:     "waived",
+				Title:           "no expiry waiver",
+				Body:            "perpetual waiver",
+				File:            "internal/engine/closeout.go",
+				Line:            10,
+				WaivedBy:        "reviewer",
+				WaivedAt:        now,
+				WaiverReason:    "permanent accepted risk",
+				WaiverExpiresAt: time.Time{},
+			},
+			threshold: state.SeverityP1,
+			wantOpen:  false,
+			wantBlock: false,
+		},
+		{
+			name: "open finding without waiver still blocks",
+			finding: state.ReviewFinding{
+				ID:          "f-4",
+				Severity:    state.SeverityP1,
+				Disposition: "open",
+				Title:       "open finding",
+				Body:        "open",
+				File:        "internal/engine/closeout.go",
+				Line:        10,
+			},
+			threshold: state.SeverityP1,
+			wantOpen:  true,
+			wantBlock: true,
+		},
+	}
+
+	for _, tc := range cases {
+		got, ok := normalizeReviewFinding(tc.finding)
+		if !ok {
+			t.Fatalf("%s: expected finding to normalize", tc.name)
+		}
+		if tc.wantOpen {
+			if got.Disposition != "open" {
+				t.Fatalf("%s: expected disposition open, got %q", tc.name, got.Disposition)
+			}
+			if got.WaivedBy != "" || !got.WaivedAt.IsZero() || got.WaiverReason != "" || !got.WaiverExpiresAt.IsZero() {
+				t.Fatalf("%s: expected waived metadata to be cleared for expired waiver", tc.name)
+			}
+		} else if got.Disposition != tc.finding.Disposition {
+			t.Fatalf("%s: expected disposition %q, got %q", tc.name, tc.finding.Disposition, got.Disposition)
+		}
+		if gotBlock := ReviewFindingBlocks(tc.finding, tc.threshold); gotBlock != tc.wantBlock {
+			t.Fatalf("%s: expected ReviewFindingBlocks=%v, got %v", tc.name, tc.wantBlock, gotBlock)
+		}
+	}
+}
+
 func TestDeriveCriteriaEvidence_DiffFromChangedFiles(t *testing.T) {
 	req := baseCloseoutRequest()
 	req.implementation = &state.ImplementationArtifact{

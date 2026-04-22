@@ -143,7 +143,7 @@ func TestRunCommands_UsesAllowlistedEnvOnly(t *testing.T) {
 	}
 }
 
-func TestRunCommands_StartsWithCleanEnv(t *testing.T) {
+func TestRunCommands_DefaultEnvExcludesNonAllowlistedVars(t *testing.T) {
 	repoRoot := t.TempDir()
 	t.Setenv("DROP_ME", "secret")
 
@@ -164,7 +164,35 @@ func TestRunCommands_StartsWithCleanEnv(t *testing.T) {
 		t.Fatalf("read stdout artifact: %v", err)
 	}
 	if got := strings.TrimSpace(string(stdoutData)); got != "missing" {
-		t.Fatalf("expected clean environment to omit inherited variables, got %q", got)
+		t.Fatalf("expected default environment to omit non-allowlisted inherited variables, got %q", got)
+	}
+}
+
+func TestRunCommands_DefaultEnvIncludesCommonVars(t *testing.T) {
+	repoRoot := t.TempDir()
+	t.Setenv("PATH", "/tmp/verk-test-bin")
+	t.Setenv("HOME", "/tmp/verk-test-home")
+	t.Setenv("CI", "true")
+	t.Setenv("DROP_ME", "secret")
+
+	results, err := RunCommands(context.Background(), repoRoot, []string{
+		`printf '%s|%s|%s|%s' "${PATH:-missing}" "${HOME:-missing}" "${CI:-missing}" "${DROP_ME:-missing}"`,
+	}, policy.VerificationConfig{
+		DefaultTimeoutMinutes: 1,
+	})
+	if err != nil {
+		t.Fatalf("RunCommands returned error: %v", err)
+	}
+	if len(results) != 1 {
+		t.Fatalf("expected 1 command result, got %d", len(results))
+	}
+
+	stdoutData, err := os.ReadFile(results[0].StdoutPath)
+	if err != nil {
+		t.Fatalf("read stdout artifact: %v", err)
+	}
+	if got := strings.TrimSpace(string(stdoutData)); got != "/tmp/verk-test-bin|/tmp/verk-test-home|true|missing" {
+		t.Fatalf("expected allowlisted default variables to be present, got %q", got)
 	}
 }
 

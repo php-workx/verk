@@ -838,7 +838,9 @@ func defaultRunStreamingCommand(ctx context.Context, binary string, args []strin
 	}
 
 	if scanErr := scanner.Err(); scanErr != nil {
-		if cmd.Process != nil {
+		if cmd.Cancel != nil {
+			_ = cmd.Cancel()
+		} else if cmd.Process != nil {
 			_ = cmd.Process.Kill()
 		}
 		_ = cmd.Wait() // wait for stderr copy goroutine to finish before reading stderr
