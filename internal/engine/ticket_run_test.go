@@ -112,6 +112,105 @@ func TestRunTicket_HappyPath(t *testing.T) {
 	}
 }
 
+func TestExecuteVerification_AdvisoryDerivedFailureTriggersBestEffortRepair(t *testing.T) {
+	repoRoot := t.TempDir()
+	installFailingRuff(t)
+
+	cfg := policy.DefaultConfig()
+	cfg.Policy.MaxImplementationAttempts = 3
+
+	stubToolSignals(t, ToolSignals{HasRuff: true})
+
+	st := newVerificationTestState(t, "run-advisory-repair", "ver-advisory-repair", cfg, 1)
+	st.repoRoot = repoRoot
+	st.implementation = &state.ImplementationArtifact{
+		ChangedFiles: []string{"tests/test_smoke.py"},
+	}
+
+	blocked, err := st.executeVerification(context.Background(), repoRoot)
+	if err != nil {
+		t.Fatalf("executeVerification: %v", err)
+	}
+	if blocked {
+		t.Fatalf("expected advisory-only derived failure not to block")
+	}
+	if st.currentPhase != state.TicketPhaseImplement {
+		t.Fatalf("expected best-effort advisory repair to return to implement phase, got %q", st.currentPhase)
+	}
+	if len(st.repairCycles) != 1 {
+		t.Fatalf("expected one best-effort repair cycle, got %d", len(st.repairCycles))
+	}
+	if len(st.repairCycles[0].TriggerCheckIDs) != 1 {
+		t.Fatalf("expected one triggering advisory check id, got %#v", st.repairCycles[0].TriggerCheckIDs)
+	}
+	if st.verification == nil || st.verification.ValidationCoverage == nil {
+		t.Fatalf("expected verification coverage to be recorded")
+	}
+	if !st.verification.Passed {
+		t.Fatalf("expected advisory-only failure to keep verification artifact passed")
+	}
+	if len(st.verification.ValidationCoverage.UnresolvedBlockers) != 0 {
+		t.Fatalf("expected no unresolved blockers for advisory-only failure, got %#v", st.verification.ValidationCoverage.UnresolvedBlockers)
+	}
+}
+
+func TestExecuteVerification_AdvisoryDerivedFailureDoesNotBlockAfterRepairBudget(t *testing.T) {
+	repoRoot := t.TempDir()
+	installFailingRuff(t)
+
+	cfg := policy.DefaultConfig()
+	cfg.Policy.MaxImplementationAttempts = 1
+
+	stubToolSignals(t, ToolSignals{HasRuff: true})
+
+	st := newVerificationTestState(t, "run-advisory-budget", "ver-advisory-budget", cfg, 1)
+	st.repoRoot = repoRoot
+	st.implementation = &state.ImplementationArtifact{
+		ChangedFiles: []string{"tests/test_smoke.py"},
+	}
+
+	blocked, err := st.executeVerification(context.Background(), repoRoot)
+	if err != nil {
+		t.Fatalf("executeVerification: %v", err)
+	}
+	if blocked {
+		t.Fatalf("expected advisory-only derived failure not to block after repair budget")
+	}
+	if st.currentPhase != state.TicketPhaseReview {
+		t.Fatalf("expected advisory-only failure to continue to review after budget, got %q", st.currentPhase)
+	}
+	if len(st.repairCycles) != 0 {
+		t.Fatalf("expected no extra advisory repair cycle after budget, got %d", len(st.repairCycles))
+	}
+	if st.blockReason != "" {
+		t.Fatalf("expected no block reason for advisory-only failure, got %q", st.blockReason)
+	}
+	if st.verification == nil || !st.verification.Passed {
+		t.Fatalf("expected advisory-only failure to keep verification artifact passed")
+	}
+}
+
+func installFailingRuff(t *testing.T) {
+	t.Helper()
+	binDir := t.TempDir()
+	ruffPath := filepath.Join(binDir, "ruff")
+	if err := os.WriteFile(ruffPath, []byte("#!/bin/sh\nexit 1\n"), 0o755); err != nil {
+		t.Fatalf("write fake ruff: %v", err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+}
+
+func stubToolSignals(t *testing.T, signals ToolSignals) {
+	t.Helper()
+	originalToolSignals := toolSignalsProvider
+	t.Cleanup(func() {
+		toolSignalsProvider = originalToolSignals
+	})
+	toolSignalsProvider = func(string) ToolSignals {
+		return signals
+	}
+}
+
 func TestRunTicket_VerifyFailureLoopsToImplement(t *testing.T) {
 	repoRoot := t.TempDir()
 	cfg := policy.DefaultConfig()

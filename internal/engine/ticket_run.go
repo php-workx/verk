@@ -560,6 +560,20 @@ func (st *ticketRunState) executeVerification(ctx context.Context, repoRoot stri
 	if err := st.persist(); err != nil {
 		return false, err
 	}
+	if verifyPassed {
+		advisoryFailingIDs := verificationAdvisoryFailingCheckIDs(st.verification)
+		if len(advisoryFailingIDs) > 0 && st.implementationAttempts < st.cfg.Policy.MaxImplementationAttempts {
+			appendVerificationRepairCycle(st, advisoryFailingIDs)
+			st.progressDetail(fmt.Sprintf("advisory checks failed; best-effort repair: %s", strings.Join(advisoryFailingIDs, ", ")))
+			if err := st.transitionTo(state.TicketPhaseImplement); err != nil {
+				return false, err
+			}
+			if err := st.persist(); err != nil {
+				return false, err
+			}
+			return false, nil
+		}
+	}
 	if !verifyPassed {
 		if err := handleVerificationFailure(st, *verifyArtifact); err != nil {
 			return false, err
@@ -673,6 +687,45 @@ func verificationFailingCheckIDs(verification *state.VerificationArtifact) []str
 		return nil
 	}
 	return failingCheckIDs(*verification.ValidationCoverage)
+}
+
+// verificationAdvisoryFailingCheckIDs returns failed check ids whose
+// ValidationCheck is explicitly advisory. These failures are safe to route
+// through best-effort repair, but they must not become blockers on their own.
+func verificationAdvisoryFailingCheckIDs(verification *state.VerificationArtifact) []string {
+	if verification == nil || verification.ValidationCoverage == nil {
+		return nil
+	}
+	return advisoryFailingCheckIDs(*verification.ValidationCoverage)
+}
+
+func advisoryFailingCheckIDs(coverage state.ValidationCoverageArtifact) []string {
+	checks := make(map[string]state.ValidationCheck, len(coverage.DeclaredChecks)+len(coverage.DerivedChecks))
+	for _, check := range coverage.DeclaredChecks {
+		checks[check.ID] = check
+	}
+	for _, check := range coverage.DerivedChecks {
+		checks[check.ID] = check
+	}
+
+	latest := make(map[string]state.ValidationCheckResult, len(coverage.ExecutedChecks))
+	for _, exec := range coverage.ExecutedChecks {
+		latest[exec.CheckID] = exec.Result
+	}
+
+	out := make([]string, 0)
+	for id, result := range latest {
+		if result != state.ValidationCheckResultFailed {
+			continue
+		}
+		check, ok := checks[id]
+		if !ok || !check.Advisory {
+			continue
+		}
+		out = append(out, id)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // buildVerificationBlockReason composes a clear block reason for a
