@@ -393,8 +393,8 @@ func TestNormalizeReviewFinding(t *testing.T) {
 			if got.WaivedBy != "" || !got.WaivedAt.IsZero() || got.WaiverReason != "" || !got.WaiverExpiresAt.IsZero() {
 				t.Fatalf("%s: expected waived metadata to be cleared for expired waiver", tc.name)
 			}
-		} else if got.Disposition == "open" {
-			t.Fatalf("%s: expected disposition %q, got open", tc.name, tc.finding.Disposition)
+		} else if got.Disposition != tc.finding.Disposition {
+			t.Fatalf("%s: expected disposition %q, got %q", tc.name, tc.finding.Disposition, got.Disposition)
 		}
 		if gotBlock := ReviewFindingBlocks(tc.finding, tc.threshold); gotBlock != tc.wantBlock {
 			t.Fatalf("%s: expected ReviewFindingBlocks=%v, got %v", tc.name, tc.wantBlock, gotBlock)

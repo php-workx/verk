@@ -350,7 +350,7 @@ func TestResumeRun_ClosedPhase_Closable_StaysClosed(t *testing.T) {
 	if snapshot.Closeout == nil {
 		t.Fatalf("expected repaired closeout, got %#v", snapshot.Closeout)
 	}
-	if snapshot.Closeout == nil || !snapshot.Closeout.Closable {
+	if !snapshot.Closeout.Closable {
 		t.Fatalf("expected closable closeout, got %#v", snapshot.Closeout)
 	}
 }

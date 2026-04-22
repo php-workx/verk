@@ -196,25 +196,6 @@ func TestRunCommands_DefaultEnvIncludesCommonVars(t *testing.T) {
 	}
 }
 
-func TestRunCommands_PathDependentCommandWorksByDefault(t *testing.T) {
-	repoRoot := t.TempDir()
-
-	results, err := RunCommands(context.Background(), repoRoot, []string{
-		"go version",
-	}, policy.VerificationConfig{
-		DefaultTimeoutMinutes: 1,
-	})
-	if err != nil {
-		t.Fatalf("RunCommands returned error: %v", err)
-	}
-	if len(results) != 1 {
-		t.Fatalf("expected 1 command result, got %d", len(results))
-	}
-	if results[0].ExitCode != 0 {
-		t.Fatalf("expected PATH-dependent command to run, got exit code %d", results[0].ExitCode)
-	}
-}
-
 func TestRunCommands_DefaultEnvIncludesPath(t *testing.T) {
 	// When no EnvPassthrough is configured, verification commands must still
 	// be able to find executables via PATH. This tests the fix for ver-93kv:

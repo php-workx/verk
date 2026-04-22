@@ -569,9 +569,6 @@ func assertPathUnderBase(target, base string) error {
 	if rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
 		return fmt.Errorf("claim path escapes base directory")
 	}
-	if strings.HasPrefix(rel, "..") {
-		return fmt.Errorf("claim path escapes base directory")
-	}
 	return nil
 }
 

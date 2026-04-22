@@ -67,7 +67,7 @@ func TestLatestRunID_NoRunsDir(t *testing.T) {
 }
 
 func TestLatestRunID_CrossTicketIDOrder(t *testing.T) {
-	// run-ticket-z-2000 sorts lex BEFORE run-ticket-a-1000,
+	// run-ticket-a-1000 sorts lex BEFORE run-ticket-z-2000,
 	// but 2000 > 1000, so run-ticket-z-2000 must win.
 	repoRoot := t.TempDir()
 	runsDir := filepath.Join(repoRoot, ".verk", "runs")

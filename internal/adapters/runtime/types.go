@@ -338,7 +338,7 @@ func isCanonicalSeverity(severity Severity) bool {
 func isBlockingFinding(finding ReviewFinding, threshold Severity) bool {
 	if finding.Disposition != ReviewDispositionOpen {
 		// Re-evaluate expired waivers as if they were open; otherwise reject.
-		isExpiredWaiver := finding.Disposition == ReviewDispositionWaived && finding.WaiverExpiresAt != nil && !finding.WaiverExpiresAt.After(time.Now())
+		isExpiredWaiver := finding.Disposition == ReviewDispositionWaived && finding.WaiverExpiresAt != nil && finding.WaiverExpiresAt.Before(time.Now())
 		if !isExpiredWaiver {
 			return false
 		}

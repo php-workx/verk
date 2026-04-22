@@ -193,6 +193,18 @@ func TestRunCLIFromDir_LargeOutput_NoDeadlock(t *testing.T) {
 		TicketIDs:    ticketIDs,
 	})
 
+	for _, ticketID := range ticketIDs {
+		writeJSONFixture(t, filepath.Join(repoRoot, ".verk", "runs", largeRunID, "tickets", ticketID, "ticket-run.json"), map[string]any{
+			"schema_version":          1,
+			"run_id":                  largeRunID,
+			"ticket_id":               ticketID,
+			"current_phase":           "implement",
+			"implementation_attempts": 1,
+			"verification_attempts":   0,
+			"review_attempts":         0,
+		})
+	}
+
 	stdout, stderr, code := runCLIFromDir(t, repoRoot, "status", largeRunID)
 	if code != 0 {
 		t.Fatalf("status %s failed: code=%d stderr=%s", largeRunID, code, stderr)
