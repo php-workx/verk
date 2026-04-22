@@ -240,21 +240,33 @@ func ParseResultBlock(text string) (VerkResultBlock, bool) {
 
 	// 1. Direct parse — the AI returned only JSON as instructed.
 	var block VerkResultBlock
-	if err := json.Unmarshal([]byte(text), &block); err == nil && block.Status != "" {
-		return block, true
+	if err := json.Unmarshal([]byte(text), &block); err == nil {
+		return finalizeResultBlock(block)
 	}
 
 	// 2. Sentinel-prefixed line fallback.
-	if b, ok := parseSentinelLine[VerkResultBlock](text, ResultSentinel); ok && b.Status != "" && ValidateWorkerStatus(WorkerStatus(b.Status)) == nil {
-		return b, true
+	if b, ok := parseSentinelLine[VerkResultBlock](text, ResultSentinel); ok {
+		return finalizeResultBlock(b)
 	}
 
 	// 3. Last JSON object fallback.
-	if b, ok := parseLastJSON[VerkResultBlock](stripSentinelLines(text, ResultSentinel)); ok && b.Status != "" {
-		return b, true
+	if b, ok := parseLastJSON[VerkResultBlock](stripSentinelLines(text, ResultSentinel)); ok {
+		return finalizeResultBlock(b)
 	}
 
 	return VerkResultBlock{}, false
+}
+
+func finalizeResultBlock(b VerkResultBlock) (VerkResultBlock, bool) {
+	if b.Status == "" {
+		return VerkResultBlock{}, false
+	}
+	status, ok := NormalizeWorkerStatusString(b.Status)
+	if !ok {
+		return VerkResultBlock{}, false
+	}
+	b.Status = string(status)
+	return b, true
 }
 
 // ParseReviewBlock extracts a VerkReviewBlock from AI output.
@@ -263,19 +275,31 @@ func ParseReviewBlock(text string) (VerkReviewBlock, bool) {
 	text = strings.TrimSpace(text)
 
 	var block VerkReviewBlock
-	if err := json.Unmarshal([]byte(text), &block); err == nil && block.ReviewStatus != "" {
-		return block, true
+	if err := json.Unmarshal([]byte(text), &block); err == nil {
+		return finalizeReviewBlock(block)
 	}
 
-	if b, ok := parseSentinelLine[VerkReviewBlock](text, ReviewSentinel); ok && b.ReviewStatus != "" && ValidateReviewStatus(ReviewStatus(b.ReviewStatus)) == nil {
-		return b, true
+	if b, ok := parseSentinelLine[VerkReviewBlock](text, ReviewSentinel); ok {
+		return finalizeReviewBlock(b)
 	}
 
-	if b, ok := parseLastJSON[VerkReviewBlock](stripSentinelLines(text, ReviewSentinel)); ok && b.ReviewStatus != "" {
-		return b, true
+	if b, ok := parseLastJSON[VerkReviewBlock](stripSentinelLines(text, ReviewSentinel)); ok {
+		return finalizeReviewBlock(b)
 	}
 
 	return VerkReviewBlock{}, false
+}
+
+func finalizeReviewBlock(b VerkReviewBlock) (VerkReviewBlock, bool) {
+	switch NormalizeKey(b.ReviewStatus) {
+	case string(ReviewStatusPassed):
+		b.ReviewStatus = string(ReviewStatusPassed)
+	case string(ReviewStatusFindings):
+		b.ReviewStatus = string(ReviewStatusFindings)
+	default:
+		return VerkReviewBlock{}, false
+	}
+	return b, true
 }
 
 // parseSentinelLine scans for a line starting with the given prefix and parses
