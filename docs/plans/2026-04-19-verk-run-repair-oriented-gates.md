@@ -5,7 +5,7 @@
 - Date: 2026-04-19
 - Owner: Ronny Unger
 - Epic: `ver-vyag`
-- Status: planned
+- Status: implemented
 
 ## Summary
 
@@ -175,15 +175,20 @@ Suggested derivations:
 - YAML files: YAML parse or lint when a local tool exists.
 - Shell files: shellcheck when available.
 
-Derived checks should be focused and cheap. Missing optional tooling should be
-recorded as skipped rather than failing the run by default.
+Derived checks should be focused and cheap. Ticket-scoped derived checks are
+advisory by default: a failing advisory check may trigger best-effort repair
+while implementation attempts remain, but it does not block ticket closure on
+its own. Missing optional tooling should be recorded as skipped rather than
+failing the run by default.
 
 ### 4. Ticket Closeout
 
 Ticket closeout should run declared and derived checks before closing. Failing
-checks should trigger repair while budget remains. Closeout should block only
-when repair fails, repair is unsafe without user input, or the system cannot map
-the problem to a safe action.
+required checks should trigger repair while budget remains. Failing advisory
+checks should trigger best-effort repair while implementation attempts remain,
+then remain visible in validation coverage without blocking closure. Closeout
+should block only when required repair fails, repair is unsafe without user
+input, or the system cannot map the problem to a safe action.
 
 The closeout artifact should include validation coverage so the operator and
 resume logic can understand the state later.

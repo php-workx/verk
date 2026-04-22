@@ -72,6 +72,12 @@ most recent entry based on `FinishedAt`.
 
 ## Blocked Closure
 
+Advisory checks are coverage signals first. A failed advisory check may create a
+best-effort repair cycle reference while ticket implementation attempts remain,
+but it must not create an unresolved blocker by itself. Required checks and
+reviewer/policy-promoted findings are the cases that make a coverage artifact
+non-closable.
+
 When a scope cannot close:
 
 1. Set `Closable = false` on the `ValidationCoverageArtifact`.
