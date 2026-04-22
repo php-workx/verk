@@ -135,3 +135,57 @@ func TestDoRunEpic_CurrentPointerClearedOnEngineFailure(t *testing.T) {
 			"(got non-empty runID pointing at potentially missing run.json)", runID)
 	}
 }
+
+func TestDoRunEpic_CurrentPointerSetForPersistedBlockedRun(t *testing.T) {
+	dir := t.TempDir()
+	initCLITestRepo(t, dir)
+
+	ticketsDir := filepath.Join(dir, ".tickets")
+	if err := os.MkdirAll(ticketsDir, 0o755); err != nil {
+		t.Fatalf("mkdir .tickets: %v", err)
+	}
+	epic := tkmd.Ticket{
+		ID:     "ver-current-epic",
+		Title:  "Current pointer epic",
+		Status: tkmd.StatusReady,
+		UnknownFrontmatter: map[string]any{
+			"type": "epic",
+		},
+	}
+	child := tkmd.Ticket{
+		ID:     "ver-current-child",
+		Title:  "Blocked child",
+		Status: tkmd.StatusBlocked,
+		UnknownFrontmatter: map[string]any{
+			"parent": epic.ID,
+			"type":   "task",
+		},
+	}
+	if err := tkmd.SaveTicket(filepath.Join(ticketsDir, epic.ID+".md"), epic); err != nil {
+		t.Fatalf("save epic: %v", err)
+	}
+	if err := tkmd.SaveTicket(filepath.Join(ticketsDir, child.ID+".md"), child); err != nil {
+		t.Fatalf("save child: %v", err)
+	}
+
+	t.Chdir(dir)
+
+	var stdout, stderr bytes.Buffer
+	runID, err := doRunEpic(&stdout, &stderr, epic.ID)
+	if err == nil {
+		t.Fatal("expected blocked epic error, got nil")
+	}
+	if runID == "" {
+		t.Fatal("expected doRunEpic to return a non-empty runID")
+	}
+	if _, statErr := os.Stat(filepath.Join(dir, ".verk", "runs", runID, "run.json")); statErr != nil {
+		t.Fatalf("expected persisted run artifact: %v", statErr)
+	}
+	data, readErr := os.ReadFile(filepath.Join(dir, ".verk", "current"))
+	if readErr != nil {
+		t.Fatalf("read .verk/current: %v", readErr)
+	}
+	if got := strings.TrimSpace(string(data)); got != runID {
+		t.Fatalf("expected .verk/current=%q for blocked persisted run, got %q", runID, got)
+	}
+}

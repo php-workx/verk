@@ -39,6 +39,24 @@ func drainProgress(ch <-chan engine.ProgressEvent) {
 	}()
 }
 
+func writeCurrentRunIDIfArtifactExists(repoRoot, runID string, errw io.Writer) bool {
+	if runID == "" {
+		return false
+	}
+	runPath := filepath.Join(repoRoot, ".verk", "runs", runID, "run.json")
+	if _, err := os.Stat(runPath); err != nil {
+		if !os.IsNotExist(err) {
+			_, _ = fmt.Fprintf(errw, "warning: could not inspect run artifact: %v\n", err)
+		}
+		return false
+	}
+	if wErr := writeCurrentRunID(repoRoot, runID); wErr != nil {
+		_, _ = fmt.Fprintf(errw, "warning: could not write current run: %v\n", wErr)
+		return false
+	}
+	return true
+}
+
 // saveJSONAtomic and saveTicket are package-level variables so tests can inject
 // fake implementations to exercise error paths without a real filesystem.
 // saveJSONAtomic is used both for the initial run.json persistence in
@@ -374,6 +392,10 @@ func doRunEpic(w, errw io.Writer, ticketID string) (string, error) {
 	// Wait for the engine goroutine to finish before reading result/runErr.
 	wg.Wait()
 
+	// If engine.RunEpic persisted run.json, make it resumable even when the
+	// terminal result is a blocked run that the operator does not retry now.
+	currentRunWritten := writeCurrentRunIDIfArtifactExists(repoRoot, runID, errw)
+
 	if runErr != nil {
 		// If the run ended in a structured blocked state, hand off to the
 		// blocked-run handler so the operator sees which tickets are blocked
@@ -395,11 +417,13 @@ func doRunEpic(w, errw io.Writer, ticketID string) (string, error) {
 		return runID, runErr
 	}
 
-	// The epic run artifact has been persisted by engine.RunEpic before it can
-	// return here. Write the current-run pointer after that point so .verk/current
-	// never points at a run without run.json on disk.
-	if wErr := writeCurrentRunID(repoRoot, runID); wErr != nil {
-		_, _ = fmt.Fprintf(errw, "warning: could not write current run: %v\n", wErr)
+	if !currentRunWritten {
+		// The epic run artifact has been persisted by engine.RunEpic before it
+		// can return successfully. Write the current-run pointer after that point
+		// so .verk/current never points at a run without run.json on disk.
+		if wErr := writeCurrentRunID(repoRoot, runID); wErr != nil {
+			_, _ = fmt.Fprintf(errw, "warning: could not write current run: %v\n", wErr)
+		}
 	}
 
 	_, _ = fmt.Fprintf(w, "status=%s phase=%s\n", result.Run.Status, result.Run.CurrentPhase)
