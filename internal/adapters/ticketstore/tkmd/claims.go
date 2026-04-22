@@ -16,6 +16,9 @@ const (
 	defaultClaimTTL    = 30 * time.Minute
 )
 
+// ErrInvalidIdentifier marks claim identifiers rejected before filesystem access.
+var ErrInvalidIdentifier = errors.New("invalid identifier")
+
 // saveAtomic is the atomic JSON save function used by RenewClaim.
 // Package-internal; overridable in tests.
 var saveAtomic = state.SaveJSONAtomic
@@ -618,22 +621,22 @@ func resolvePathForContainment(path string) (string, error) {
 // directory semantics.
 func validateClaimIdentifier(id, label string) error {
 	if id == "" {
-		return fmt.Errorf("%s is required", label)
+		return fmt.Errorf("%w: %s is required", ErrInvalidIdentifier, label)
 	}
 	if id == "." || id == ".." {
-		return fmt.Errorf("%s contains path traversal", label)
+		return fmt.Errorf("%w: %s contains path traversal", ErrInvalidIdentifier, label)
 	}
 	if filepath.IsAbs(id) {
-		return fmt.Errorf("%s contains absolute path", label)
+		return fmt.Errorf("%w: %s contains absolute path", ErrInvalidIdentifier, label)
 	}
 	if strings.Contains(id, "..") {
-		return fmt.Errorf("%s contains path traversal", label)
+		return fmt.Errorf("%w: %s contains path traversal", ErrInvalidIdentifier, label)
 	}
 	if strings.ContainsAny(id, "/\\") {
-		return fmt.Errorf("%s contains path separator", label)
+		return fmt.Errorf("%w: %s contains path separator", ErrInvalidIdentifier, label)
 	}
 	if cleaned := filepath.Clean(id); cleaned != id {
-		return fmt.Errorf("%s is not a clean identifier", label)
+		return fmt.Errorf("%w: %s is not a clean identifier", ErrInvalidIdentifier, label)
 	}
 	return nil
 }

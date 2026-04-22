@@ -263,9 +263,7 @@ func TestAcquireClaim_RejectsPathTraversalIdentifiers(t *testing.T) {
 	for _, tc := range maliciousIDs {
 		t.Run(tc.name, func(t *testing.T) {
 			_, err := AcquireClaim(dir, tc.runID, tc.ticketID, "lease-x", 10*time.Minute)
-			if err == nil {
-				t.Fatalf("expected claim to be rejected for %s", tc.name)
-			}
+			assertInvalidIdentifierError(t, err, "claim", tc.name)
 		})
 	}
 }
@@ -299,9 +297,7 @@ func TestRenewClaim_RejectsPathTraversalIdentifiers(t *testing.T) {
 	for _, tc := range maliciousIDs {
 		t.Run(tc.name, func(t *testing.T) {
 			_, err := RenewClaim(dir, tc.runID, tc.ticketID, "lease-x", 10*time.Minute)
-			if err == nil {
-				t.Fatalf("expected renew to be rejected for %s", tc.name)
-			}
+			assertInvalidIdentifierError(t, err, "renew", tc.name)
 		})
 	}
 }
@@ -335,10 +331,21 @@ func TestReleaseClaim_RejectsPathTraversalIdentifiers(t *testing.T) {
 	for _, tc := range maliciousIDs {
 		t.Run(tc.name, func(t *testing.T) {
 			err := ReleaseClaim(dir, tc.runID, tc.ticketID, "lease-x", "test")
-			if err == nil {
-				t.Fatalf("expected release to be rejected for %s", tc.name)
-			}
+			assertInvalidIdentifierError(t, err, "release", tc.name)
 		})
+	}
+}
+
+func assertInvalidIdentifierError(t *testing.T, err error, operation, name string) {
+	t.Helper()
+	if err == nil {
+		t.Fatalf("expected %s to be rejected for %s", operation, name)
+	}
+	if !errors.Is(err, ErrInvalidIdentifier) {
+		t.Fatalf("expected invalid identifier error for %s %s, got %v", operation, name, err)
+	}
+	if strings.Contains(err.Error(), "not found") {
+		t.Fatalf("expected upfront validation error for %s %s, got %v", operation, name, err)
 	}
 }
 

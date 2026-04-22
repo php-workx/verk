@@ -164,6 +164,29 @@ func TestExecuteVerification_AdvisoryDerivedFailureTriggersBestEffortRepair(t *t
 	}
 }
 
+func TestAdvisoryFailingCheckIDs_DeclaredCheckWinsIDCollision(t *testing.T) {
+	coverage := state.ValidationCoverageArtifact{
+		DeclaredChecks: []state.ValidationCheck{{
+			ID:       "same-id",
+			Command:  "just check",
+			Advisory: false,
+		}},
+		DerivedChecks: []state.ValidationCheck{{
+			ID:       "same-id",
+			Command:  "just check",
+			Advisory: true,
+		}},
+		ExecutedChecks: []state.ValidationCheckExecution{{
+			CheckID: "same-id",
+			Result:  state.ValidationCheckResultFailed,
+		}},
+	}
+
+	if got := advisoryFailingCheckIDs(coverage); len(got) != 0 {
+		t.Fatalf("declared check should override advisory derived collision, got %#v", got)
+	}
+}
+
 func TestExecuteVerification_AdvisoryDerivedFailureDoesNotBlockAfterRepairBudget(t *testing.T) {
 	repoRoot := t.TempDir()
 	installFailingRuff(t)
@@ -520,14 +543,14 @@ func TestRunTicket_RenewsFromLiveClaimWhenRequestClaimIsStale(t *testing.T) {
 
 	now := time.Now().UTC()
 	requestClaim.LeasedAt = now
-	requestClaim.ExpiresAt = now.Add(1500 * time.Millisecond)
+	requestClaim.ExpiresAt = now.Add(3 * time.Second)
 
 	liveClaim := requestClaim
-	liveClaim.ExpiresAt = now.Add(250 * time.Millisecond)
+	liveClaim.ExpiresAt = now.Add(900 * time.Millisecond)
 	durableClaimPath := seedClaimSnapshots(t, repoRoot, "run-live-renewal", ticket.ID, liveClaim)
 
 	adapter := &sleepyRuntimeAdapter{
-		reviewDelay: 700 * time.Millisecond,
+		reviewDelay: 1300 * time.Millisecond,
 		workerResult: runtime.WorkerResult{
 			Status:             runtime.WorkerStatusDone,
 			RetryClass:         runtime.RetryClassTerminal,

@@ -702,10 +702,12 @@ func verificationAdvisoryFailingCheckIDs(verification *state.VerificationArtifac
 
 func advisoryFailingCheckIDs(coverage state.ValidationCoverageArtifact) []string {
 	checks := make(map[string]state.ValidationCheck, len(coverage.DeclaredChecks)+len(coverage.DerivedChecks))
-	for _, check := range coverage.DeclaredChecks {
+	for _, check := range coverage.DerivedChecks {
 		checks[check.ID] = check
 	}
-	for _, check := range coverage.DerivedChecks {
+	// Declared checks intentionally override derived checks on ID collisions:
+	// ticket-authored validation must not be downgraded by an advisory derived duplicate.
+	for _, check := range coverage.DeclaredChecks {
 		checks[check.ID] = check
 	}
 
