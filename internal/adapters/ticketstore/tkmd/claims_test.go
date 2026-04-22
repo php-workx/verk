@@ -375,6 +375,62 @@ func TestClaimPaths_PreservesValidIdentifiers(t *testing.T) {
 	}
 }
 
+func TestClaimPaths_RejectsSymlinkEscapingBase(t *testing.T) {
+	tests := []struct {
+		name  string
+		setup func(t *testing.T, dir string)
+	}{
+		{
+			name: "live claim dir symlink",
+			setup: func(t *testing.T, dir string) {
+				t.Helper()
+				ticketsDir := filepath.Join(dir, ".tickets")
+				outside := filepath.Join(dir, "outside-live")
+				if err := os.MkdirAll(ticketsDir, 0o755); err != nil {
+					t.Fatalf("mkdir tickets dir: %v", err)
+				}
+				if err := os.MkdirAll(outside, 0o755); err != nil {
+					t.Fatalf("mkdir outside dir: %v", err)
+				}
+				if err := os.Symlink(outside, filepath.Join(ticketsDir, ".claims")); err != nil {
+					t.Skipf("symlink not supported: %v", err)
+				}
+			},
+		},
+		{
+			name: "durable claim dir symlink",
+			setup: func(t *testing.T, dir string) {
+				t.Helper()
+				durableParent := filepath.Join(dir, ".verk", "runs", "run-a")
+				outside := filepath.Join(dir, "outside-durable")
+				if err := os.MkdirAll(durableParent, 0o755); err != nil {
+					t.Fatalf("mkdir durable parent: %v", err)
+				}
+				if err := os.MkdirAll(outside, 0o755); err != nil {
+					t.Fatalf("mkdir outside dir: %v", err)
+				}
+				if err := os.Symlink(outside, filepath.Join(durableParent, "claims")); err != nil {
+					t.Skipf("symlink not supported: %v", err)
+				}
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			tc.setup(t, dir)
+			_, _, err := claimPaths(dir, "run-a", "ticket-1")
+			if err == nil {
+				t.Fatal("expected symlink escape to be rejected")
+			}
+			if !strings.Contains(err.Error(), "claim path escapes base directory") {
+				t.Fatalf("expected escape error, got %v", err)
+			}
+		})
+	}
+}
+
 func assertPathWithin(t *testing.T, child, parent string) {
 	t.Helper()
 	rel, err := filepath.Rel(filepath.Clean(parent), filepath.Clean(child))

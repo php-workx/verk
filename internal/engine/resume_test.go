@@ -260,6 +260,9 @@ func TestResumeRun_ClosedPhase_NonClosable_BecomesBlocked(t *testing.T) {
 	if snapshot.Closeout == nil {
 		t.Fatalf("expected closeout to be repaired, got %#v", snapshot.Closeout)
 	}
+	if snapshot.Closeout.FailedGate == "" {
+		t.Fatalf("expected non-empty FailedGate, got %#v", snapshot.Closeout)
+	}
 	if snapshot.BlockReason != snapshot.Closeout.FailedGate {
 		t.Fatalf("expected BlockReason %q, got %q", snapshot.Closeout.FailedGate, snapshot.BlockReason)
 	}

@@ -81,6 +81,11 @@ func TestDoRunTicket_FinalSaveFailure(t *testing.T) {
 	if runID == "" {
 		t.Fatal("expected non-empty runID even on persistence failure")
 	}
+	currentPath := filepath.Join(dir, ".verk", "current")
+	data, readErr := os.ReadFile(currentPath)
+	if readErr == nil && strings.TrimSpace(string(data)) == runID {
+		t.Fatalf(".verk/current advanced to %q after final run persistence failed", runID)
+	}
 	if stdout.Len() > 0 {
 		t.Fatalf("expected no success output on stdout, got %q", stdout.String())
 	}

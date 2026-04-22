@@ -1440,6 +1440,12 @@ func (st *ticketRunState) snapshot() TicketRunSnapshot {
 	return snapshot
 }
 
+// ticketOutcomeForPhase intentionally maps only legacy terminal phases:
+// state.TicketPhaseClosed -> state.TicketOutcomeClosed and
+// state.TicketPhaseBlocked -> state.TicketOutcomeBlocked. More specific
+// outcomes such as state.TicketOutcomeFailedRetryable,
+// state.TicketOutcomeNeedsDecision, and state.TicketOutcomeCancelled are
+// deferred to follow-up state-machine work.
 func ticketOutcomeForPhase(phase state.TicketPhase) state.TicketOutcome {
 	switch phase {
 	case state.TicketPhaseClosed:

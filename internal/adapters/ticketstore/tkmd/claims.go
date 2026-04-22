@@ -550,6 +550,12 @@ func claimPaths(rootDir, runID, ticketID string) (string, string, error) {
 	durableDir := filepath.Join(repoRoot, ".verk", "runs", runID, "claims")
 	livePath := filepath.Join(liveDir, ticketID+".json")
 	durablePath := filepath.Join(durableDir, "claim-"+ticketID+".json")
+	if err := os.MkdirAll(liveDir, 0o755); err != nil {
+		return "", "", fmt.Errorf("create claim dir: %w", err)
+	}
+	if err := os.MkdirAll(durableDir, 0o755); err != nil {
+		return "", "", fmt.Errorf("create durable claim dir: %w", err)
+	}
 	if err := assertPathUnderBase(livePath, liveDir); err != nil {
 		return "", "", err
 	}
@@ -562,7 +568,15 @@ func claimPaths(rootDir, runID, ticketID string) (string, string, error) {
 func assertPathUnderBase(target, base string) error {
 	cleanTarget := filepath.Clean(target)
 	cleanBase := filepath.Clean(base)
-	rel, err := filepath.Rel(cleanBase, cleanTarget)
+	resolvedBase, err := resolveBaseForContainment(cleanBase)
+	if err != nil {
+		return fmt.Errorf("claim path resolution failed: resolve base %q: %w", cleanBase, err)
+	}
+	resolvedTarget, err := resolvePathForContainment(cleanTarget)
+	if err != nil {
+		return fmt.Errorf("claim path resolution failed: resolve target %q: %w", cleanTarget, err)
+	}
+	rel, err := filepath.Rel(resolvedBase, resolvedTarget)
 	if err != nil {
 		return fmt.Errorf("claim path resolution failed: %w", err)
 	}
@@ -570,6 +584,32 @@ func assertPathUnderBase(target, base string) error {
 		return fmt.Errorf("claim path escapes base directory")
 	}
 	return nil
+}
+
+func resolveBaseForContainment(base string) (string, error) {
+	if _, err := filepath.EvalSymlinks(base); err != nil {
+		return "", err
+	}
+	parent, err := filepath.EvalSymlinks(filepath.Dir(base))
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(parent, filepath.Base(base)), nil
+}
+
+func resolvePathForContainment(path string) (string, error) {
+	resolved, err := filepath.EvalSymlinks(path)
+	if err == nil {
+		return resolved, nil
+	}
+	if !os.IsNotExist(err) {
+		return "", err
+	}
+	parent, parentErr := filepath.EvalSymlinks(filepath.Dir(path))
+	if parentErr != nil {
+		return "", parentErr
+	}
+	return filepath.Join(parent, filepath.Base(path)), nil
 }
 
 // validateClaimIdentifier rejects identifiers that could escape the intended

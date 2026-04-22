@@ -93,12 +93,51 @@ func TestDoRunTicket_CurrentPointerNotSetOnSaveFailure(t *testing.T) {
 	// If the file doesn't exist, that's the correct outcome too.
 }
 
-// TestDoRunEpic_CurrentPointerClearedOnEngineFailure verifies the fix for
-// doRunEpic: when engine.RunEpic returns an error before it can successfully
-// persist the initial run artifact, writeCurrentRunID should not be called.
-// If .verk/current still changes, it must either point to a valid run artifact
-// (not exercised here) or remain empty/unchanged.
-func TestDoRunEpic_CurrentPointerClearedOnEngineFailure(t *testing.T) {
+func TestDoRunTicket_CurrentPointerNotSetOnTicketSaveFailure(t *testing.T) {
+	dir := t.TempDir()
+	initCLITestRepo(t, dir)
+
+	ticketsDir := filepath.Join(dir, ".tickets")
+	if err := os.MkdirAll(ticketsDir, 0o755); err != nil {
+		t.Fatalf("mkdir .tickets: %v", err)
+	}
+	ticket := tkmd.Ticket{
+		ID:     "ver-ticket-save",
+		Title:  "Ticket save failure test",
+		Status: tkmd.StatusReady,
+	}
+	if err := tkmd.SaveTicket(filepath.Join(ticketsDir, "ver-ticket-save.md"), ticket); err != nil {
+		t.Fatalf("save ticket: %v", err)
+	}
+
+	origSaveTicket := saveTicket
+	defer func() { saveTicket = origSaveTicket }()
+	saveTicket = func(_ string, _ tkmd.Ticket) error {
+		return errors.New("injected ticket save error")
+	}
+
+	t.Chdir(dir)
+
+	var stdout, stderr bytes.Buffer
+	runID, err := doRunTicket(&stdout, &stderr, "ver-ticket-save")
+	if err == nil {
+		t.Fatal("expected error from injected ticket save failure, got nil")
+	}
+	if runID == "" {
+		t.Fatal("expected doRunTicket to return a non-empty runID even on failure")
+	}
+
+	currentPath := filepath.Join(dir, ".verk", "current")
+	data, readErr := os.ReadFile(currentPath)
+	if readErr == nil && strings.TrimSpace(string(data)) == runID {
+		t.Errorf(".verk/current = %q after ticket save failure; pointer must not advance", runID)
+	}
+}
+
+// TestDoRunEpic_DoesNotAdvanceCurrentOnEngineFailure verifies that doRunEpic
+// does not advance .verk/current to a new runID when engine.RunEpic returns an
+// error before it can successfully persist the initial run artifact.
+func TestDoRunEpic_DoesNotAdvanceCurrentOnEngineFailure(t *testing.T) {
 	dir := t.TempDir()
 	initCLITestRepo(t, dir)
 	// Intentionally do NOT create the epic ticket file.
@@ -131,7 +170,7 @@ func TestDoRunEpic_CurrentPointerClearedOnEngineFailure(t *testing.T) {
 	}
 	got := strings.TrimSpace(string(data))
 	if got == runID {
-		t.Errorf(".verk/current = %q after engine failure; pointer must be cleared "+
+		t.Errorf(".verk/current = %q after engine failure; pointer must not advance "+
 			"(got non-empty runID pointing at potentially missing run.json)", runID)
 	}
 }

@@ -193,7 +193,7 @@ func TestParseReviewBlock_ValidatesAndNormalizesAllParsePaths(t *testing.T) {
 		},
 		{
 			name:       "last JSON normalizes spaces",
-			input:      "Review follows:\n{\"review_status\":\"passed\",\"summary\":\"ok\",\"findings\":[]}",
+			input:      "Review follows:\n{\"review_status\":\" Passed \",\"summary\":\"ok\",\"findings\":[]}",
 			wantFound:  true,
 			wantStatus: "passed",
 		},

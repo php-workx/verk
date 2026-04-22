@@ -256,15 +256,9 @@ func doRunTicket(w, errw io.Writer, ticketID string) (runID string, err error) {
 	if err := saveJSONAtomic(filepath.Join(repoRoot, ".verk", "runs", runID, "run.json"), run); err != nil {
 		return runID, err
 	}
-	// Write the current-run pointer only after run.json is on disk.  An early
-	// return above (lock, claim, adapter, git, or this save) leaves the pointer
-	// untouched so subsequent commands never resolve to a run without an artifact.
-	if wErr := writeCurrentRunID(repoRoot, runID); wErr != nil {
-		_, _ = fmt.Fprintf(errw, "warning: could not write current run: %v\n", wErr)
-	}
 
 	ticket.Status = tkmd.StatusInProgress
-	if err := tkmd.SaveTicket(filepath.Join(repoRoot, ".tickets", ticketID+".md"), ticket); err != nil {
+	if err := saveTicket(filepath.Join(repoRoot, ".tickets", ticketID+".md"), ticket); err != nil {
 		return runID, err
 	}
 
@@ -325,6 +319,11 @@ func doRunTicket(w, errw io.Writer, ticketID string) (runID string, err error) {
 	); err != nil {
 		emitRunID = false
 		return runID, err
+	}
+	// Publish the current-run pointer only after the run is durably resumable:
+	// initial run.json, ticket state, engine result, and final run.json all exist.
+	if wErr := writeCurrentRunID(repoRoot, runID); wErr != nil {
+		_, _ = fmt.Fprintf(errw, "warning: could not write current run: %v\n", wErr)
 	}
 	return runID, nil
 }
