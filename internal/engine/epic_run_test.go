@@ -371,8 +371,15 @@ func TestRunEpicScopeViolationBlocksWave(t *testing.T) {
 		t.Fatal("expected non-nil error for scope violation, got nil")
 	}
 
+	worktreeRoot, err := ResolveWorktreeRoot(repoRoot)
+	if err != nil {
+		t.Fatalf("resolve worktree root: %v", err)
+	}
+	worktreeScopePath := filepath.Join(worktreeRoot, "run-scope", child.ID, "out-of-scope.txt")
 	if _, statErr := os.Stat(touchOutsideScope); statErr != nil {
-		t.Fatalf("expected scope violation fixture file to exist: %v", statErr)
+		if _, worktreeErr := os.Stat(worktreeScopePath); worktreeErr != nil {
+			t.Fatalf("expected scope violation fixture file in repo or worktree: repo=%v worktree=%v", statErr, worktreeErr)
+		}
 	}
 	// Scope violation must fail closed: the wave should fail and the epic should
 	// not complete (G9: scope checks fail closed).
@@ -941,7 +948,7 @@ func mustRunGit(t *testing.T, dir string, args ...string) {
 
 	cmd := exec.Command("git", args...)
 	cmd.Dir = dir
-	cmd.Env = append(os.Environ(), "GIT_OPTIONAL_LOCKS=0")
+	cmd.Env = engineGitEnv()
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("git %v failed: %v\n%s", args, err, string(out))
@@ -951,7 +958,7 @@ func mustRunGit(t *testing.T, dir string, args ...string) {
 func gitOutput(dir string, args ...string) (string, error) {
 	cmd := exec.Command("git", args...)
 	cmd.Dir = dir
-	cmd.Env = append(os.Environ(), "GIT_OPTIONAL_LOCKS=0")
+	cmd.Env = engineGitEnv()
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return "", err

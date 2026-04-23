@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"log"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -141,6 +142,8 @@ func collectBlockedTickets(repoRoot, runID string, children []tkmd.Ticket) []Blo
 
 type RunEpicRequest struct {
 	RepoRoot             string
+	WorktreePath         string
+	WorktreeRoot         string
 	RunID                string
 	RootTicketID         string
 	BaseBranch           string
@@ -173,6 +176,16 @@ func RunEpic(ctx context.Context, req RunEpicRequest) (RunEpicResult, error) { /
 	defer func() { _ = lock.Release() }()
 
 	cfg := normalizeEpicConfig(req.Config)
+	workRoot, resolveErr := ResolveWorktreeRoot(req.RepoRoot)
+	if resolveErr != nil {
+		log.Printf("[WARN] reconcile worktrees: resolve cache root: %v", resolveErr)
+	} else if err := ReconcileWorktrees(ctx, req.RepoRoot, workRoot); err != nil {
+		log.Printf("[WARN] reconcile worktrees: %v", err)
+	}
+	if req.WorktreeRoot == "" && workRoot != "" {
+		req.WorktreeRoot = workRoot
+	}
+
 	repo, err := git.New(req.RepoRoot)
 	if err != nil {
 		return RunEpicResult{}, err
@@ -373,6 +386,11 @@ func RunEpic(ctx context.Context, req RunEpicRequest) (RunEpicResult, error) { /
 		}
 		result.Run.ResumeCursor["wave_baseline_changed_files"] = append([]string(nil), waveBaselineChangedFiles...)
 
+		waveManager, err := prepareWaveWorktrees(ctx, req.RepoRoot, wave.WaveBaseCommit, req.RunID, req.WorktreeRoot, wave.TicketIDs)
+		if err != nil {
+			return result, err
+		}
+
 		outcomes := make([]waveTicketOutcome, len(wave.TicketIDs))
 		var wg sync.WaitGroup
 		for i, ticketID := range wave.TicketIDs {
@@ -383,7 +401,13 @@ func RunEpic(ctx context.Context, req RunEpicRequest) (RunEpicResult, error) { /
 				defer wg.Done()
 				const maxCrashRetries = 2
 				for attempt := 0; attempt <= maxCrashRetries; attempt++ {
-					outcome, crashed := executeWithRecovery(ctx, req, cfg, wave, ticketID, 1, nil, registrar)
+					worktreePath := ""
+					if waveManager != nil {
+						worktreePath = waveManager.WorktreePath(ticketID)
+					}
+					ticketReq := req
+					ticketReq.WorktreePath = worktreePath
+					outcome, crashed := executeWithRecovery(ctx, ticketReq, cfg, wave, ticketID, 1, nil, registrar)
 					if !crashed {
 						outcomes[i] = outcome
 						return
@@ -404,9 +428,30 @@ func RunEpic(ctx context.Context, req RunEpicRequest) (RunEpicResult, error) { /
 		}
 		wg.Wait()
 
-		ticketPhases := make([]state.TicketPhase, len(outcomes))
 		waveFailed := false
 		var waveErr error
+		var conflictErr error
+		if waveManager != nil {
+			conflicts, detectErr := waveManager.DetectConflicts()
+			if detectErr != nil {
+				if waveErr == nil {
+					waveErr = detectErr
+				}
+				waveFailed = true
+			} else if len(conflicts) > 0 {
+				conflictErr = &IntraWaveConflictError{Conflicts: conflicts}
+				log.Printf("[ERROR] wave %s detected intra-wave conflicts: %#v", waveID, conflicts)
+				if waveErr == nil {
+					waveErr = conflictErr
+				}
+				waveFailed = true
+			}
+		}
+
+		ticketPhases := make([]state.TicketPhase, len(outcomes))
+		if waveErr == nil && conflictErr != nil {
+			waveFailed = true
+		}
 		for i, outcome := range outcomes {
 			ticketPhases[i] = outcome.phase
 			if outcome.err != nil {
@@ -417,7 +462,12 @@ func RunEpic(ctx context.Context, req RunEpicRequest) (RunEpicResult, error) { /
 			}
 		}
 
-		changedFiles, err := repo.ChangedFilesAgainst(baseCommit)
+		var changedFiles []string
+		if waveManager != nil {
+			changedFiles, err = changedFilesFromManager(waveManager, wave.TicketIDs)
+		} else {
+			changedFiles, err = repo.ChangedFilesAgainst(baseCommit)
+		}
 		if err != nil {
 			return result, err
 		}
@@ -441,6 +491,12 @@ func RunEpic(ctx context.Context, req RunEpicRequest) (RunEpicResult, error) { /
 		})
 		if waveFailed {
 			acceptedWave.Status = state.WaveStatusFailed
+			if conflictErr != nil {
+				if acceptedWave.Acceptance == nil {
+					acceptedWave.Acceptance = map[string]any{}
+				}
+				acceptedWave.Acceptance["intra_wave_conflicts"] = conflictErr.(*IntraWaveConflictError).Conflicts
+			}
 			if acceptedWave.Acceptance == nil {
 				acceptedWave.Acceptance = map[string]any{}
 			}
@@ -487,6 +543,13 @@ func RunEpic(ctx context.Context, req RunEpicRequest) (RunEpicResult, error) { /
 			result.Run.Status = state.EpicRunStatusBlocked
 			result.Run.CurrentPhase = state.TicketPhaseBlocked
 			blockErr := acceptErr
+			if conflictErr != nil {
+				blockErr = conflictErr
+			} else if waveErr != nil && blockErr == nil {
+				blockErr = waveErr
+			} else if waveErr != nil && blockErr != nil {
+				blockErr = errors.Join(blockErr, waveErr)
+			}
 			if waveFailed && blockErr == nil {
 				blockErr = fmt.Errorf("%w: wave %s had ticket failures", ErrEpicBlocked, waveID)
 			}
@@ -645,22 +708,7 @@ func waveClaimsReleased(repoRoot, runID string, ticketIDs []string) (bool, error
 }
 
 func filterEngineOwnedFiles(changed []string) []string {
-	if len(changed) == 0 {
-		return nil
-	}
-	out := make([]string, 0, len(changed))
-	for _, file := range changed {
-		switch {
-		case strings.HasPrefix(file, ".verk/"):
-			continue
-		case strings.HasPrefix(file, ".tickets/.claims/"):
-			continue
-		case strings.HasPrefix(file, ".tickets/"):
-			continue
-		}
-		out = append(out, file)
-	}
-	return out
+	return filterEngineOwnedFilesInternal(changed)
 }
 
 type waveTicketOutcome struct {
@@ -1131,6 +1179,7 @@ func executeEpicTicket(ctx context.Context, req RunEpicRequest, cfg policy.Confi
 
 	ticketResult, err := RunTicket(ctx, RunTicketRequest{
 		RepoRoot:             req.RepoRoot,
+		WorktreePath:         req.WorktreePath,
 		RunID:                req.RunID,
 		BaseCommit:           wave.WaveBaseCommit,
 		Ticket:               ticket,

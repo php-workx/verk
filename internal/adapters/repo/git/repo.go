@@ -2,6 +2,8 @@ package git
 
 import (
 	"bytes"
+	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -15,6 +17,8 @@ type Repo struct {
 	root         string
 	physicalRoot string
 }
+
+var ErrWorktreeExists = errors.New("worktree already exists")
 
 func New(worktree string) (*Repo, error) {
 	if worktree == "" {
@@ -213,6 +217,81 @@ func (r *Repo) NormalizeOwnedPath(candidate string) (string, error) {
 	return normalizeOwnedPath(r.root, r.physicalRoot, candidate)
 }
 
+// CreateWorktree creates a linked worktree at targetPath at commitish.
+//
+// git worktree add is O(100ms–seconds on large repositories, and callers should
+// create worktrees serially (not in parallel) to avoid `.git/worktrees/` lock
+// contention.
+func (r *Repo) CreateWorktree(ctx context.Context, commitish, targetPath string) error {
+	if r == nil {
+		return fmt.Errorf("nil repo")
+	}
+	if strings.TrimSpace(commitish) == "" {
+		return fmt.Errorf("commitish is required")
+	}
+	if strings.TrimSpace(targetPath) == "" {
+		return fmt.Errorf("target path is required")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	worktreeRoot := r.root
+	targetPath, err := canonicalPath(worktreeRoot, targetPath)
+	if err != nil {
+		return fmt.Errorf("normalize target path %q: %w", targetPath, err)
+	}
+
+	already, err := hasWorktreePath(worktreeRoot, targetPath)
+	if err != nil {
+		return err
+	}
+	if already {
+		return ErrWorktreeExists
+	}
+
+	targetParent := filepath.Dir(targetPath)
+	if targetParent != "." && targetParent != "" {
+		if err := os.MkdirAll(targetParent, 0o755); err != nil {
+			return fmt.Errorf("create worktree parent directory %q: %w", targetParent, err)
+		}
+	}
+
+	if _, err := gitBytesContext(ctx, worktreeRoot, "worktree", "add", "--detach", targetPath, commitish); err != nil {
+		return fmt.Errorf("create worktree %q for commit %q: %w", targetPath, commitish, err)
+	}
+	return nil
+}
+
+func (r *Repo) RemoveWorktree(targetPath string) error {
+	if r == nil {
+		return fmt.Errorf("nil repo")
+	}
+	if strings.TrimSpace(targetPath) == "" {
+		return fmt.Errorf("target path is required")
+	}
+
+	worktreeRoot := r.root
+	targetPath, err := canonicalPath(worktreeRoot, targetPath)
+	if err != nil {
+		return fmt.Errorf("normalize target path %q: %w", targetPath, err)
+	}
+
+	if _, err := gitBytes(worktreeRoot, "worktree", "remove", "--force", targetPath); err == nil {
+		return nil
+	} else if !isWorktreeMissingFromGit(err) && !isPathMissing(targetPath) {
+		return err
+	}
+
+	if err := os.RemoveAll(targetPath); err != nil {
+		return fmt.Errorf("remove worktree path %q: %w", targetPath, err)
+	}
+	if _, err := gitBytes(worktreeRoot, "worktree", "prune"); err != nil {
+		return fmt.Errorf("prune worktrees: %w", err)
+	}
+	return nil
+}
+
 func (r *Repo) PathsOverlap(a, b string) bool {
 	return PathsOverlap(a, b)
 }
@@ -330,6 +409,77 @@ func hasPathPrefix(pathValue, prefix string) bool {
 	return strings.HasPrefix(pathValue, prefix+"/")
 }
 
+func hasWorktreePath(mainRoot, target string) (bool, error) {
+	targetPath, err := canonicalPath(mainRoot, target)
+	if err != nil {
+		return false, err
+	}
+	targetPath = normalizeComparablePathWithFallbackResolve(targetPath)
+
+	out, err := gitBytes(mainRoot, "worktree", "list", "--porcelain")
+	if err != nil {
+		return false, err
+	}
+
+	for _, line := range strings.Split(string(out), "\n") {
+		if !strings.HasPrefix(line, "worktree ") {
+			continue
+		}
+		raw := strings.TrimSpace(strings.TrimPrefix(line, "worktree "))
+		if raw == "" {
+			continue
+		}
+		pathValue, err := canonicalPath(mainRoot, raw)
+		if err != nil {
+			return false, err
+		}
+		pathValue = normalizeComparablePathWithFallbackResolve(pathValue)
+		if pathValue == targetPath {
+			info, err := os.Stat(pathValue)
+			if err != nil {
+				if os.IsNotExist(err) {
+					return false, nil
+				}
+				return false, fmt.Errorf("check worktree path %q: %w", pathValue, err)
+			}
+			return info.IsDir(), nil
+		}
+	}
+	return false, nil
+}
+
+func canonicalPath(mainRoot, target string) (string, error) {
+	if mainRoot == "" {
+		return "", fmt.Errorf("main root is required")
+	}
+	if target == "" {
+		return "", fmt.Errorf("target is required")
+	}
+
+	resolved, err := filepath.Abs(target)
+	if err != nil {
+		return "", err
+	}
+	if !filepath.IsAbs(target) {
+		resolved = filepath.Join(mainRoot, target)
+	}
+
+	resolved = filepath.Clean(resolved)
+	if normalized, err := resolvePath(resolved); err == nil {
+		return normalized, nil
+	}
+
+	return resolved, nil
+}
+
+func normalizeComparablePathWithFallbackResolve(candidate string) string {
+	candidate = filepath.Clean(candidate)
+	if resolved, err := resolvePath(candidate); err == nil {
+		return filepath.Clean(resolved)
+	}
+	return candidate
+}
+
 func pathWithinRoot(root, candidate string) bool {
 	root = filepath.Clean(root)
 	candidate = filepath.Clean(candidate)
@@ -381,6 +531,31 @@ func splitNullList(data []byte) []string {
 	return out
 }
 
+func gitBytesContext(ctx context.Context, cwd string, args ...string) ([]byte, error) {
+	cmd := exec.CommandContext(ctx, "git", args...)
+	cmd.Dir = cwd
+	cmd.Env = gitCommandEnv()
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		msg := strings.TrimSpace(string(out))
+		if msg != "" {
+			return nil, fmt.Errorf("git %s: %w: %s", strings.Join(args, " "), err, msg)
+		}
+		return nil, fmt.Errorf("git %s: %w", strings.Join(args, " "), err)
+	}
+	return out, nil
+}
+
+func isWorktreeMissingFromGit(err error) bool {
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "not a working tree")
+}
+
+func isPathMissing(candidate string) bool {
+	_, err := os.Stat(candidate)
+	return err != nil && os.IsNotExist(err)
+}
+
 func gitOutput(cwd string, args ...string) (string, error) {
 	out, err := gitBytes(cwd, args...)
 	if err != nil {
@@ -392,7 +567,7 @@ func gitOutput(cwd string, args ...string) (string, error) {
 func gitBytes(cwd string, args ...string) ([]byte, error) {
 	cmd := exec.Command("git", args...)
 	cmd.Dir = cwd
-	cmd.Env = append(os.Environ(), "GIT_OPTIONAL_LOCKS=0")
+	cmd.Env = gitCommandEnv()
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		msg := strings.TrimSpace(string(out))
@@ -402,6 +577,26 @@ func gitBytes(cwd string, args ...string) ([]byte, error) {
 		return nil, fmt.Errorf("git %s: %w", strings.Join(args, " "), err)
 	}
 	return out, nil
+}
+
+func gitCommandEnv() []string {
+	env := os.Environ()
+	out := make([]string, 0, len(env)+1)
+	for _, entry := range env {
+		key, _, found := strings.Cut(entry, "=")
+		if !found {
+			out = append(out, entry)
+			continue
+		}
+		switch key {
+		case "GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_PREFIX", "GIT_SUPER_PREFIX":
+			continue
+		default:
+			out = append(out, entry)
+		}
+	}
+	out = append(out, "GIT_OPTIONAL_LOCKS=0")
+	return out
 }
 
 func (r *Repo) verifyCommit(baseCommit string) error {
