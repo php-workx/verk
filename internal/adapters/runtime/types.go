@@ -79,6 +79,7 @@ type ReviewRequest struct {
 	Model                    string              `json:"model,omitempty"`
 	Reasoning                string              `json:"reasoning,omitempty"`
 	FallbackReason           string              `json:"fallback_reason,omitempty"`
+	WorktreePath             string              `json:"worktree_path,omitempty"`
 	InputArtifactPath        string              `json:"input_artifact_path,omitempty"`
 	Instructions             string              `json:"instructions,omitempty"`
 	Diff                     string              `json:"diff,omitempty"`

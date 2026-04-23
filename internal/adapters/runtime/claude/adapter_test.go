@@ -119,7 +119,7 @@ func TestRunWorker_NormalizesAndCapturesArtifacts(t *testing.T) {
 		times = times[1:]
 		return value
 	}
-	runCommand = func(ctx context.Context, binary string, args []string, stdin []byte, env []string, timeout time.Duration) (commandResult, error) {
+	runCommand = func(ctx context.Context, binary string, args []string, stdin []byte, env []string, workDir string, timeout time.Duration) (commandResult, error) {
 		t.Helper()
 		if binary != "claude-test" {
 			t.Fatalf("expected binary claude-test, got %q", binary)
@@ -135,6 +135,9 @@ func TestRunWorker_NormalizesAndCapturesArtifacts(t *testing.T) {
 		}
 		if !strings.Contains(promptText, "Attempt: 2") {
 			t.Fatalf("expected prompt to contain attempt number, got: %s", promptText)
+		}
+		if workDir != "/tmp/worktree" {
+			t.Fatalf("expected workDir /tmp/worktree, got %q", workDir)
 		}
 
 		if timeout != 7*time.Minute {
@@ -209,6 +212,101 @@ func TestRunWorker_NormalizesAndCapturesArtifacts(t *testing.T) {
 	}
 }
 
+func TestRunWorker_StreamingCommandUsesWorktreePath(t *testing.T) {
+	oldRunStreamingCommand := runStreamingCommand
+	oldNow := now
+	defer func() {
+		runStreamingCommand = oldRunStreamingCommand
+		now = oldNow
+	}()
+
+	now = func() time.Time {
+		return time.Date(2026, 4, 2, 11, 0, 0, 0, time.UTC)
+	}
+
+	runStreamingCommand = func(ctx context.Context, binary string, args []string, stdin []byte, env []string, workDir string, timeout time.Duration, onProgress func(string)) (commandResult, error) {
+		t.Helper()
+		if binary != "claude-test" {
+			t.Fatalf("expected binary claude-test, got %q", binary)
+		}
+		if !hasArg(args, "--output-format") {
+			t.Fatalf("expected output-format arg in args: %v", args)
+		}
+		if workDir != "/tmp/worktree-streaming" {
+			t.Fatalf("expected workDir /tmp/worktree-streaming, got %q", workDir)
+		}
+		if onProgress != nil {
+			onProgress("starting")
+		}
+		return commandResult{
+			stdout:   mockCLIOutput(`{"status":"done","completion_code":"ok"}`, false),
+			exitCode: 0,
+		}, nil
+	}
+
+	adapter := NewWithCommand("claude-test")
+	result, err := adapter.RunWorker(context.Background(), runtime.WorkerRequest{
+		LeaseID:      "lease-stream-1",
+		TicketID:     "ticket-stream-1",
+		WorktreePath: "/tmp/worktree-streaming",
+		OnProgress: func(detail string) {
+			if strings.TrimSpace(detail) == "" {
+				t.Fatalf("expected non-empty progress detail")
+			}
+		},
+	})
+	if err != nil {
+		t.Fatalf("RunWorker returned error: %v", err)
+	}
+	if result.Status != runtime.WorkerStatusDone {
+		t.Fatalf("expected done, got %q", result.Status)
+	}
+}
+
+func TestRunWorker_StreamingCommandUsesEmptyWorktreePathWhenUnset(t *testing.T) {
+	oldRunStreamingCommand := runStreamingCommand
+	oldNow := now
+	defer func() {
+		runStreamingCommand = oldRunStreamingCommand
+		now = oldNow
+	}()
+
+	now = func() time.Time {
+		return time.Date(2026, 4, 2, 11, 5, 0, 0, time.UTC)
+	}
+
+	runStreamingCommand = func(ctx context.Context, binary string, args []string, stdin []byte, env []string, workDir string, timeout time.Duration, onProgress func(string)) (commandResult, error) {
+		t.Helper()
+		if workDir != "" {
+			t.Fatalf("expected empty workDir when WorktreePath is unset, got %q", workDir)
+		}
+		if onProgress != nil {
+			onProgress("starting")
+		}
+		return commandResult{
+			stdout:   mockCLIOutput(`{"status":"done","completion_code":"ok"}`, false),
+			exitCode: 0,
+		}, nil
+	}
+
+	adapter := NewWithCommand("claude-test")
+	result, err := adapter.RunWorker(context.Background(), runtime.WorkerRequest{
+		LeaseID:  "lease-stream-2",
+		TicketID: "ticket-stream-2",
+		OnProgress: func(detail string) {
+			if strings.TrimSpace(detail) == "" {
+				t.Fatalf("expected non-empty progress detail")
+			}
+		},
+	})
+	if err != nil {
+		t.Fatalf("RunWorker returned error: %v", err)
+	}
+	if result.Status != runtime.WorkerStatusDone {
+		t.Fatalf("expected done, got %q", result.Status)
+	}
+}
+
 func TestRunWorker_BlockedStatus(t *testing.T) {
 	oldRunCommand := runCommand
 	oldNow := now
@@ -221,7 +319,10 @@ func TestRunWorker_BlockedStatus(t *testing.T) {
 		return time.Date(2026, 4, 2, 12, 0, 0, 0, time.UTC)
 	}
 
-	runCommand = func(ctx context.Context, binary string, args []string, stdin []byte, env []string, timeout time.Duration) (commandResult, error) {
+	runCommand = func(ctx context.Context, binary string, args []string, stdin []byte, env []string, workDir string, timeout time.Duration) (commandResult, error) {
+		if workDir != "" {
+			t.Fatalf("expected empty workDir when WorktreePath is unset, got %q", workDir)
+		}
 		resultJSON := `{"status":"blocked","completion_code":"missing_dependency","block_reason":"required service unavailable"}`
 		return commandResult{
 			stdout:   mockCLIOutput(resultJSON, false),
@@ -257,7 +358,7 @@ func TestRunWorker_FallbackWhenNoResultBlock(t *testing.T) {
 		return time.Date(2026, 4, 2, 12, 0, 0, 0, time.UTC)
 	}
 
-	runCommand = func(ctx context.Context, binary string, args []string, stdin []byte, env []string, timeout time.Duration) (commandResult, error) {
+	runCommand = func(ctx context.Context, binary string, args []string, stdin []byte, env []string, workDir string, timeout time.Duration) (commandResult, error) {
 		// AI didn't follow JSON-only instruction — returned prose
 		resultText := "I made all the changes. Everything looks good."
 		return commandResult{
@@ -297,7 +398,7 @@ func TestRunReviewer_NormalizesFindingsAndDerivesStatus(t *testing.T) {
 		times = times[1:]
 		return value
 	}
-	runCommand = func(ctx context.Context, binary string, args []string, stdin []byte, env []string, timeout time.Duration) (commandResult, error) {
+	runCommand = func(ctx context.Context, binary string, args []string, stdin []byte, env []string, workDir string, timeout time.Duration) (commandResult, error) {
 		t.Helper()
 		if binary != "claude-test" {
 			t.Fatalf("expected binary claude-test, got %q", binary)
@@ -372,7 +473,7 @@ func TestRunReviewer_PassedReview(t *testing.T) {
 		return time.Date(2026, 4, 2, 14, 0, 0, 0, time.UTC)
 	}
 
-	runCommand = func(ctx context.Context, binary string, args []string, stdin []byte, env []string, timeout time.Duration) (commandResult, error) {
+	runCommand = func(ctx context.Context, binary string, args []string, stdin []byte, env []string, workDir string, timeout time.Duration) (commandResult, error) {
 		resultJSON := `{"review_status":"passed","summary":"clean implementation, all criteria met","findings":[]}`
 		return commandResult{
 			stdout: mockCLIOutput(resultJSON, false),
@@ -400,10 +501,13 @@ func TestCheckAvailability_UsesVersionProbe(t *testing.T) {
 	defer func() { runCommand = oldRunCommand }()
 
 	probed := false
-	runCommand = func(ctx context.Context, binary string, args []string, stdin []byte, env []string, timeout time.Duration) (commandResult, error) {
+	runCommand = func(ctx context.Context, binary string, args []string, stdin []byte, env []string, workDir string, timeout time.Duration) (commandResult, error) {
 		probed = true
 		if binary != "claude-test" {
 			t.Fatalf("expected binary claude-test, got %q", binary)
+		}
+		if workDir != "" {
+			t.Fatalf("expected empty workDir for availability check, got %q", workDir)
 		}
 		if len(args) != 1 || args[0] != "--version" {
 			t.Fatalf("expected version probe, got %v", args)
@@ -431,7 +535,7 @@ func TestRunWorker_NeedsContextStatus(t *testing.T) {
 		return time.Date(2026, 4, 2, 12, 0, 0, 0, time.UTC)
 	}
 
-	runCommand = func(ctx context.Context, binary string, args []string, stdin []byte, env []string, timeout time.Duration) (commandResult, error) {
+	runCommand = func(ctx context.Context, binary string, args []string, stdin []byte, env []string, workDir string, timeout time.Duration) (commandResult, error) {
 		resultJSON := `{"status":"needs_context","completion_code":"missing_spec","block_reason":"acceptance criteria unclear"}`
 		return commandResult{
 			stdout:   mockCLIOutput(resultJSON, false),
@@ -468,7 +572,7 @@ func TestRunWorker_NeedsMoreContextHyphenated(t *testing.T) {
 	}
 
 	// Simulate a runtime returning the hyphenated form "needs-more-context"
-	runCommand = func(ctx context.Context, binary string, args []string, stdin []byte, env []string, timeout time.Duration) (commandResult, error) {
+	runCommand = func(ctx context.Context, binary string, args []string, stdin []byte, env []string, workDir string, timeout time.Duration) (commandResult, error) {
 		resultJSON := `{"status":"needs-more-context","completion_code":"missing_spec","block_reason":"need operator input"}`
 		return commandResult{
 			stdout:   mockCLIOutput(resultJSON, false),
@@ -582,6 +686,7 @@ func TestRunStreamingCommand_ScannerError(t *testing.T) {
 		[]string{"-test.run=^$"}, // no tests match; TestMain writes the huge line then exits
 		nil,
 		env,
+		"",
 		10*time.Second,
 		nil,
 	)
@@ -639,6 +744,7 @@ func TestRunStreamingCommand_ScannerErrorKillsProcessGroup(t *testing.T) {
 		[]string{"-test.run=^$"},
 		nil,
 		env,
+		"",
 		10*time.Second,
 		nil,
 	)
@@ -675,6 +781,7 @@ func TestRunStreamingCommand_NormalCompletion_SelfBinary(t *testing.T) {
 		[]string{"-test.run=^$"}, // no tests match; TestMain writes stream-json and exits
 		nil,
 		env,
+		"",
 		10*time.Second,
 		func(msg string) {
 			sawProgress = true

@@ -27,7 +27,11 @@ func TestRunWorker_NormalizesAndCapturesArtifacts(t *testing.T) {
 		times = times[1:]
 		return value
 	}
-	runCommand = func(ctx context.Context, binary string, args []string, stdin []byte, env []string, timeout time.Duration) (commandResult, error) {
+	runCommand = func(ctx context.Context, binary string, args []string, stdin []byte, env []string, workDir string, timeout time.Duration) (commandResult, error) {
+		if workDir != "" {
+			t.Fatalf("expected Codex process workdir to remain unset, got %q", workDir)
+		}
+
 		t.Helper()
 		if binary != "codex-test" {
 			t.Fatalf("expected binary codex-test, got %q", binary)
@@ -148,7 +152,11 @@ func TestRunReviewer_NormalizesFindingsAndDerivesStatus(t *testing.T) {
 		times = times[1:]
 		return value
 	}
-	runCommand = func(ctx context.Context, binary string, args []string, stdin []byte, env []string, timeout time.Duration) (commandResult, error) {
+	runCommand = func(ctx context.Context, binary string, args []string, stdin []byte, env []string, workDir string, timeout time.Duration) (commandResult, error) {
+		if workDir != "" {
+			t.Fatalf("expected Codex process workdir to remain unset, got %q", workDir)
+		}
+
 		t.Helper()
 		if binary != "codex-test" {
 			t.Fatalf("expected binary codex-test, got %q", binary)
@@ -221,6 +229,47 @@ func TestRunReviewer_NormalizesFindingsAndDerivesStatus(t *testing.T) {
 	}
 }
 
+func TestRunReviewer_UsesCodexCdFlagForWorktreePath(t *testing.T) {
+	oldRunCommand := runCommand
+	oldNow := now
+	defer func() {
+		runCommand = oldRunCommand
+		now = oldNow
+	}()
+
+	now = func() time.Time {
+		return time.Date(2026, 4, 2, 13, 0, 0, 0, time.UTC)
+	}
+
+	runCommand = func(ctx context.Context, binary string, args []string, stdin []byte, env []string, workDir string, timeout time.Duration) (commandResult, error) {
+		t.Helper()
+		if workDir != "" {
+			t.Fatalf("expected Codex process workdir to remain unset, got %q", workDir)
+		}
+		assertArgValue(t, args, "-C", "/tmp/review-worktree")
+		if hasArg(args, "--cwd") {
+			t.Fatalf("expected Codex -C/--cd flag, not unsupported --cwd: %v", args)
+		}
+
+		outputJSON := `{"review_status":"passed","summary":"clean implementation","findings":[]}`
+		return commandResult{stdout: []byte(outputJSON)}, nil
+	}
+
+	adapter := NewWithCommand("codex-test")
+	if _, err := adapter.RunReviewer(context.Background(), runtime.ReviewRequest{
+		LeaseID:                  "lease-worktree-review",
+		TicketID:                 "ticket-worktree-review",
+		WorktreePath:             "/tmp/review-worktree",
+		EffectiveReviewThreshold: runtime.SeverityP2,
+		ExecutionConfig: runtime.ExecutionConfig{
+			ReviewerTimeoutMinutes: 7,
+			AuthEnvVars:            []string{"VERK_API_KEY"},
+		},
+	}); err != nil {
+		t.Fatalf("RunReviewer returned error: %v", err)
+	}
+}
+
 func TestRunReviewer_PassedReview(t *testing.T) {
 	oldRunCommand := runCommand
 	oldNow := now
@@ -233,7 +282,11 @@ func TestRunReviewer_PassedReview(t *testing.T) {
 		return time.Date(2026, 4, 2, 14, 0, 0, 0, time.UTC)
 	}
 
-	runCommand = func(ctx context.Context, binary string, args []string, stdin []byte, env []string, timeout time.Duration) (commandResult, error) {
+	runCommand = func(ctx context.Context, binary string, args []string, stdin []byte, env []string, workDir string, timeout time.Duration) (commandResult, error) {
+		if workDir != "" {
+			t.Fatalf("expected Codex process workdir to remain unset, got %q", workDir)
+		}
+
 		outputJSON := `{"review_status":"passed","summary":"clean implementation","findings":[]}`
 		return commandResult{
 			stdout: []byte(outputJSON),
@@ -261,7 +314,11 @@ func TestCheckAvailability_UsesVersionProbe(t *testing.T) {
 	defer func() { runCommand = oldRunCommand }()
 
 	probed := false
-	runCommand = func(ctx context.Context, binary string, args []string, stdin []byte, env []string, timeout time.Duration) (commandResult, error) {
+	runCommand = func(ctx context.Context, binary string, args []string, stdin []byte, env []string, workDir string, timeout time.Duration) (commandResult, error) {
+		if workDir != "" {
+			t.Fatalf("expected Codex process workdir to remain unset, got %q", workDir)
+		}
+
 		probed = true
 		if binary != "codex-test" {
 			t.Fatalf("expected binary codex-test, got %q", binary)
@@ -292,7 +349,11 @@ func TestRunWorker_NeedsContextStatus(t *testing.T) {
 		return time.Date(2026, 4, 2, 12, 0, 0, 0, time.UTC)
 	}
 
-	runCommand = func(ctx context.Context, binary string, args []string, stdin []byte, env []string, timeout time.Duration) (commandResult, error) {
+	runCommand = func(ctx context.Context, binary string, args []string, stdin []byte, env []string, workDir string, timeout time.Duration) (commandResult, error) {
+		if workDir != "" {
+			t.Fatalf("expected Codex process workdir to remain unset, got %q", workDir)
+		}
+
 		resultJSON := `{"status":"needs_context","completion_code":"missing_spec","block_reason":"acceptance criteria unclear"}`
 		return commandResult{
 			stdout:   []byte(resultJSON),
@@ -329,7 +390,11 @@ func TestRunWorker_NeedsMoreContextHyphenated(t *testing.T) {
 	}
 
 	// Simulate a runtime returning the hyphenated form "needs-more-context"
-	runCommand = func(ctx context.Context, binary string, args []string, stdin []byte, env []string, timeout time.Duration) (commandResult, error) {
+	runCommand = func(ctx context.Context, binary string, args []string, stdin []byte, env []string, workDir string, timeout time.Duration) (commandResult, error) {
+		if workDir != "" {
+			t.Fatalf("expected Codex process workdir to remain unset, got %q", workDir)
+		}
+
 		resultJSON := `{"status":"needs-more-context","completion_code":"missing_spec","block_reason":"need operator input"}`
 		return commandResult{
 			stdout:   []byte(resultJSON),
@@ -365,7 +430,11 @@ func TestRunWorker_FallbackWhenNoJSON(t *testing.T) {
 		return time.Date(2026, 4, 2, 12, 0, 0, 0, time.UTC)
 	}
 
-	runCommand = func(ctx context.Context, binary string, args []string, stdin []byte, env []string, timeout time.Duration) (commandResult, error) {
+	runCommand = func(ctx context.Context, binary string, args []string, stdin []byte, env []string, workDir string, timeout time.Duration) (commandResult, error) {
+		if workDir != "" {
+			t.Fatalf("expected Codex process workdir to remain unset, got %q", workDir)
+		}
+
 		return commandResult{
 			stdout:   []byte("I made all the changes. Everything looks good."),
 			exitCode: 0,
@@ -397,7 +466,11 @@ func TestRunWorker_SentinelFallback(t *testing.T) {
 		return time.Date(2026, 4, 2, 12, 0, 0, 0, time.UTC)
 	}
 
-	runCommand = func(ctx context.Context, binary string, args []string, stdin []byte, env []string, timeout time.Duration) (commandResult, error) {
+	runCommand = func(ctx context.Context, binary string, args []string, stdin []byte, env []string, workDir string, timeout time.Duration) (commandResult, error) {
+		if workDir != "" {
+			t.Fatalf("expected Codex process workdir to remain unset, got %q", workDir)
+		}
+
 		// AI mixed prose with a sentinel-prefixed JSON line
 		output := "Done with changes.\nVERK_RESULT:{\"status\":\"done\",\"completion_code\":\"ok\"}"
 		return commandResult{
@@ -504,4 +577,16 @@ func TestBuildReviewArgs_IncludesModelAndReasoning(t *testing.T) {
 	args := buildReviewArgs(req, "prompt-body")
 	assertArgValue(t, args, "--model", "gpt-5")
 	assertArgValue(t, args, "-c", "model_reasoning_effort=high")
+}
+
+func TestBuildReviewArgs_UsesCodexCdFlagForWorktree(t *testing.T) {
+	req := runtime.ReviewRequest{
+		LeaseID:      "lease-1",
+		WorktreePath: "/tmp/review-worktree",
+	}
+	args := buildReviewArgs(req, "prompt-body")
+	assertArgValue(t, args, "-C", "/tmp/review-worktree")
+	if hasArg(args, "--cwd") {
+		t.Fatalf("expected Codex -C/--cd flag, not unsupported --cwd: %v", args)
+	}
 }

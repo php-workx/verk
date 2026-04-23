@@ -387,6 +387,20 @@ func TestBuildReviewPrompt_ContainsThreshold(t *testing.T) {
 	}
 }
 
+func TestBuildReviewPrompt_ContainsNoCommitNoEditDirective(t *testing.T) {
+	prompt := BuildReviewPrompt(ReviewRequest{
+		TicketID:                 "VER-003",
+		LeaseID:                  "lease-3",
+		EffectiveReviewThreshold: "P2",
+	})
+	if !strings.Contains(prompt, "Do not commit, merge, rebase, or edit files") {
+		t.Fatal("expected reviewer no-commit/no-edit directive in review prompt")
+	}
+	if !strings.Contains(prompt, "Return review findings only") {
+		t.Fatal("expected findings-only requirement in review prompt")
+	}
+}
+
 func TestWorkerSystemPrompt_JSONOnly(t *testing.T) {
 	prompt := WorkerSystemPrompt()
 	if !strings.Contains(prompt, "ONLY a JSON object") {

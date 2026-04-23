@@ -27,6 +27,7 @@ func TestRunStreamingCommand_NormalCompletion(t *testing.T) {
 		[]string{"-c", fmt.Sprintf("printf '%%s\n' '%s'", resultLine)},
 		nil,
 		nil,
+		"",
 		10*time.Second,
 		nil,
 	)

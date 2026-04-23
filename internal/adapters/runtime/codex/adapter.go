@@ -77,7 +77,7 @@ func (a *Adapter) CheckAvailability(ctx context.Context) error {
 		ctx = context.Background()
 	}
 
-	result, err := runCommand(ctx, a.binary(), []string{"--version"}, nil, runtimeCommandEnv(runtime.ExecutionConfig{}), 0)
+	result, err := runCommand(ctx, a.binary(), []string{"--version"}, nil, runtimeCommandEnv(runtime.ExecutionConfig{}), "", 0)
 	if err != nil {
 		return fmt.Errorf("%s availability check failed: %w", runtimeName, err)
 	}
@@ -97,7 +97,7 @@ func (a *Adapter) RunWorker(ctx context.Context, req runtime.WorkerRequest) (run
 
 	prompt := runtime.BuildWorkerPrompt(req)
 	args := buildWorkerArgs(req, prompt)
-	execResult, err := runCommand(ctx, a.binary(), args, nil, runtimeCommandEnv(req.ExecutionConfig), runtimeCommandTimeout(req.ExecutionConfig.WorkerTimeoutMinutes))
+	execResult, err := runCommand(ctx, a.binary(), args, nil, runtimeCommandEnv(req.ExecutionConfig), "", runtimeCommandTimeout(req.ExecutionConfig.WorkerTimeoutMinutes))
 	finishedAt := now().UTC()
 	if err != nil {
 		return runtime.WorkerResult{}, fmt.Errorf("run %s worker: %w", runtimeName, err)
@@ -165,7 +165,7 @@ func (a *Adapter) RunReviewer(ctx context.Context, req runtime.ReviewRequest) (r
 
 	prompt := runtime.BuildReviewPrompt(req)
 	args := buildReviewArgs(req, prompt)
-	execResult, err := runCommand(ctx, a.binary(), args, nil, runtimeCommandEnv(req.ExecutionConfig), runtimeCommandTimeout(req.ExecutionConfig.ReviewerTimeoutMinutes))
+	execResult, err := runCommand(ctx, a.binary(), args, nil, runtimeCommandEnv(req.ExecutionConfig), "", runtimeCommandTimeout(req.ExecutionConfig.ReviewerTimeoutMinutes))
 	finishedAt := now().UTC()
 	if err != nil {
 		return runtime.ReviewResult{}, fmt.Errorf("run %s reviewer: %w", runtimeName, err)
@@ -326,6 +326,7 @@ func buildWorkerArgs(req runtime.WorkerRequest, prompt string) []string {
 	args = appendModelArgs(args, req.Model)
 	args = appendReasoningArgs(args, req.Reasoning)
 	if req.WorktreePath != "" {
+		// ver-wi10: keep process cwd unset because Codex uses `-C/--cd` for worktree/config resolution.
 		args = append(args, "-C", req.WorktreePath)
 	}
 	args = append(args, prompt)
@@ -342,6 +343,11 @@ func buildReviewArgs(req runtime.ReviewRequest, prompt string) []string {
 	)
 	args = appendModelArgs(args, req.Model)
 	args = appendReasoningArgs(args, req.Reasoning)
+	if req.WorktreePath != "" {
+		// Verifier parity with ver-wi10: keep process cwd unset and route all
+		// filesystem access through Codex's `-C/--cd` flag.
+		args = append(args, "-C", req.WorktreePath)
+	}
 	args = append(args, prompt)
 	return args
 }
@@ -665,7 +671,7 @@ func ensureRuntime(value, fallback string) string {
 	return strings.TrimSpace(value)
 }
 
-func defaultRunCommand(ctx context.Context, binary string, args []string, stdin []byte, env []string, timeout time.Duration) (commandResult, error) {
+func defaultRunCommand(ctx context.Context, binary string, args []string, stdin []byte, env []string, _workDir string, timeout time.Duration) (commandResult, error) {
 	if timeout > 0 {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, timeout)

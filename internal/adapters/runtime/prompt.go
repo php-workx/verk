@@ -171,6 +171,7 @@ func BuildReviewPrompt(req ReviewRequest) string {
 	}
 	fmt.Fprintf(&b, "Review threshold: %s (findings at or above this severity block closure)\n", req.EffectiveReviewThreshold)
 	fmt.Fprintf(&b, "Lease ID: %s\n", req.LeaseID)
+	b.WriteString("Do not commit, merge, rebase, or edit files. Return review findings only.\n")
 
 	if req.Instructions != "" {
 		b.WriteString("\n")
