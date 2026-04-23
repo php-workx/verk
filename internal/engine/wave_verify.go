@@ -364,7 +364,7 @@ func executeWaveChecks(
 ) ([]verifycommand.CommandResult, map[string]verifycommand.CommandResult, error) {
 	var qualityResults []verifycommand.CommandResult
 	if len(waveCommands) > 0 {
-		results, err := verifycommand.RunQualityCommands(ctx, repoRoot, waveCommands, cfg)
+		results, err := verifycommand.RunQualityCommands(ctx, repoRoot, "", waveCommands, cfg)
 		if err != nil {
 			return nil, nil, fmt.Errorf("run wave gate commands: %w", err)
 		}
@@ -384,7 +384,7 @@ func executeWaveChecks(
 			ids = append(ids, c.ID)
 		}
 		if len(commands) > 0 {
-			results, err := verifycommand.RunCommands(ctx, repoRoot, commands, cfg)
+			results, err := verifycommand.RunCommands(ctx, repoRoot, "", commands, cfg)
 			if err != nil {
 				return nil, nil, fmt.Errorf("run derived wave checks: %w", err)
 			}
@@ -864,6 +864,26 @@ func pendingWaveVerificationID(cursor map[string]any) (string, bool) {
 	return id, ok && id != ""
 }
 
+func waveVerificationReachedTerminalFailure(wave *state.WaveArtifact) bool {
+	if wave == nil || wave.Acceptance == nil {
+		return false
+	}
+	passed, ok := wave.Acceptance["wave_verification_passed"].(bool)
+	return ok && !passed
+}
+
+func clearPendingWaveVerificationOnTerminalFailure(cursor map[string]any, runPath string, run *state.RunArtifact, wave *state.WaveArtifact) error {
+	if !waveVerificationReachedTerminalFailure(wave) {
+		return nil
+	}
+	clearPendingWaveVerification(cursor)
+	if run == nil || strings.TrimSpace(runPath) == "" {
+		return nil
+	}
+	run.UpdatedAt = time.Now().UTC()
+	return state.SaveJSONAtomic(runPath, run)
+}
+
 // resumePendingWaveVerification checks if a prior wave is still pending
 // verification in the run cursor and re-runs the loop if so. Returns an
 // error if verification fails, in which case the caller should block the epic.
@@ -903,6 +923,9 @@ func resumePendingWaveVerification(
 	})
 
 	if err := runWaveVerificationLoop(ctx, req, cfg, &pendingWave, wavePath, pendingWave.ActualScope); err != nil {
+		if clearErr := clearPendingWaveVerificationOnTerminalFailure(cursor, runPath, run, &pendingWave); clearErr != nil {
+			return errors.Join(err, fmt.Errorf("clear terminal pending wave verification: %w", clearErr))
+		}
 		return err
 	}
 

@@ -551,6 +551,9 @@ func resumeEpicMode(ctx context.Context, req ResumeRequest, artifacts *runArtifa
 				return allResumed, err
 			}
 			if verifyErr := runWaveVerificationLoop(ctx, epicReq, cfg, &acceptedWave, wavePath, changedFiles); verifyErr != nil {
+				if clearErr := clearPendingWaveVerificationOnTerminalFailure(artifacts.Run.ResumeCursor, runPath, &artifacts.Run, &acceptedWave); clearErr != nil {
+					return allResumed, errors.Join(verifyErr, fmt.Errorf("clear terminal pending wave verification: %w", clearErr))
+				}
 				artifacts.Run.Status = state.EpicRunStatusBlocked
 				artifacts.Run.CurrentPhase = state.TicketPhaseBlocked
 				if saveErr := state.SaveJSONAtomic(runPath, artifacts.Run); saveErr != nil {

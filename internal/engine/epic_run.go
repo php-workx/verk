@@ -580,6 +580,9 @@ func RunEpic(ctx context.Context, req RunEpicRequest) (RunEpicResult, error) { /
 				return result, err
 			}
 			if verifyErr := runWaveVerificationLoop(ctx, req, cfg, &acceptedWave, wavePath, changedFiles); verifyErr != nil {
+				if clearErr := clearPendingWaveVerificationOnTerminalFailure(result.Run.ResumeCursor, runPath, &result.Run, &acceptedWave); clearErr != nil {
+					return result, errors.Join(verifyErr, fmt.Errorf("clear terminal pending wave verification: %w", clearErr))
+				}
 				result.Run.Status = state.EpicRunStatusBlocked
 				result.Run.CurrentPhase = state.TicketPhaseBlocked
 				if saveErr := state.SaveJSONAtomic(runPath, result.Run); saveErr != nil {
@@ -1095,6 +1098,13 @@ func runSubEpic(ctx context.Context, req RunEpicRequest, cfg policy.Config, pare
 				return outcome
 			}
 			if verifyErr := runWaveVerificationLoop(ctx, req, cfg, &acceptedSubWave, subWavePath, changedFiles); verifyErr != nil {
+				if waveVerificationReachedTerminalFailure(&acceptedSubWave) {
+					if clearErr := reg.clearPendingSubWaveVerification(); clearErr != nil {
+						outcome.err = errors.Join(verifyErr, fmt.Errorf("clear sub-wave %s pending verification: %w", subWaveID, clearErr))
+						outcome.phase = state.TicketPhaseBlocked
+						return outcome
+					}
+				}
 				outcome.err = verifyErr
 				outcome.phase = state.TicketPhaseBlocked
 				return outcome

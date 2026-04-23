@@ -641,3 +641,57 @@ func TestResumePendingWaveVerification_NotPassedYet_RerunsAndClearsOnSuccess(t *
 			reloadedWave.Acceptance["wave_verification_passed"])
 	}
 }
+
+// TestResumePendingWaveVerification_TerminalFailureClearsMarker verifies that
+// a pending wave marker is cleared once verification reaches a terminal failed
+// outcome. Without this, the next `verk run` re-enters the same exhausted wave
+// verification loop and never gets back to reopened blocked tickets.
+func TestResumePendingWaveVerification_TerminalFailureClearsMarker(t *testing.T) {
+	repoRoot, wavePath, wave := makeWaveVerifyFixture(t)
+	if err := state.SaveJSONAtomic(wavePath, wave); err != nil {
+		t.Fatal(err)
+	}
+
+	runPath := filepath.Join(repoRoot, ".verk", "runs", "run-test", "run.json")
+	run := state.RunArtifact{
+		ArtifactMeta: state.ArtifactMeta{RunID: "run-test"},
+		Status:       state.EpicRunStatusBlocked,
+		ResumeCursor: map[string]any{},
+	}
+	if err := state.SaveJSONAtomic(runPath, run); err != nil {
+		t.Fatal(err)
+	}
+
+	cursor := run.ResumeCursor
+	setPendingWaveVerification(cursor, "wave-1")
+
+	adapter := runtimefake.New(nil, nil)
+	cfg := policy.DefaultConfig()
+	cfg.Verification.QualityCommands = []policy.QualityCommand{qualityCmd("false")}
+	cfg.Policy.MaxWaveRepairCycles = 0
+
+	err := resumePendingWaveVerification(context.Background(), makeEpicReq(repoRoot, adapter), cfg, cursor, runPath, &run)
+	if err == nil {
+		t.Fatal("expected terminal verification failure, got nil")
+	}
+
+	if _, ok := pendingWaveVerificationID(cursor); ok {
+		t.Fatal("expected pending wave verification marker to be cleared after terminal failure")
+	}
+
+	var persisted state.RunArtifact
+	if err := state.LoadJSON(runPath, &persisted); err != nil {
+		t.Fatalf("reload run: %v", err)
+	}
+	if _, ok := pendingWaveVerificationID(persisted.ResumeCursor); ok {
+		t.Fatalf("expected persisted run cursor to have no pending wave marker, cursor=%v", persisted.ResumeCursor)
+	}
+
+	var reloadedWave state.WaveArtifact
+	if err := state.LoadJSON(wavePath, &reloadedWave); err != nil {
+		t.Fatalf("reload wave artifact: %v", err)
+	}
+	if got, ok := reloadedWave.Acceptance["wave_verification_passed"].(bool); !ok || got {
+		t.Fatalf("expected wave_verification_passed=false after terminal failure, acceptance=%v", reloadedWave.Acceptance)
+	}
+}
