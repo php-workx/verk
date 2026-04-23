@@ -66,6 +66,22 @@ func TestRunTicket_HappyPath(t *testing.T) {
 	if err != nil {
 		t.Fatalf("RunTicket returned error: %v", err)
 	}
+	repoRootAbs, err := filepath.Abs(repoRoot)
+	if err != nil {
+		t.Fatalf("resolve repo root %q: %v", repoRoot, err)
+	}
+	if len(adapter.WorkerRequests()) != 1 {
+		t.Fatalf("expected 1 worker request, got %d", len(adapter.WorkerRequests()))
+	}
+	if adapter.WorkerRequests()[0].WorktreePath != repoRootAbs {
+		t.Fatalf("expected worker to use repo-root worktree %q, got %q", repoRootAbs, adapter.WorkerRequests()[0].WorktreePath)
+	}
+	if len(adapter.ReviewRequests()) != 1 {
+		t.Fatalf("expected 1 review request, got %d", len(adapter.ReviewRequests()))
+	}
+	if adapter.ReviewRequests()[0].WorktreePath != repoRootAbs {
+		t.Fatalf("expected reviewer to use repo-root worktree %q, got %q", repoRootAbs, adapter.ReviewRequests()[0].WorktreePath)
+	}
 	if result.Snapshot.CurrentPhase != state.TicketPhaseClosed {
 		t.Fatalf("expected closed phase, got %q", result.Snapshot.CurrentPhase)
 	}
@@ -122,6 +138,179 @@ func TestRunTicket_HappyPath(t *testing.T) {
 	}
 }
 
+func TestRunTicket_UsesExplicitWorktreePathForWorkersAndArtifactsStayOnRepoRoot(t *testing.T) {
+	repoRoot := t.TempDir()
+	worktreePath := filepath.Join(repoRoot, "worktree")
+	if err := os.MkdirAll(worktreePath, 0o755); err != nil {
+		t.Fatalf("make explicit worktree: %v", err)
+	}
+
+	cfg := policy.DefaultConfig()
+	cfg.Runtime.WorkerTimeoutMinutes = 7
+	cfg.Runtime.ReviewerTimeoutMinutes = 9
+	ticket := testTicket("ver-worktree")
+	plan, claim := testPlanAndClaim(t, repoRoot, ticket, cfg, "run-worktree", "lease-worktree", []string{`true`})
+
+	started, finished := testRunTimes()
+	adapter := runtimefake.New(
+		[]runtime.WorkerResult{
+			{
+				Status:             runtime.WorkerStatusDone,
+				RetryClass:         runtime.RetryClassTerminal,
+				LeaseID:            claim.LeaseID,
+				StartedAt:          started,
+				FinishedAt:         finished,
+				ResultArtifactPath: filepath.Join(repoRoot, "worker.json"),
+			},
+		},
+		[]runtime.ReviewResult{
+			{
+				Status:             runtime.WorkerStatusDone,
+				RetryClass:         runtime.RetryClassTerminal,
+				LeaseID:            claim.LeaseID,
+				StartedAt:          finished.Add(time.Second),
+				FinishedAt:         finished.Add(2 * time.Second),
+				ReviewStatus:       runtime.ReviewStatusPassed,
+				Summary:            "clean",
+				ResultArtifactPath: filepath.Join(repoRoot, "review.json"),
+			},
+		},
+	)
+
+	result, err := RunTicket(context.Background(), RunTicketRequest{
+		RepoRoot:     repoRoot,
+		WorktreePath: worktreePath,
+		RunID:        "run-worktree",
+		Ticket:       ticket,
+		Plan:         plan,
+		Claim:        claim,
+		Adapter:      adapter,
+		Config:       cfg,
+	})
+	if err != nil {
+		t.Fatalf("RunTicket returned error: %v", err)
+	}
+
+	if len(adapter.WorkerRequests()) != 1 {
+		t.Fatalf("expected 1 worker request, got %d", len(adapter.WorkerRequests()))
+	}
+	if adapter.WorkerRequests()[0].WorktreePath != worktreePath {
+		t.Fatalf("expected worker to use explicit worktree %q, got %q", worktreePath, adapter.WorkerRequests()[0].WorktreePath)
+	}
+	if len(adapter.ReviewRequests()) != 1 {
+		t.Fatalf("expected 1 review request, got %d", len(adapter.ReviewRequests()))
+	}
+	if adapter.ReviewRequests()[0].WorktreePath != worktreePath {
+		t.Fatalf("expected reviewer to use explicit worktree %q, got %q", worktreePath, adapter.ReviewRequests()[0].WorktreePath)
+	}
+
+	snapshotPath := filepath.Join(repoRoot, ".verk", "runs", "run-worktree", "tickets", ticket.ID, "ticket-run.json")
+	if result.Path != snapshotPath {
+		t.Fatalf("expected result path to target repo-root artifacts, got %q", result.Path)
+	}
+	if _, statErr := os.Stat(snapshotPath); statErr != nil {
+		t.Fatalf("expected snapshot on repo root: %v", statErr)
+	}
+
+	durableClaimPath := filepath.Join(repoRoot, ".verk", "runs", "run-worktree", "claims", "claim-"+ticket.ID+".json")
+	var durableClaim state.ClaimArtifact
+	if err := state.LoadJSON(durableClaimPath, &durableClaim); err != nil {
+		t.Fatalf("load durable claim from repo root: %v", err)
+	}
+	if durableClaim.State != "released" {
+		t.Fatalf("expected released durable claim, got %q", durableClaim.State)
+	}
+
+	verificationArtifactPath := filepath.Join(repoRoot, ".verk", "runs", "run-worktree", "tickets", ticket.ID, "verification.json")
+	if _, statErr := os.Stat(verificationArtifactPath); statErr != nil {
+		t.Fatalf("expected verification artifact on repo root: %v", statErr)
+	}
+}
+
+func TestRunTicket_ReviewDiffIncludesWorktreeOnlyFile(t *testing.T) {
+	repoRoot := t.TempDir()
+	mustRunGit(t, repoRoot, "init")
+	mustRunGit(t, repoRoot, "config", "user.email", "test@example.com")
+	mustRunGit(t, repoRoot, "config", "user.name", "Test User")
+	if err := os.WriteFile(filepath.Join(repoRoot, "base.txt"), []byte("base\n"), 0o644); err != nil {
+		t.Fatalf("seed repo: %v", err)
+	}
+	mustRunGit(t, repoRoot, "add", "base.txt")
+	mustRunGit(t, repoRoot, "commit", "-m", "base")
+
+	headOut, err := gitOutput(repoRoot, "rev-parse", "HEAD")
+	if err != nil {
+		t.Fatalf("rev-parse HEAD: %v", err)
+	}
+	baseCommit := strings.TrimSpace(headOut)
+
+	worktreePath := filepath.Join(repoRoot, "worktree-review")
+	mustRunGit(t, repoRoot, "worktree", "add", worktreePath, "HEAD")
+	if err := os.WriteFile(filepath.Join(worktreePath, "ticket-only.txt"), []byte("worktree file\n"), 0o644); err != nil {
+		t.Fatalf("write worktree-only file: %v", err)
+	}
+	mustRunGit(t, worktreePath, "add", "ticket-only.txt")
+	mustRunGit(t, worktreePath, "commit", "-m", "ticket-only change")
+
+	cfg := policy.DefaultConfig()
+	cfg.Runtime.WorkerTimeoutMinutes = 7
+	cfg.Runtime.ReviewerTimeoutMinutes = 9
+	cfg.Runtime.AuthEnvVars = []string{"VERK_API_KEY"}
+	ticket := testTicket("ver-wi20-worktree")
+	plan, claim := testPlanAndClaim(t, repoRoot, ticket, cfg, "run-wi20-review-diff", "lease-wi20-review-diff", []string{`true`})
+
+	started, finished := testRunTimes()
+	adapter := runtimefake.New(
+		[]runtime.WorkerResult{
+			{
+				Status:             runtime.WorkerStatusDone,
+				RetryClass:         runtime.RetryClassTerminal,
+				LeaseID:            claim.LeaseID,
+				StartedAt:          started,
+				FinishedAt:         finished,
+				ResultArtifactPath: filepath.Join(repoRoot, "worker.json"),
+			},
+		},
+		[]runtime.ReviewResult{
+			{
+				Status:             runtime.WorkerStatusDone,
+				RetryClass:         runtime.RetryClassTerminal,
+				LeaseID:            claim.LeaseID,
+				StartedAt:          finished.Add(time.Second),
+				FinishedAt:         finished.Add(2 * time.Second),
+				ReviewStatus:       runtime.ReviewStatusPassed,
+				Summary:            "clean",
+				ResultArtifactPath: filepath.Join(repoRoot, "review.json"),
+			},
+		},
+	)
+
+	_, err = RunTicket(context.Background(), RunTicketRequest{
+		RepoRoot:     repoRoot,
+		WorktreePath: worktreePath,
+		RunID:        "run-wi20-review-diff",
+		BaseCommit:   baseCommit,
+		Ticket:       ticket,
+		Plan:         plan,
+		Claim:        claim,
+		Adapter:      adapter,
+		Config:       cfg,
+	})
+	if err != nil {
+		t.Fatalf("RunTicket returned error: %v", err)
+	}
+	if len(adapter.ReviewRequests()) != 1 {
+		t.Fatalf("expected 1 review request, got %d", len(adapter.ReviewRequests()))
+	}
+	reviewReq := adapter.ReviewRequests()[0]
+	if reviewReq.WorktreePath != worktreePath {
+		t.Fatalf("expected reviewer worktree %q, got %q", worktreePath, reviewReq.WorktreePath)
+	}
+	if !strings.Contains(reviewReq.Diff, "ticket-only.txt") {
+		t.Fatalf("expected worktree-only file in review diff: %q", reviewReq.Diff)
+	}
+}
+
 func TestExecuteVerification_AdvisoryDerivedFailureTriggersBestEffortRepair(t *testing.T) {
 	repoRoot := t.TempDir()
 	installFailingRuff(t)
@@ -133,11 +322,12 @@ func TestExecuteVerification_AdvisoryDerivedFailureTriggersBestEffortRepair(t *t
 
 	st := newVerificationTestState(t, "run-advisory-repair", "ver-advisory-repair", cfg, 1)
 	st.repoRoot = repoRoot
+	st.worktreePath = repoRoot
 	st.implementation = &state.ImplementationArtifact{
 		ChangedFiles: []string{"tests/test_smoke.py"},
 	}
 
-	blocked, err := st.executeVerification(context.Background(), repoRoot)
+	blocked, err := st.executeVerification(context.Background())
 	if err != nil {
 		t.Fatalf("executeVerification: %v", err)
 	}
@@ -198,11 +388,12 @@ func TestExecuteVerification_AdvisoryDerivedFailureDoesNotBlockAfterRepairBudget
 
 	st := newVerificationTestState(t, "run-advisory-budget", "ver-advisory-budget", cfg, 1)
 	st.repoRoot = repoRoot
+	st.worktreePath = repoRoot
 	st.implementation = &state.ImplementationArtifact{
 		ChangedFiles: []string{"tests/test_smoke.py"},
 	}
 
-	blocked, err := st.executeVerification(context.Background(), repoRoot)
+	blocked, err := st.executeVerification(context.Background())
 	if err != nil {
 		t.Fatalf("executeVerification: %v", err)
 	}

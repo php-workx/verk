@@ -43,7 +43,7 @@ type CommandResult struct { //nolint:revive // stuttering name is intentional fo
 	FinishedAt time.Time `json:"finished_at"`
 }
 
-func RunCommands(ctx context.Context, repoRoot string, cmds []string, cfg policy.VerificationConfig) ([]CommandResult, error) {
+func RunCommands(ctx context.Context, repoRoot, workDir string, cmds []string, cfg policy.VerificationConfig) ([]CommandResult, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -53,6 +53,15 @@ func RunCommands(ctx context.Context, repoRoot string, cmds []string, cfg policy
 		return nil, fmt.Errorf("resolve repo root %q: %w", repoRoot, err)
 	}
 	absRepoRoot = filepath.Clean(absRepoRoot)
+
+	if workDir = strings.TrimSpace(workDir); workDir == "" {
+		workDir = repoRoot
+	}
+	absWorkDir, err := filepath.Abs(workDir)
+	if err != nil {
+		return nil, fmt.Errorf("resolve work dir %q: %w", workDir, err)
+	}
+	absWorkDir = filepath.Clean(absWorkDir)
 
 	info, err := os.Stat(absRepoRoot)
 	if err != nil {
@@ -116,7 +125,7 @@ func RunCommands(ctx context.Context, repoRoot string, cmds []string, cfg policy
 			// bounded cwd, timeout, and allowlisted environment.
 			// nosemgrep: go.lang.security.audit.dangerous-exec-command.dangerous-exec-command
 			cmd := exec.CommandContext(cmdCtx, "/bin/sh", "-c", command)
-			cmd.Dir = absRepoRoot
+			cmd.Dir = absWorkDir
 			cmd.Env = env
 			cmd.Stdout = stdoutFile
 			cmd.Stderr = stderrFile
@@ -146,7 +155,7 @@ func RunCommands(ctx context.Context, repoRoot string, cmds []string, cfg policy
 
 			return CommandResult{
 				Command:    command,
-				Cwd:        absRepoRoot,
+				Cwd:        absWorkDir,
 				ExitCode:   exitCode,
 				TimedOut:   timedOut,
 				DurationMS: finishedAt.Sub(startedAt).Milliseconds(),
@@ -169,7 +178,7 @@ func RunCommands(ctx context.Context, repoRoot string, cmds []string, cfg policy
 // subdirectories. Each QualityCommand specifies a path relative to repoRoot and
 // one or more shell commands to run sequentially from that directory. This
 // supports monorepo setups where different packages have different gates.
-func RunQualityCommands(ctx context.Context, repoRoot string, cmds []policy.QualityCommand, cfg policy.VerificationConfig) ([]CommandResult, error) {
+func RunQualityCommands(ctx context.Context, repoRoot, workDir string, cmds []policy.QualityCommand, cfg policy.VerificationConfig) ([]CommandResult, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -182,6 +191,14 @@ func RunQualityCommands(ctx context.Context, repoRoot string, cmds []policy.Qual
 		return nil, fmt.Errorf("resolve repo root %q: %w", repoRoot, err)
 	}
 	absRepoRoot = filepath.Clean(absRepoRoot)
+	if workDir = strings.TrimSpace(workDir); workDir == "" {
+		workDir = repoRoot
+	}
+	absWorkDir, err := filepath.Abs(workDir)
+	if err != nil {
+		return nil, fmt.Errorf("resolve work dir %q: %w", workDir, err)
+	}
+	absWorkDir = filepath.Clean(absWorkDir)
 
 	info, err := os.Stat(absRepoRoot)
 	if err != nil {
@@ -209,10 +226,10 @@ func RunQualityCommands(ctx context.Context, repoRoot string, cmds []policy.Qual
 	var results []CommandResult
 	cmdIndex := 0
 	for _, qc := range cmds {
-		workDir := absRepoRoot
+		cmdWorkDir := absWorkDir
 		if qc.Path != "" {
-			workDir = filepath.Join(absRepoRoot, filepath.Clean(qc.Path))
-			if !strings.HasPrefix(workDir+string(filepath.Separator), absRepoRoot+string(filepath.Separator)) {
+			cmdWorkDir = filepath.Join(absWorkDir, filepath.Clean(qc.Path))
+			if !strings.HasPrefix(cmdWorkDir+string(filepath.Separator), absWorkDir+string(filepath.Separator)) {
 				return results, fmt.Errorf("quality command path %q escapes repo root", qc.Path)
 			}
 		}
@@ -258,7 +275,7 @@ func RunQualityCommands(ctx context.Context, repoRoot string, cmds []policy.Qual
 				// allowlisted.
 				// nosemgrep: go.lang.security.audit.dangerous-exec-command.dangerous-exec-command
 				cmd := exec.CommandContext(cmdCtx, "/bin/sh", "-c", command)
-				cmd.Dir = workDir
+				cmd.Dir = cmdWorkDir
 				cmd.Env = env
 				cmd.Stdout = stdoutFile
 				cmd.Stderr = stderrFile
@@ -288,7 +305,7 @@ func RunQualityCommands(ctx context.Context, repoRoot string, cmds []policy.Qual
 
 				return CommandResult{
 					Command:    command,
-					Cwd:        workDir,
+					Cwd:        cmdWorkDir,
 					ExitCode:   exitCode,
 					TimedOut:   timedOut,
 					DurationMS: finishedAt.Sub(startedAt).Milliseconds(),

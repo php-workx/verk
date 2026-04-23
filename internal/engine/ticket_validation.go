@@ -81,6 +81,7 @@ func deriveTicketChecks(st *ticketRunState) DeriveChecksResult {
 func runDerivedChecks(
 	ctx context.Context,
 	repoRoot string,
+	workDir string,
 	checks []state.ValidationCheck,
 	cfg policy.VerificationConfig,
 ) (map[string]verifycommand.CommandResult, []verifycommand.CommandResult, error) {
@@ -102,7 +103,7 @@ func runDerivedChecks(
 	if len(commands) == 0 {
 		return out, ordered, nil
 	}
-	results, err := verifycommand.RunCommands(ctx, repoRoot, commands, cfg)
+	results, err := verifycommand.RunCommands(ctx, repoRoot, workDir, commands, cfg)
 	if err != nil {
 		return nil, nil, fmt.Errorf("run derived checks: %w", err)
 	}

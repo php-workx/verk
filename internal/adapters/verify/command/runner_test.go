@@ -20,13 +20,22 @@ type failingCloser struct {
 func (f *failingCloser) Write(p []byte) (int, error) { return len(p), nil }
 func (f *failingCloser) Close() error                { return f.closeErr }
 
+func canonicalTestPath(t *testing.T, p string) string {
+	t.Helper()
+	resolved, err := filepath.EvalSymlinks(p)
+	if err == nil {
+		return filepath.Clean(resolved)
+	}
+	return filepath.Clean(p)
+}
+
 func TestRunCommands_CapturesExitCodeAndArtifacts(t *testing.T) {
 	repoRoot := t.TempDir()
 	if err := os.WriteFile(filepath.Join(repoRoot, "marker.txt"), []byte("present"), 0o644); err != nil {
 		t.Fatalf("write marker file: %v", err)
 	}
 
-	results, err := RunCommands(context.Background(), repoRoot, []string{
+	results, err := RunCommands(context.Background(), repoRoot, "", []string{
 		"test -f marker.txt && printf 'hello' && printf 'err' >&2",
 	}, policy.VerificationConfig{
 		DefaultTimeoutMinutes: 1,
@@ -86,13 +95,83 @@ func TestRunCommands_CapturesExitCodeAndArtifacts(t *testing.T) {
 	}
 }
 
+func TestRunCommands_UsesWorkDirForCommandExecution(t *testing.T) {
+	repoRoot := t.TempDir()
+	workDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(workDir, "marker.txt"), []byte("present"), 0o644); err != nil {
+		t.Fatalf("write marker file: %v", err)
+	}
+
+	results, err := RunCommands(context.Background(), repoRoot, workDir, []string{
+		"pwd && test -f marker.txt",
+	}, policy.VerificationConfig{
+		DefaultTimeoutMinutes: 1,
+	})
+	if err != nil {
+		t.Fatalf("RunCommands returned error: %v", err)
+	}
+	if len(results) != 1 {
+		t.Fatalf("expected 1 command result, got %d", len(results))
+	}
+
+	result := results[0]
+	expectedCwd, err := filepath.Abs(workDir)
+	if err != nil {
+		t.Fatalf("resolve expected work dir: %v", err)
+	}
+	if canonicalTestPath(t, result.Cwd) != canonicalTestPath(t, expectedCwd) {
+		t.Fatalf("expected cwd %q, got %q", canonicalTestPath(t, expectedCwd), canonicalTestPath(t, result.Cwd))
+	}
+
+	artifactRoot, err := filepath.Abs(filepath.Join(repoRoot, ".verk", "verification"))
+	if err != nil {
+		t.Fatalf("resolve expected artifact root: %v", err)
+	}
+	if !strings.HasPrefix(canonicalTestPath(t, result.StdoutPath), canonicalTestPath(t, artifactRoot)) {
+		t.Fatalf("expected stdout artifact path under %q, got %q", canonicalTestPath(t, artifactRoot), canonicalTestPath(t, result.StdoutPath))
+	}
+
+	stdoutData, err := os.ReadFile(result.StdoutPath)
+	if err != nil {
+		t.Fatalf("read stdout artifact: %v", err)
+	}
+	if canonicalTestPath(t, strings.TrimSpace(string(stdoutData))) != canonicalTestPath(t, filepath.Clean(workDir)) {
+		t.Fatalf("expected command to execute in %q, got stdout %q", canonicalTestPath(t, filepath.Clean(workDir)), canonicalTestPath(t, strings.TrimSpace(string(stdoutData))))
+	}
+}
+
+func TestRunCommands_EmptyWorkDirFallsBackToRepoRoot(t *testing.T) {
+	repoRoot := t.TempDir()
+
+	results, err := RunCommands(context.Background(), repoRoot, "", []string{
+		"pwd",
+	}, policy.VerificationConfig{
+		DefaultTimeoutMinutes: 1,
+	})
+	if err != nil {
+		t.Fatalf("RunCommands returned error: %v", err)
+	}
+	if len(results) != 1 {
+		t.Fatalf("expected 1 command result, got %d", len(results))
+	}
+
+	expectedCwd, err := filepath.Abs(repoRoot)
+	if err != nil {
+		t.Fatalf("resolve expected cwd: %v", err)
+	}
+	result := results[0]
+	if canonicalTestPath(t, result.Cwd) != canonicalTestPath(t, filepath.Clean(expectedCwd)) {
+		t.Fatalf("expected fallback cwd %q, got %q", canonicalTestPath(t, filepath.Clean(expectedCwd)), canonicalTestPath(t, result.Cwd))
+	}
+}
+
 func TestRunCommands_TimeoutMarksTimedOut(t *testing.T) {
 	repoRoot := t.TempDir()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
 	defer cancel()
 
-	results, err := RunCommands(ctx, repoRoot, []string{
+	results, err := RunCommands(ctx, repoRoot, "", []string{
 		"/bin/sleep 1",
 	}, policy.VerificationConfig{
 		DefaultTimeoutMinutes: 1,
@@ -121,7 +200,7 @@ func TestRunCommands_UsesAllowlistedEnvOnly(t *testing.T) {
 	t.Setenv("KEEP_ME", "allowed")
 	t.Setenv("DROP_ME", "secret")
 
-	results, err := RunCommands(context.Background(), repoRoot, []string{
+	results, err := RunCommands(context.Background(), repoRoot, "", []string{
 		`printf '%s' "${KEEP_ME:-missing}:${DROP_ME:-missing}"`,
 	}, policy.VerificationConfig{
 		DefaultTimeoutMinutes: 1,
@@ -147,7 +226,7 @@ func TestRunCommands_DefaultEnvExcludesNonAllowlistedVars(t *testing.T) {
 	repoRoot := t.TempDir()
 	t.Setenv("DROP_ME", "secret")
 
-	results, err := RunCommands(context.Background(), repoRoot, []string{
+	results, err := RunCommands(context.Background(), repoRoot, "", []string{
 		`printf '%s' "${DROP_ME:-missing}"`,
 	}, policy.VerificationConfig{
 		DefaultTimeoutMinutes: 1,
@@ -175,7 +254,7 @@ func TestRunCommands_DefaultEnvIncludesCommonVars(t *testing.T) {
 	t.Setenv("CI", "true")
 	t.Setenv("DROP_ME", "secret")
 
-	results, err := RunCommands(context.Background(), repoRoot, []string{
+	results, err := RunCommands(context.Background(), repoRoot, "", []string{
 		`printf '%s|%s|%s|%s' "${PATH:-missing}" "${HOME:-missing}" "${CI:-missing}" "${DROP_ME:-missing}"`,
 	}, policy.VerificationConfig{
 		DefaultTimeoutMinutes: 1,
@@ -204,7 +283,7 @@ func TestRunCommands_DefaultEnvIncludesPath(t *testing.T) {
 	// allowlist (PATH, HOME, etc.).
 	repoRoot := t.TempDir()
 
-	results, err := RunCommands(context.Background(), repoRoot, []string{
+	results, err := RunCommands(context.Background(), repoRoot, "", []string{
 		`printf '%s' "${PATH:-missing}"`,
 	}, policy.VerificationConfig{
 		DefaultTimeoutMinutes: 1,
@@ -261,7 +340,7 @@ func TestRunCommands_CloseErrorPropagated(t *testing.T) {
 	}
 
 	repoRoot := t.TempDir()
-	_, err := RunCommands(context.Background(), repoRoot, []string{"true"}, policy.VerificationConfig{
+	_, err := RunCommands(context.Background(), repoRoot, "", []string{"true"}, policy.VerificationConfig{
 		DefaultTimeoutMinutes: 1,
 	})
 	if err == nil {
@@ -276,7 +355,7 @@ func TestRunCommands_CloseErrorPropagated(t *testing.T) {
 // returned when files close normally.
 func TestRunCommands_CloseSucceeds(t *testing.T) {
 	repoRoot := t.TempDir()
-	results, err := RunCommands(context.Background(), repoRoot, []string{"true"}, policy.VerificationConfig{
+	results, err := RunCommands(context.Background(), repoRoot, "", []string{"true"}, policy.VerificationConfig{
 		DefaultTimeoutMinutes: 1,
 	})
 	if err != nil {
@@ -298,7 +377,7 @@ func TestRunQualityCommands_CloseErrorPropagated(t *testing.T) {
 	}
 
 	repoRoot := t.TempDir()
-	_, err := RunQualityCommands(context.Background(), repoRoot, []policy.QualityCommand{
+	_, err := RunQualityCommands(context.Background(), repoRoot, "", []policy.QualityCommand{
 		{Run: []string{"true"}},
 	}, policy.VerificationConfig{
 		DefaultTimeoutMinutes: 1,
@@ -317,6 +396,7 @@ func TestRunQualityCommands_NonexistentRepoRoot(t *testing.T) {
 	_, err := RunQualityCommands(
 		context.Background(),
 		"/nonexistent/path/that/does/not/exist/ver-7anh",
+		"",
 		[]policy.QualityCommand{{Run: []string{"true"}}},
 		policy.VerificationConfig{DefaultTimeoutMinutes: 1},
 	)
@@ -340,6 +420,7 @@ func TestRunQualityCommands_RepoRootIsFile(t *testing.T) {
 	_, err := RunQualityCommands(
 		context.Background(),
 		filePath,
+		"",
 		[]policy.QualityCommand{{Run: []string{"true"}}},
 		policy.VerificationConfig{DefaultTimeoutMinutes: 1},
 	)
@@ -358,6 +439,7 @@ func TestRunQualityCommands_ValidRepoRoot(t *testing.T) {
 	results, err := RunQualityCommands(
 		context.Background(),
 		repoRoot,
+		"",
 		[]policy.QualityCommand{{Run: []string{"true"}}},
 		policy.VerificationConfig{DefaultTimeoutMinutes: 1},
 	)
