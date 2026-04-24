@@ -21,7 +21,7 @@ func TestRunWaveVerificationLoop_RunsWaveCommandsInAdditionToQualityCommands(t *
 		{Path: ".", Run: []string{"printf wave >> wave-checks.log"}},
 	}
 
-	err := runWaveVerificationLoop(context.Background(), makeEpicReq(repoRoot, adapter), cfg, wave, wavePath, nil)
+	err := runWaveVerificationLoop(context.Background(), makeEpicReq(repoRoot, adapter), cfg, wave, wavePath, nil, "")
 	if err != nil {
 		t.Fatalf("expected nil error, got: %v", err)
 	}

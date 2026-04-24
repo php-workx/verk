@@ -67,7 +67,7 @@ func TestRunWaveVerificationLoop_NoQualityCommands(t *testing.T) {
 	cfg := policy.DefaultConfig()
 	cfg.Verification.QualityCommands = nil
 
-	err := runWaveVerificationLoop(context.Background(), makeEpicReq(repoRoot, adapter), cfg, wave, wavePath, nil)
+	err := runWaveVerificationLoop(context.Background(), makeEpicReq(repoRoot, adapter), cfg, wave, wavePath, nil, "")
 	if err != nil {
 		t.Fatalf("expected nil error, got: %v", err)
 	}
@@ -86,7 +86,7 @@ func TestRunWaveVerificationLoop_PassesFirstTry(t *testing.T) {
 	cfg := policy.DefaultConfig()
 	cfg.Verification.QualityCommands = []policy.QualityCommand{qualityCmd("true")}
 
-	err := runWaveVerificationLoop(context.Background(), makeEpicReq(repoRoot, adapter), cfg, wave, wavePath, nil)
+	err := runWaveVerificationLoop(context.Background(), makeEpicReq(repoRoot, adapter), cfg, wave, wavePath, nil, "")
 	if err != nil {
 		t.Fatalf("expected nil error, got: %v", err)
 	}
@@ -108,7 +108,7 @@ func TestRunWaveVerificationLoop_MaxWaveRepairCyclesZero_FailsImmediately(t *tes
 	cfg.Verification.QualityCommands = []policy.QualityCommand{qualityCmd("false")}
 	cfg.Policy.MaxWaveRepairCycles = 0
 
-	err := runWaveVerificationLoop(context.Background(), makeEpicReq(repoRoot, adapter), cfg, wave, wavePath, nil)
+	err := runWaveVerificationLoop(context.Background(), makeEpicReq(repoRoot, adapter), cfg, wave, wavePath, nil, "")
 
 	if err == nil {
 		t.Fatal("expected error, got nil")
@@ -151,7 +151,7 @@ func TestRunWaveVerificationLoop_RepairSucceedsOnFirstCycle(t *testing.T) {
 	cfg.Verification.QualityCommands = []policy.QualityCommand{{Path: ".", Run: []string{toggleScript}}}
 	cfg.Policy.MaxWaveRepairCycles = 3
 
-	err := runWaveVerificationLoop(context.Background(), makeEpicReq(repoRoot, adapter), cfg, wave, wavePath, []string{"some/file.go"})
+	err := runWaveVerificationLoop(context.Background(), makeEpicReq(repoRoot, adapter), cfg, wave, wavePath, []string{"some/file.go"}, "")
 	if err != nil {
 		t.Fatalf("expected nil error after repair, got: %v", err)
 	}
@@ -186,7 +186,7 @@ func TestRunWaveVerificationLoop_ExhaustsRepairCycles(t *testing.T) {
 	cfg.Verification.QualityCommands = []policy.QualityCommand{qualityCmd("false")}
 	cfg.Policy.MaxWaveRepairCycles = 2
 
-	err := runWaveVerificationLoop(context.Background(), makeEpicReq(repoRoot, adapter), cfg, wave, wavePath, nil)
+	err := runWaveVerificationLoop(context.Background(), makeEpicReq(repoRoot, adapter), cfg, wave, wavePath, nil, "")
 
 	if err == nil {
 		t.Fatal("expected error after exhausting repair cycles, got nil")
@@ -211,7 +211,7 @@ func TestRunWaveVerificationLoop_WorkerError_Aborts(t *testing.T) {
 	cfg.Verification.QualityCommands = []policy.QualityCommand{qualityCmd("false")}
 	cfg.Policy.MaxWaveRepairCycles = 3
 
-	err := runWaveVerificationLoop(context.Background(), makeEpicReq(repoRoot, adapter), cfg, wave, wavePath, nil)
+	err := runWaveVerificationLoop(context.Background(), makeEpicReq(repoRoot, adapter), cfg, wave, wavePath, nil, "")
 
 	if err == nil {
 		t.Fatal("expected error when worker call fails, got nil")
@@ -246,7 +246,7 @@ func TestRunWaveVerificationLoop_RepairWaveIDAndLeaseID(t *testing.T) {
 	cfg := policy.DefaultConfig()
 	cfg.Verification.QualityCommands = []policy.QualityCommand{{Path: ".", Run: []string{toggleScript}}}
 
-	if err := runWaveVerificationLoop(context.Background(), makeEpicReq(repoRoot, adapter), cfg, wave, wavePath, nil); err != nil {
+	if err := runWaveVerificationLoop(context.Background(), makeEpicReq(repoRoot, adapter), cfg, wave, wavePath, nil, ""); err != nil {
 		t.Fatal(err)
 	}
 
@@ -349,7 +349,7 @@ func TestRunWaveVerificationLoop_RecordsValidationCoverage(t *testing.T) {
 	cfg := policy.DefaultConfig()
 	cfg.Verification.QualityCommands = []policy.QualityCommand{qualityCmd("true")}
 
-	if err := runWaveVerificationLoop(context.Background(), makeEpicReq(repoRoot, adapter), cfg, wave, wavePath, nil); err != nil {
+	if err := runWaveVerificationLoop(context.Background(), makeEpicReq(repoRoot, adapter), cfg, wave, wavePath, nil, ""); err != nil {
 		t.Fatalf("expected nil error, got: %v", err)
 	}
 	if wave.ValidationCoverage == nil {
@@ -405,7 +405,7 @@ func TestRunWaveVerificationLoop_ExhaustedBudget_PreservesHistory(t *testing.T) 
 	cfg.Verification.QualityCommands = []policy.QualityCommand{qualityCmd("false")}
 	cfg.Policy.MaxWaveRepairCycles = 2
 
-	err := runWaveVerificationLoop(context.Background(), makeEpicReq(repoRoot, adapter), cfg, wave, wavePath, nil)
+	err := runWaveVerificationLoop(context.Background(), makeEpicReq(repoRoot, adapter), cfg, wave, wavePath, nil, "")
 	if err == nil {
 		t.Fatal("expected error after exhausting repair cycles, got nil")
 	}
@@ -464,7 +464,7 @@ func TestRunWaveVerificationLoop_RepairDisabled_RecordsBlockerWithHistory(t *tes
 	cfg.Verification.QualityCommands = []policy.QualityCommand{qualityCmd("false")}
 	cfg.Policy.MaxWaveRepairCycles = 0
 
-	err := runWaveVerificationLoop(context.Background(), makeEpicReq(repoRoot, adapter), cfg, wave, wavePath, nil)
+	err := runWaveVerificationLoop(context.Background(), makeEpicReq(repoRoot, adapter), cfg, wave, wavePath, nil, "")
 	if err == nil {
 		t.Fatal("expected error when repair is disabled and checks fail")
 	}
