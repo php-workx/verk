@@ -307,6 +307,305 @@ func prepareWaveWorktrees(ctx context.Context, repoRoot, baseRef, runID, workRoo
 	return manager, nil
 }
 
+type WaveIntegrationManager struct {
+	repoRoot     string
+	runID        string
+	baseRef      string
+	worktreePath string
+}
+
+func integrationBaseRef(runID string) string {
+	return fmt.Sprintf("refs/verk/runs/%s/base", strings.TrimSpace(runID))
+}
+
+func integrationTicketRef(runID, ticketID string) string {
+	return fmt.Sprintf("refs/verk/runs/%s/tickets/%s", strings.TrimSpace(runID), strings.TrimSpace(ticketID))
+}
+
+func ensureIntegrationBaseRef(repoRoot, runID, baseCommit string) (string, error) {
+	refName := integrationBaseRef(runID)
+	if _, err := gitRevParse(repoRoot, refName); err == nil {
+		return refName, nil
+	}
+	if err := gitUpdateRef(repoRoot, refName, baseCommit); err != nil {
+		return "", fmt.Errorf("initialize integration base ref %q at %q: %w", refName, baseCommit, err)
+	}
+	return refName, nil
+}
+
+func prepareWaveIntegration(ctx context.Context, repoRoot, runID, workRoot, baseRef string) (*WaveIntegrationManager, error) {
+	if strings.TrimSpace(workRoot) == "" {
+		resolvedRoot, err := ResolveWorktreeRoot(repoRoot)
+		if err != nil {
+			return nil, err
+		}
+		workRoot = resolvedRoot
+	}
+	refName, err := ensureIntegrationBaseRef(repoRoot, runID, baseRef)
+	if err != nil {
+		return nil, err
+	}
+
+	repo, err := git.New(repoRoot)
+	if err != nil {
+		return nil, fmt.Errorf("open repo root %q: %w", repoRoot, err)
+	}
+	worktreePath := filepath.Join(workRoot, runID, "_integration")
+	if err := repo.RemoveWorktree(worktreePath); err != nil && !worktreePathMissing(worktreePath) {
+		return nil, fmt.Errorf("reset integration worktree %q: %w", worktreePath, err)
+	}
+	if err := repo.CreateWorktree(ctx, refName, worktreePath); err != nil {
+		return nil, fmt.Errorf("create integration worktree %q from %q: %w", worktreePath, refName, err)
+	}
+	if err := establishWorktreeVerkSymlink(worktreePath, repoRoot); err != nil {
+		_ = repo.RemoveWorktree(worktreePath)
+		return nil, fmt.Errorf("link integration .verk symlink: %w", err)
+	}
+	return &WaveIntegrationManager{
+		repoRoot:     strings.TrimSpace(repoRoot),
+		runID:        strings.TrimSpace(runID),
+		baseRef:      refName,
+		worktreePath: worktreePath,
+	}, nil
+}
+
+func (m *WaveIntegrationManager) WorktreePath() string {
+	if m == nil {
+		return ""
+	}
+	return m.worktreePath
+}
+
+func (m *WaveIntegrationManager) BaseRef() string {
+	if m == nil {
+		return ""
+	}
+	return m.baseRef
+}
+
+func (m *WaveIntegrationManager) Cleanup() error {
+	if m == nil || strings.TrimSpace(m.worktreePath) == "" {
+		return nil
+	}
+	repo, err := git.New(m.repoRoot)
+	if err != nil {
+		return fmt.Errorf("open repo root %q: %w", m.repoRoot, err)
+	}
+	return repo.RemoveWorktree(m.worktreePath)
+}
+
+func (m *WaveIntegrationManager) FreezeAcceptedTicket(ticketID, worktreePath string, changedFiles []string) (string, error) {
+	if m == nil {
+		return "", fmt.Errorf("wave integration manager is nil")
+	}
+	if strings.TrimSpace(worktreePath) == "" {
+		return "", fmt.Errorf("accepted ticket %q worktree path is required", ticketID)
+	}
+	refName := integrationTicketRef(m.runID, ticketID)
+
+	if len(changedFiles) > 0 {
+		if err := gitAddAllPaths(worktreePath, changedFiles); err != nil {
+			return "", fmt.Errorf("stage accepted ticket %q: %w", ticketID, err)
+		}
+	}
+
+	changes, err := effectiveGitStatusChanges(worktreePath)
+	if err != nil {
+		return "", fmt.Errorf("read accepted ticket %q status: %w", ticketID, err)
+	}
+	if len(changes) > 0 {
+		if err := gitCommitChanges(worktreePath, fmt.Sprintf("verk: freeze %s", ticketID)); err != nil {
+			return "", fmt.Errorf("commit accepted ticket %q: %w", ticketID, err)
+		}
+	}
+
+	head, err := gitRevParse(worktreePath, "HEAD")
+	if err != nil {
+		return "", fmt.Errorf("resolve accepted ticket %q head: %w", ticketID, err)
+	}
+	if err := gitUpdateRef(m.repoRoot, refName, head); err != nil {
+		return "", fmt.Errorf("update accepted ticket ref %q: %w", refName, err)
+	}
+	return refName, nil
+}
+
+func (m *WaveIntegrationManager) ApplyAcceptedTicketRefs(ctx context.Context, refs []string) error {
+	if m == nil {
+		return fmt.Errorf("wave integration manager is nil")
+	}
+	if len(refs) == 0 {
+		return nil
+	}
+	args := make([]string, 0, 4+len(refs))
+	args = append(args, "-C", m.worktreePath, "cherry-pick", "--no-commit")
+	args = append(args, refs...)
+	cmd := exec.CommandContext(ctx, "git", args...)
+	cmd.Env = engineGitEnv()
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		msg := strings.TrimSpace(string(bytes.TrimSpace(out)))
+		if msg != "" {
+			return fmt.Errorf("apply accepted ticket refs: %w: %s", err, msg)
+		}
+		return fmt.Errorf("apply accepted ticket refs: %w", err)
+	}
+	return nil
+}
+
+func (m *WaveIntegrationManager) ApplyToMain(changedFiles []string) error {
+	if m == nil {
+		return fmt.Errorf("wave integration manager is nil")
+	}
+	if len(changedFiles) == 0 {
+		return nil
+	}
+	manager := &WorktreeManager{
+		mainRoot:  m.repoRoot,
+		worktrees: map[string]string{"integration": m.worktreePath},
+	}
+	if err := manager.MergeToMain("integration"); err != nil {
+		return err
+	}
+	if err := gitAddAllPaths(m.repoRoot, changedFiles); err != nil {
+		return fmt.Errorf("stage integrated wave changes in main tree: %w", err)
+	}
+	return nil
+}
+
+func (m *WaveIntegrationManager) CommitWave(waveID string) (string, error) {
+	if m == nil {
+		return "", fmt.Errorf("wave integration manager is nil")
+	}
+	changes, err := effectiveGitStatusChanges(m.worktreePath)
+	if err != nil {
+		return "", fmt.Errorf("read integration status for %s: %w", waveID, err)
+	}
+	if len(changes) > 0 {
+		if err := gitCommitChanges(m.worktreePath, fmt.Sprintf("verk: integrate %s", waveID)); err != nil {
+			return "", fmt.Errorf("commit integrated wave %s: %w", waveID, err)
+		}
+	}
+	head, err := gitRevParse(m.worktreePath, "HEAD")
+	if err != nil {
+		return "", fmt.Errorf("resolve integration head for %s: %w", waveID, err)
+	}
+	if err := gitUpdateRef(m.repoRoot, m.baseRef, head); err != nil {
+		return "", fmt.Errorf("advance integration base ref %q: %w", m.baseRef, err)
+	}
+	return head, nil
+}
+
+func assertMainTreeMatchesWaveBase(repoRoot, baseRef string) error {
+	repo, err := git.New(repoRoot)
+	if err != nil {
+		return fmt.Errorf("open repo root %q: %w", repoRoot, err)
+	}
+	changed, err := repo.ChangedFilesAgainst(baseRef)
+	if err != nil {
+		return fmt.Errorf("compare main tree against wave base %q: %w", baseRef, err)
+	}
+	effective := filterEngineOwnedFilesInternal(changed)
+	if len(effective) == 0 {
+		return nil
+	}
+	limit := effective
+	if len(limit) > 8 {
+		limit = append(append([]string(nil), effective[:8]...), fmt.Sprintf("... (%d more)", len(effective)-8))
+	}
+	return fmt.Errorf("dirty main tree relative to wave base %s: %s", strings.TrimSpace(baseRef), strings.Join(limit, ", "))
+}
+
+func effectiveGitStatusChanges(worktreePath string) ([]mergeToMainChange, error) {
+	rawStatus, err := gitStatusPorcelainV2(worktreePath)
+	if err != nil {
+		return nil, err
+	}
+	changes, err := parsePorcelainToMergeChanges(rawStatus)
+	if err != nil {
+		return nil, err
+	}
+	return filterSyntheticWorktreeChanges(changes), nil
+}
+
+func gitAddAllPaths(worktreePath string, paths []string) error {
+	if len(paths) == 0 {
+		return nil
+	}
+	args := make([]string, 0, 5+len(paths))
+	args = append(args, "-C", worktreePath, "add", "-A", "--")
+	args = append(args, paths...)
+	cmd := exec.Command("git", args...)
+	cmd.Env = engineGitEnv()
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		msg := strings.TrimSpace(string(bytes.TrimSpace(out)))
+		if msg != "" {
+			return fmt.Errorf("git add tracked paths: %w: %s", err, msg)
+		}
+		return fmt.Errorf("git add tracked paths: %w", err)
+	}
+	return nil
+}
+
+func gitCommitChanges(worktreePath, message string) error {
+	cmd := exec.Command("git", "-C", worktreePath, "commit", "-m", message)
+	cmd.Env = engineGitEnv()
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		msg := strings.TrimSpace(string(bytes.TrimSpace(out)))
+		if msg != "" {
+			return fmt.Errorf("git commit: %w: %s", err, msg)
+		}
+		return fmt.Errorf("git commit: %w", err)
+	}
+	return nil
+}
+
+func gitRevParse(worktreePath, ref string) (string, error) {
+	out, err := exec.Command("git", "-C", worktreePath, "rev-parse", "--verify", ref+"^{commit}").CombinedOutput()
+	if err != nil {
+		msg := strings.TrimSpace(string(bytes.TrimSpace(out)))
+		if msg != "" {
+			return "", fmt.Errorf("git rev-parse %s: %w: %s", ref, err, msg)
+		}
+		return "", fmt.Errorf("git rev-parse %s: %w", ref, err)
+	}
+	return strings.TrimSpace(string(out)), nil
+}
+
+func gitUpdateRef(repoRoot, refName, commitish string) error {
+	cmd := exec.Command("git", "-C", repoRoot, "update-ref", refName, commitish)
+	cmd.Env = engineGitEnv()
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		msg := strings.TrimSpace(string(bytes.TrimSpace(out)))
+		if msg != "" {
+			return fmt.Errorf("git update-ref %s %s: %w: %s", refName, commitish, err, msg)
+		}
+		return fmt.Errorf("git update-ref %s %s: %w", refName, commitish, err)
+	}
+	return nil
+}
+
+func persistWorktreeDiff(repoRoot, runID, ticketID, diff string) (string, error) {
+	if strings.TrimSpace(diff) == "" {
+		return "", nil
+	}
+	diffPath := filepath.Join(repoRoot, ".verk", "runs", runID, "tickets", ticketID, "worktree.diff")
+	if err := os.MkdirAll(filepath.Dir(diffPath), 0o755); err != nil {
+		return "", fmt.Errorf("create diff artifact dir: %w", err)
+	}
+	if err := os.WriteFile(diffPath, []byte(diff), 0o644); err != nil {
+		return "", fmt.Errorf("write diff artifact %q: %w", diffPath, err)
+	}
+	return diffPath, nil
+}
+
+func worktreePathMissing(path string) bool {
+	_, err := os.Stat(path)
+	return err != nil && os.IsNotExist(err)
+}
+
 func changedFilesFromManager(manager *WorktreeManager, ticketIDs []string) ([]string, error) {
 	if manager == nil {
 		return nil, nil

@@ -483,6 +483,7 @@ func resumeEpicMode(ctx context.Context, req ResumeRequest, artifacts *runArtifa
 		wg.Wait()
 
 		ticketPhases := make([]state.TicketPhase, len(outcomes))
+		allClosed := true
 		waveFailed := false
 		var waveErr error
 		var conflictErr error
@@ -503,6 +504,9 @@ func resumeEpicMode(ctx context.Context, req ResumeRequest, artifacts *runArtifa
 		}
 		for i, outcome := range outcomes {
 			ticketPhases[i] = outcome.phase
+			if outcome.phase != state.TicketPhaseClosed {
+				allClosed = false
+			}
 			if outcome.err != nil {
 				waveFailed = true
 				if waveErr == nil {
@@ -565,6 +569,9 @@ func resumeEpicMode(ctx context.Context, req ResumeRequest, artifacts *runArtifa
 				acceptedWave.Acceptance["crash_reason"] = waveErr.Error()
 			}
 		}
+		if !allClosed && acceptedWave.Status == state.WaveStatusAccepted {
+			acceptedWave.Status = state.WaveStatusFailed
+		}
 		if acceptedWave.Acceptance == nil {
 			acceptedWave.Acceptance = map[string]any{}
 		}
@@ -577,6 +584,9 @@ func resumeEpicMode(ctx context.Context, req ResumeRequest, artifacts *runArtifa
 		if err := state.SaveJSONAtomic(wavePath, acceptedWave); err != nil {
 			cleanupWaveManager()
 			return allResumed, err
+		}
+		if !allClosed && !waveFailed {
+			waveFailed = true
 		}
 		closedCount := countClosedTickets(outcomes)
 		blockedIDs := collectBlockedTicketIDs(outcomes)
@@ -620,7 +630,7 @@ func resumeEpicMode(ctx context.Context, req ResumeRequest, artifacts *runArtifa
 				cleanupWaveManager()
 				return allResumed, err
 			}
-			if verifyErr := runWaveVerificationLoop(ctx, epicReq, cfg, &acceptedWave, wavePath, changedFiles); verifyErr != nil {
+			if verifyErr := runWaveVerificationLoop(ctx, epicReq, cfg, &acceptedWave, wavePath, changedFiles, epicReq.WorktreePath); verifyErr != nil {
 				if clearErr := clearPendingWaveVerificationOnTerminalFailure(artifacts.Run.ResumeCursor, runPath, &artifacts.Run, &acceptedWave); clearErr != nil {
 					cleanupWaveManager()
 					return allResumed, errors.Join(verifyErr, fmt.Errorf("clear terminal pending wave verification: %w", clearErr))

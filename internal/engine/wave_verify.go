@@ -35,7 +35,11 @@ func runWaveVerificationLoop(
 	wave *state.WaveArtifact,
 	wavePath string,
 	changedFiles []string,
+	workDir string,
 ) error {
+	if strings.TrimSpace(workDir) == "" {
+		workDir = req.RepoRoot
+	}
 	plan := waveDerivationPlan(*wave, changedFiles)
 	derivation := DeriveChecks(DeriveChecksInput{
 		Plan:                   plan,
@@ -59,7 +63,7 @@ func runWaveVerificationLoop(
 	wave.ValidationCoverage = coverage
 	syncWaveAcceptanceFromCoverage(wave, coverage)
 
-	qualityResults, derivedResults, err := executeWaveChecks(ctx, req.RepoRoot, cfg.Verification, waveCommands, derivedChecks)
+	qualityResults, derivedResults, err := executeWaveChecks(ctx, req.RepoRoot, workDir, cfg.Verification, waveCommands, derivedChecks)
 	if err != nil {
 		return fmt.Errorf("wave verification: run checks: %w", err)
 	}
@@ -120,7 +124,7 @@ func runWaveVerificationLoop(
 			Runtime:         workerProfile.Runtime,
 			Model:           workerProfile.Model,
 			Reasoning:       workerProfile.Reasoning,
-			WorktreePath:    req.RepoRoot,
+			WorktreePath:    workDir,
 			Instructions:    instructions,
 			ExecutionConfig: executionConfigFromPolicy(cfg),
 			OnProgress: func(detail string) {
@@ -144,7 +148,7 @@ func runWaveVerificationLoop(
 		// Re-run only the previously failing derived checks plus the configured
 		// wave gate, not the entire derived set.
 		retryDerivedChecks := derivedChecksByIDs(derivedChecks, failingIDs)
-		qualityResults, derivedResults, err = executeWaveChecks(ctx, req.RepoRoot, cfg.Verification, waveCommands, retryDerivedChecks)
+		qualityResults, derivedResults, err = executeWaveChecks(ctx, req.RepoRoot, workDir, cfg.Verification, waveCommands, retryDerivedChecks)
 		if err != nil {
 			return fmt.Errorf("wave verification: run checks after repair cycle %d: %w", cycle, err)
 		}
@@ -358,13 +362,14 @@ func buildWaveQualityChecks(runID, waveID string, cmds []policy.QualityCommand) 
 func executeWaveChecks(
 	ctx context.Context,
 	repoRoot string,
+	workDir string,
 	cfg policy.VerificationConfig,
 	waveCommands []policy.QualityCommand,
 	derivedChecks []state.ValidationCheck,
 ) ([]verifycommand.CommandResult, map[string]verifycommand.CommandResult, error) {
 	var qualityResults []verifycommand.CommandResult
 	if len(waveCommands) > 0 {
-		results, err := verifycommand.RunQualityCommands(ctx, repoRoot, "", waveCommands, cfg)
+		results, err := verifycommand.RunQualityCommands(ctx, repoRoot, workDir, waveCommands, cfg)
 		if err != nil {
 			return nil, nil, fmt.Errorf("run wave gate commands: %w", err)
 		}
@@ -384,7 +389,7 @@ func executeWaveChecks(
 			ids = append(ids, c.ID)
 		}
 		if len(commands) > 0 {
-			results, err := verifycommand.RunCommands(ctx, repoRoot, "", commands, cfg)
+			results, err := verifycommand.RunCommands(ctx, repoRoot, workDir, commands, cfg)
 			if err != nil {
 				return nil, nil, fmt.Errorf("run derived wave checks: %w", err)
 			}
@@ -922,7 +927,7 @@ func resumePendingWaveVerification(
 		Detail:   fmt.Sprintf("re-running wave verification for %s", pendingWaveID),
 	})
 
-	if err := runWaveVerificationLoop(ctx, req, cfg, &pendingWave, wavePath, pendingWave.ActualScope); err != nil {
+	if err := runWaveVerificationLoop(ctx, req, cfg, &pendingWave, wavePath, pendingWave.ActualScope, req.WorktreePath); err != nil {
 		if clearErr := clearPendingWaveVerificationOnTerminalFailure(cursor, runPath, run, &pendingWave); clearErr != nil {
 			return errors.Join(err, fmt.Errorf("clear terminal pending wave verification: %w", clearErr))
 		}
