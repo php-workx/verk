@@ -500,24 +500,26 @@ func handleImplementResult(st *ticketRunState, result runtime.WorkerResult, req 
 			CreatedAt:     stateTime(),
 			UpdatedAt:     stateTime(),
 		},
-		TicketID:          st.req.Ticket.ID,
-		Attempt:           st.implementationAttempts,
-		Runtime:           attemptRuntime,
-		Model:             strings.TrimSpace(req.Model),
-		Reasoning:         strings.TrimSpace(req.Reasoning),
-		FallbackReason:    strings.TrimSpace(req.FallbackReason),
-		Status:            string(result.Status),
-		CompletionCode:    result.CompletionCode,
-		RetryClass:        result.RetryClass,
-		Concerns:          result.Concerns,
-		LeaseID:           result.LeaseID,
-		InputArtifactPath: req.InputArtifactPath,
-		StartedAt:         result.StartedAt,
-		FinishedAt:        result.FinishedAt,
-		Artifacts:         compactStrings([]string{result.StdoutPath, result.StderrPath, result.ResultArtifactPath}),
-		TokenUsage:        cloneRuntimeTokenUsage(result.TokenUsage),
-		ActivityStats:     cloneRuntimeActivityStats(result.ActivityStats),
-		ChangedFiles:      []string{},
+		TicketID:              st.req.Ticket.ID,
+		Attempt:               st.implementationAttempts,
+		Runtime:               attemptRuntime,
+		Model:                 strings.TrimSpace(req.Model),
+		Reasoning:             strings.TrimSpace(req.Reasoning),
+		FallbackReason:        strings.TrimSpace(req.FallbackReason),
+		Status:                string(result.Status),
+		CompletionCode:        result.CompletionCode,
+		RetryClass:            result.RetryClass,
+		Concerns:              result.Concerns,
+		LeaseID:               result.LeaseID,
+		InputArtifactPath:     req.InputArtifactPath,
+		StartedAt:             result.StartedAt,
+		FinishedAt:            result.FinishedAt,
+		Artifacts:             compactStrings([]string{result.StdoutPath, result.StderrPath, result.ResultArtifactPath}),
+		TokenUsage:            cloneRuntimeTokenUsage(result.TokenUsage),
+		ActivityStats:         cloneRuntimeActivityStats(result.ActivityStats),
+		RawChangedFiles:       []string{},
+		EffectiveChangedFiles: []string{},
+		ChangedFiles:          []string{},
 	}
 
 	switch result.Status {
@@ -527,11 +529,14 @@ func handleImplementResult(st *ticketRunState, result runtime.WorkerResult, req 
 		}
 		st.blockReason = ""
 		st.implementation.BlockReason = ""
-		changedFiles, err := collectChangedFiles(st.worktreePath, st.req.BaseCommit)
+		rawChangedFiles, err := collectRawChangedFiles(st.worktreePath, st.req.BaseCommit)
 		if err != nil {
 			return fmt.Errorf("collect changed files: %w", err)
 		}
-		st.implementation.ChangedFiles = changedFiles
+		effectiveChangedFiles := filterEngineOwnedFiles(rawChangedFiles)
+		st.implementation.RawChangedFiles = rawChangedFiles
+		st.implementation.EffectiveChangedFiles = effectiveChangedFiles
+		st.implementation.ChangedFiles = effectiveChangedFiles
 	case runtime.WorkerStatusNeedsContext, runtime.WorkerStatusBlocked:
 		reason := workerBlockReason(result)
 		st.blockReason = reason
@@ -655,7 +660,17 @@ func collectDiff(repoRoot, baseCommit string) (string, error) {
 	return diff, nil
 }
 
+//nolint:unparam // retained as the backward-compatible filtered helper used by tests
 func collectChangedFiles(repoRoot, baseCommit string) ([]string, error) {
+	files, err := collectRawChangedFiles(repoRoot, baseCommit)
+	if err != nil {
+		return nil, err
+	}
+	filtered := filterEngineOwnedFiles(files)
+	return filtered, nil
+}
+
+func collectRawChangedFiles(repoRoot, baseCommit string) ([]string, error) {
 	baseCommit = strings.TrimSpace(baseCommit)
 	if baseCommit == "" {
 		return nil, nil
@@ -668,8 +683,7 @@ func collectChangedFiles(repoRoot, baseCommit string) ([]string, error) {
 	if err != nil {
 		return nil, fmt.Errorf("collect changed files against %s: %w", baseCommit, err)
 	}
-	filtered := filterEngineOwnedFiles(files)
-	return filtered, nil
+	return dedupeAndSortChanged(files), nil
 }
 
 func handleVerificationFailure(st *ticketRunState, verification state.VerificationArtifact) error {

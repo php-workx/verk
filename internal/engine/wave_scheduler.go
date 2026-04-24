@@ -13,6 +13,7 @@ import (
 type WaveAcceptanceRequest struct {
 	Wave                 state.WaveArtifact
 	TicketPhases         []state.TicketPhase
+	RawChangedFiles      []string
 	ChangedFiles         []string
 	TicketScopes         map[string][]string // ticket ID -> owned paths for per-ticket scope validation
 	ClaimsReleased       bool
@@ -162,6 +163,10 @@ func AcceptWave(req WaveAcceptanceRequest) (state.WaveArtifact, error) {
 	wave.Acceptance["claims_released"] = req.ClaimsReleased
 	wave.Acceptance["persistence_succeeded"] = req.PersistenceSucceeded
 	wave.Acceptance["ticket_count"] = len(wave.TicketIDs)
+	if len(req.RawChangedFiles) > 0 {
+		wave.Acceptance["changed_files_raw"] = append([]string(nil), uniqueSorted(req.RawChangedFiles)...)
+	}
+	wave.Acceptance["changed_files_effective"] = append([]string(nil), uniqueSorted(req.ChangedFiles)...)
 
 	// Hard failures — these indicate structural problems that prevent
 	// the wave from being meaningfully accepted.

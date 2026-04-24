@@ -156,26 +156,28 @@ type PlanCriterion struct {
 
 type ImplementationArtifact struct {
 	ArtifactMeta
-	TicketID          string                `json:"ticket_id"`
-	Attempt           int                   `json:"attempt"`
-	Runtime           string                `json:"runtime"`
-	Model             string                `json:"model,omitempty"`
-	Reasoning         string                `json:"reasoning,omitempty"`
-	FallbackReason    string                `json:"fallback_reason,omitempty"`
-	Status            string                `json:"status"`
-	CompletionCode    string                `json:"completion_code"`
-	RetryClass        RetryClass            `json:"retry_class"`
-	Concerns          []string              `json:"concerns"`
-	FailureReason     string                `json:"failure_reason"`
-	BlockReason       string                `json:"block_reason"`
-	ChangedFiles      []string              `json:"changed_files"`
-	Artifacts         []string              `json:"artifacts"`
-	TokenUsage        *RuntimeTokenUsage    `json:"token_usage,omitempty"`
-	ActivityStats     *RuntimeActivityStats `json:"activity_stats,omitempty"`
-	LeaseID           string                `json:"lease_id"`
-	InputArtifactPath string                `json:"input_artifact_path,omitempty"`
-	StartedAt         time.Time             `json:"started_at"`
-	FinishedAt        time.Time             `json:"finished_at"`
+	TicketID              string                `json:"ticket_id"`
+	Attempt               int                   `json:"attempt"`
+	Runtime               string                `json:"runtime"`
+	Model                 string                `json:"model,omitempty"`
+	Reasoning             string                `json:"reasoning,omitempty"`
+	FallbackReason        string                `json:"fallback_reason,omitempty"`
+	Status                string                `json:"status"`
+	CompletionCode        string                `json:"completion_code"`
+	RetryClass            RetryClass            `json:"retry_class"`
+	Concerns              []string              `json:"concerns"`
+	FailureReason         string                `json:"failure_reason"`
+	BlockReason           string                `json:"block_reason"`
+	RawChangedFiles       []string              `json:"raw_changed_files,omitempty"`
+	EffectiveChangedFiles []string              `json:"effective_changed_files,omitempty"`
+	ChangedFiles          []string              `json:"changed_files"`
+	Artifacts             []string              `json:"artifacts"`
+	TokenUsage            *RuntimeTokenUsage    `json:"token_usage,omitempty"`
+	ActivityStats         *RuntimeActivityStats `json:"activity_stats,omitempty"`
+	LeaseID               string                `json:"lease_id"`
+	InputArtifactPath     string                `json:"input_artifact_path,omitempty"`
+	StartedAt             time.Time             `json:"started_at"`
+	FinishedAt            time.Time             `json:"finished_at"`
 }
 
 type RuntimeTokenUsage struct {

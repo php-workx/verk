@@ -376,15 +376,16 @@ func RunEpic(ctx context.Context, req RunEpicRequest) (RunEpicResult, error) { /
 			Tickets: append([]string(nil), wave.TicketIDs...),
 		})
 
-		waveBaselineChangedFiles, err := repo.ChangedFilesAgainst(baseCommit)
+		waveBaselineRawChangedFiles, err := repo.ChangedFilesAgainst(baseCommit)
 		if err != nil {
 			return result, err
 		}
-		waveBaselineChangedFiles = filterEngineOwnedFiles(waveBaselineChangedFiles)
+		waveBaselineChangedFiles := filterEngineOwnedFiles(waveBaselineRawChangedFiles)
 		if result.Run.ResumeCursor == nil {
 			result.Run.ResumeCursor = map[string]any{}
 		}
 		result.Run.ResumeCursor["wave_baseline_changed_files"] = append([]string(nil), waveBaselineChangedFiles...)
+		result.Run.ResumeCursor["wave_baseline_raw_changed_files"] = append([]string(nil), waveBaselineRawChangedFiles...)
 
 		waveManager, err := prepareWaveWorktrees(ctx, req.RepoRoot, wave.WaveBaseCommit, req.RunID, req.WorktreeRoot, wave.TicketIDs)
 		if err != nil {
@@ -462,17 +463,26 @@ func RunEpic(ctx context.Context, req RunEpicRequest) (RunEpicResult, error) { /
 			}
 		}
 
+		var rawChangedFiles []string
 		var changedFiles []string
 		if waveManager != nil {
+			rawChangedFiles, err = rawChangedFilesFromManager(waveManager, wave.TicketIDs)
+			if err != nil {
+				return result, err
+			}
 			changedFiles, err = changedFilesFromManager(waveManager, wave.TicketIDs)
 		} else {
-			changedFiles, err = repo.ChangedFilesAgainst(baseCommit)
+			rawChangedFiles, err = repo.ChangedFilesAgainst(baseCommit)
+			if err == nil {
+				changedFiles = append([]string(nil), rawChangedFiles...)
+			}
 		}
 		if err != nil {
 			return result, err
 		}
 		changedFiles = filterEngineOwnedFiles(changedFiles)
 		changedFiles = subtractFiles(changedFiles, waveBaselineChangedFiles)
+		rawChangedFiles = subtractFiles(rawChangedFiles, waveBaselineRawChangedFiles)
 
 		claimsReleased, err := waveClaimsReleased(req.RepoRoot, req.RunID, wave.TicketIDs)
 		if err != nil {
@@ -483,6 +493,7 @@ func RunEpic(ctx context.Context, req RunEpicRequest) (RunEpicResult, error) { /
 		acceptedWave, acceptErr := AcceptWave(WaveAcceptanceRequest{
 			Wave:                 wave,
 			TicketPhases:         ticketPhases,
+			RawChangedFiles:      rawChangedFiles,
 			ChangedFiles:         changedFiles,
 			TicketScopes:         ticketScopes,
 			ClaimsReleased:       claimsReleased,
@@ -495,6 +506,7 @@ func RunEpic(ctx context.Context, req RunEpicRequest) (RunEpicResult, error) { /
 				if acceptedWave.Acceptance == nil {
 					acceptedWave.Acceptance = map[string]any{}
 				}
+				acceptedWave.Acceptance["conflict_scope"] = "deliverable"
 				acceptedWave.Acceptance["intra_wave_conflicts"] = conflictErr.(*IntraWaveConflictError).Conflicts
 			}
 			if acceptedWave.Acceptance == nil {
@@ -508,6 +520,7 @@ func RunEpic(ctx context.Context, req RunEpicRequest) (RunEpicResult, error) { /
 			acceptedWave.Acceptance = map[string]any{}
 		}
 		acceptedWave.Acceptance["baseline_changed_files"] = append([]string(nil), waveBaselineChangedFiles...)
+		acceptedWave.Acceptance["baseline_raw_changed_files"] = append([]string(nil), waveBaselineRawChangedFiles...)
 		acceptedWave.UpdatedAt = time.Now().UTC()
 		if acceptedWave.FinishedAt.IsZero() {
 			acceptedWave.FinishedAt = acceptedWave.UpdatedAt

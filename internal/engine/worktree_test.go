@@ -724,6 +724,100 @@ func TestWorktreeManager_ChangedFilesFiltersEngineOwned(t *testing.T) {
 	}
 }
 
+func TestWorktreeManager_ChangedFilesFiltersNonDeliverablePathsButRawPreservesThem(t *testing.T) {
+	mainRoot := t.TempDir()
+	baseCommit := initEpicRepo(t, mainRoot)
+	manager := NewWorktreeManager(mainRoot, baseCommit, "run-nondeliverable", t.TempDir())
+	path, err := manager.CreateWorktree(context.Background(), "ticket-nondeliverable")
+	if err != nil {
+		t.Fatalf("CreateWorktree: %v", err)
+	}
+
+	if err := os.WriteFile(filepath.Join(path, "tracked.txt"), []byte("changed\n"), 0o644); err != nil {
+		t.Fatalf("edit tracked file in worktree: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(path, ".gocache"), 0o755); err != nil {
+		t.Fatalf("prepare go cache dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(path, ".gocache", "cache.txt"), []byte("cache\n"), 0o644); err != nil {
+		t.Fatalf("write go cache file: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(path, ".pytest_cache"), 0o755); err != nil {
+		t.Fatalf("prepare pytest cache dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(path, ".pytest_cache", "state"), []byte("state\n"), 0o644); err != nil {
+		t.Fatalf("write pytest cache file: %v", err)
+	}
+
+	rawChanged, err := manager.RawChangedFiles("ticket-nondeliverable")
+	if err != nil {
+		t.Fatalf("RawChangedFiles: %v", err)
+	}
+	if !contains(rawChanged, ".gocache/cache.txt") {
+		t.Fatalf("expected raw changed files to include go cache path, got %v", rawChanged)
+	}
+	if !contains(rawChanged, ".pytest_cache/state") {
+		t.Fatalf("expected raw changed files to include pytest cache path, got %v", rawChanged)
+	}
+
+	changed, err := manager.ChangedFiles("ticket-nondeliverable")
+	if err != nil {
+		t.Fatalf("ChangedFiles: %v", err)
+	}
+	if contains(changed, ".gocache/cache.txt") {
+		t.Fatalf("expected go cache path filtered from deliverable changes, got %v", changed)
+	}
+	if contains(changed, ".pytest_cache/state") {
+		t.Fatalf("expected pytest cache path filtered from deliverable changes, got %v", changed)
+	}
+	if !contains(changed, "tracked.txt") {
+		t.Fatalf("expected tracked.txt in deliverable changes, got %v", changed)
+	}
+}
+
+func TestWorktreeManager_DetectConflictsIgnoresNonDeliverableOverlap(t *testing.T) {
+	mainRoot := t.TempDir()
+	baseCommit := initEpicRepo(t, mainRoot)
+	manager := NewWorktreeManager(mainRoot, baseCommit, "run-conflict-filter", t.TempDir())
+
+	pathA, err := manager.CreateWorktree(context.Background(), "ticket-a")
+	if err != nil {
+		t.Fatalf("CreateWorktree ticket-a: %v", err)
+	}
+	pathB, err := manager.CreateWorktree(context.Background(), "ticket-b")
+	if err != nil {
+		t.Fatalf("CreateWorktree ticket-b: %v", err)
+	}
+
+	if err := os.MkdirAll(filepath.Join(pathA, ".gocache"), 0o755); err != nil {
+		t.Fatalf("prepare go cache dir ticket-a: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(pathA, ".gocache", "shared"), []byte("a\n"), 0o644); err != nil {
+		t.Fatalf("write go cache file ticket-a: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(pathA, "ticket-a.txt"), []byte("a\n"), 0o644); err != nil {
+		t.Fatalf("write deliverable file ticket-a: %v", err)
+	}
+
+	if err := os.MkdirAll(filepath.Join(pathB, ".gocache"), 0o755); err != nil {
+		t.Fatalf("prepare go cache dir ticket-b: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(pathB, ".gocache", "shared"), []byte("b\n"), 0o644); err != nil {
+		t.Fatalf("write go cache file ticket-b: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(pathB, "ticket-b.txt"), []byte("b\n"), 0o644); err != nil {
+		t.Fatalf("write deliverable file ticket-b: %v", err)
+	}
+
+	conflicts, err := manager.DetectConflicts()
+	if err != nil {
+		t.Fatalf("DetectConflicts: %v", err)
+	}
+	if len(conflicts) != 0 {
+		t.Fatalf("expected non-deliverable overlap to be ignored, got conflicts %#v", conflicts)
+	}
+}
+
 func TestWorktreeManager_Diff(t *testing.T) {
 	mainRoot := t.TempDir()
 	baseCommit := initEpicRepo(t, mainRoot)

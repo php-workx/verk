@@ -647,6 +647,10 @@ func TestResumeRun_BlockedTicketIsReset_EpicMode(t *testing.T) {
 	repoRoot := t.TempDir()
 	baseCommit := initEpicRepo(t, repoRoot)
 	runID := "run-blocked-reset"
+	worktreeRoot, err := ResolveWorktreeRoot(repoRoot)
+	if err != nil {
+		t.Fatalf("resolve worktree root: %v", err)
+	}
 
 	epic := epicTicket("epic-reset")
 	mustSaveTicket(t, repoRoot, epic)
@@ -738,5 +742,16 @@ func TestResumeRun_BlockedTicketIsReset_EpicMode(t *testing.T) {
 	reqs := adapter.WorkerRequests()
 	if len(reqs) == 0 {
 		t.Error("expected adapter to be called for the re-executed blocked ticket, got 0 calls")
+	}
+	if got := reqs[0].WorktreePath; got == "" {
+		t.Fatal("expected resumed epic ticket to use an isolated worktree path, got empty path")
+	} else {
+		expectedPrefix := filepath.Join(worktreeRoot, runID) + string(filepath.Separator)
+		if !strings.HasPrefix(got, expectedPrefix) {
+			t.Fatalf("expected resumed worktree path under %q, got %q", expectedPrefix, got)
+		}
+		if got == repoRoot {
+			t.Fatalf("expected resumed epic ticket to avoid repo root %q, got %q", repoRoot, got)
+		}
 	}
 }

@@ -137,6 +137,14 @@ func (wm *WorktreeManager) WorktreePath(ticketID string) string {
 }
 
 func (wm *WorktreeManager) ChangedFiles(ticketID string) ([]string, error) {
+	raw, err := wm.RawChangedFiles(ticketID)
+	if err != nil {
+		return nil, err
+	}
+	return dedupeAndSortChanged(filterEngineOwnedFilesInternal(raw)), nil
+}
+
+func (wm *WorktreeManager) RawChangedFiles(ticketID string) ([]string, error) {
 	if wm == nil {
 		return nil, fmt.Errorf("worktree manager is nil")
 	}
@@ -155,7 +163,7 @@ func (wm *WorktreeManager) ChangedFiles(ticketID string) ([]string, error) {
 	if err != nil {
 		return nil, fmt.Errorf("collect changed files in %q against %q: %w", worktreePath, wm.baseRef, err)
 	}
-	return dedupeAndSortChanged(filterEngineOwnedFilesInternal(changed)), nil
+	return dedupeAndSortChanged(changed), nil
 }
 
 func (wm *WorktreeManager) DetectConflicts() ([]Conflict, error) {
@@ -306,6 +314,21 @@ func changedFilesFromManager(manager *WorktreeManager, ticketIDs []string) ([]st
 	all := make([]string, 0)
 	for _, ticketID := range ticketIDs {
 		changed, err := manager.ChangedFiles(ticketID)
+		if err != nil {
+			return nil, err
+		}
+		all = append(all, changed...)
+	}
+	return dedupeAndSortChanged(all), nil
+}
+
+func rawChangedFilesFromManager(manager *WorktreeManager, ticketIDs []string) ([]string, error) {
+	if manager == nil {
+		return nil, nil
+	}
+	all := make([]string, 0)
+	for _, ticketID := range ticketIDs {
+		changed, err := manager.RawChangedFiles(ticketID)
 		if err != nil {
 			return nil, err
 		}
@@ -595,6 +618,32 @@ func isEngineOwned(path string) bool {
 	default:
 		return false
 	}
+}
+
+func isNonDeliverablePath(path string) bool {
+	if isEngineOwned(path) {
+		return true
+	}
+	segments := pathSegments(strings.TrimSpace(path))
+	if len(segments) == 0 {
+		return false
+	}
+
+	switch segments[0] {
+	case ".gocache", ".pytest_cache", ".ruff_cache", ".mypy_cache", ".tox", ".nox", ".parcel-cache", ".turbo", ".gradle":
+		return true
+	case ".next":
+		return len(segments) > 1 && segments[1] == "cache"
+	case "node_modules":
+		return len(segments) > 1 && segments[1] == ".cache"
+	}
+
+	base := filepath.Base(filepath.ToSlash(strings.TrimSpace(path)))
+	switch base {
+	case "coverage.out", "coverage.html", ".coverage":
+		return true
+	}
+	return strings.HasPrefix(base, ".coverage.")
 }
 
 type MergeToMainPartialError struct {
@@ -1320,7 +1369,7 @@ func filterEngineOwnedFilesInternal(changed []string) []string {
 	}
 	out := make([]string, 0, len(changed))
 	for _, file := range changed {
-		if isEngineOwned(file) {
+		if isNonDeliverablePath(file) {
 			continue
 		}
 		out = append(out, file)
