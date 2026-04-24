@@ -12,6 +12,7 @@ bin/
 # Coverage
 coverage.out
 coverage.html
+.gocache/
 
 # Secrets
 .env

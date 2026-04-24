@@ -418,6 +418,58 @@ func TestRunWorker_NeedsMoreContextHyphenated(t *testing.T) {
 	}
 }
 
+func TestRunWorker_UsageLimitIsRetryableAndPreservesMessage(t *testing.T) {
+	oldRunCommand := runCommand
+	oldNow := now
+	defer func() {
+		runCommand = oldRunCommand
+		now = oldNow
+	}()
+
+	now = func() time.Time {
+		return time.Date(2026, 4, 23, 16, 2, 1, 0, time.UTC)
+	}
+
+	runCommand = func(ctx context.Context, binary string, args []string, stdin []byte, env []string, workDir string, timeout time.Duration) (commandResult, error) {
+		if workDir != "" {
+			t.Fatalf("expected Codex process workdir to remain unset, got %q", workDir)
+		}
+
+		outputJSON := strings.Join([]string{
+			`{"type":"thread.started","thread_id":"thread-1"}`,
+			`{"type":"turn.started"}`,
+			`{"type":"error","message":"You've hit your usage limit for GPT-5.3-Codex-Spark. Switch to another model now, or try again at Apr 27th, 2026 4:32 PM."}`,
+			`{"type":"turn.failed","error":{"message":"You've hit your usage limit for GPT-5.3-Codex-Spark. Switch to another model now, or try again at Apr 27th, 2026 4:32 PM."}}`,
+		}, "\n")
+		return commandResult{
+			stdout:   []byte(outputJSON),
+			exitCode: 1,
+		}, nil
+	}
+
+	adapter := NewWithCommand("codex-test")
+	result, err := adapter.RunWorker(context.Background(), runtime.WorkerRequest{
+		LeaseID:      "lease-usage-limit",
+		TicketID:     "ticket-usage-limit",
+		WorktreePath: "/tmp/worktree",
+	})
+	if err != nil {
+		t.Fatalf("RunWorker returned error: %v", err)
+	}
+	if result.Status != runtime.WorkerStatusBlocked {
+		t.Fatalf("expected blocked status for usage limit, got %q", result.Status)
+	}
+	if result.RetryClass != runtime.RetryClassRetryable {
+		t.Fatalf("expected retryable retry class for usage limit, got %q", result.RetryClass)
+	}
+	if !strings.Contains(result.BlockReason, "usage limit") {
+		t.Fatalf("expected block reason to contain usage limit message, got %q", result.BlockReason)
+	}
+	if strings.Contains(result.BlockReason, `{"type":"thread.started"}`) {
+		t.Fatalf("expected block reason to surface the Codex error message, got raw event stream %q", result.BlockReason)
+	}
+}
+
 func TestRunWorker_FallbackWhenNoJSON(t *testing.T) {
 	oldRunCommand := runCommand
 	oldNow := now

@@ -79,7 +79,11 @@ func (a *Adapter) CheckAvailability(ctx context.Context) error {
 		ctx = context.Background()
 	}
 
-	result, err := runCommand(ctx, a.binary(), []string{"--version"}, nil, runtimeCommandEnv(runtime.ExecutionConfig{}), "", 0)
+	env, err := runtimeCommandEnv(runtime.ExecutionConfig{}, "")
+	if err != nil {
+		return fmt.Errorf("build %s availability environment: %w", runtimeName, err)
+	}
+	result, err := runCommand(ctx, a.binary(), []string{"--version"}, nil, env, "", 0)
 	if err != nil {
 		return fmt.Errorf("%s availability check failed: %w", runtimeName, err)
 	}
@@ -96,16 +100,19 @@ func (a *Adapter) RunWorker(ctx context.Context, req runtime.WorkerRequest) (run
 
 	req.Runtime = ensureRuntime(req.Runtime, runtimeName)
 	startedAt := now().UTC()
+	env, err := runtimeCommandEnv(req.ExecutionConfig, req.WorktreePath)
+	if err != nil {
+		return runtime.WorkerResult{}, err
+	}
 
-	var err error
 	prompt := runtime.BuildWorkerPrompt(req)
 	args := buildWorkerArgs(req)
 	var execResult commandResult
 	var execErr error
 	if req.OnProgress != nil {
-		execResult, execErr = runStreamingCommand(ctx, a.binary(), args, []byte(prompt), runtimeCommandEnv(req.ExecutionConfig), req.WorktreePath, runtimeCommandTimeout(req.ExecutionConfig.WorkerTimeoutMinutes), req.OnProgress)
+		execResult, execErr = runStreamingCommand(ctx, a.binary(), args, []byte(prompt), env, req.WorktreePath, runtimeCommandTimeout(req.ExecutionConfig.WorkerTimeoutMinutes), req.OnProgress)
 	} else {
-		execResult, execErr = runCommand(ctx, a.binary(), args, []byte(prompt), runtimeCommandEnv(req.ExecutionConfig), req.WorktreePath, runtimeCommandTimeout(req.ExecutionConfig.WorkerTimeoutMinutes))
+		execResult, execErr = runCommand(ctx, a.binary(), args, []byte(prompt), env, req.WorktreePath, runtimeCommandTimeout(req.ExecutionConfig.WorkerTimeoutMinutes))
 	}
 	finishedAt := now().UTC()
 	if execErr != nil {
@@ -170,16 +177,18 @@ func (a *Adapter) RunReviewer(ctx context.Context, req runtime.ReviewRequest) (r
 
 	req.Runtime = ensureRuntime(req.Runtime, runtimeName)
 	startedAt := now().UTC()
-
-	var err error
+	env, err := runtimeCommandEnv(req.ExecutionConfig, req.WorktreePath)
+	if err != nil {
+		return runtime.ReviewResult{}, err
+	}
 	prompt := runtime.BuildReviewPrompt(req)
 	args := buildReviewArgs(req)
 	var execResult commandResult
 	var execErr error
 	if req.OnProgress != nil {
-		execResult, execErr = runStreamingCommand(ctx, a.binary(), args, []byte(prompt), runtimeCommandEnv(req.ExecutionConfig), req.WorktreePath, runtimeCommandTimeout(req.ExecutionConfig.ReviewerTimeoutMinutes), req.OnProgress)
+		execResult, execErr = runStreamingCommand(ctx, a.binary(), args, []byte(prompt), env, req.WorktreePath, runtimeCommandTimeout(req.ExecutionConfig.ReviewerTimeoutMinutes), req.OnProgress)
 	} else {
-		execResult, execErr = runCommand(ctx, a.binary(), args, []byte(prompt), runtimeCommandEnv(req.ExecutionConfig), req.WorktreePath, runtimeCommandTimeout(req.ExecutionConfig.ReviewerTimeoutMinutes))
+		execResult, execErr = runCommand(ctx, a.binary(), args, []byte(prompt), env, req.WorktreePath, runtimeCommandTimeout(req.ExecutionConfig.ReviewerTimeoutMinutes))
 	}
 	finishedAt := now().UTC()
 	if execErr != nil {
@@ -735,8 +744,8 @@ func encodeJSON(file *os.File, payload any) error {
 // Claude Code needs access to auth credentials (keychain, ~/.claude/) which
 // require the ambient environment. Config-specified AuthEnvVars are informational
 // only — they document which vars the runtime expects but don't restrict the env.
-func runtimeCommandEnv(_ runtime.ExecutionConfig) []string {
-	return nil
+func runtimeCommandEnv(_ runtime.ExecutionConfig, worktreePath string) ([]string, error) {
+	return runtime.BuildIsolatedProcessEnv(os.Environ(), worktreePath)
 }
 
 func runtimeCommandTimeout(minutes int) time.Duration {

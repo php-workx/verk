@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	runtimeenv "verk/internal/adapters/runtime"
 	"verk/internal/policy"
 )
 
@@ -304,6 +305,38 @@ func TestRunCommands_DefaultEnvIncludesPath(t *testing.T) {
 	}
 	if strings.TrimSpace(string(stdoutData)) == "missing" {
 		t.Fatalf("PATH must be available in default verification environment")
+	}
+}
+
+func TestVerificationEnv_IsolatesToolCachesOutsideWorkingTreeOutputs(t *testing.T) {
+	repoRoot := t.TempDir()
+	workDir := filepath.Join(t.TempDir(), "worktree")
+	if err := os.MkdirAll(workDir, 0o755); err != nil {
+		t.Fatalf("prepare work dir: %v", err)
+	}
+
+	env, err := runtimeenv.BuildIsolatedProcessEnv(verificationEnv(nil), repoRoot)
+	if err != nil {
+		t.Fatalf("BuildIsolatedProcessEnv returned error: %v", err)
+	}
+
+	envMap := make(map[string]string, len(env))
+	for _, pair := range env {
+		key, value, ok := strings.Cut(pair, "=")
+		if !ok {
+			continue
+		}
+		envMap[key] = value
+	}
+
+	for _, key := range []string{"TMPDIR", "GOCACHE", "GOTMPDIR", "XDG_CACHE_HOME"} {
+		value := envMap[key]
+		if strings.TrimSpace(value) == "" {
+			t.Fatalf("expected %s in prepared environment, got %v", key, envMap)
+		}
+		if strings.HasPrefix(filepath.Clean(value), filepath.Clean(workDir)+string(filepath.Separator)) {
+			t.Fatalf("expected %s outside worktree root %q, got %q", key, workDir, value)
+		}
 	}
 }
 

@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strings"
 	"time"
+	runtimeenv "verk/internal/adapters/runtime"
 	"verk/internal/policy"
 )
 
@@ -71,7 +72,10 @@ func RunCommands(ctx context.Context, repoRoot, workDir string, cmds []string, c
 		return nil, fmt.Errorf("repo root %q is not a directory", absRepoRoot)
 	}
 
-	env := verificationEnv(cfg.EnvPassthrough)
+	env, err := runtimeenv.BuildIsolatedProcessEnv(verificationEnv(cfg.EnvPassthrough), absRepoRoot)
+	if err != nil {
+		return nil, fmt.Errorf("build verification environment: %w", err)
+	}
 	timeout := time.Duration(cfg.DefaultTimeoutMinutes) * time.Minute
 	if timeout <= 0 {
 		timeout = defaultVerificationTimeout
@@ -178,6 +182,8 @@ func RunCommands(ctx context.Context, repoRoot, workDir string, cmds []string, c
 // subdirectories. Each QualityCommand specifies a path relative to repoRoot and
 // one or more shell commands to run sequentially from that directory. This
 // supports monorepo setups where different packages have different gates.
+//
+//nolint:cyclop // explicit path validation and command execution branches are the core behavior here
 func RunQualityCommands(ctx context.Context, repoRoot, workDir string, cmds []policy.QualityCommand, cfg policy.VerificationConfig) ([]CommandResult, error) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -208,7 +214,10 @@ func RunQualityCommands(ctx context.Context, repoRoot, workDir string, cmds []po
 		return nil, fmt.Errorf("repo root %q is not a directory", absRepoRoot)
 	}
 
-	env := verificationEnv(cfg.EnvPassthrough)
+	env, err := runtimeenv.BuildIsolatedProcessEnv(verificationEnv(cfg.EnvPassthrough), absRepoRoot)
+	if err != nil {
+		return nil, fmt.Errorf("build verification environment: %w", err)
+	}
 	timeout := time.Duration(cfg.DefaultTimeoutMinutes) * time.Minute
 	if timeout <= 0 {
 		timeout = defaultVerificationTimeout
