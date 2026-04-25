@@ -654,11 +654,12 @@ func resumeEpicMode(ctx context.Context, req ResumeRequest, artifacts *runArtifa
 			}
 			diff, diffErr := waveManager.Diff(wave.TicketIDs[i])
 			if diffErr != nil {
-				log.Printf("[WARN] persist diff artifact for %s: %v", wave.TicketIDs[i], diffErr)
-				continue
+				cleanupWaveManager()
+				return allResumed, fmt.Errorf("persist diff artifact for %s: %w", wave.TicketIDs[i], diffErr)
 			}
 			if persistErr := persistWorktreeDiff(artifacts.RepoRoot, req.RunID, wave.TicketIDs[i], diff); persistErr != nil {
-				log.Printf("[WARN] persist diff artifact for %s: %v", wave.TicketIDs[i], persistErr)
+				cleanupWaveManager()
+				return allResumed, fmt.Errorf("persist diff artifact for %s: %w", wave.TicketIDs[i], persistErr)
 			}
 		}
 
@@ -692,10 +693,22 @@ func resumeEpicMode(ctx context.Context, req ResumeRequest, artifacts *runArtifa
 		// A wave may still block on sibling tickets, but closed tickets can be
 		// safely integrated after the accepted subset passes the same gate.
 		var integration *WaveIntegrationManager
+		cleanupIntegration := func() {
+			if integration == nil {
+				return
+			}
+			if cleanupErr := integration.Cleanup(); cleanupErr != nil {
+				log.Printf("[WARN] cleanup wave integration worktree: %v", cleanupErr)
+			}
+		}
+		cleanupWaveResources := func() {
+			cleanupIntegration()
+			cleanupWaveManager()
+		}
 		if len(mergeEligibleTicketIDs) > 0 && conflictErr == nil && acceptErr == nil {
 			mergeChangedFiles, changedErr := changedFilesFromManager(waveManager, mergeEligibleTicketIDs)
 			if changedErr != nil {
-				cleanupWaveManager()
+				cleanupWaveResources()
 				return allResumed, changedErr
 			}
 			mergeChangedFiles = filterEngineOwnedFiles(mergeChangedFiles)
@@ -703,7 +716,7 @@ func resumeEpicMode(ctx context.Context, req ResumeRequest, artifacts *runArtifa
 
 			integration, err = prepareWaveIntegration(ctx, artifacts.RepoRoot, req.RunID, epicReq.WorktreeRoot, wave.WaveBaseCommit)
 			if err != nil {
-				cleanupWaveManager()
+				cleanupWaveResources()
 				return allResumed, err
 			}
 			acceptedRefs := make([]string, 0, len(mergeEligibleTicketIDs))
@@ -713,24 +726,24 @@ func resumeEpicMode(ctx context.Context, req ResumeRequest, artifacts *runArtifa
 				}
 				effectiveFiles, changedErr := waveManager.ChangedFiles(ticketID)
 				if changedErr != nil {
-					cleanupWaveManager()
+					cleanupWaveResources()
 					return allResumed, changedErr
 				}
 				refName, freezeErr := integration.FreezeAcceptedTicket(ticketID, waveManager.WorktreePath(ticketID), effectiveFiles)
 				if freezeErr != nil {
-					cleanupWaveManager()
+					cleanupWaveResources()
 					return allResumed, freezeErr
 				}
 				acceptedRefs = append(acceptedRefs, refName)
 			}
 			if err := integration.ApplyAcceptedTicketRefs(ctx, acceptedRefs); err != nil {
-				cleanupWaveManager()
+				cleanupWaveResources()
 				return allResumed, err
 			}
 			epicReq.WorktreePath = integration.WorktreePath()
 			oldBaseHead, err := gitRevParse(artifacts.RepoRoot, wave.WaveBaseCommit)
 			if err != nil {
-				cleanupWaveManager()
+				cleanupWaveResources()
 				return allResumed, err
 			}
 			pendingTx := pendingWaveIntegrationTransaction{
@@ -742,25 +755,25 @@ func resumeEpicMode(ctx context.Context, req ResumeRequest, artifacts *runArtifa
 			}
 			setPendingWaveIntegration(artifacts.Run.ResumeCursor, pendingTx)
 			if err := state.SaveJSONAtomic(runPath, artifacts.Run); err != nil {
-				cleanupWaveManager()
+				cleanupWaveResources()
 				return allResumed, err
 			}
 			if verifyErr := runWaveVerificationLoop(ctx, epicReq, cfg, &acceptedWave, wavePath, mergeChangedFiles, epicReq.WorktreePath); verifyErr != nil {
 				if clearErr := clearPendingWaveVerificationOnTerminalFailure(artifacts.Run.ResumeCursor, runPath, &artifacts.Run, &acceptedWave); clearErr != nil {
-					cleanupWaveManager()
+					cleanupWaveResources()
 					return allResumed, errors.Join(verifyErr, fmt.Errorf("clear terminal pending wave verification: %w", clearErr))
 				}
 				artifacts.Run.Status = state.EpicRunStatusBlocked
 				artifacts.Run.CurrentPhase = state.TicketPhaseBlocked
 				if saveErr := state.SaveJSONAtomic(runPath, artifacts.Run); saveErr != nil {
-					cleanupWaveManager()
+					cleanupWaveResources()
 					return allResumed, errors.Join(verifyErr, fmt.Errorf("persist run state: %w", saveErr))
 				}
-				cleanupWaveManager()
+				cleanupWaveResources()
 				return allResumed, verifyErr
 			}
 			if err := completePendingWaveIntegrationTransaction(epicReq, artifacts.Run.ResumeCursor, runPath, &artifacts.Run, &acceptedWave, wavePath, pendingTx, integration); err != nil {
-				cleanupWaveManager()
+				cleanupWaveResources()
 				return allResumed, err
 			}
 			currentBaseRef = integration.BaseRef()
@@ -773,10 +786,10 @@ func resumeEpicMode(ctx context.Context, req ResumeRequest, artifacts *runArtifa
 			}
 		}
 		if err := state.SaveJSONAtomic(runPath, artifacts.Run); err != nil {
-			cleanupWaveManager()
+			cleanupWaveResources()
 			return allResumed, err
 		}
-		cleanupWaveManager()
+		cleanupWaveResources()
 		if blockErr != nil {
 			artifacts.Run.Status = state.EpicRunStatusBlocked
 			artifacts.Run.CurrentPhase = state.TicketPhaseBlocked

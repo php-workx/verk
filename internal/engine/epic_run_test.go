@@ -1104,6 +1104,127 @@ func TestRunEpic_DoesNotAdvanceHiddenBaseWhenMainApplyFails(t *testing.T) {
 	}
 }
 
+func TestRunEpic_FinalRunSaveFailureAfterMainApplyIsRecoverable(t *testing.T) {
+	repoRoot := t.TempDir()
+	baseCommit := initEpicRepo(t, repoRoot)
+	worktreeRoot := t.TempDir()
+	runID := "run-final-save-recoverable"
+	cfg := policy.DefaultConfig()
+	cfg.Verification.QualityCommands = nil
+	cfg.Verification.WaveCommands = nil
+
+	root := epicTicket("epic-final-save-recoverable")
+	child := epicChildTicket("ticket-final-save-recoverable", root.ID, tkmd.StatusReady, nil, []string{"docs/final-save.txt"})
+	mustSaveTicket(t, repoRoot, root)
+	mustSaveTicket(t, repoRoot, child)
+
+	integration, err := prepareWaveIntegration(context.Background(), repoRoot, runID, worktreeRoot, baseCommit)
+	if err != nil {
+		t.Fatalf("prepare wave integration: %v", err)
+	}
+	t.Cleanup(func() { _ = integration.Cleanup() })
+
+	acceptedCommit := createDetachedWorktreeCommit(t, repoRoot, baseCommit, map[string]string{
+		"docs/final-save.txt": "final save\n",
+	})
+	acceptedRef := integrationTicketRef(runID, child.ID)
+	if err := gitUpdateRef(repoRoot, acceptedRef, acceptedCommit); err != nil {
+		t.Fatalf("seed accepted ref: %v", err)
+	}
+	if err := integration.ApplyAcceptedTicketRefs(context.Background(), []string{acceptedRef}); err != nil {
+		t.Fatalf("apply accepted ref: %v", err)
+	}
+
+	runPath := runJSONPath(repoRoot, runID)
+	wavePath := waveArtifactPath(repoRoot, runID, "wave-1")
+	wave := state.WaveArtifact{
+		ArtifactMeta:   state.ArtifactMeta{SchemaVersion: 1, RunID: runID},
+		WaveID:         "wave-1",
+		Ordinal:        1,
+		Status:         state.WaveStatusAccepted,
+		TicketIDs:      []string{child.ID},
+		PlannedScope:   []string{"docs/final-save.txt"},
+		ActualScope:    []string{"docs/final-save.txt"},
+		Acceptance:     map[string]any{"wave_verification_passed": true},
+		WaveBaseCommit: baseCommit,
+	}
+	if err := state.SaveJSONAtomic(wavePath, wave); err != nil {
+		t.Fatalf("save wave artifact: %v", err)
+	}
+
+	run := state.RunArtifact{
+		ArtifactMeta: state.ArtifactMeta{SchemaVersion: 1, RunID: runID},
+		Mode:         "epic",
+		RootTicketID: root.ID,
+		Status:       state.EpicRunStatusRunning,
+		CurrentPhase: state.TicketPhaseImplement,
+		WaveIDs:      []string{wave.WaveID},
+		TicketIDs:    []string{child.ID},
+		BaseCommit:   baseCommit,
+		ResumeCursor: map[string]any{"wave_ordinal": 1},
+	}
+	tx := pendingWaveIntegrationTransaction{
+		WaveID:       wave.WaveID,
+		BaseCommit:   baseCommit,
+		AcceptedRefs: []string{acceptedRef},
+		ChangedFiles: []string{"docs/final-save.txt"},
+		WorktreePath: integration.WorktreePath(),
+	}
+	setPendingWaveIntegration(run.ResumeCursor, tx)
+	if err := state.SaveJSONAtomic(runPath, run); err != nil {
+		t.Fatalf("save initial run artifact: %v", err)
+	}
+
+	badRunPath := filepath.Join(repoRoot, "tracked.txt", "run.json")
+	err = completePendingWaveIntegrationTransaction(
+		RunEpicRequest{RepoRoot: repoRoot, RunID: runID, WorktreeRoot: worktreeRoot, Config: cfg},
+		run.ResumeCursor,
+		badRunPath,
+		&run,
+		&wave,
+		wavePath,
+		tx,
+		integration,
+	)
+	if err == nil {
+		t.Fatal("expected final run save failure")
+	}
+	if !strings.Contains(err.Error(), "persist run state") {
+		t.Fatalf("expected final save error to mention persist run state, got %v", err)
+	}
+	if got, readErr := os.ReadFile(filepath.Join(repoRoot, "docs", "final-save.txt")); readErr != nil || string(got) != "final save\n" {
+		t.Fatalf("expected integrated file on main after failed final save, got %q err=%v", string(got), readErr)
+	}
+
+	if err := integration.Cleanup(); err != nil {
+		t.Fatalf("cleanup integration worktree: %v", err)
+	}
+	var durableRun state.RunArtifact
+	if err := state.LoadJSON(runPath, &durableRun); err != nil {
+		t.Fatalf("load durable pending run: %v", err)
+	}
+	err = resumePendingWaveVerification(
+		context.Background(),
+		RunEpicRequest{RepoRoot: repoRoot, RunID: runID, WorktreeRoot: worktreeRoot, Config: cfg},
+		cfg,
+		durableRun.ResumeCursor,
+		runPath,
+		&durableRun,
+	)
+	if err != nil {
+		t.Fatalf("resume pending already-applied integration: %v", err)
+	}
+	if _, ok := pendingWaveVerificationID(durableRun.ResumeCursor); ok {
+		t.Fatalf("expected pending wave verification to clear after recovery, cursor=%v", durableRun.ResumeCursor)
+	}
+	if _, ok := durableRun.ResumeCursor["pending_wave_integration"]; ok {
+		t.Fatalf("expected pending wave integration to clear after recovery, cursor=%v", durableRun.ResumeCursor)
+	}
+	if got, ok := durableRun.ResumeCursor["last_wave_base_commit"].(string); !ok || got == "" || got == baseCommit {
+		t.Fatalf("expected recovered last_wave_base_commit to advance, got %q cursor=%v", got, durableRun.ResumeCursor)
+	}
+}
+
 func TestRunEpic_AppliesPostRepairFilesToMain(t *testing.T) {
 	repoRoot := t.TempDir()
 	baseCommit := initEpicRepo(t, repoRoot)
@@ -1326,6 +1447,70 @@ func TestRunEpicBlockedTicketKeepsMainTreeCleanAndPersistsDiffArtifact(t *testin
 	}
 	if !strings.Contains(string(diffContent), "tracked.txt") {
 		t.Fatalf("expected diff artifact to mention tracked.txt, got %q", string(diffContent))
+	}
+}
+
+func TestRunEpic_BlocksWhenFailedTicketDiffPersistenceFails(t *testing.T) {
+	repoRoot := t.TempDir()
+	baseCommit := initEpicRepo(t, repoRoot)
+	runID := "run-blocked-diff-persist-fail"
+	cfg := policy.DefaultConfig()
+	cfg.Verification.QualityCommands = nil
+	cfg.Verification.WaveCommands = nil
+
+	root := epicTicket("epic-blocked-diff-persist-fail")
+	child := epicChildTicket("ticket-blocked-diff-persist-fail", root.ID, tkmd.StatusReady, nil, []string{"tracked.txt"})
+	mustSaveTicket(t, repoRoot, root)
+	mustSaveTicket(t, repoRoot, child)
+
+	diffPath := filepath.Join(repoRoot, ".verk", "runs", runID, "tickets", child.ID, "worktree.diff")
+	if err := os.MkdirAll(diffPath, 0o755); err != nil {
+		t.Fatalf("seed unwritable diff artifact path: %v", err)
+	}
+
+	start := epicTestStart()
+	adapter := functionAdapter{
+		runWorker: func(ctx context.Context, req runtime.WorkerRequest) (runtime.WorkerResult, error) {
+			if err := os.WriteFile(filepath.Join(req.WorktreePath, "tracked.txt"), []byte("blocked output\n"), 0o644); err != nil {
+				return runtime.WorkerResult{}, err
+			}
+			return runtime.WorkerResult{
+				Status:             runtime.WorkerStatusBlocked,
+				RetryClass:         runtime.RetryClassRetryable,
+				BlockReason:        "blocked after writing candidate output",
+				LeaseID:            req.LeaseID,
+				StartedAt:          start,
+				FinishedAt:         start.Add(time.Second),
+				ResultArtifactPath: filepath.Join(repoRoot, child.ID+".worker.json"),
+			}, nil
+		},
+		runReviewer: func(ctx context.Context, req runtime.ReviewRequest) (runtime.ReviewResult, error) {
+			return runtime.ReviewResult{
+				Status:             runtime.WorkerStatusDone,
+				RetryClass:         runtime.RetryClassTerminal,
+				LeaseID:            req.LeaseID,
+				StartedAt:          start.Add(2 * time.Second),
+				FinishedAt:         start.Add(3 * time.Second),
+				ReviewStatus:       runtime.ReviewStatusPassed,
+				Summary:            "clean",
+				ResultArtifactPath: filepath.Join(repoRoot, req.TicketID+".review.json"),
+			}, nil
+		},
+	}
+
+	_, err := RunEpic(context.Background(), RunEpicRequest{
+		RepoRoot:     repoRoot,
+		RunID:        runID,
+		RootTicketID: root.ID,
+		BaseCommit:   baseCommit,
+		Adapter:      adapter,
+		Config:       cfg,
+	})
+	if err == nil {
+		t.Fatal("expected blocked epic result with diff artifact persistence failure")
+	}
+	if !strings.Contains(err.Error(), "persist diff artifact") {
+		t.Fatalf("expected error to mention persist diff artifact, got %v", err)
 	}
 }
 

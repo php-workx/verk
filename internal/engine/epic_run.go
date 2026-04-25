@@ -615,6 +615,7 @@ func RunEpic(ctx context.Context, req RunEpicRequest) (RunEpicResult, error) { /
 				_ = updateTicketStoreStatus(req.RepoRoot, wave.TicketIDs[i], tkmd.StatusOpen)
 			}
 		}
+		var diffArtifactErr error
 		for i, outcome := range outcomes {
 			if outcome.phase == state.TicketPhaseClosed {
 				continue
@@ -625,18 +626,31 @@ func RunEpic(ctx context.Context, req RunEpicRequest) (RunEpicResult, error) { /
 			diff, diffErr := waveManager.Diff(wave.TicketIDs[i])
 			if diffErr != nil {
 				log.Printf("[WARN] persist diff artifact for %s: %v", wave.TicketIDs[i], diffErr)
+				diffArtifactErr = errors.Join(diffArtifactErr, fmt.Errorf("persist diff artifact for %s: %w", wave.TicketIDs[i], diffErr))
 				continue
 			}
 			if persistErr := persistWorktreeDiff(req.RepoRoot, req.RunID, wave.TicketIDs[i], diff); persistErr != nil {
 				log.Printf("[WARN] persist diff artifact for %s: %v", wave.TicketIDs[i], persistErr)
+				diffArtifactErr = errors.Join(diffArtifactErr, fmt.Errorf("persist diff artifact for %s: %w", wave.TicketIDs[i], persistErr))
 			}
 		}
 
 		var blockErr error
+		if diffArtifactErr != nil {
+			waveFailed = true
+			if waveErr == nil {
+				waveErr = diffArtifactErr
+			} else {
+				waveErr = errors.Join(waveErr, diffArtifactErr)
+			}
+		}
 		if acceptErr != nil || waveFailed {
 			blockErr = acceptErr
 			if conflictErr != nil {
 				blockErr = conflictErr
+				if diffArtifactErr != nil {
+					blockErr = errors.Join(blockErr, diffArtifactErr)
+				}
 			} else if waveErr != nil && blockErr == nil {
 				blockErr = waveErr
 			} else if waveErr != nil && blockErr != nil {

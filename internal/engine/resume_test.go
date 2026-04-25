@@ -1138,6 +1138,168 @@ func TestResumeRun_IntegratesClosedSiblingWhenWaveHasBlockedTicket(t *testing.T)
 	}
 }
 
+func TestResumeRun_CleansIntegrationWorktreeAfterWaveIntegration(t *testing.T) {
+	repoRoot := t.TempDir()
+	worktreeRoot := t.TempDir()
+	t.Setenv("VERK_WORKTREE_ROOT", worktreeRoot)
+	baseCommit := initEpicRepo(t, repoRoot)
+	runID := "run-resume-clean-integration"
+	cfg := policy.DefaultConfig()
+	cfg.Verification.QualityCommands = nil
+	cfg.Verification.WaveCommands = nil
+
+	epic := epicTicket("epic-resume-clean-integration")
+	child := epicChildTicket("ticket-resume-clean-integration", epic.ID, tkmd.StatusBlocked, nil, []string{"resumed.txt"})
+	mustSaveTicket(t, repoRoot, epic)
+	mustSaveTicket(t, repoRoot, child)
+
+	writeOpRunFixture(t, repoRoot, runID, state.RunArtifact{
+		ArtifactMeta: state.ArtifactMeta{SchemaVersion: 1, RunID: runID},
+		Mode:         "epic",
+		RootTicketID: epic.ID,
+		Status:       state.EpicRunStatusBlocked,
+		CurrentPhase: state.TicketPhaseBlocked,
+		BaseCommit:   baseCommit,
+		TicketIDs:    []string{child.ID},
+		ResumeCursor: map[string]any{},
+	})
+	writeTicketRunFixture(t, repoRoot, runID, TicketRunSnapshot{
+		ArtifactMeta: state.ArtifactMeta{SchemaVersion: 1, RunID: runID},
+		TicketID:     child.ID,
+		CurrentPhase: state.TicketPhaseBlocked,
+		BlockReason:  "retry me",
+	})
+	writePlanFixture(t, repoRoot, runID, state.PlanArtifact{
+		ArtifactMeta:             state.ArtifactMeta{SchemaVersion: 1, RunID: runID},
+		TicketID:                 child.ID,
+		EffectiveReviewThreshold: state.SeverityP2,
+	})
+
+	start := epicTestStart()
+	adapter := functionAdapter{
+		runWorker: func(ctx context.Context, req runtime.WorkerRequest) (runtime.WorkerResult, error) {
+			if strings.TrimSpace(req.WorktreePath) == "" {
+				return runtime.WorkerResult{}, fmt.Errorf("worker did not receive worktree path")
+			}
+			if err := os.WriteFile(filepath.Join(req.WorktreePath, "resumed.txt"), []byte("resumed output\n"), 0o644); err != nil {
+				return runtime.WorkerResult{}, err
+			}
+			return runtime.WorkerResult{
+				Status:             runtime.WorkerStatusDone,
+				RetryClass:         runtime.RetryClassTerminal,
+				LeaseID:            req.LeaseID,
+				StartedAt:          start,
+				FinishedAt:         start.Add(time.Second),
+				ResultArtifactPath: filepath.Join(repoRoot, child.ID+".worker.json"),
+			}, nil
+		},
+		runReviewer: func(ctx context.Context, req runtime.ReviewRequest) (runtime.ReviewResult, error) {
+			return runtime.ReviewResult{
+				Status:             runtime.WorkerStatusDone,
+				RetryClass:         runtime.RetryClassTerminal,
+				LeaseID:            req.LeaseID,
+				StartedAt:          start.Add(2 * time.Second),
+				FinishedAt:         start.Add(3 * time.Second),
+				ReviewStatus:       runtime.ReviewStatusPassed,
+				Summary:            "clean",
+				ResultArtifactPath: filepath.Join(repoRoot, child.ID+".review.json"),
+			}, nil
+		},
+	}
+
+	report, err := ResumeRun(context.Background(), ResumeRequest{
+		RepoRoot: repoRoot,
+		RunID:    runID,
+		Adapter:  adapter,
+		Config:   cfg,
+	})
+	if err != nil {
+		t.Fatalf("ResumeRun returned error: %v", err)
+	}
+	if report.Run.Status != state.EpicRunStatusCompleted {
+		t.Fatalf("expected completed resumed run, got %q", report.Run.Status)
+	}
+	resolvedWorktreeRoot, err := ResolveWorktreeRoot(repoRoot)
+	if err != nil {
+		t.Fatalf("resolve worktree root: %v", err)
+	}
+	integrationPath := filepath.Join(resolvedWorktreeRoot, runID, "_integration")
+	if _, statErr := os.Stat(integrationPath); !os.IsNotExist(statErr) {
+		t.Fatalf("expected resume integration worktree to be removed, got %q: %v", integrationPath, statErr)
+	}
+}
+
+func TestResumeRun_BlocksWhenFailedTicketDiffPersistenceFails(t *testing.T) {
+	repoRoot := t.TempDir()
+	baseCommit := initEpicRepo(t, repoRoot)
+	runID := "run-resume-diff-persist-fail"
+	cfg := policy.DefaultConfig()
+	cfg.Verification.QualityCommands = nil
+	cfg.Verification.WaveCommands = nil
+
+	epic := epicTicket("epic-resume-diff-persist-fail")
+	blocked := epicChildTicket("ticket-resume-diff-persist-fail", epic.ID, tkmd.StatusBlocked, nil, []string{"blocked.txt"})
+	mustSaveTicket(t, repoRoot, epic)
+	mustSaveTicket(t, repoRoot, blocked)
+
+	writeOpRunFixture(t, repoRoot, runID, state.RunArtifact{
+		ArtifactMeta: state.ArtifactMeta{SchemaVersion: 1, RunID: runID},
+		Mode:         "epic",
+		RootTicketID: epic.ID,
+		Status:       state.EpicRunStatusBlocked,
+		CurrentPhase: state.TicketPhaseBlocked,
+		BaseCommit:   baseCommit,
+		TicketIDs:    []string{blocked.ID},
+		ResumeCursor: map[string]any{},
+	})
+	writeTicketRunFixture(t, repoRoot, runID, TicketRunSnapshot{
+		ArtifactMeta: state.ArtifactMeta{SchemaVersion: 1, RunID: runID},
+		TicketID:     blocked.ID,
+		CurrentPhase: state.TicketPhaseBlocked,
+		BlockReason:  "retry me",
+	})
+	writePlanFixture(t, repoRoot, runID, state.PlanArtifact{
+		ArtifactMeta:             state.ArtifactMeta{SchemaVersion: 1, RunID: runID},
+		TicketID:                 blocked.ID,
+		EffectiveReviewThreshold: state.SeverityP2,
+	})
+	diffPath := filepath.Join(repoRoot, ".verk", "runs", runID, "tickets", blocked.ID, "worktree.diff")
+	if err := os.MkdirAll(diffPath, 0o755); err != nil {
+		t.Fatalf("seed unwritable diff artifact path: %v", err)
+	}
+
+	start := epicTestStart()
+	adapter := functionAdapter{
+		runWorker: func(ctx context.Context, req runtime.WorkerRequest) (runtime.WorkerResult, error) {
+			if err := os.WriteFile(filepath.Join(req.WorktreePath, "blocked.txt"), []byte("blocked output\n"), 0o644); err != nil {
+				return runtime.WorkerResult{}, err
+			}
+			return runtime.WorkerResult{
+				Status:             runtime.WorkerStatusBlocked,
+				RetryClass:         runtime.RetryClassRetryable,
+				BlockReason:        "still blocked",
+				LeaseID:            req.LeaseID,
+				StartedAt:          start,
+				FinishedAt:         start.Add(time.Second),
+				ResultArtifactPath: filepath.Join(repoRoot, blocked.ID+".worker.json"),
+			}, nil
+		},
+	}
+
+	_, err := ResumeRun(context.Background(), ResumeRequest{
+		RepoRoot: repoRoot,
+		RunID:    runID,
+		Adapter:  adapter,
+		Config:   cfg,
+	})
+	if err == nil {
+		t.Fatal("expected ResumeRun to fail when blocked ticket diff persistence fails")
+	}
+	if !strings.Contains(err.Error(), "persist diff artifact") {
+		t.Fatalf("expected error to contain %q, got %v", "persist diff artifact", err)
+	}
+}
+
 func TestResumeRun_DoesNotMutateMainWhenWaveCommitFails(t *testing.T) {
 	repoRoot := t.TempDir()
 	baseCommit := initEpicRepo(t, repoRoot)
