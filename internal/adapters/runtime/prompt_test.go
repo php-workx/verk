@@ -434,6 +434,27 @@ func TestWorkerSystemPrompt_ExternalReviewReadiness(t *testing.T) {
 	}
 }
 
+func TestWorkerSystemPrompt_AllowsOnlySafeLocalCommits(t *testing.T) {
+	prompt := WorkerSystemPrompt()
+	if strings.Contains(prompt, "Do not commit changes") {
+		t.Fatalf("prompt still forbids all commits:\n%s", prompt)
+	}
+	for _, phrase := range []string{
+		"local commits",
+		"assigned worktree only",
+		"Do not push",
+		"Do not merge",
+		"Do not rebase",
+		"Do not amend shared refs",
+		"Do not move branches",
+		"Do not touch the main worktree",
+	} {
+		if !strings.Contains(prompt, phrase) {
+			t.Fatalf("expected worker prompt to contain %q:\n%s", phrase, prompt)
+		}
+	}
+}
+
 func TestReviewerSystemPrompt_JSONOnly(t *testing.T) {
 	prompt := ReviewerSystemPrompt()
 	if !strings.Contains(prompt, "ONLY a JSON object") {

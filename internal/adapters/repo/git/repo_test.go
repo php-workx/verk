@@ -78,6 +78,45 @@ func TestChangedFilesAgainstBaseline(t *testing.T) {
 	}
 }
 
+func TestDiffAgainstIncludesUntrackedFiles(t *testing.T) {
+	repo, root, baseCommit := newTestRepo(t)
+
+	if err := os.WriteFile(filepath.Join(root, "new.txt"), []byte("new\n"), 0o644); err != nil {
+		t.Fatalf("write untracked file: %v", err)
+	}
+
+	diff, err := repo.DiffAgainst(baseCommit)
+	if err != nil {
+		t.Fatalf("DiffAgainst: %v", err)
+	}
+	if !strings.Contains(diff, "diff --git a/new.txt b/new.txt") {
+		t.Fatalf("expected untracked file diff, got:\n%s", diff)
+	}
+	if !strings.Contains(diff, "+new") {
+		t.Fatalf("expected untracked file content in diff, got:\n%s", diff)
+	}
+}
+
+func TestDiffAgainstSkipsDisappearedUntrackedFiles(t *testing.T) {
+	repo, root, _ := newTestRepo(t)
+
+	path := filepath.Join(root, "gone.txt")
+	if err := os.WriteFile(path, []byte("gone\n"), 0o644); err != nil {
+		t.Fatalf("write untracked file: %v", err)
+	}
+	if err := os.Remove(path); err != nil {
+		t.Fatalf("remove untracked file: %v", err)
+	}
+
+	diff, err := repo.diffUntrackedFiles([]string{"gone.txt"})
+	if err != nil {
+		t.Fatalf("diffUntrackedFiles: %v", err)
+	}
+	if diff != "" {
+		t.Fatalf("expected disappeared untracked file to be skipped, got:\n%s", diff)
+	}
+}
+
 func TestCreateWorktreeSetsHeadAndChangedFiles(t *testing.T) {
 	repo, root, head := newTestRepo(t)
 	worktreePath := filepath.Join(root, "worktree-one")
@@ -133,6 +172,31 @@ func TestCreateWorktreeCreatesMissingParentDirectory(t *testing.T) {
 
 	if info, err := os.Stat(filepath.Dir(worktreePath)); err != nil || !info.IsDir() {
 		t.Fatalf("missing parent dir was not created: stat=%v, isDir=%v", err, info != nil && info.IsDir())
+	}
+}
+
+func TestCreateWorktreeFromLinkedWorktreeUsesMainWorktreeRoot(t *testing.T) {
+	repo, root, head := newTestRepo(t)
+	linkedPath := filepath.Join(root, "linked-source")
+	if err := repo.CreateWorktree(context.Background(), head, linkedPath); err != nil {
+		t.Fatalf("CreateWorktree linked source: %v", err)
+	}
+
+	linkedRepo, err := New(linkedPath)
+	if err != nil {
+		t.Fatalf("New linked repo: %v", err)
+	}
+	if err := linkedRepo.CreateWorktree(context.Background(), head, "created-from-linked"); err != nil {
+		t.Fatalf("CreateWorktree from linked repo: %v", err)
+	}
+
+	wantPath := filepath.Join(root, "created-from-linked")
+	if _, err := os.Stat(wantPath); err != nil {
+		t.Fatalf("expected worktree add to run from main worktree root %q: %v", wantPath, err)
+	}
+	wrongPath := filepath.Join(linkedPath, "created-from-linked")
+	if _, err := os.Stat(wrongPath); err == nil {
+		t.Fatalf("expected no worktree nested under linked root %q", wrongPath)
 	}
 }
 

@@ -267,6 +267,7 @@ func TestLoadEpicChildrenValid(t *testing.T) {
 		"id: epic-ok",
 		"title: \"Test Epic\"",
 		"status: open",
+		"type: epic",
 		"deps: [child-1, child-2]",
 		"---",
 		"",
@@ -436,6 +437,7 @@ func TestHasChildrenViaDeps(t *testing.T) {
 		"---",
 		"id: epic-2",
 		"status: open",
+		"type: epic",
 		"deps: [dep-child-1, dep-child-2]",
 		"---",
 		"",
@@ -454,6 +456,48 @@ func TestHasChildrenViaDeps(t *testing.T) {
 	}
 	if !has {
 		t.Fatal("expected epic-2 to have children via deps")
+	}
+}
+
+func TestNonEpicDepsDoNotCreateChildren(t *testing.T) {
+	dir := t.TempDir()
+	ticketsDir := filepath.Join(dir, ".tickets")
+	if err := os.MkdirAll(ticketsDir, 0o755); err != nil {
+		t.Fatalf("mkdir .tickets: %v", err)
+	}
+
+	taskPath := filepath.Join(ticketsDir, "task-1.md")
+	content := strings.Join([]string{
+		"---",
+		"id: task-1",
+		"status: open",
+		"type: task",
+		"deps: [dep-a, dep-b]",
+		"---",
+		"",
+		"Task body.",
+		"",
+	}, "\n")
+	if err := os.WriteFile(taskPath, []byte(content), 0o644); err != nil {
+		t.Fatalf("write task: %v", err)
+	}
+	writeTicketToRepo(t, dir, "dep-a", "", StatusOpen)
+	writeTicketToRepo(t, dir, "dep-b", "", StatusOpen)
+
+	has, err := HasChildren(dir, "task-1")
+	if err != nil {
+		t.Fatalf("HasChildren: %v", err)
+	}
+	if has {
+		t.Fatal("expected non-epic task deps to remain scheduling edges, not child edges")
+	}
+
+	children, err := ListAllChildren(dir, "task-1")
+	if err != nil {
+		t.Fatalf("ListAllChildren: %v", err)
+	}
+	if len(children) != 0 {
+		t.Fatalf("expected no children for non-epic task deps, got %v", children)
 	}
 }
 

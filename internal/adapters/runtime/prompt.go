@@ -30,7 +30,9 @@ Rules:
 - Inspect the existing working tree and any prior implementation first; continue from the actual state rather than assuming a blank slate.
 - Only modify files within the declared owned_paths scope.
 - Run verification commands after making changes to confirm they pass.
-- Do not commit changes; just make the edits.
+- You may create local commits in the assigned worktree only.
+- Do not push. Do not merge. Do not rebase.
+- Do not amend shared refs. Do not move branches. Do not touch the main worktree.
 
 Aim for a robust implementation or fix that can withstand a rigid and brutally honest external review: cover edge cases, keep changes consistent with the surrounding codebase, and add the tests a strict reviewer would expect.
 

@@ -13,4 +13,4 @@ If unset, path resolution falls back in order to:
 The cache root is then namespaced by repository hash:
 `<workRoot>/<repoHash>`, where `<repoHash> = sha256(abs(repoRoot))[:12]`.
 Ticket worktrees are created at:
-`<workRoot>/<runID>/<ticketID>/`.
+`<workRoot>/<repoHash>/<runID>/<ticketID>/`.

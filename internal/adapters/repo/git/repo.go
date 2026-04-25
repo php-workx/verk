@@ -207,7 +207,93 @@ func (r *Repo) DiffAgainst(baseCommit string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return out, nil
+	untracked, err := gitBytes(r.root, "ls-files", "--others", "--exclude-standard", "-z")
+	if err != nil {
+		return "", err
+	}
+	untrackedDiff, err := r.diffUntrackedFiles(splitNullList(untracked))
+	if err != nil {
+		return "", err
+	}
+	return out + untrackedDiff, nil
+}
+
+func (r *Repo) diffUntrackedFiles(paths []string) (string, error) {
+	var buf bytes.Buffer
+	for _, raw := range paths {
+		normalized, err := normalizeRepoRelativePath(raw)
+		if err != nil {
+			return "", fmt.Errorf("normalize untracked file %q: %w", raw, err)
+		}
+		fullPath := filepath.Join(r.root, filepath.FromSlash(normalized))
+		info, err := os.Lstat(fullPath)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				continue
+			}
+			return "", fmt.Errorf("stat untracked file %q: %w", normalized, err)
+		}
+		mode := "100644"
+		var content []byte
+		if info.Mode()&os.ModeSymlink != 0 {
+			mode = "120000"
+			target, readErr := os.Readlink(fullPath)
+			if readErr != nil {
+				if errors.Is(readErr, os.ErrNotExist) {
+					continue
+				}
+				return "", fmt.Errorf("read untracked symlink %q: %w", normalized, readErr)
+			}
+			content = []byte(target)
+		} else {
+			if info.Mode()&0o111 != 0 {
+				mode = "100755"
+			}
+			read, readErr := os.ReadFile(fullPath)
+			if readErr != nil {
+				if errors.Is(readErr, os.ErrNotExist) {
+					continue
+				}
+				return "", fmt.Errorf("read untracked file %q: %w", normalized, readErr)
+			}
+			content = read
+		}
+		if buf.Len() > 0 && !bytes.HasSuffix(buf.Bytes(), []byte("\n")) {
+			buf.WriteByte('\n')
+		}
+		writeNewFileDiff(&buf, normalized, mode, content)
+	}
+	return buf.String(), nil
+}
+
+func writeNewFileDiff(buf *bytes.Buffer, relPath, mode string, content []byte) {
+	lineCount := 0
+	if len(content) > 0 {
+		lineCount = bytes.Count(content, []byte("\n"))
+		if !bytes.HasSuffix(content, []byte("\n")) {
+			lineCount++
+		}
+	}
+	fmt.Fprintf(buf, "diff --git a/%s b/%s\n", relPath, relPath)
+	fmt.Fprintf(buf, "new file mode %s\n", mode)
+	fmt.Fprintf(buf, "index 0000000..0000000\n")
+	fmt.Fprintf(buf, "--- /dev/null\n")
+	fmt.Fprintf(buf, "+++ b/%s\n", relPath)
+	fmt.Fprintf(buf, "@@ -0,0 +1,%d @@\n", lineCount)
+	if len(content) == 0 {
+		return
+	}
+	lines := bytes.SplitAfter(content, []byte("\n"))
+	for _, line := range lines {
+		if len(line) == 0 {
+			continue
+		}
+		buf.WriteByte('+')
+		buf.Write(line)
+		if !bytes.HasSuffix(line, []byte("\n")) {
+			buf.WriteByte('\n')
+		}
+	}
 }
 
 func (r *Repo) NormalizeOwnedPath(candidate string) (string, error) {
@@ -236,8 +322,11 @@ func (r *Repo) CreateWorktree(ctx context.Context, commitish, targetPath string)
 		ctx = context.Background()
 	}
 
-	worktreeRoot := r.root
-	targetPath, err := canonicalPath(worktreeRoot, targetPath)
+	worktreeRoot, err := r.MainWorktreeRoot()
+	if err != nil {
+		return fmt.Errorf("resolve main worktree root: %w", err)
+	}
+	targetPath, err = canonicalPath(worktreeRoot, targetPath)
 	if err != nil {
 		return fmt.Errorf("normalize target path %q: %w", targetPath, err)
 	}
@@ -271,8 +360,11 @@ func (r *Repo) RemoveWorktree(targetPath string) error {
 		return fmt.Errorf("target path is required")
 	}
 
-	worktreeRoot := r.root
-	targetPath, err := canonicalPath(worktreeRoot, targetPath)
+	worktreeRoot, err := r.MainWorktreeRoot()
+	if err != nil {
+		return fmt.Errorf("resolve main worktree root: %w", err)
+	}
+	targetPath, err = canonicalPath(worktreeRoot, targetPath)
 	if err != nil {
 		return fmt.Errorf("normalize target path %q: %w", targetPath, err)
 	}
