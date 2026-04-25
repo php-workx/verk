@@ -108,14 +108,39 @@ func (wm *WorktreeManager) CreateWorktree(ctx context.Context, ticketID string) 
 	if err != nil {
 		return "", fmt.Errorf("open main repo %q: %w", wm.mainRoot, err)
 	}
-	if err := repo.CreateWorktree(ctx, baseRef, worktreePath); err != nil {
+
+	err = repo.CreateWorktree(ctx, baseRef, worktreePath)
+	if err != nil && !errors.Is(err, git.ErrWorktreeExists) {
 		return "", fmt.Errorf("create worktree for ticket %q: %w", ticketID, err)
 	}
-	if err := establishWorktreeVerkSymlink(worktreePath, wm.mainRoot); err != nil {
-		if removeErr := repo.RemoveWorktree(worktreePath); removeErr != nil {
-			return "", fmt.Errorf("create worktree symlink for ticket %q: %w; cleanup: %v", ticketID, err, removeErr)
+
+	if errors.Is(err, git.ErrWorktreeExists) {
+		// Worktree already exists (e.g. from a prior failed attempt in the same run).
+		// Verify the .verk symlink is intact, then reuse the existing worktree.
+		linkTarget := filepath.Join(wm.mainRoot, ".verk")
+		linkPath := filepath.Join(worktreePath, ".verk")
+		if fi, readErr := os.Lstat(linkPath); readErr == nil && fi.Mode()&os.ModeSymlink != 0 {
+			if existing, _ := os.Readlink(linkPath); existing != linkTarget {
+				_ = os.RemoveAll(linkPath)
+				if symErr := os.Symlink(linkTarget, linkPath); symErr != nil {
+					return "", fmt.Errorf("fix worktree symlink for ticket %q: %w", ticketID, symErr)
+				}
+			}
+		} else {
+			// Symlink missing or not a symlink — recreate it.
+			_ = os.RemoveAll(linkPath)
+			if symErr := os.Symlink(linkTarget, linkPath); symErr != nil {
+				return "", fmt.Errorf("recreate worktree symlink for ticket %q: %w", ticketID, symErr)
+			}
 		}
-		return "", fmt.Errorf("create worktree symlink for ticket %q: %w", ticketID, err)
+	} else if err == nil {
+		// Fresh worktree — establish the symlink.
+		if symErr := establishWorktreeVerkSymlink(worktreePath, wm.mainRoot); symErr != nil {
+			if removeErr := repo.RemoveWorktree(worktreePath); removeErr != nil {
+				return "", fmt.Errorf("create worktree symlink for ticket %q: %w; cleanup: %v", ticketID, symErr, removeErr)
+			}
+			return "", fmt.Errorf("create worktree symlink for ticket %q: %w", ticketID, symErr)
+		}
 	}
 
 	wm.worktrees[ticketID] = worktreePath
@@ -177,6 +202,14 @@ func (wm *WorktreeManager) DetectConflicts() ([]Conflict, error) {
 		ticketIDs = append(ticketIDs, strings.TrimSpace(ticketID))
 	}
 	wm.mu.Unlock()
+
+	return wm.DetectConflictsFor(ticketIDs)
+}
+
+func (wm *WorktreeManager) DetectConflictsFor(ticketIDs []string) ([]Conflict, error) {
+	if wm == nil {
+		return nil, fmt.Errorf("worktree manager is nil")
+	}
 
 	sort.Strings(ticketIDs)
 	pathToTicketIDs := make(map[string]map[string]struct{}, len(ticketIDs)*2)
@@ -419,6 +452,10 @@ func (m *WaveIntegrationManager) FreezeAcceptedTicket(ticketID, worktreePath str
 		}
 	}
 
+	if err := m.validateAcceptedTicketTree(ticketID, worktreePath); err != nil {
+		return "", err
+	}
+
 	head, err := gitRevParse(worktreePath, "HEAD")
 	if err != nil {
 		return "", fmt.Errorf("resolve accepted ticket %q head: %w", ticketID, err)
@@ -427,6 +464,23 @@ func (m *WaveIntegrationManager) FreezeAcceptedTicket(ticketID, worktreePath str
 		return "", fmt.Errorf("update accepted ticket ref %q: %w", refName, err)
 	}
 	return refName, nil
+}
+
+func (m *WaveIntegrationManager) validateAcceptedTicketTree(ticketID, worktreePath string) error {
+	baseRef := strings.TrimSpace(m.baseRef)
+	if baseRef == "" {
+		return fmt.Errorf("validate accepted ticket %q tree: base ref is required", ticketID)
+	}
+	changed, err := gitTouchedPathsInCommitRange(worktreePath, baseRef, "HEAD")
+	if err != nil {
+		return fmt.Errorf("validate accepted ticket %q tree: %w", ticketID, err)
+	}
+	for _, file := range changed {
+		if isEngineOwned(file) {
+			return fmt.Errorf("accepted ticket %q contains engine-owned path %q", ticketID, file)
+		}
+	}
+	return nil
 }
 
 func (m *WaveIntegrationManager) ApplyAcceptedTicketRefs(ctx context.Context, refs []string) error {
@@ -561,6 +615,33 @@ func gitCommitChanges(worktreePath, message string) error {
 	return nil
 }
 
+func gitTouchedPathsInCommitRange(worktreePath, fromRef, toRef string) ([]string, error) {
+	rangeSpec := fmt.Sprintf("%s..%s", fromRef, toRef)
+	cmd := exec.Command("git", "-C", worktreePath, "log", "--format=", "--name-only", "-z", rangeSpec, "--")
+	cmd.Env = engineGitEnv()
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		msg := strings.TrimSpace(string(bytes.TrimSpace(out)))
+		if msg != "" {
+			return nil, fmt.Errorf("git log --name-only %s: %w: %s", rangeSpec, err, msg)
+		}
+		return nil, fmt.Errorf("git log --name-only %s: %w", rangeSpec, err)
+	}
+	if len(out) == 0 {
+		return nil, nil
+	}
+	parts := bytes.Split(out, []byte{0})
+	touched := make([]string, 0, len(parts))
+	for _, part := range parts {
+		file := strings.TrimSpace(string(part))
+		if file == "" {
+			continue
+		}
+		touched = append(touched, file)
+	}
+	return dedupeAndSortChanged(touched), nil
+}
+
 func gitRevParse(worktreePath, ref string) (string, error) {
 	out, err := exec.Command("git", "-C", worktreePath, "rev-parse", "--verify", ref+"^{commit}").CombinedOutput()
 	if err != nil {
@@ -587,18 +668,18 @@ func gitUpdateRef(repoRoot, refName, commitish string) error {
 	return nil
 }
 
-func persistWorktreeDiff(repoRoot, runID, ticketID, diff string) (string, error) {
+func persistWorktreeDiff(repoRoot, runID, ticketID, diff string) error {
 	if strings.TrimSpace(diff) == "" {
-		return "", nil
+		return nil
 	}
 	diffPath := filepath.Join(repoRoot, ".verk", "runs", runID, "tickets", ticketID, "worktree.diff")
 	if err := os.MkdirAll(filepath.Dir(diffPath), 0o755); err != nil {
-		return "", fmt.Errorf("create diff artifact dir: %w", err)
+		return fmt.Errorf("create diff artifact dir: %w", err)
 	}
 	if err := os.WriteFile(diffPath, []byte(diff), 0o644); err != nil {
-		return "", fmt.Errorf("write diff artifact %q: %w", diffPath, err)
+		return fmt.Errorf("write diff artifact %q: %w", diffPath, err)
 	}
-	return diffPath, nil
+	return nil
 }
 
 func worktreePathMissing(path string) bool {
@@ -846,13 +927,19 @@ func engineGitEnv() []string {
 			continue
 		}
 		switch key {
-		case "GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_PREFIX", "GIT_SUPER_PREFIX":
+		case "GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_PREFIX", "GIT_SUPER_PREFIX", "GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL":
 			continue
 		default:
 			out = append(out, entry)
 		}
 	}
-	out = append(out, "GIT_OPTIONAL_LOCKS=0")
+	out = append(out,
+		"GIT_OPTIONAL_LOCKS=0",
+		"GIT_AUTHOR_NAME=verk",
+		"GIT_AUTHOR_EMAIL=verk@localhost",
+		"GIT_COMMITTER_NAME=verk",
+		"GIT_COMMITTER_EMAIL=verk@localhost",
+	)
 	return out
 }
 
@@ -917,32 +1004,6 @@ func isEngineOwned(path string) bool {
 	default:
 		return false
 	}
-}
-
-func isNonDeliverablePath(path string) bool {
-	if isEngineOwned(path) {
-		return true
-	}
-	segments := pathSegments(strings.TrimSpace(path))
-	if len(segments) == 0 {
-		return false
-	}
-
-	switch segments[0] {
-	case ".gocache", ".pytest_cache", ".ruff_cache", ".mypy_cache", ".tox", ".nox", ".parcel-cache", ".turbo", ".gradle":
-		return true
-	case ".next":
-		return len(segments) > 1 && segments[1] == "cache"
-	case "node_modules":
-		return len(segments) > 1 && segments[1] == ".cache"
-	}
-
-	base := filepath.Base(filepath.ToSlash(strings.TrimSpace(path)))
-	switch base {
-	case "coverage.out", "coverage.html", ".coverage":
-		return true
-	}
-	return strings.HasPrefix(base, ".coverage.")
 }
 
 type MergeToMainPartialError struct {
@@ -1668,7 +1729,7 @@ func filterEngineOwnedFilesInternal(changed []string) []string {
 	}
 	out := make([]string, 0, len(changed))
 	for _, file := range changed {
-		if isNonDeliverablePath(file) {
+		if isEngineOwned(file) {
 			continue
 		}
 		out = append(out, file)

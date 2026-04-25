@@ -145,6 +145,10 @@ policy.
 
 Decision: failed, blocked, cancelled, and needs-decision outcomes never merge to
 the main tree, while diffs and concise failure summaries are always retained.
+Closed sibling tickets remain merge-eligible: the wave integration gate freezes
+and verifies only closed ticket refs, advances the hidden integration base for
+that accepted subset, applies the integrated delta to the main tree, and then
+leaves the epic blocked on the failed tickets.
 Rationale: keeps the workspace clean while preserving evidence for triage and
 operator review.
 
@@ -168,6 +172,10 @@ Decision: sub-epics must either use the same isolation machinery or be
 explicitly rejected.
 Rationale: silent shared-workspace execution in nested flows violates the isolation
 contract.
+
+Current implementation choice: explicitly reject nested sub-epics during
+worktree-isolated epic runs with an operator-facing error until recursive hidden
+base / integration handling exists for descendant waves.
 
 ### 15) Cancellation and claims
 
@@ -195,8 +203,9 @@ usage varies.
 ### 18) Wave integration gate
 
 Decision: the orchestrator merges only accepted internal ticket refs into hidden
-integration base, performs wave-level checks there, then applies the integrated
-result to main; conflicts block by default with no hidden priority.
+integration base, performs wave-level checks there, commits and advances the
+hidden base, then applies the integrated result to main; conflicts block by
+default with no hidden priority.
 Rationale: this gate is the run's integrity boundary and prevents
 last-writer-wins behavior.
 
@@ -322,8 +331,9 @@ Replace shared-workspace baseline subtraction with per-ticket worktrees:
 7. Detect intra-wave conflicts before integration.
 8. Merge only accepted ticket refs into the integration base.
 9. Run wave-level checks on the integrated result.
-10. Apply the integrated wave delta to main.
-11. Advance the hidden integration ref for the next wave.
+10. Commit the integrated result and advance the hidden integration ref for the
+    next wave.
+11. Apply the integrated wave delta to main.
 12. Clean up worktrees on completion or failure.
 
 The same flow applies to resumed epics. Sub-epics must not bypass it.

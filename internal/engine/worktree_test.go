@@ -590,6 +590,42 @@ func TestWorktreeManager_CreateWorktreeAndSymlink(t *testing.T) {
 	}
 }
 
+func TestWorktreeManager_CreateWorktreeReusesExistingWorktree(t *testing.T) {
+	mainRoot := t.TempDir()
+	baseCommit := initEpicRepo(t, mainRoot)
+	if err := os.MkdirAll(filepath.Join(mainRoot, ".verk"), 0o755); err != nil {
+		t.Fatalf("prepare .verk in main root: %v", err)
+	}
+
+	manager := NewWorktreeManager(mainRoot, baseCommit, "run-reuse", t.TempDir())
+
+	// First creation succeeds.
+	path1, err := manager.CreateWorktree(context.Background(), "ticket-reuse")
+	if err != nil {
+		t.Fatalf("first CreateWorktree: %v", err)
+	}
+
+	// Second creation on same ticket should succeed by reusing the existing worktree.
+	path2, err := manager.CreateWorktree(context.Background(), "ticket-reuse")
+	if err != nil {
+		t.Fatalf("second CreateWorktree (reuse): %v", err)
+	}
+	if path2 != path1 {
+		t.Fatalf("reused worktree path %q != original path %q", path2, path1)
+	}
+
+	// Verify the worktree is functional.
+	markerPath := filepath.Join(path2, ".verk", "reuse-test.txt")
+	if err := os.WriteFile(markerPath, []byte("reused"), 0o644); err != nil {
+		t.Fatalf("write through reused worktree symlink: %v", err)
+	}
+	if got, err := os.ReadFile(filepath.Join(mainRoot, ".verk", "reuse-test.txt")); err != nil {
+		t.Fatalf("read shared .verk marker from main root: %v", err)
+	} else if string(got) != "reused" {
+		t.Fatalf("unexpected marker value %q", string(got))
+	}
+}
+
 func TestWorktreeManager_CreateWorktreeSerializesGitWorktreeAdd(t *testing.T) {
 	mainRoot := t.TempDir()
 	baseCommit := initEpicRepo(t, mainRoot)
@@ -724,7 +760,32 @@ func TestWorktreeManager_ChangedFilesFiltersEngineOwned(t *testing.T) {
 	}
 }
 
-func TestWorktreeManager_ChangedFilesFiltersNonDeliverablePathsButRawPreservesThem(t *testing.T) {
+func TestWorktreeManager_ChangedFilesKeepsNonEngineOwnedCacheLikePaths(t *testing.T) {
+	mainRoot := t.TempDir()
+	baseCommit := initEpicRepo(t, mainRoot)
+	manager := NewWorktreeManager(mainRoot, baseCommit, "run-cache-deliverable", t.TempDir())
+	path, err := manager.CreateWorktree(context.Background(), "ticket-cache-deliverable")
+	if err != nil {
+		t.Fatalf("CreateWorktree: %v", err)
+	}
+
+	if err := os.MkdirAll(filepath.Join(path, ".gradle"), 0o755); err != nil {
+		t.Fatalf("prepare gradle dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(path, ".gradle", "settings.gradle"), []byte("pluginManagement {}\n"), 0o644); err != nil {
+		t.Fatalf("write gradle settings: %v", err)
+	}
+
+	changed, err := manager.ChangedFiles("ticket-cache-deliverable")
+	if err != nil {
+		t.Fatalf("ChangedFiles: %v", err)
+	}
+	if !contains(changed, ".gradle/settings.gradle") {
+		t.Fatalf("expected .gradle/settings.gradle to remain deliverable, got %v", changed)
+	}
+}
+
+func TestWorktreeManager_ChangedFilesKeepsNonEngineOwnedPaths(t *testing.T) {
 	mainRoot := t.TempDir()
 	baseCommit := initEpicRepo(t, mainRoot)
 	manager := NewWorktreeManager(mainRoot, baseCommit, "run-nondeliverable", t.TempDir())
@@ -764,18 +825,18 @@ func TestWorktreeManager_ChangedFilesFiltersNonDeliverablePathsButRawPreservesTh
 	if err != nil {
 		t.Fatalf("ChangedFiles: %v", err)
 	}
-	if contains(changed, ".gocache/cache.txt") {
-		t.Fatalf("expected go cache path filtered from deliverable changes, got %v", changed)
+	if !contains(changed, ".gocache/cache.txt") {
+		t.Fatalf("expected go cache path in deliverable changes, got %v", changed)
 	}
-	if contains(changed, ".pytest_cache/state") {
-		t.Fatalf("expected pytest cache path filtered from deliverable changes, got %v", changed)
+	if !contains(changed, ".pytest_cache/state") {
+		t.Fatalf("expected pytest cache path in deliverable changes, got %v", changed)
 	}
 	if !contains(changed, "tracked.txt") {
 		t.Fatalf("expected tracked.txt in deliverable changes, got %v", changed)
 	}
 }
 
-func TestWorktreeManager_DetectConflictsIgnoresNonDeliverableOverlap(t *testing.T) {
+func TestWorktreeManager_DetectConflictsReportsNonEngineOwnedOverlap(t *testing.T) {
 	mainRoot := t.TempDir()
 	baseCommit := initEpicRepo(t, mainRoot)
 	manager := NewWorktreeManager(mainRoot, baseCommit, "run-conflict-filter", t.TempDir())
@@ -813,8 +874,11 @@ func TestWorktreeManager_DetectConflictsIgnoresNonDeliverableOverlap(t *testing.
 	if err != nil {
 		t.Fatalf("DetectConflicts: %v", err)
 	}
-	if len(conflicts) != 0 {
-		t.Fatalf("expected non-deliverable overlap to be ignored, got conflicts %#v", conflicts)
+	if len(conflicts) != 1 {
+		t.Fatalf("expected one non-engine-owned overlap conflict, got conflicts %#v", conflicts)
+	}
+	if conflicts[0].Path != ".gocache/shared" {
+		t.Fatalf("expected .gocache/shared conflict, got %#v", conflicts[0])
 	}
 }
 
@@ -837,6 +901,111 @@ func TestWorktreeManager_Diff(t *testing.T) {
 	}
 	if !strings.Contains(diff, "diff --git a/tracked.txt b/tracked.txt") {
 		t.Fatalf("expected tracked.txt diff, got %q", diff)
+	}
+}
+
+func TestWaveIntegration_InternalCommitsDoNotRequireUserGitIdentity(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("GIT_AUTHOR_NAME", "")
+	t.Setenv("GIT_AUTHOR_EMAIL", "")
+	t.Setenv("GIT_COMMITTER_NAME", "")
+	t.Setenv("GIT_COMMITTER_EMAIL", "")
+
+	repoRoot := t.TempDir()
+	mustRunGit(t, repoRoot, "init")
+	if err := os.WriteFile(filepath.Join(repoRoot, "file.txt"), []byte("content\n"), 0o644); err != nil {
+		t.Fatalf("write file: %v", err)
+	}
+	if err := gitAddAllPaths(repoRoot, []string{"file.txt"}); err != nil {
+		t.Fatalf("git add: %v", err)
+	}
+	if err := gitCommitChanges(repoRoot, "verk: internal commit without user identity"); err != nil {
+		t.Fatalf("internal commit should not require user git identity: %v", err)
+	}
+}
+
+func TestWaveIntegration_RejectsCommittedEngineOwnedPathsBeforeTicketRef(t *testing.T) {
+	mainRoot := t.TempDir()
+	baseCommit := initEpicRepo(t, mainRoot)
+	runID := "run-reject-engine-owned"
+	ticketID := "ticket-engine-owned"
+	manager := NewWorktreeManager(mainRoot, baseCommit, runID, t.TempDir())
+
+	worktreePath, err := manager.CreateWorktree(context.Background(), ticketID)
+	if err != nil {
+		t.Fatalf("CreateWorktree: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(worktreePath, ".tickets"), 0o755); err != nil {
+		t.Fatalf("prepare .tickets: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(worktreePath, ".tickets", "owned.md"), []byte("engine metadata\n"), 0o644); err != nil {
+		t.Fatalf("write engine-owned file: %v", err)
+	}
+	mustRunGit(t, worktreePath, "add", "-A")
+	mustRunGit(t, worktreePath, "commit", "-m", "worker committed engine metadata")
+
+	integration := &WaveIntegrationManager{
+		repoRoot: mainRoot,
+		runID:    runID,
+		baseRef:  baseCommit,
+	}
+	refName, err := integration.FreezeAcceptedTicket(ticketID, worktreePath, nil)
+	if err == nil {
+		t.Fatalf("expected committed engine-owned path to be rejected")
+	}
+	if !strings.Contains(err.Error(), "engine-owned path") {
+		t.Fatalf("expected engine-owned path error, got %v", err)
+	}
+	if refName != "" {
+		t.Fatalf("expected no accepted ticket ref name, got %q", refName)
+	}
+	if _, parseErr := gitRevParse(mainRoot, integrationTicketRef(runID, ticketID)); parseErr == nil {
+		t.Fatalf("expected accepted ticket ref to remain unset")
+	}
+}
+
+func TestWaveIntegration_RejectsEngineOwnedPathTouchedAndRemovedBeforeTicketRef(t *testing.T) {
+	mainRoot := t.TempDir()
+	baseCommit := initEpicRepo(t, mainRoot)
+	runID := "run-reject-engine-owned-history"
+	ticketID := "ticket-engine-owned-history"
+	manager := NewWorktreeManager(mainRoot, baseCommit, runID, t.TempDir())
+
+	worktreePath, err := manager.CreateWorktree(context.Background(), ticketID)
+	if err != nil {
+		t.Fatalf("CreateWorktree: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(worktreePath, ".tickets"), 0o755); err != nil {
+		t.Fatalf("prepare .tickets: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(worktreePath, ".tickets", "transient.md"), []byte("engine metadata\n"), 0o644); err != nil {
+		t.Fatalf("write transient engine-owned file: %v", err)
+	}
+	mustRunGit(t, worktreePath, "add", "-A")
+	mustRunGit(t, worktreePath, "commit", "-m", "worker added engine metadata")
+	if err := os.Remove(filepath.Join(worktreePath, ".tickets", "transient.md")); err != nil {
+		t.Fatalf("remove transient engine-owned file: %v", err)
+	}
+	mustRunGit(t, worktreePath, "add", "-A")
+	mustRunGit(t, worktreePath, "commit", "-m", "worker removed engine metadata")
+
+	integration := &WaveIntegrationManager{
+		repoRoot: mainRoot,
+		runID:    runID,
+		baseRef:  baseCommit,
+	}
+	refName, err := integration.FreezeAcceptedTicket(ticketID, worktreePath, nil)
+	if err == nil {
+		t.Fatalf("expected transient engine-owned path history to be rejected")
+	}
+	if !strings.Contains(err.Error(), "engine-owned path") {
+		t.Fatalf("expected engine-owned path error, got %v", err)
+	}
+	if refName != "" {
+		t.Fatalf("expected no accepted ticket ref name, got %q", refName)
+	}
+	if _, parseErr := gitRevParse(mainRoot, integrationTicketRef(runID, ticketID)); parseErr == nil {
+		t.Fatalf("expected accepted ticket ref to remain unset")
 	}
 }
 

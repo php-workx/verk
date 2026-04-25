@@ -1,11 +1,14 @@
 package engine
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"io/fs"
 	"log"
+	"os"
+	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -404,6 +407,25 @@ func RunEpic(ctx context.Context, req RunEpicRequest) (RunEpicResult, error) { /
 		if err != nil {
 			return result, err
 		}
+		var integration *WaveIntegrationManager
+		cleanedWaveResources := false
+		cleanupWaveResources := func() {
+			if cleanedWaveResources {
+				return
+			}
+			cleanedWaveResources = true
+			if integration != nil {
+				if cleanupErr := integration.Cleanup(); cleanupErr != nil {
+					log.Printf("[WARN] cleanup wave integration worktree: %v", cleanupErr)
+				}
+			}
+			if waveManager != nil {
+				if cleanupErr := waveManager.CleanupAll(); cleanupErr != nil {
+					log.Printf("[WARN] cleanup wave worktrees: %v", cleanupErr)
+				}
+			}
+		}
+		defer cleanupWaveResources() //nolint:gocritic // protects early returns while the current wave is in progress.
 
 		outcomes := make([]waveTicketOutcome, len(wave.TicketIDs))
 		var wg sync.WaitGroup
@@ -442,11 +464,23 @@ func RunEpic(ctx context.Context, req RunEpicRequest) (RunEpicResult, error) { /
 		}
 		wg.Wait()
 
-		waveFailed := false
+		ticketPhases := make([]state.TicketPhase, len(outcomes))
+		allClosed := true
+		mergeEligibleTicketIDs := make([]string, 0, len(outcomes))
+		for i, outcome := range outcomes {
+			ticketPhases[i] = outcome.phase
+			if outcome.phase != state.TicketPhaseClosed {
+				allClosed = false
+			} else {
+				mergeEligibleTicketIDs = append(mergeEligibleTicketIDs, wave.TicketIDs[i])
+			}
+		}
+
+		waveFailed := !allClosed
 		var waveErr error
 		var conflictErr error
 		if waveManager != nil {
-			conflicts, detectErr := waveManager.DetectConflicts()
+			conflicts, detectErr := waveManager.DetectConflictsFor(mergeEligibleTicketIDs)
 			if detectErr != nil {
 				if waveErr == nil {
 					waveErr = detectErr
@@ -462,16 +496,10 @@ func RunEpic(ctx context.Context, req RunEpicRequest) (RunEpicResult, error) { /
 			}
 		}
 
-		ticketPhases := make([]state.TicketPhase, len(outcomes))
-		allClosed := true
 		if waveErr == nil && conflictErr != nil {
 			waveFailed = true
 		}
-		for i, outcome := range outcomes {
-			ticketPhases[i] = outcome.phase
-			if outcome.phase != state.TicketPhaseClosed {
-				allClosed = false
-			}
+		for _, outcome := range outcomes {
 			if outcome.err != nil {
 				waveFailed = true
 				if waveErr == nil {
@@ -589,15 +617,14 @@ func RunEpic(ctx context.Context, req RunEpicRequest) (RunEpicResult, error) { /
 				log.Printf("[WARN] persist diff artifact for %s: %v", wave.TicketIDs[i], diffErr)
 				continue
 			}
-			if _, persistErr := persistWorktreeDiff(req.RepoRoot, req.RunID, wave.TicketIDs[i], diff); persistErr != nil {
+			if persistErr := persistWorktreeDiff(req.RepoRoot, req.RunID, wave.TicketIDs[i], diff); persistErr != nil {
 				log.Printf("[WARN] persist diff artifact for %s: %v", wave.TicketIDs[i], persistErr)
 			}
 		}
 
+		var blockErr error
 		if acceptErr != nil || waveFailed {
-			result.Run.Status = state.EpicRunStatusBlocked
-			result.Run.CurrentPhase = state.TicketPhaseBlocked
-			blockErr := acceptErr
+			blockErr = acceptErr
 			if conflictErr != nil {
 				blockErr = conflictErr
 			} else if waveErr != nil && blockErr == nil {
@@ -608,35 +635,25 @@ func RunEpic(ctx context.Context, req RunEpicRequest) (RunEpicResult, error) { /
 			if waveFailed && blockErr == nil {
 				blockErr = fmt.Errorf("%w: wave %s had ticket failures", ErrEpicBlocked, waveID)
 			}
-			if err := state.SaveJSONAtomic(runPath, result.Run); err != nil {
-				return result, errors.Join(blockErr, fmt.Errorf("persist run state: %w", err))
-			}
-			// Wrap the wave failure in BlockedRunError so the CLI can render the
-			// same retry guidance it uses for the "no ready tickets" branch.
-			// Re-read the current ticket store so block reasons reflect the state
-			// written by each ticket's finalization defer.
-			blockedChildren, childErr := listEpicChildren(req.RepoRoot, req.RootTicketID)
-			if childErr != nil {
-				return result, blockErr
-			}
-			return result, &BlockedRunError{
-				RunID:          req.RunID,
-				Status:         state.EpicRunStatusBlocked,
-				BlockedTickets: collectBlockedTickets(req.RepoRoot, req.RunID, blockedChildren),
-				Cause:          blockErr,
-			}
 		}
 
-		var integration *WaveIntegrationManager
-		// Run wave-level verification after all tickets merge. Mark pending in
-		// the cursor first so a crash during repair is detectable on resume.
-		if acceptedWave.Status == state.WaveStatusAccepted {
+		// Run wave-level verification for the merge-eligible ticket subset.
+		// A wave may still block on sibling tickets, but closed tickets can be
+		// safely integrated after the accepted subset passes the same gate.
+		if len(mergeEligibleTicketIDs) > 0 && conflictErr == nil && acceptErr == nil {
+			mergeChangedFiles, changedErr := changedFilesFromManager(waveManager, mergeEligibleTicketIDs)
+			if changedErr != nil {
+				return result, changedErr
+			}
+			mergeChangedFiles = filterEngineOwnedFiles(mergeChangedFiles)
+			mergeChangedFiles = subtractFiles(mergeChangedFiles, waveBaselineChangedFiles)
+
 			integration, err = prepareWaveIntegration(ctx, req.RepoRoot, req.RunID, req.WorktreeRoot, wave.WaveBaseCommit)
 			if err != nil {
 				return result, err
 			}
-			acceptedRefs := make([]string, 0, len(wave.TicketIDs))
-			for _, ticketID := range wave.TicketIDs {
+			acceptedRefs := make([]string, 0, len(mergeEligibleTicketIDs))
+			for _, ticketID := range mergeEligibleTicketIDs {
 				if waveManager == nil {
 					continue
 				}
@@ -657,7 +674,7 @@ func RunEpic(ctx context.Context, req RunEpicRequest) (RunEpicResult, error) { /
 			if err := state.SaveJSONAtomic(runPath, result.Run); err != nil {
 				return result, err
 			}
-			if verifyErr := runWaveVerificationLoop(ctx, req, cfg, &acceptedWave, wavePath, changedFiles, integration.WorktreePath()); verifyErr != nil {
+			if verifyErr := runWaveVerificationLoop(ctx, req, cfg, &acceptedWave, wavePath, mergeChangedFiles, integration.WorktreePath()); verifyErr != nil {
 				if clearErr := clearPendingWaveVerificationOnTerminalFailure(result.Run.ResumeCursor, runPath, &result.Run, &acceptedWave); clearErr != nil {
 					return result, errors.Join(verifyErr, fmt.Errorf("clear terminal pending wave verification: %w", clearErr))
 				}
@@ -668,11 +685,15 @@ func RunEpic(ctx context.Context, req RunEpicRequest) (RunEpicResult, error) { /
 				}
 				return result, verifyErr
 			}
-			if err := integration.ApplyToMain(changedFiles); err != nil {
+			oldBaseHead, err := gitRevParse(req.RepoRoot, wave.WaveBaseCommit)
+			if err != nil {
 				return result, err
 			}
 			newBaseHead, err := integration.CommitWave(acceptedWave.WaveID)
 			if err != nil {
+				return result, err
+			}
+			if err := applyIntegrationCommitToMain(req.RepoRoot, oldBaseHead, newBaseHead, mergeChangedFiles); err != nil {
 				return result, err
 			}
 			if strings.TrimSpace(newBaseHead) != "" && result.Run.ResumeCursor != nil {
@@ -691,7 +712,64 @@ func RunEpic(ctx context.Context, req RunEpicRequest) (RunEpicResult, error) { /
 		if err := state.SaveJSONAtomic(runPath, result.Run); err != nil {
 			return result, err
 		}
+		cleanupWaveResources()
+		if blockErr != nil {
+			result.Run.Status = state.EpicRunStatusBlocked
+			result.Run.CurrentPhase = state.TicketPhaseBlocked
+			result.Run.UpdatedAt = time.Now().UTC()
+			if err := state.SaveJSONAtomic(runPath, result.Run); err != nil {
+				return result, errors.Join(blockErr, fmt.Errorf("persist run state: %w", err))
+			}
+			// Wrap the wave failure in BlockedRunError so the CLI can render the
+			// same retry guidance it uses for the "no ready tickets" branch.
+			// Re-read the current ticket store so block reasons reflect the state
+			// written by each ticket's finalization defer.
+			blockedChildren, childErr := listEpicChildren(req.RepoRoot, req.RootTicketID)
+			if childErr != nil {
+				return result, blockErr
+			}
+			return result, &BlockedRunError{
+				RunID:          req.RunID,
+				Status:         state.EpicRunStatusBlocked,
+				BlockedTickets: collectBlockedTickets(req.RepoRoot, req.RunID, blockedChildren),
+				Cause:          blockErr,
+			}
+		}
 	}
+}
+
+func applyIntegrationCommitToMain(repoRoot, fromCommit, toCommit string, changedFiles []string) error {
+	if len(changedFiles) == 0 {
+		return nil
+	}
+	args := make([]string, 0, 8+len(changedFiles))
+	args = append(args, "-C", repoRoot, "diff", "--binary", fromCommit, toCommit, "--")
+	args = append(args, changedFiles...)
+	diffCmd := exec.Command("git", args...)
+	diffCmd.Env = engineGitEnv()
+	patch, err := diffCmd.CombinedOutput()
+	if err != nil {
+		msg := strings.TrimSpace(string(bytes.TrimSpace(patch)))
+		if msg != "" {
+			return fmt.Errorf("diff integrated wave %s..%s: %w: %s", fromCommit, toCommit, err, msg)
+		}
+		return fmt.Errorf("diff integrated wave %s..%s: %w", fromCommit, toCommit, err)
+	}
+	if len(bytes.TrimSpace(patch)) == 0 {
+		return nil
+	}
+	applyCmd := exec.Command("git", "-C", repoRoot, "apply", "--index", "--whitespace=nowarn")
+	applyCmd.Env = engineGitEnv()
+	applyCmd.Stdin = bytes.NewReader(patch)
+	out, err := applyCmd.CombinedOutput()
+	if err != nil {
+		msg := strings.TrimSpace(string(bytes.TrimSpace(out)))
+		if msg != "" {
+			return fmt.Errorf("apply integrated wave to main: %w: %s", err, msg)
+		}
+		return fmt.Errorf("apply integrated wave to main: %w", err)
+	}
+	return nil
 }
 
 func validateRunEpicRequest(req RunEpicRequest) error {
@@ -767,6 +845,38 @@ func updateTicketStatus(path string, status tkmd.Status) error {
 	}
 	ticket.Status = status
 	return tkmd.SaveTicket(path, ticket)
+}
+
+func persistTicketBlockedSnapshot(repoRoot, runID, ticketID, reason string) error {
+	var snapshot TicketRunSnapshot
+	if err := loadTicketSnapshot(repoRoot, runID, ticketID, &snapshot); err != nil {
+		if !os.IsNotExist(extractReadErr(err)) {
+			return err
+		}
+		snapshot = TicketRunSnapshot{
+			ArtifactMeta: state.ArtifactMeta{
+				SchemaVersion: artifactSchemaVersion,
+				RunID:         runID,
+				CreatedAt:     stateTime(),
+			},
+			TicketID: ticketID,
+		}
+	}
+	if snapshot.CreatedAt.IsZero() {
+		snapshot.CreatedAt = stateTime()
+	}
+	snapshot.UpdatedAt = stateTime()
+	snapshot.CurrentPhase = state.TicketPhaseBlocked
+	snapshot.Outcome = state.TicketOutcomeBlocked
+	snapshot.BlockReason = strings.TrimSpace(reason)
+	return state.WriteTransitionCommit(
+		state.TransitionPaths{
+			TicketArtifactPath: ticketSnapshotPath(repoRoot, runID, ticketID),
+		},
+		state.TransitionPayloads{
+			TicketArtifact: snapshot,
+		},
+	)
 }
 
 func loadEpicTicket(repoRoot, ticketID string) (tkmd.Ticket, error) {
@@ -937,6 +1047,17 @@ func resetOrphanedChildren(repoRoot string, children []tkmd.Ticket) error {
 // to detect circular epic-child relationships and return a blocked outcome early.
 func runSubEpic(ctx context.Context, req RunEpicRequest, cfg policy.Config, parentTicketID string, parentWave state.WaveArtifact, depth int, ancestors map[string]struct{}, reg *subEpicRegistrar) waveTicketOutcome { //nolint:gocognit,cyclop // orchestration loop mirroring RunEpic; refactored hotspots live in helpers
 	outcome := waveTicketOutcome{ticketID: parentTicketID, phase: state.TicketPhaseBlocked}
+
+	// Top-level epic waves now run inside isolated worktrees with a hidden
+	// integration base. Nested sub-epics still need a separate recursive
+	// integration/ref model so accepted grandchild work becomes the parent
+	// ticket's visible base without mutating the main tree. Until that exists,
+	// fail explicitly instead of silently falling back to shared-workspace
+	// execution inside an isolated run.
+	if strings.TrimSpace(req.WorktreeRoot) != "" || strings.TrimSpace(req.WorktreePath) != "" {
+		outcome.err = fmt.Errorf("sub-epic isolation is not implemented yet for %s: nested child waves cannot run inside isolated epic worktrees", parentTicketID)
+		return outcome
+	}
 
 	// Cycle guard: if this ticket already appears in the ancestor chain we have
 	// a circular epic-child relationship. Return a blocked outcome immediately so
@@ -1236,17 +1357,25 @@ func executeEpicTicket(ctx context.Context, req RunEpicRequest, cfg policy.Confi
 	}
 	if hasChildren && depth < maxDepth {
 		subOutcome := runSubEpic(ctx, req, cfg, ticketID, wave, depth, ancestors, reg)
-		if subOutcome.err != nil {
-			return subOutcome
-		}
-		// If sub-tickets didn't all close, the parent can't proceed.
-		// Persist the blocked state durably so the parent ticket is not eligible
-		// for rescheduling in a subsequent wave while the descendant remains
+		// If sub-tickets didn't all close, the parent can't proceed. Persist the
+		// blocked state durably so the parent ticket is not eligible for
+		// rescheduling in a subsequent wave while the descendant remains
 		// unresolved. Without this, the outer run loop would find the parent
 		// still open/ready and schedule it again, creating a repeated-wave loop.
-		if subOutcome.phase != state.TicketPhaseClosed {
+		if subOutcome.err != nil || subOutcome.phase != state.TicketPhaseClosed {
 			if updateErr := updateTicketStoreStatus(req.RepoRoot, ticketID, tkmd.StatusBlocked); updateErr != nil {
 				subOutcome.err = fmt.Errorf("persist blocked status for %s: %w", ticketID, updateErr)
+			}
+			blockReason := ""
+			if subOutcome.err != nil {
+				blockReason = subOutcome.err.Error()
+			}
+			if persistErr := persistTicketBlockedSnapshot(req.RepoRoot, req.RunID, ticketID, blockReason); persistErr != nil {
+				if subOutcome.err != nil {
+					subOutcome.err = errors.Join(subOutcome.err, fmt.Errorf("persist blocked snapshot for %s: %w", ticketID, persistErr))
+				} else {
+					subOutcome.err = fmt.Errorf("persist blocked snapshot for %s: %w", ticketID, persistErr)
+				}
 			}
 			return subOutcome
 		}

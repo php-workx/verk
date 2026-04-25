@@ -2,9 +2,11 @@ package e2e
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -207,23 +209,32 @@ func TestEpicThreeLevelHierarchy(t *testing.T) {
 		Adapter:      adapter,
 		Config:       cfg,
 	})
-	if err != nil {
-		t.Fatalf("RunEpic returned error: %v", err)
+	if !errors.Is(err, engine.ErrEpicBlocked) {
+		t.Fatalf("expected ErrEpicBlocked, got %v", err)
 	}
-	if result.Run.Status != state.EpicRunStatusCompleted {
-		t.Fatalf("expected completed epic, got status %s", result.Run.Status)
+	if !strings.Contains(err.Error(), "sub-epic isolation is not implemented yet") {
+		t.Fatalf("expected explicit unsupported isolation message, got %v", err)
+	}
+	if result.Run.Status != state.EpicRunStatusBlocked {
+		t.Fatalf("expected blocked epic, got status %s", result.Run.Status)
 	}
 
-	// All 3 tickets (sub-1, ticket-1, ticket-2) should have been dispatched
+	// Only unaffected top-level siblings should be dispatched. The parent ticket
+	// with nested children blocks before its own worker starts, and the nested
+	// child must not run at all.
 	workerReqs := adapter.WorkerRequests()
 	startedSet := make(map[string]bool)
 	for _, req := range workerReqs {
 		startedSet[req.TicketID] = true
 	}
-	for _, id := range []string{"sub-1", "ticket-1", "ticket-2"} {
-		if !startedSet[id] {
-			t.Errorf("expected ticket %q to be started, got %v", id, sortedKeys(startedSet))
-		}
+	if !startedSet["ticket-2"] {
+		t.Fatalf("expected unaffected sibling ticket to run, got %v", sortedKeys(startedSet))
+	}
+	if startedSet["ticket-1"] {
+		t.Fatalf("expected parent ticket with nested children to block before dispatch, got %v", sortedKeys(startedSet))
+	}
+	if startedSet["sub-1"] {
+		t.Fatalf("expected nested sub-ticket to remain undispatched, got %v", sortedKeys(startedSet))
 	}
 }
 

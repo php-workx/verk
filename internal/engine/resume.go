@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 	"verk/internal/adapters/runtime"
@@ -310,12 +311,15 @@ func resumeEpicMode(ctx context.Context, req ResumeRequest, artifacts *runArtifa
 	if err != nil {
 		return nil, err
 	}
+	baseCommit, err := resolveResumeWaveBase(artifacts.RepoRoot, artifacts.Run)
+	if err != nil {
+		return nil, err
+	}
+	currentBaseRef := baseCommit
 
 	// Determine the last completed wave ordinal from ResumeCursor
 	lastWaveOrdinal := resumeCursorWaveOrdinal(artifacts.Run.ResumeCursor)
 	waveOrdinal := lastWaveOrdinal
-
-	baseCommit := artifacts.Run.BaseCommit
 
 	// Reset incomplete tickets (including blocked) to "ready" so ListReadyChildren
 	// can pick them up. Only closed tickets are skipped — blocked tickets must be
@@ -405,13 +409,22 @@ func resumeEpicMode(ctx context.Context, req ResumeRequest, artifacts *runArtifa
 			}
 			return allResumed, err
 		}
+		if err := assertMainTreeMatchesWaveBase(artifacts.RepoRoot, currentBaseRef); err != nil {
+			artifacts.Run.Status = state.EpicRunStatusBlocked
+			artifacts.Run.CurrentPhase = state.TicketPhaseBlocked
+			artifacts.Run.UpdatedAt = time.Now().UTC()
+			if saveErr := state.SaveJSONAtomic(runPath, artifacts.Run); saveErr != nil {
+				return allResumed, errors.Join(err, fmt.Errorf("persist run state: %w", saveErr))
+			}
+			return allResumed, err
+		}
 
 		waveOrdinal++
 		waveID := fmt.Sprintf("wave-%d", waveOrdinal)
 		wave.WaveID = waveID
 		wave.Ordinal = waveOrdinal
 		wave.Status = state.WaveStatusRunning
-		wave.WaveBaseCommit = baseCommit
+		wave.WaveBaseCommit = currentBaseRef
 		wave.StartedAt = time.Now().UTC()
 		wavePath := filepath.Join(artifacts.RepoRoot, ".verk", "runs", req.RunID, "waves", waveID+".json")
 		if err := state.SaveJSONAtomic(wavePath, wave); err != nil {
@@ -423,7 +436,7 @@ func resumeEpicMode(ctx context.Context, req ResumeRequest, artifacts *runArtifa
 			Tickets: append([]string(nil), wave.TicketIDs...),
 		})
 
-		waveBaselineRawChangedFiles, err := repo.ChangedFilesAgainst(baseCommit)
+		waveBaselineRawChangedFiles, err := repo.ChangedFilesAgainst(currentBaseRef)
 		if err != nil {
 			return allResumed, err
 		}
@@ -484,11 +497,21 @@ func resumeEpicMode(ctx context.Context, req ResumeRequest, artifacts *runArtifa
 
 		ticketPhases := make([]state.TicketPhase, len(outcomes))
 		allClosed := true
-		waveFailed := false
+		mergeEligibleTicketIDs := make([]string, 0, len(outcomes))
+		for i, outcome := range outcomes {
+			ticketPhases[i] = outcome.phase
+			if outcome.phase != state.TicketPhaseClosed {
+				allClosed = false
+			} else {
+				mergeEligibleTicketIDs = append(mergeEligibleTicketIDs, wave.TicketIDs[i])
+			}
+		}
+
+		waveFailed := !allClosed
 		var waveErr error
 		var conflictErr error
 		if waveManager != nil {
-			conflicts, detectErr := waveManager.DetectConflicts()
+			conflicts, detectErr := waveManager.DetectConflictsFor(mergeEligibleTicketIDs)
 			if detectErr != nil {
 				if waveErr == nil {
 					waveErr = detectErr
@@ -502,11 +525,10 @@ func resumeEpicMode(ctx context.Context, req ResumeRequest, artifacts *runArtifa
 				waveFailed = true
 			}
 		}
-		for i, outcome := range outcomes {
-			ticketPhases[i] = outcome.phase
-			if outcome.phase != state.TicketPhaseClosed {
-				allClosed = false
-			}
+		if waveErr == nil && conflictErr != nil {
+			waveFailed = true
+		}
+		for _, outcome := range outcomes {
 			if outcome.err != nil {
 				waveFailed = true
 				if waveErr == nil {
@@ -525,7 +547,7 @@ func resumeEpicMode(ctx context.Context, req ResumeRequest, artifacts *runArtifa
 			}
 			changedFiles, err = changedFilesFromManager(waveManager, wave.TicketIDs)
 		} else {
-			rawChangedFiles, err = repo.ChangedFilesAgainst(baseCommit)
+			rawChangedFiles, err = repo.ChangedFilesAgainst(currentBaseRef)
 			if err == nil {
 				changedFiles = append([]string(nil), rawChangedFiles...)
 			}
@@ -544,6 +566,7 @@ func resumeEpicMode(ctx context.Context, req ResumeRequest, artifacts *runArtifa
 			return allResumed, err
 		}
 
+		ticketDetails := buildWaveTicketDetails(artifacts.RepoRoot, req.RunID, wave.TicketIDs, outcomes)
 		acceptedWave, acceptErr := AcceptWave(WaveAcceptanceRequest{
 			Wave:                 wave,
 			TicketPhases:         ticketPhases,
@@ -552,6 +575,7 @@ func resumeEpicMode(ctx context.Context, req ResumeRequest, artifacts *runArtifa
 			TicketScopes:         ticketScopes,
 			ClaimsReleased:       claimsReleased,
 			PersistenceSucceeded: true,
+			TicketDetails:        ticketDetails,
 		})
 		if waveFailed {
 			acceptedWave.Status = state.WaveStatusFailed
@@ -587,16 +611,21 @@ func resumeEpicMode(ctx context.Context, req ResumeRequest, artifacts *runArtifa
 		}
 		if !allClosed && !waveFailed {
 			waveFailed = true
+			if waveErr == nil {
+				waveErr = fmt.Errorf("wave %s has non-closed tickets", waveID)
+			}
 		}
 		closedCount := countClosedTickets(outcomes)
 		blockedIDs := collectBlockedTicketIDs(outcomes)
+		blockedDetails := waveBlockedTicketEvents(blockedIDs, ticketPhases, wave.TicketIDs, ticketDetails)
 		SendProgress(ctx, req.Progress, ProgressEvent{
-			Type:           EventWaveCompleted,
-			WaveID:         waveOrdinal,
-			Closed:         closedCount,
-			Total:          len(wave.TicketIDs),
-			Success:        acceptedWave.Status == state.WaveStatusAccepted,
-			BlockedTickets: blockedIDs,
+			Type:                 EventWaveCompleted,
+			WaveID:               waveOrdinal,
+			Closed:               closedCount,
+			Total:                len(wave.TicketIDs),
+			Success:              acceptedWave.Status == state.WaveStatusAccepted,
+			BlockedTickets:       blockedIDs,
+			BlockedTicketDetails: blockedDetails,
 		})
 		artifacts.Run.WaveIDs = append(artifacts.Run.WaveIDs, acceptedWave.WaveID)
 		artifacts.Run.UpdatedAt = time.Now().UTC()
@@ -610,6 +639,37 @@ func resumeEpicMode(ctx context.Context, req ResumeRequest, artifacts *runArtifa
 			}
 			allResumed = appendIfMissing(allResumed, tid)
 		}
+		for i, outcome := range outcomes {
+			if outcome.phase == state.TicketPhaseClosed {
+				continue
+			}
+			if waveManager == nil {
+				continue
+			}
+			diff, diffErr := waveManager.Diff(wave.TicketIDs[i])
+			if diffErr != nil {
+				log.Printf("[WARN] persist diff artifact for %s: %v", wave.TicketIDs[i], diffErr)
+				continue
+			}
+			if persistErr := persistWorktreeDiff(artifacts.RepoRoot, req.RunID, wave.TicketIDs[i], diff); persistErr != nil {
+				log.Printf("[WARN] persist diff artifact for %s: %v", wave.TicketIDs[i], persistErr)
+			}
+		}
+
+		var blockErr error
+		if acceptErr != nil || waveFailed {
+			blockErr = acceptErr
+			if conflictErr != nil {
+				blockErr = conflictErr
+			} else if waveErr != nil && blockErr == nil {
+				blockErr = waveErr
+			} else if waveErr != nil && blockErr != nil {
+				blockErr = errors.Join(blockErr, waveErr)
+			}
+			if waveFailed && blockErr == nil {
+				blockErr = fmt.Errorf("%w: wave %s had ticket failures", ErrEpicBlocked, waveID)
+			}
+		}
 
 		if acceptErr != nil {
 			artifacts.Run.Status = state.EpicRunStatusBlocked
@@ -622,15 +682,52 @@ func resumeEpicMode(ctx context.Context, req ResumeRequest, artifacts *runArtifa
 			return allResumed, acceptErr
 		}
 
-		// Run wave-level verification after all tickets merge. Mark pending in
-		// the cursor first so a crash during repair is detectable on resume.
-		if acceptedWave.Status == state.WaveStatusAccepted {
+		// Run wave-level verification for the merge-eligible ticket subset.
+		// A wave may still block on sibling tickets, but closed tickets can be
+		// safely integrated after the accepted subset passes the same gate.
+		var integration *WaveIntegrationManager
+		if len(mergeEligibleTicketIDs) > 0 && conflictErr == nil && acceptErr == nil {
+			mergeChangedFiles, changedErr := changedFilesFromManager(waveManager, mergeEligibleTicketIDs)
+			if changedErr != nil {
+				cleanupWaveManager()
+				return allResumed, changedErr
+			}
+			mergeChangedFiles = filterEngineOwnedFiles(mergeChangedFiles)
+			mergeChangedFiles = subtractFiles(mergeChangedFiles, waveBaselineChangedFiles)
+
+			integration, err = prepareWaveIntegration(ctx, artifacts.RepoRoot, req.RunID, epicReq.WorktreeRoot, wave.WaveBaseCommit)
+			if err != nil {
+				cleanupWaveManager()
+				return allResumed, err
+			}
+			acceptedRefs := make([]string, 0, len(mergeEligibleTicketIDs))
+			for _, ticketID := range mergeEligibleTicketIDs {
+				if waveManager == nil {
+					continue
+				}
+				effectiveFiles, changedErr := waveManager.ChangedFiles(ticketID)
+				if changedErr != nil {
+					cleanupWaveManager()
+					return allResumed, changedErr
+				}
+				refName, freezeErr := integration.FreezeAcceptedTicket(ticketID, waveManager.WorktreePath(ticketID), effectiveFiles)
+				if freezeErr != nil {
+					cleanupWaveManager()
+					return allResumed, freezeErr
+				}
+				acceptedRefs = append(acceptedRefs, refName)
+			}
+			if err := integration.ApplyAcceptedTicketRefs(ctx, acceptedRefs); err != nil {
+				cleanupWaveManager()
+				return allResumed, err
+			}
+			epicReq.WorktreePath = integration.WorktreePath()
 			setPendingWaveVerification(artifacts.Run.ResumeCursor, acceptedWave.WaveID)
 			if err := state.SaveJSONAtomic(runPath, artifacts.Run); err != nil {
 				cleanupWaveManager()
 				return allResumed, err
 			}
-			if verifyErr := runWaveVerificationLoop(ctx, epicReq, cfg, &acceptedWave, wavePath, changedFiles, epicReq.WorktreePath); verifyErr != nil {
+			if verifyErr := runWaveVerificationLoop(ctx, epicReq, cfg, &acceptedWave, wavePath, mergeChangedFiles, epicReq.WorktreePath); verifyErr != nil {
 				if clearErr := clearPendingWaveVerificationOnTerminalFailure(artifacts.Run.ResumeCursor, runPath, &artifacts.Run, &acceptedWave); clearErr != nil {
 					cleanupWaveManager()
 					return allResumed, errors.Join(verifyErr, fmt.Errorf("clear terminal pending wave verification: %w", clearErr))
@@ -644,19 +741,73 @@ func resumeEpicMode(ctx context.Context, req ResumeRequest, artifacts *runArtifa
 				cleanupWaveManager()
 				return allResumed, verifyErr
 			}
+			oldBaseHead, err := gitRevParse(artifacts.RepoRoot, wave.WaveBaseCommit)
+			if err != nil {
+				cleanupWaveManager()
+				return allResumed, err
+			}
+			newBaseHead, err := integration.CommitWave(acceptedWave.WaveID)
+			if err != nil {
+				cleanupWaveManager()
+				return allResumed, err
+			}
+			if err := applyIntegrationCommitToMain(artifacts.RepoRoot, oldBaseHead, newBaseHead, mergeChangedFiles); err != nil {
+				cleanupWaveManager()
+				return allResumed, err
+			}
+			currentBaseRef = integration.BaseRef()
+			if strings.TrimSpace(newBaseHead) != "" && artifacts.Run.ResumeCursor != nil {
+				artifacts.Run.ResumeCursor["last_wave_base_commit"] = newBaseHead
+			}
 			clearPendingWaveVerification(artifacts.Run.ResumeCursor)
 		}
 
 		if artifacts.Run.ResumeCursor != nil {
 			artifacts.Run.ResumeCursor["wave_ordinal"] = waveOrdinal
-			artifacts.Run.ResumeCursor["last_wave_base_commit"] = wave.WaveBaseCommit
+			if _, ok := artifacts.Run.ResumeCursor["last_wave_base_commit"]; !ok {
+				artifacts.Run.ResumeCursor["last_wave_base_commit"] = wave.WaveBaseCommit
+			}
 		}
 		if err := state.SaveJSONAtomic(runPath, artifacts.Run); err != nil {
 			cleanupWaveManager()
 			return allResumed, err
 		}
 		cleanupWaveManager()
+		if blockErr != nil {
+			artifacts.Run.Status = state.EpicRunStatusBlocked
+			artifacts.Run.CurrentPhase = state.TicketPhaseBlocked
+			artifacts.Run.UpdatedAt = time.Now().UTC()
+			if err := state.SaveJSONAtomic(runPath, artifacts.Run); err != nil {
+				return allResumed, errors.Join(blockErr, fmt.Errorf("persist run state: %w", err))
+			}
+		}
 	}
+}
+
+func resolveResumeWaveBase(repoRoot string, run state.RunArtifact) (string, error) {
+	refName := integrationBaseRef(run.RunID)
+	if _, err := gitRevParse(repoRoot, refName); err == nil {
+		return refName, nil
+	}
+
+	lastBaseCommit := ""
+	if run.ResumeCursor != nil {
+		if raw, ok := run.ResumeCursor["last_wave_base_commit"].(string); ok {
+			lastBaseCommit = strings.TrimSpace(raw)
+		}
+	}
+	if lastBaseCommit != "" {
+		if err := gitUpdateRef(repoRoot, refName, lastBaseCommit); err != nil {
+			return "", fmt.Errorf("reconstruct integration base %q from last_wave_base_commit %q: %w", refName, lastBaseCommit, err)
+		}
+		return refName, nil
+	}
+
+	if resumeCursorWaveOrdinal(run.ResumeCursor) > 0 || len(run.WaveIDs) > 0 {
+		return "", fmt.Errorf("cannot reconstruct integration base %q for resume: missing hidden ref and last_wave_base_commit", refName)
+	}
+
+	return ensureIntegrationBaseRef(repoRoot, run.RunID, run.BaseCommit)
 }
 
 // resumeAdapter resolves a runtime adapter for the given plan from the resume request.
