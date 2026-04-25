@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 	"verk/internal/adapters/runtime"
@@ -539,11 +540,10 @@ func TestWaveDerivation_DocsWave_DerivesStaleWordingCheck(t *testing.T) {
 	}
 }
 
-// TestResumePendingWaveVerification_AlreadyPassed_ClearsCursorWithoutRerun
-// verifies TC5: when the pending wave already passed, resumePendingWaveVerification
-// must clear the cursor marker and return without re-running the verification loop.
-// This prevents duplicating work that completed before a process crash.
-func TestResumePendingWaveVerification_AlreadyPassed_ClearsCursorWithoutRerun(t *testing.T) {
+// TestResumePendingWaveVerification_AlreadyPassedWithoutTransactionPreservesCursor
+// verifies that a top-level wave that passed verification is not treated as
+// complete until its durable integration transaction has also completed.
+func TestResumePendingWaveVerification_AlreadyPassedWithoutTransactionPreservesCursor(t *testing.T) {
 	repoRoot, wavePath, wave := makeWaveVerifyFixture(t)
 
 	// Mark wave as already verified.
@@ -572,13 +572,17 @@ func TestResumePendingWaveVerification_AlreadyPassed_ClearsCursorWithoutRerun(t 
 	cfg.Policy.MaxWaveRepairCycles = 0
 
 	err := resumePendingWaveVerification(context.Background(), makeEpicReq(repoRoot, adapter), cfg, cursor, runPath, &run)
-	if err != nil {
-		t.Fatalf("expected nil error for already-passed wave, got: %v", err)
+	if err == nil {
+		t.Fatal("expected error for already-passed wave without integration transaction")
+	}
+	if !strings.Contains(err.Error(), "no durable integration transaction") {
+		t.Fatalf("expected durable transaction error, got: %v", err)
 	}
 
-	// Cursor must be cleared so the next resume does not repeat the check.
-	if _, ok := pendingWaveVerificationID(cursor); ok {
-		t.Error("expected pending wave verification marker to be cleared")
+	// Cursor must remain so resume does not skip a wave that has not been
+	// committed to the hidden base and applied to main.
+	if pending, ok := pendingWaveVerificationID(cursor); !ok || pending != "wave-1" {
+		t.Fatalf("expected pending wave verification marker to remain, cursor=%v", cursor)
 	}
 
 	// No worker must have been invoked — the loop was skipped entirely.

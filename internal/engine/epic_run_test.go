@@ -1023,7 +1023,7 @@ func TestRunEpicDoesNotMutateMainWhenFreshWaveCommitFails(t *testing.T) {
 	}
 }
 
-func TestRunEpic_MainApplyFailureAfterHiddenBaseAdvanceIsRecoverable(t *testing.T) {
+func TestRunEpic_DoesNotAdvanceHiddenBaseWhenMainApplyFails(t *testing.T) {
 	repoRoot := t.TempDir()
 	baseCommit := initEpicRepo(t, repoRoot)
 	runID := "run-main-apply-fail"
@@ -1088,8 +1088,8 @@ func TestRunEpic_MainApplyFailureAfterHiddenBaseAdvanceIsRecoverable(t *testing.
 	if parseErr != nil {
 		t.Fatalf("expected hidden base ref to remain available: %v", parseErr)
 	}
-	if newBaseHead == baseCommit {
-		t.Fatalf("expected hidden base to advance before main apply failure")
+	if newBaseHead != baseCommit {
+		t.Fatalf("hidden base advanced before main apply succeeded: got %s, want %s", newBaseHead, baseCommit)
 	}
 
 	var run state.RunArtifact
@@ -1099,8 +1099,163 @@ func TestRunEpic_MainApplyFailureAfterHiddenBaseAdvanceIsRecoverable(t *testing.
 	if pending, ok := pendingWaveVerificationID(run.ResumeCursor); !ok || pending != "wave-1" {
 		t.Fatalf("expected pending wave verification to remain for retry, cursor=%v", run.ResumeCursor)
 	}
-	if got, ok := run.ResumeCursor["last_wave_base_commit"].(string); ok && got == newBaseHead {
+	if got, ok := run.ResumeCursor["last_wave_base_commit"].(string); ok && got != baseCommit {
 		t.Fatalf("last_wave_base_commit advanced before main apply succeeded: %q", got)
+	}
+}
+
+func TestRunEpic_AppliesPostRepairFilesToMain(t *testing.T) {
+	repoRoot := t.TempDir()
+	baseCommit := initEpicRepo(t, repoRoot)
+	runID := "run-post-repair-main"
+	cfg := policy.DefaultConfig()
+	cfg.Verification.QualityCommands = nil
+	cfg.Verification.WaveCommands = []policy.QualityCommand{{Path: ".", Run: []string{"test -f repair.txt"}}}
+	cfg.Policy.MaxWaveRepairCycles = 1
+
+	root := epicTicket("epic-post-repair-main")
+	child := epicChildTicket("ticket-post-repair-main", root.ID, tkmd.StatusReady, nil, []string{"primary.txt"})
+	mustSaveTicket(t, repoRoot, root)
+	mustSaveTicket(t, repoRoot, child)
+
+	start := epicTestStart()
+	adapter := functionAdapter{
+		runWorker: func(ctx context.Context, req runtime.WorkerRequest) (runtime.WorkerResult, error) {
+			if req.WaveID != "" {
+				if err := os.WriteFile(filepath.Join(req.WorktreePath, "repair.txt"), []byte("repair\n"), 0o644); err != nil {
+					return runtime.WorkerResult{}, err
+				}
+				return runtime.WorkerResult{
+					Status:             runtime.WorkerStatusDone,
+					RetryClass:         runtime.RetryClassTerminal,
+					LeaseID:            req.LeaseID,
+					StartedAt:          start,
+					FinishedAt:         start.Add(time.Second),
+					ResultArtifactPath: filepath.Join(repoRoot, "wave-repair.worker.json"),
+				}, nil
+			}
+			if req.TicketID != child.ID {
+				return runtime.WorkerResult{}, fmt.Errorf("unexpected worker ticket %q", req.TicketID)
+			}
+			if err := os.WriteFile(filepath.Join(req.WorktreePath, "primary.txt"), []byte("primary\n"), 0o644); err != nil {
+				return runtime.WorkerResult{}, err
+			}
+			return runtime.WorkerResult{
+				Status:             runtime.WorkerStatusDone,
+				RetryClass:         runtime.RetryClassTerminal,
+				LeaseID:            req.LeaseID,
+				StartedAt:          start,
+				FinishedAt:         start.Add(time.Second),
+				ResultArtifactPath: filepath.Join(repoRoot, child.ID+".worker.json"),
+			}, nil
+		},
+		runReviewer: func(ctx context.Context, req runtime.ReviewRequest) (runtime.ReviewResult, error) {
+			return runtime.ReviewResult{
+				Status:             runtime.WorkerStatusDone,
+				RetryClass:         runtime.RetryClassTerminal,
+				LeaseID:            req.LeaseID,
+				StartedAt:          start.Add(2 * time.Second),
+				FinishedAt:         start.Add(3 * time.Second),
+				ReviewStatus:       runtime.ReviewStatusPassed,
+				Summary:            "clean",
+				ResultArtifactPath: filepath.Join(repoRoot, "review.json"),
+			}, nil
+		},
+	}
+
+	result, err := RunEpic(context.Background(), RunEpicRequest{
+		RepoRoot:     repoRoot,
+		RunID:        runID,
+		RootTicketID: root.ID,
+		BaseCommit:   baseCommit,
+		Adapter:      adapter,
+		Config:       cfg,
+	})
+	if err != nil {
+		t.Fatalf("RunEpic returned error: %v", err)
+	}
+	if result.Run.Status != state.EpicRunStatusCompleted {
+		t.Fatalf("expected completed run, got %q", result.Run.Status)
+	}
+	for _, path := range []string{"primary.txt", "repair.txt"} {
+		if _, err := os.Stat(filepath.Join(repoRoot, path)); err != nil {
+			t.Fatalf("expected %s applied to main: %v", path, err)
+		}
+	}
+}
+
+func TestRunEpic_PersistsWaveOrdinalBeforeWaveArtifact(t *testing.T) {
+	repoRoot := t.TempDir()
+	baseCommit := initEpicRepo(t, repoRoot)
+	runID := "run-wave-cursor-before-artifact"
+	cfg := policy.DefaultConfig()
+	cfg.Verification.QualityCommands = nil
+	cfg.Verification.WaveCommands = nil
+
+	root := epicTicket("epic-wave-cursor-before-artifact")
+	child := epicChildTicket("ticket-wave-cursor-before-artifact", root.ID, tkmd.StatusReady, nil, []string{"tracked.txt"})
+	mustSaveTicket(t, repoRoot, root)
+	mustSaveTicket(t, repoRoot, child)
+
+	adapter := newBlockingEpicAdapter(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	type runOutcome struct {
+		result RunEpicResult
+		err    error
+	}
+	done := make(chan runOutcome, 1)
+	go func() {
+		result, err := RunEpic(ctx, RunEpicRequest{
+			RepoRoot:     repoRoot,
+			RunID:        runID,
+			RootTicketID: root.ID,
+			BaseCommit:   baseCommit,
+			Adapter:      adapter,
+			Config:       cfg,
+		})
+		done <- runOutcome{result: result, err: err}
+	}()
+
+	select {
+	case got := <-adapter.started:
+		if got != child.ID {
+			t.Fatalf("unexpected worker ticket %q", got)
+		}
+	case <-time.After(5 * time.Second):
+		cancel()
+		t.Fatal("timed out waiting for worker to start")
+	}
+
+	var duringWave state.RunArtifact
+	if err := state.LoadJSON(runJSONPath(repoRoot, runID), &duringWave); err != nil {
+		close(adapter.release)
+		t.Fatalf("load run while wave is active: %v", err)
+	}
+
+	close(adapter.release)
+	select {
+	case outcome := <-done:
+		if outcome.err != nil {
+			t.Fatalf("RunEpic returned error after releasing worker: %v", outcome.err)
+		}
+	case <-time.After(5 * time.Second):
+		cancel()
+		t.Fatal("timed out waiting for RunEpic to finish")
+	}
+
+	if got := resumeCursorWaveOrdinal(duringWave.ResumeCursor); got != 1 {
+		t.Fatalf("expected wave_ordinal to be durable before worker started, got %d in cursor %#v", got, duringWave.ResumeCursor)
+	}
+	foundWaveID := false
+	for _, waveID := range duringWave.WaveIDs {
+		if waveID == "wave-1" {
+			foundWaveID = true
+			break
+		}
+	}
+	if !foundWaveID {
+		t.Fatalf("expected wave-1 in durable WaveIDs before worker started, got %#v", duringWave.WaveIDs)
 	}
 }
 

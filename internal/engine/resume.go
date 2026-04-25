@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"log"
-	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -317,9 +316,10 @@ func resumeEpicMode(ctx context.Context, req ResumeRequest, artifacts *runArtifa
 	}
 	currentBaseRef := baseCommit
 
-	// Determine the last completed wave ordinal from ResumeCursor
-	lastWaveOrdinal := resumeCursorWaveOrdinal(artifacts.Run.ResumeCursor)
-	waveOrdinal := lastWaveOrdinal
+	waveOrdinal, err := maxDurableWaveOrdinal(artifacts.RepoRoot, req.RunID, artifacts.Run)
+	if err != nil {
+		return nil, err
+	}
 
 	// Reset incomplete tickets (including blocked) to "ready" so ListReadyChildren
 	// can pick them up. Only closed tickets are skipped — blocked tickets must be
@@ -426,8 +426,14 @@ func resumeEpicMode(ctx context.Context, req ResumeRequest, artifacts *runArtifa
 		wave.Status = state.WaveStatusRunning
 		wave.WaveBaseCommit = currentBaseRef
 		wave.StartedAt = time.Now().UTC()
-		wavePath := filepath.Join(artifacts.RepoRoot, ".verk", "runs", req.RunID, "waves", waveID+".json")
+		wavePath := waveArtifactPath(artifacts.RepoRoot, req.RunID, waveID)
+		if err := ensureFreshWaveArtifactPath(artifacts.RepoRoot, req.RunID, waveID); err != nil {
+			return allResumed, err
+		}
 		if err := state.SaveJSONAtomic(wavePath, wave); err != nil {
+			return allResumed, err
+		}
+		if err := persistScheduledWaveRunState(&artifacts.Run, runPath, waveID, waveOrdinal); err != nil {
 			return allResumed, err
 		}
 		SendProgress(ctx, req.Progress, ProgressEvent{
@@ -627,7 +633,7 @@ func resumeEpicMode(ctx context.Context, req ResumeRequest, artifacts *runArtifa
 			BlockedTickets:       blockedIDs,
 			BlockedTicketDetails: blockedDetails,
 		})
-		artifacts.Run.WaveIDs = append(artifacts.Run.WaveIDs, acceptedWave.WaveID)
+		artifacts.Run.WaveIDs = appendIfMissing(artifacts.Run.WaveIDs, acceptedWave.WaveID)
 		artifacts.Run.UpdatedAt = time.Now().UTC()
 
 		// Ticket store is updated by RunTicket's defer for normal completions.
@@ -722,7 +728,19 @@ func resumeEpicMode(ctx context.Context, req ResumeRequest, artifacts *runArtifa
 				return allResumed, err
 			}
 			epicReq.WorktreePath = integration.WorktreePath()
-			setPendingWaveVerification(artifacts.Run.ResumeCursor, acceptedWave.WaveID)
+			oldBaseHead, err := gitRevParse(artifacts.RepoRoot, wave.WaveBaseCommit)
+			if err != nil {
+				cleanupWaveManager()
+				return allResumed, err
+			}
+			pendingTx := pendingWaveIntegrationTransaction{
+				WaveID:       acceptedWave.WaveID,
+				BaseCommit:   oldBaseHead,
+				AcceptedRefs: acceptedRefs,
+				ChangedFiles: mergeChangedFiles,
+				WorktreePath: integration.WorktreePath(),
+			}
+			setPendingWaveIntegration(artifacts.Run.ResumeCursor, pendingTx)
 			if err := state.SaveJSONAtomic(runPath, artifacts.Run); err != nil {
 				cleanupWaveManager()
 				return allResumed, err
@@ -741,25 +759,11 @@ func resumeEpicMode(ctx context.Context, req ResumeRequest, artifacts *runArtifa
 				cleanupWaveManager()
 				return allResumed, verifyErr
 			}
-			oldBaseHead, err := gitRevParse(artifacts.RepoRoot, wave.WaveBaseCommit)
-			if err != nil {
-				cleanupWaveManager()
-				return allResumed, err
-			}
-			newBaseHead, err := integration.CommitWave(acceptedWave.WaveID)
-			if err != nil {
-				cleanupWaveManager()
-				return allResumed, err
-			}
-			if err := applyIntegrationCommitToMain(artifacts.RepoRoot, oldBaseHead, newBaseHead, mergeChangedFiles); err != nil {
+			if err := completePendingWaveIntegrationTransaction(epicReq, artifacts.Run.ResumeCursor, runPath, &artifacts.Run, &acceptedWave, wavePath, pendingTx, integration); err != nil {
 				cleanupWaveManager()
 				return allResumed, err
 			}
 			currentBaseRef = integration.BaseRef()
-			if strings.TrimSpace(newBaseHead) != "" && artifacts.Run.ResumeCursor != nil {
-				artifacts.Run.ResumeCursor["last_wave_base_commit"] = newBaseHead
-			}
-			clearPendingWaveVerification(artifacts.Run.ResumeCursor)
 		}
 
 		if artifacts.Run.ResumeCursor != nil {

@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -252,7 +253,10 @@ func RunEpic(ctx context.Context, req RunEpicRequest) (RunEpicResult, error) { /
 
 	result := RunEpicResult{Run: run, Path: runPath}
 	registrar := &subEpicRegistrar{run: &result.Run, runPath: runPath}
-	waveOrdinal := 0
+	waveOrdinal, err := maxDurableWaveOrdinal(req.RepoRoot, req.RunID, result.Run)
+	if err != nil {
+		return result, err
+	}
 
 	for {
 		if err := ctx.Err(); err != nil {
@@ -382,8 +386,14 @@ func RunEpic(ctx context.Context, req RunEpicRequest) (RunEpicResult, error) { /
 		wave.Status = state.WaveStatusRunning
 		wave.WaveBaseCommit = waveBaseRef
 		wave.StartedAt = time.Now().UTC()
-		wavePath := filepath.Join(req.RepoRoot, ".verk", "runs", req.RunID, "waves", waveID+".json")
+		wavePath := waveArtifactPath(req.RepoRoot, req.RunID, waveID)
+		if err := ensureFreshWaveArtifactPath(req.RepoRoot, req.RunID, waveID); err != nil {
+			return result, err
+		}
 		if err := state.SaveJSONAtomic(wavePath, wave); err != nil {
+			return result, err
+		}
+		if err := persistScheduledWaveRunState(&result.Run, runPath, waveID, waveOrdinal); err != nil {
 			return result, err
 		}
 		SendProgress(ctx, req.Progress, ProgressEvent{
@@ -595,7 +605,7 @@ func RunEpic(ctx context.Context, req RunEpicRequest) (RunEpicResult, error) { /
 			BlockedTicketDetails: blockedDetails,
 		})
 		result.Waves = append(result.Waves, acceptedWave)
-		result.Run.WaveIDs = append(result.Run.WaveIDs, acceptedWave.WaveID)
+		result.Run.WaveIDs = appendIfMissing(result.Run.WaveIDs, acceptedWave.WaveID)
 		result.Run.UpdatedAt = time.Now().UTC()
 
 		// Ticket store is updated by RunTicket's defer for normal completions.
@@ -670,7 +680,18 @@ func RunEpic(ctx context.Context, req RunEpicRequest) (RunEpicResult, error) { /
 			if err := integration.ApplyAcceptedTicketRefs(ctx, acceptedRefs); err != nil {
 				return result, err
 			}
-			setPendingWaveVerification(result.Run.ResumeCursor, acceptedWave.WaveID)
+			oldBaseHead, err := gitRevParse(req.RepoRoot, wave.WaveBaseCommit)
+			if err != nil {
+				return result, err
+			}
+			pendingTx := pendingWaveIntegrationTransaction{
+				WaveID:       acceptedWave.WaveID,
+				BaseCommit:   oldBaseHead,
+				AcceptedRefs: acceptedRefs,
+				ChangedFiles: mergeChangedFiles,
+				WorktreePath: integration.WorktreePath(),
+			}
+			setPendingWaveIntegration(result.Run.ResumeCursor, pendingTx)
 			if err := state.SaveJSONAtomic(runPath, result.Run); err != nil {
 				return result, err
 			}
@@ -685,21 +706,9 @@ func RunEpic(ctx context.Context, req RunEpicRequest) (RunEpicResult, error) { /
 				}
 				return result, verifyErr
 			}
-			oldBaseHead, err := gitRevParse(req.RepoRoot, wave.WaveBaseCommit)
-			if err != nil {
+			if err := completePendingWaveIntegrationTransaction(req, result.Run.ResumeCursor, runPath, &result.Run, &acceptedWave, wavePath, pendingTx, integration); err != nil {
 				return result, err
 			}
-			newBaseHead, err := integration.CommitWave(acceptedWave.WaveID)
-			if err != nil {
-				return result, err
-			}
-			if err := applyIntegrationCommitToMain(req.RepoRoot, oldBaseHead, newBaseHead, mergeChangedFiles); err != nil {
-				return result, err
-			}
-			if strings.TrimSpace(newBaseHead) != "" && result.Run.ResumeCursor != nil {
-				result.Run.ResumeCursor["last_wave_base_commit"] = newBaseHead
-			}
-			clearPendingWaveVerification(result.Run.ResumeCursor)
 			result.Waves[len(result.Waves)-1] = acceptedWave
 		}
 
@@ -758,10 +767,21 @@ func applyIntegrationCommitToMain(repoRoot, fromCommit, toCommit string, changed
 	if len(bytes.TrimSpace(patch)) == 0 {
 		return nil
 	}
+	checkCmd := exec.Command("git", "-C", repoRoot, "apply", "--index", "--check", "--whitespace=nowarn")
+	checkCmd.Env = engineGitEnv()
+	checkCmd.Stdin = bytes.NewReader(patch)
+	out, err := checkCmd.CombinedOutput()
+	if err != nil {
+		msg := strings.TrimSpace(string(bytes.TrimSpace(out)))
+		if msg != "" {
+			return fmt.Errorf("check integrated wave apply to main: %w: %s", err, msg)
+		}
+		return fmt.Errorf("check integrated wave apply to main: %w", err)
+	}
 	applyCmd := exec.Command("git", "-C", repoRoot, "apply", "--index", "--whitespace=nowarn")
 	applyCmd.Env = engineGitEnv()
 	applyCmd.Stdin = bytes.NewReader(patch)
-	out, err := applyCmd.CombinedOutput()
+	out, err = applyCmd.CombinedOutput()
 	if err != nil {
 		msg := strings.TrimSpace(string(bytes.TrimSpace(out)))
 		if msg != "" {
@@ -770,6 +790,39 @@ func applyIntegrationCommitToMain(repoRoot, fromCommit, toCommit string, changed
 		return fmt.Errorf("apply integrated wave to main: %w", err)
 	}
 	return nil
+}
+
+func finalIntegratedChangedFiles(repoRoot, fromCommit, toCommit string) ([]string, error) {
+	files, err := gitTouchedPathsInCommitRange(repoRoot, fromCommit, toCommit)
+	if err != nil {
+		return nil, fmt.Errorf("collect final integrated wave paths %s..%s: %w", fromCommit, toCommit, err)
+	}
+	return filterEngineOwnedFiles(files), nil
+}
+
+func syncAcceptedWaveChangedFiles(wave *state.WaveArtifact, changedFiles []string) {
+	if wave == nil {
+		return
+	}
+	files := append([]string(nil), changedFiles...)
+	wave.ActualScope = files
+	if wave.Acceptance == nil {
+		wave.Acceptance = map[string]any{}
+	}
+	wave.Acceptance["changed_files_effective"] = append([]string(nil), files...)
+}
+
+func rollbackIntegrationBaseOrJoin(primary error, integration *WaveIntegrationManager, oldBaseHead, newBaseHead string) error {
+	if primary == nil {
+		return nil
+	}
+	if integration == nil {
+		return primary
+	}
+	if err := integration.RollbackBaseRef(oldBaseHead, newBaseHead); err != nil {
+		return errors.Join(primary, fmt.Errorf("rollback integration base ref after failed main apply: %w", err))
+	}
+	return primary
 }
 
 func validateRunEpicRequest(req RunEpicRequest) error {
@@ -908,6 +961,66 @@ func waveClaimsReleased(repoRoot, runID string, ticketIDs []string) (bool, error
 		}
 	}
 	return true, nil
+}
+
+func maxDurableWaveOrdinal(repoRoot, runID string, run state.RunArtifact) (int, error) {
+	maxOrdinal := resumeCursorWaveOrdinal(run.ResumeCursor)
+	for _, waveID := range run.WaveIDs {
+		if ordinal, ok := topLevelWaveOrdinal(waveID); ok && ordinal > maxOrdinal {
+			maxOrdinal = ordinal
+		}
+	}
+
+	waveDir := filepath.Join(runDir(repoRoot, runID), "waves")
+	entries, err := os.ReadDir(waveDir)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return maxOrdinal, nil
+		}
+		return 0, fmt.Errorf("read wave artifact directory: %w", err)
+	}
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
+			continue
+		}
+		waveID := strings.TrimSuffix(entry.Name(), ".json")
+		if ordinal, ok := topLevelWaveOrdinal(waveID); ok && ordinal > maxOrdinal {
+			maxOrdinal = ordinal
+		}
+	}
+	return maxOrdinal, nil
+}
+
+func topLevelWaveOrdinal(waveID string) (int, bool) {
+	suffix, ok := strings.CutPrefix(strings.TrimSpace(waveID), "wave-")
+	if !ok || suffix == "" {
+		return 0, false
+	}
+	ordinal, err := strconv.Atoi(suffix)
+	if err != nil || ordinal <= 0 {
+		return 0, false
+	}
+	return ordinal, true
+}
+
+func ensureFreshWaveArtifactPath(repoRoot, runID, waveID string) error {
+	path := waveArtifactPath(repoRoot, runID, waveID)
+	if _, err := os.Stat(path); err == nil {
+		return fmt.Errorf("refusing to overwrite existing wave artifact %s at %s", waveID, path)
+	} else if !errors.Is(err, fs.ErrNotExist) {
+		return fmt.Errorf("stat wave artifact %s: %w", waveID, err)
+	}
+	return nil
+}
+
+func persistScheduledWaveRunState(run *state.RunArtifact, runPath, waveID string, waveOrdinal int) error {
+	if run.ResumeCursor == nil {
+		run.ResumeCursor = map[string]any{}
+	}
+	run.ResumeCursor["wave_ordinal"] = waveOrdinal
+	run.WaveIDs = appendIfMissing(run.WaveIDs, waveID)
+	run.UpdatedAt = time.Now().UTC()
+	return state.SaveJSONAtomic(runPath, *run)
 }
 
 func filterEngineOwnedFiles(changed []string) []string {

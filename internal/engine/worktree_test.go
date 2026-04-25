@@ -626,6 +626,89 @@ func TestWorktreeManager_CreateWorktreeReusesExistingWorktree(t *testing.T) {
 	}
 }
 
+func TestPrepareWaveWorktrees_RecreatesExistingDirtyWorktree(t *testing.T) {
+	mainRoot := t.TempDir()
+	baseCommit := initEpicRepo(t, mainRoot)
+	if err := os.MkdirAll(filepath.Join(mainRoot, ".verk"), 0o755); err != nil {
+		t.Fatalf("prepare .verk in main root: %v", err)
+	}
+
+	runID := "run-dirty-recreate"
+	ticketID := "ticket-dirty"
+	workRoot := t.TempDir()
+	manager, err := prepareWaveWorktrees(context.Background(), mainRoot, baseCommit, runID, workRoot, []string{ticketID})
+	if err != nil {
+		t.Fatalf("initial prepareWaveWorktrees: %v", err)
+	}
+	worktreePath := manager.WorktreePath(ticketID)
+	stalePath := filepath.Join(worktreePath, "stale.txt")
+	if err := os.WriteFile(stalePath, []byte("stale\n"), 0o644); err != nil {
+		t.Fatalf("write stale file: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(worktreePath, "tracked.txt"), []byte("dirty\n"), 0o644); err != nil {
+		t.Fatalf("dirty tracked file: %v", err)
+	}
+
+	manager, err = prepareWaveWorktrees(context.Background(), mainRoot, baseCommit, runID, workRoot, []string{ticketID})
+	if err != nil {
+		t.Fatalf("reprepare dirty worktree: %v", err)
+	}
+	worktreePath = manager.WorktreePath(ticketID)
+	if _, err := os.Stat(stalePath); !os.IsNotExist(err) {
+		t.Fatalf("expected stale file removed after recreate, stat err=%v", err)
+	}
+	got, err := os.ReadFile(filepath.Join(worktreePath, "tracked.txt"))
+	if err != nil {
+		t.Fatalf("read recreated tracked file: %v", err)
+	}
+	if string(got) != "base\n" {
+		t.Fatalf("expected recreated tracked file at base content, got %q", string(got))
+	}
+}
+
+func TestPrepareWaveWorktrees_RejectsExistingWrongBaseWorktree(t *testing.T) {
+	mainRoot := t.TempDir()
+	baseCommit := initEpicRepo(t, mainRoot)
+	if err := os.MkdirAll(filepath.Join(mainRoot, ".verk"), 0o755); err != nil {
+		t.Fatalf("prepare .verk in main root: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(mainRoot, "later.txt"), []byte("later\n"), 0o644); err != nil {
+		t.Fatalf("write later file: %v", err)
+	}
+	mustRunGit(t, mainRoot, "add", "later.txt")
+	mustRunGit(t, mainRoot, "commit", "-m", "add later file")
+	laterOut, err := gitOutput(mainRoot, "rev-parse", "HEAD")
+	if err != nil {
+		t.Fatalf("resolve later commit: %v", err)
+	}
+	laterCommit := strings.TrimSpace(laterOut)
+
+	runID := "run-wrong-base"
+	ticketID := "ticket-wrong-base"
+	workRoot := t.TempDir()
+	worktreePath := filepath.Join(workRoot, runID, ticketID)
+	if err := os.MkdirAll(filepath.Dir(worktreePath), 0o755); err != nil {
+		t.Fatalf("prepare worktree parent: %v", err)
+	}
+	mustRunGit(t, mainRoot, "worktree", "add", "--detach", worktreePath, laterCommit)
+
+	manager, err := prepareWaveWorktrees(context.Background(), mainRoot, baseCommit, runID, workRoot, []string{ticketID})
+	if err != nil {
+		t.Fatalf("prepare existing wrong-base worktree: %v", err)
+	}
+	worktreePath = manager.WorktreePath(ticketID)
+	head, err := gitRevParse(worktreePath, "HEAD")
+	if err != nil {
+		t.Fatalf("resolve recreated worktree HEAD: %v", err)
+	}
+	if head != baseCommit {
+		t.Fatalf("expected existing wrong-base worktree recreated at %s, got %s", baseCommit, head)
+	}
+	if _, err := os.Stat(filepath.Join(worktreePath, "later.txt")); !os.IsNotExist(err) {
+		t.Fatalf("expected later file removed after recreate, stat err=%v", err)
+	}
+}
+
 func TestWorktreeManager_CreateWorktreeSerializesGitWorktreeAdd(t *testing.T) {
 	mainRoot := t.TempDir()
 	baseCommit := initEpicRepo(t, mainRoot)
@@ -924,6 +1007,37 @@ func TestWaveIntegration_InternalCommitsDoNotRequireUserGitIdentity(t *testing.T
 	}
 }
 
+func TestGitRevParseIgnoresHostileGitEnvironment(t *testing.T) {
+	mainRoot := t.TempDir()
+	mainCommit := initEpicRepo(t, mainRoot)
+
+	hostileRoot := t.TempDir()
+	initEpicRepo(t, hostileRoot)
+	if err := os.WriteFile(filepath.Join(hostileRoot, "hostile.txt"), []byte("hostile\n"), 0o644); err != nil {
+		t.Fatalf("write hostile file: %v", err)
+	}
+	mustRunGit(t, hostileRoot, "add", "hostile.txt")
+	mustRunGit(t, hostileRoot, "commit", "-m", "hostile commit")
+	hostileOut, err := gitOutput(hostileRoot, "rev-parse", "HEAD")
+	if err != nil {
+		t.Fatalf("resolve hostile commit: %v", err)
+	}
+	hostileCommit := strings.TrimSpace(hostileOut)
+	t.Setenv("GIT_DIR", filepath.Join(hostileRoot, ".git"))
+	t.Setenv("GIT_WORK_TREE", hostileRoot)
+	t.Setenv("GIT_INDEX_FILE", filepath.Join(t.TempDir(), "hostile-index"))
+	t.Setenv("GIT_OBJECT_DIRECTORY", filepath.Join(hostileRoot, ".git", "objects"))
+	t.Setenv("GIT_ALTERNATE_OBJECT_DIRECTORIES", filepath.Join(hostileRoot, ".git", "objects"))
+
+	got, err := gitRevParse(mainRoot, "HEAD")
+	if err != nil {
+		t.Fatalf("gitRevParse with hostile env: %v", err)
+	}
+	if got != mainCommit {
+		t.Fatalf("gitRevParse resolved %s, want main commit %s (hostile commit %s)", got, mainCommit, hostileCommit)
+	}
+}
+
 func TestWaveIntegration_RejectsCommittedEngineOwnedPathsBeforeTicketRef(t *testing.T) {
 	mainRoot := t.TempDir()
 	baseCommit := initEpicRepo(t, mainRoot)
@@ -952,6 +1066,53 @@ func TestWaveIntegration_RejectsCommittedEngineOwnedPathsBeforeTicketRef(t *test
 	refName, err := integration.FreezeAcceptedTicket(ticketID, worktreePath, nil)
 	if err == nil {
 		t.Fatalf("expected committed engine-owned path to be rejected")
+	}
+	if !strings.Contains(err.Error(), "engine-owned path") {
+		t.Fatalf("expected engine-owned path error, got %v", err)
+	}
+	if refName != "" {
+		t.Fatalf("expected no accepted ticket ref name, got %q", refName)
+	}
+	if _, parseErr := gitRevParse(mainRoot, integrationTicketRef(runID, ticketID)); parseErr == nil {
+		t.Fatalf("expected accepted ticket ref to remain unset")
+	}
+}
+
+func TestWaveIntegration_RejectsEngineOwnedRenameSourceBeforeTicketRef(t *testing.T) {
+	mainRoot := t.TempDir()
+	initEpicRepo(t, mainRoot)
+	runID := "run-reject-engine-owned-rename"
+	ticketID := "ticket-engine-owned-rename"
+	if err := os.MkdirAll(filepath.Join(mainRoot, ".tickets"), 0o755); err != nil {
+		t.Fatalf("prepare main .tickets: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(mainRoot, ".tickets", "owned.md"), []byte("engine metadata\n"), 0o644); err != nil {
+		t.Fatalf("write engine-owned file: %v", err)
+	}
+	mustRunGit(t, mainRoot, "add", "-f", ".tickets/owned.md")
+	mustRunGit(t, mainRoot, "commit", "-m", "add engine-owned ticket file")
+	baseOut, err := gitOutput(mainRoot, "rev-parse", "HEAD")
+	if err != nil {
+		t.Fatalf("resolve engine-owned base commit: %v", err)
+	}
+	baseCommit := strings.TrimSpace(baseOut)
+
+	manager := NewWorktreeManager(mainRoot, baseCommit, runID, t.TempDir())
+	worktreePath, err := manager.CreateWorktree(context.Background(), ticketID)
+	if err != nil {
+		t.Fatalf("CreateWorktree: %v", err)
+	}
+	mustRunGit(t, worktreePath, "mv", ".tickets/owned.md", "deliverable.txt")
+	mustRunGit(t, worktreePath, "commit", "-m", "rename engine metadata to deliverable")
+
+	integration := &WaveIntegrationManager{
+		repoRoot: mainRoot,
+		runID:    runID,
+		baseRef:  baseCommit,
+	}
+	refName, err := integration.FreezeAcceptedTicket(ticketID, worktreePath, nil)
+	if err == nil {
+		t.Fatalf("expected engine-owned rename source to be rejected")
 	}
 	if !strings.Contains(err.Error(), "engine-owned path") {
 		t.Fatalf("expected engine-owned path error, got %v", err)

@@ -115,32 +115,19 @@ func (wm *WorktreeManager) CreateWorktree(ctx context.Context, ticketID string) 
 	}
 
 	if errors.Is(err, git.ErrWorktreeExists) {
-		// Worktree already exists (e.g. from a prior failed attempt in the same run).
-		// Verify the .verk symlink is intact, then reuse the existing worktree.
-		linkTarget := filepath.Join(wm.mainRoot, ".verk")
-		linkPath := filepath.Join(worktreePath, ".verk")
-		if fi, readErr := os.Lstat(linkPath); readErr == nil && fi.Mode()&os.ModeSymlink != 0 {
-			if existing, _ := os.Readlink(linkPath); existing != linkTarget {
-				_ = os.RemoveAll(linkPath)
-				if symErr := os.Symlink(linkTarget, linkPath); symErr != nil {
-					return "", fmt.Errorf("fix worktree symlink for ticket %q: %w", ticketID, symErr)
-				}
-			}
-		} else {
-			// Symlink missing or not a symlink — recreate it.
-			_ = os.RemoveAll(linkPath)
-			if symErr := os.Symlink(linkTarget, linkPath); symErr != nil {
-				return "", fmt.Errorf("recreate worktree symlink for ticket %q: %w", ticketID, symErr)
-			}
+		if removeErr := repo.RemoveWorktree(worktreePath); removeErr != nil {
+			return "", fmt.Errorf("remove existing worktree for ticket %q: %w", ticketID, removeErr)
 		}
-	} else if err == nil {
-		// Fresh worktree — establish the symlink.
-		if symErr := establishWorktreeVerkSymlink(worktreePath, wm.mainRoot); symErr != nil {
-			if removeErr := repo.RemoveWorktree(worktreePath); removeErr != nil {
-				return "", fmt.Errorf("create worktree symlink for ticket %q: %w; cleanup: %v", ticketID, symErr, removeErr)
-			}
-			return "", fmt.Errorf("create worktree symlink for ticket %q: %w", ticketID, symErr)
+		if createErr := repo.CreateWorktree(ctx, baseRef, worktreePath); createErr != nil {
+			return "", fmt.Errorf("recreate worktree for ticket %q: %w", ticketID, createErr)
 		}
+	}
+
+	if symErr := establishWorktreeVerkSymlink(worktreePath, wm.mainRoot); symErr != nil {
+		if removeErr := repo.RemoveWorktree(worktreePath); removeErr != nil {
+			return "", fmt.Errorf("create worktree symlink for ticket %q: %w; cleanup: %v", ticketID, symErr, removeErr)
+		}
+		return "", fmt.Errorf("create worktree symlink for ticket %q: %w", ticketID, symErr)
 	}
 
 	wm.worktrees[ticketID] = worktreePath
@@ -535,6 +522,9 @@ func (m *WaveIntegrationManager) CommitWave(waveID string) (string, error) {
 		return "", fmt.Errorf("read integration status for %s: %w", waveID, err)
 	}
 	if len(changes) > 0 {
+		if err := gitAddAllPaths(m.worktreePath, mergeChangePaths(changes)); err != nil {
+			return "", fmt.Errorf("stage integrated wave %s: %w", waveID, err)
+		}
 		if err := gitCommitChanges(m.worktreePath, fmt.Sprintf("verk: integrate %s", waveID)); err != nil {
 			return "", fmt.Errorf("commit integrated wave %s: %w", waveID, err)
 		}
@@ -547,6 +537,22 @@ func (m *WaveIntegrationManager) CommitWave(waveID string) (string, error) {
 		return "", fmt.Errorf("advance integration base ref %q: %w", m.baseRef, err)
 	}
 	return head, nil
+}
+
+func (m *WaveIntegrationManager) RollbackBaseRef(previousHead, expectedCurrent string) error {
+	if m == nil {
+		return fmt.Errorf("wave integration manager is nil")
+	}
+	if strings.TrimSpace(previousHead) == "" {
+		return fmt.Errorf("previous integration base head is empty")
+	}
+	if strings.TrimSpace(expectedCurrent) == "" {
+		return fmt.Errorf("expected current integration base head is empty")
+	}
+	if err := gitUpdateRefExpected(m.repoRoot, m.baseRef, previousHead, expectedCurrent); err != nil {
+		return fmt.Errorf("rollback integration base ref %q to %s: %w", m.baseRef, previousHead, err)
+	}
+	return nil
 }
 
 func assertMainTreeMatchesWaveBase(repoRoot, baseRef string) error {
@@ -617,33 +623,55 @@ func gitCommitChanges(worktreePath, message string) error {
 
 func gitTouchedPathsInCommitRange(worktreePath, fromRef, toRef string) ([]string, error) {
 	rangeSpec := fmt.Sprintf("%s..%s", fromRef, toRef)
-	cmd := exec.Command("git", "-C", worktreePath, "log", "--format=", "--name-only", "-z", rangeSpec, "--")
+	cmd := exec.Command("git", "-C", worktreePath, "log", "--format=", "--name-status", "-z", "--find-renames", "--find-copies", rangeSpec, "--")
 	cmd.Env = engineGitEnv()
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		msg := strings.TrimSpace(string(bytes.TrimSpace(out)))
 		if msg != "" {
-			return nil, fmt.Errorf("git log --name-only %s: %w: %s", rangeSpec, err, msg)
+			return nil, fmt.Errorf("git log --name-status %s: %w: %s", rangeSpec, err, msg)
 		}
-		return nil, fmt.Errorf("git log --name-only %s: %w", rangeSpec, err)
+		return nil, fmt.Errorf("git log --name-status %s: %w", rangeSpec, err)
 	}
 	if len(out) == 0 {
 		return nil, nil
 	}
 	parts := bytes.Split(out, []byte{0})
 	touched := make([]string, 0, len(parts))
-	for _, part := range parts {
-		file := strings.TrimSpace(string(part))
-		if file == "" {
+	for i := 0; i < len(parts); {
+		status := strings.TrimSpace(string(parts[i]))
+		i++
+		if status == "" {
 			continue
 		}
-		touched = append(touched, file)
+		if i >= len(parts) {
+			return nil, fmt.Errorf("parse git log --name-status %s: missing path for status %q", rangeSpec, status)
+		}
+
+		oldPath := string(parts[i])
+		i++
+		if oldPath != "" {
+			touched = append(touched, oldPath)
+		}
+		switch status[0] {
+		case 'R', 'C':
+			if i >= len(parts) {
+				return nil, fmt.Errorf("parse git log --name-status %s: missing destination for status %q", rangeSpec, status)
+			}
+			newPath := string(parts[i])
+			i++
+			if newPath != "" {
+				touched = append(touched, newPath)
+			}
+		}
 	}
 	return dedupeAndSortChanged(touched), nil
 }
 
 func gitRevParse(worktreePath, ref string) (string, error) {
-	out, err := exec.Command("git", "-C", worktreePath, "rev-parse", "--verify", ref+"^{commit}").CombinedOutput()
+	cmd := exec.Command("git", "-C", worktreePath, "rev-parse", "--verify", ref+"^{commit}")
+	cmd.Env = engineGitEnv()
+	out, err := cmd.CombinedOutput()
 	if err != nil {
 		msg := strings.TrimSpace(string(bytes.TrimSpace(out)))
 		if msg != "" {
@@ -664,6 +692,20 @@ func gitUpdateRef(repoRoot, refName, commitish string) error {
 			return fmt.Errorf("git update-ref %s %s: %w: %s", refName, commitish, err, msg)
 		}
 		return fmt.Errorf("git update-ref %s %s: %w", refName, commitish, err)
+	}
+	return nil
+}
+
+func gitUpdateRefExpected(repoRoot, refName, commitish, expectedOld string) error {
+	cmd := exec.Command("git", "-C", repoRoot, "update-ref", refName, commitish, expectedOld)
+	cmd.Env = engineGitEnv()
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		msg := strings.TrimSpace(string(bytes.TrimSpace(out)))
+		if msg != "" {
+			return fmt.Errorf("git update-ref %s %s %s: %w: %s", refName, commitish, expectedOld, err, msg)
+		}
+		return fmt.Errorf("git update-ref %s %s %s: %w", refName, commitish, expectedOld, err)
 	}
 	return nil
 }
@@ -848,6 +890,9 @@ func runStatusIsActive(runRoot string) (bool, error) {
 	var run state.RunArtifact
 	if err := json.Unmarshal(raw, &run); err != nil {
 		return false, fmt.Errorf("unmarshal run manifest %q: %w", runPath, err)
+	}
+	if _, ok := pendingWaveVerificationID(run.ResumeCursor); ok {
+		return true, nil
 	}
 
 	switch run.Status {
@@ -1264,6 +1309,25 @@ func filterSyntheticWorktreeChanges(changes []mergeToMainChange) []mergeToMainCh
 		out = append(out, change)
 	}
 	return out
+}
+
+func mergeChangePaths(changes []mergeToMainChange) []string {
+	if len(changes) == 0 {
+		return nil
+	}
+	paths := make([]string, 0, len(changes)*3)
+	for _, change := range changes {
+		if strings.TrimSpace(change.srcRel) != "" {
+			paths = append(paths, change.srcRel)
+		}
+		if strings.TrimSpace(change.destRel) != "" {
+			paths = append(paths, change.destRel)
+		}
+		if strings.TrimSpace(change.oldRel) != "" {
+			paths = append(paths, change.oldRel)
+		}
+	}
+	return dedupeAndSortChanged(paths)
 }
 
 func isSyntheticWorktreeChange(change mergeToMainChange) bool {
