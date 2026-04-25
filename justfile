@@ -20,11 +20,15 @@ pre-commit: format-check vet lint-check build-check mod-tidy-check actionlint be
 # Pre-push: pre-commit + race tests + vulnerability scan + semgrep
 pre-push: pre-commit test-race vuln semgrep
 
+# Dev gate: same broad checks as pre-push, but skip test-fast because test-race
+# already runs the full package set.
+dev-check: format-check vet lint-check build-check mod-tidy-check actionlint betterleaks test-race vuln semgrep
+
 # Full quality gate: same as pre-push
 check: pre-push
 
 # Full dev suite: quality gate + sonar
-dev: check sonar
+dev: dev-check sonar
     @echo "All checks passed!"
 
 # --- Static analysis ---
