@@ -1370,23 +1370,39 @@ func resolveWithinRoot(root, rel string) (string, error) {
 		return "", fmt.Errorf("resolve symlinks in root %q: %w", absRoot, err)
 	}
 	absTarget := filepath.Join(absRoot, rel)
-	// Resolve symlinks in the parent directory — the target itself may not
-	// exist yet (new files during merge-to-main). Walk up until we find an
-	// existing ancestor.
+	// Resolve symlinks by walking up until we find an existing ancestor.
+	// The target itself may not exist yet (new files during merge-to-main),
+	// and intermediate directories may also not exist yet.
 	parent := filepath.Dir(absTarget)
-	resolvedParent, err := filepath.EvalSymlinks(parent)
-	if err != nil {
-		return "", fmt.Errorf("resolve symlinks in parent of target %q: %w", absTarget, err)
+	for {
+		resolved, err := filepath.EvalSymlinks(parent)
+		if err == nil {
+			// Found an existing ancestor — reconstruct the target path
+			// relative to this ancestor, then join.
+			relFromParent, err := filepath.Rel(parent, absTarget)
+			if err != nil {
+				return "", fmt.Errorf("rel from %q to %q: %w", parent, absTarget, err)
+			}
+			resolvedTarget := filepath.Join(resolved, relFromParent)
+			relToRoot, err := filepath.Rel(resolvedRoot, resolvedTarget)
+			if err != nil {
+				return "", fmt.Errorf("resolve target %q in %q: %w", rel, root, err)
+			}
+			if relToRoot == ".." || strings.HasPrefix(relToRoot, ".."+string(filepath.Separator)) {
+				return "", fmt.Errorf("target %q is outside root %q", rel, root)
+			}
+			return resolvedTarget, nil
+		}
+		if !os.IsNotExist(err) {
+			return "", fmt.Errorf("resolve symlinks in %q: %w", parent, err)
+		}
+		// Parent doesn't exist yet — walk up one level.
+		next := filepath.Dir(parent)
+		if next == parent {
+			return "", fmt.Errorf("cannot find existing ancestor for %q", absTarget)
+		}
+		parent = next
 	}
-	resolvedTarget := filepath.Join(resolvedParent, filepath.Base(absTarget))
-	relToRoot, err := filepath.Rel(resolvedRoot, resolvedTarget)
-	if err != nil {
-		return "", fmt.Errorf("resolve target %q in %q: %w", rel, root, err)
-	}
-	if relToRoot == ".." || strings.HasPrefix(relToRoot, ".."+string(filepath.Separator)) {
-		return "", fmt.Errorf("target %q is outside root %q", rel, root)
-	}
-	return resolvedTarget, nil
 }
 
 func mergeToMainPreflight(worktreeRoot, mainRoot string, changes []mergeToMainChange) ([]mergeToMainChange, error) {

@@ -320,6 +320,35 @@ func TestMergeToMain_MergesUntrackedFile(t *testing.T) {
 	}
 }
 
+func TestMergeToMain_MergesFileInNewDirectory(t *testing.T) {
+	mainRoot := t.TempDir()
+	baseCommit := initEpicRepo(t, mainRoot)
+	manager := NewWorktreeManager(mainRoot, baseCommit, "run-new-dir", t.TempDir())
+	worktreePath, err := manager.CreateWorktree(context.Background(), "ticket-newdir")
+	if err != nil {
+		t.Fatalf("CreateWorktree: %v", err)
+	}
+
+	newFile := filepath.Join(worktreePath, "pkg", "new", "file.go")
+	if err := os.MkdirAll(filepath.Dir(newFile), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(newFile, []byte("package new\n"), 0o644); err != nil {
+		t.Fatalf("write new file: %v", err)
+	}
+	mustRunGit(t, worktreePath, "add", "pkg/new/file.go")
+
+	if err := manager.MergeToMain("ticket-newdir"); err != nil {
+		t.Fatalf("MergeToMain: %v", err)
+	}
+
+	if got, err := os.ReadFile(filepath.Join(mainRoot, "pkg", "new", "file.go")); err != nil {
+		t.Fatalf("read merged file in new directory: %v", err)
+	} else if string(got) != "package new\n" {
+		t.Fatalf("unexpected content: %q", string(got))
+	}
+}
+
 func TestMergeToMain_RejectsNonDirectoryDestinationParent(t *testing.T) {
 	mainRoot := t.TempDir()
 	baseCommit := initEpicRepo(t, mainRoot)
