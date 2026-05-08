@@ -229,8 +229,8 @@ git commit -m "feat: add ticket quality artifact types"
 
 - Create: `internal/engine/ticket_quality.go`
 - Test: `internal/engine/ticket_quality_test.go`
-- Reuse: `internal/adapters/ticketstore/tkmd/types.go`
-- Reuse: `internal/adapters/ticketstore/tkmd/store.go`
+- Reuse: `internal/adapters/ticketstore/epos/types.go`
+- Reuse: `internal/adapters/ticketstore/epos/store.go`
 
 **Step 1: Write failing unit tests**
 
@@ -311,7 +311,7 @@ git commit -m "feat: add deterministic ticket quality lint"
 
 - Modify: `internal/engine/ticket_quality.go`
 - Test: `internal/engine/ticket_quality_test.go`
-- Modify: `internal/adapters/ticketstore/tkmd/store.go` only if save behavior needs preserving unknown frontmatter order
+- Modify: `internal/adapters/ticketstore/epos/store.go` only if save behavior needs preserving unknown frontmatter order
 
 **Safe repairs allowed:**
 
