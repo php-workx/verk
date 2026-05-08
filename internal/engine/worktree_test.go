@@ -14,7 +14,7 @@ import (
 	"sync"
 	"testing"
 	"time"
-	tkmd "verk/internal/adapters/ticketstore/tkmd"
+	epos "verk/internal/adapters/ticketstore/epos"
 )
 
 func TestResolveWorktreeRoot_PrefersExplicitRoot(t *testing.T) {
@@ -1277,7 +1277,7 @@ func TestReconcile_StaleCacheDirWorktree_Removed(t *testing.T) {
 	}
 	mustRunGit(t, mainRoot, "worktree", "add", stalePath, baseCommit)
 
-	if _, err := tkmd.AcquireClaim(mainRoot, staleRunID, staleTicketID, "lease-stale", 30*time.Minute, now); err != nil {
+	if _, err := epos.AcquireClaim(mainRoot, staleRunID, staleTicketID, "lease-stale", 30*time.Minute, now); err != nil {
 		t.Fatalf("seed active claim: %v", err)
 	}
 	if err := os.RemoveAll(filepath.Join(mainRoot, ".verk", "runs", staleRunID)); err != nil {
@@ -1372,7 +1372,7 @@ func TestReconcile_ActiveRun_NotTouched(t *testing.T) {
 	}
 	mustRunGit(t, mainRoot, "worktree", "add", worktreePath, baseCommit)
 
-	if _, err := tkmd.AcquireClaim(mainRoot, runID, ticketID, "lease-active", 30*time.Minute, now); err != nil {
+	if _, err := epos.AcquireClaim(mainRoot, runID, ticketID, "lease-active", 30*time.Minute, now); err != nil {
 		t.Fatalf("seed active claim: %v", err)
 	}
 

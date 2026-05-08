@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 	"verk/internal/adapters/runtime"
-	"verk/internal/adapters/ticketstore/tkmd"
+	"verk/internal/adapters/ticketstore/epos"
 	"verk/internal/engine"
 	"verk/internal/policy"
 	"verk/internal/state"
@@ -188,14 +188,14 @@ func TestEpicThreeLevelHierarchy(t *testing.T) {
 	epic := epicTicket("epic-3level", []string{"internal", "docs"})
 	saveTicket(t, repoRoot, epic)
 
-	ticket1 := epicChild("ticket-1", epic.ID, tkmd.StatusOpen, []string{"internal/app"})
+	ticket1 := epicChild("ticket-1", epic.ID, epos.StatusOpen, []string{"internal/app"})
 	saveTicket(t, repoRoot, ticket1)
 
-	ticket2 := epicChild("ticket-2", epic.ID, tkmd.StatusOpen, []string{"docs"})
+	ticket2 := epicChild("ticket-2", epic.ID, epos.StatusOpen, []string{"docs"})
 	saveTicket(t, repoRoot, ticket2)
 
 	// Sub-ticket of ticket-1 (level 3)
-	sub1 := epicChild("sub-1", ticket1.ID, tkmd.StatusOpen, []string{"internal/app/sub"})
+	sub1 := epicChild("sub-1", ticket1.ID, epos.StatusOpen, []string{"internal/app/sub"})
 	saveTicket(t, repoRoot, sub1)
 
 	// Create a reflecting adapter for the 3 tickets

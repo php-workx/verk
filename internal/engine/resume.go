@@ -9,7 +9,7 @@ import (
 	"sync"
 	"time"
 	"verk/internal/adapters/runtime"
-	"verk/internal/adapters/ticketstore/tkmd"
+	"verk/internal/adapters/ticketstore/epos"
 	"verk/internal/policy"
 	"verk/internal/state"
 
@@ -87,7 +87,7 @@ func ResumeRun(ctx context.Context, req ResumeRequest) (ResumeReport, error) { /
 			if !ok {
 				return ResumeReport{}, fmt.Errorf("resume requires plan artifact for ticket %s", ticketID)
 			}
-			ticket, err := tkmd.LoadTicket(ticketMarkdownPath(artifacts.RepoRoot, ticketID))
+			ticket, err := epos.LoadTicket(ticketMarkdownPath(artifacts.RepoRoot, ticketID))
 			if err != nil {
 				return ResumeReport{}, err
 			}
@@ -215,21 +215,21 @@ func resumeTicketMode(ctx context.Context, req ResumeRequest, artifacts *runArti
 		}
 
 		// Release existing claim so we can re-acquire
-		_ = tkmd.ReleaseClaim(artifacts.RepoRoot, req.RunID, ticketID, "resume_reacquisition")
+		_ = epos.ReleaseClaim(artifacts.RepoRoot, req.RunID, ticketID, "resume_reacquisition")
 
 		// Re-acquire claim
 		leaseID := fmt.Sprintf("lease-resume-%s-%d", req.RunID, time.Now().UTC().UnixNano())
-		claim, err := tkmd.AcquireClaim(artifacts.RepoRoot, req.RunID, ticketID, leaseID, 30*time.Minute, time.Now().UTC())
+		claim, err := epos.AcquireClaim(artifacts.RepoRoot, req.RunID, ticketID, leaseID, 30*time.Minute, time.Now().UTC())
 		if err != nil {
 			return resumed, fmt.Errorf("resume claim for ticket %s: %w", ticketID, err)
 		}
 
 		// Load ticket markdown
-		ticket, err := tkmd.LoadTicket(ticketMarkdownPath(artifacts.RepoRoot, ticketID))
+		ticket, err := epos.LoadTicket(ticketMarkdownPath(artifacts.RepoRoot, ticketID))
 		if err != nil {
 			return resumed, fmt.Errorf("load ticket %s: %w", ticketID, err)
 		}
-		ticket.Status = tkmd.StatusInProgress
+		ticket.Status = epos.StatusInProgress
 
 		// Load or build plan
 		plan, ok := artifacts.Plans[ticketID]
@@ -281,13 +281,13 @@ func resumeTicketMode(ctx context.Context, req ResumeRequest, artifacts *runArti
 		// Update ticket store
 		switch result.Snapshot.CurrentPhase {
 		case state.TicketPhaseClosed:
-			ticket.Status = tkmd.StatusClosed
+			ticket.Status = epos.StatusClosed
 		case state.TicketPhaseBlocked:
-			ticket.Status = tkmd.StatusBlocked
+			ticket.Status = epos.StatusBlocked
 		default:
-			ticket.Status = tkmd.StatusBlocked
+			ticket.Status = epos.StatusBlocked
 		}
-		if err := tkmd.SaveTicket(ticketMarkdownPath(artifacts.RepoRoot, ticketID), ticket); err != nil {
+		if err := epos.SaveTicket(ticketMarkdownPath(artifacts.RepoRoot, ticketID), ticket); err != nil {
 			return resumed, err
 		}
 
@@ -330,7 +330,7 @@ func resumeEpicMode(ctx context.Context, req ResumeRequest, artifacts *runArtifa
 			continue
 		}
 		// Release existing claim
-		_ = tkmd.ReleaseClaim(artifacts.RepoRoot, req.RunID, ticketID, "resume_reacquisition")
+		_ = epos.ReleaseClaim(artifacts.RepoRoot, req.RunID, ticketID, "resume_reacquisition")
 		// Reset ticket store status to ready
 		if err := setTicketReady(artifacts.RepoRoot, ticketID); err != nil {
 			return nil, fmt.Errorf("reset ticket %s to ready: %w", ticketID, err)
@@ -371,7 +371,7 @@ func resumeEpicMode(ctx context.Context, req ResumeRequest, artifacts *runArtifa
 			return allResumed, err
 		}
 
-		ready, err := tkmd.ListReadyChildren(artifacts.RepoRoot, artifacts.Run.RootTicketID, req.RunID)
+		ready, err := epos.ListReadyChildren(artifacts.RepoRoot, artifacts.Run.RootTicketID, req.RunID)
 		if err != nil {
 			return allResumed, err
 		}
@@ -490,7 +490,7 @@ func resumeEpicMode(ctx context.Context, req ResumeRequest, artifacts *runArtifa
 						TicketID: ticketID,
 						Detail:   fmt.Sprintf("worker crashed (attempt %d/%d), retrying: %v", attempt+1, maxCrashRetries+1, outcome.err),
 					})
-					_ = tkmd.ReleaseClaim(artifacts.RepoRoot, req.RunID, ticketID, "crash recovery")
+					_ = epos.ReleaseClaim(artifacts.RepoRoot, req.RunID, ticketID, "crash recovery")
 					if attempt == maxCrashRetries {
 						outcome.phase = state.TicketPhaseBlocked
 						outcomes[i] = outcome
@@ -641,7 +641,7 @@ func resumeEpicMode(ctx context.Context, req ResumeRequest, artifacts *runArtifa
 		for i, outcome := range outcomes {
 			tid := wave.TicketIDs[i]
 			if outcome.err != nil && outcome.phase != state.TicketPhaseClosed && outcome.phase != state.TicketPhaseBlocked {
-				_ = updateTicketStoreStatus(artifacts.RepoRoot, tid, tkmd.StatusOpen)
+				_ = updateTicketStoreStatus(artifacts.RepoRoot, tid, epos.StatusOpen)
 			}
 			allResumed = appendIfMissing(allResumed, tid)
 		}
@@ -860,7 +860,7 @@ func resumeCursorWaveOrdinal(cursor map[string]any) int {
 }
 
 func reconcileTicketClaimForResume(repoRoot, runID, ticketID string, snapshot TicketRunSnapshot) (*state.ClaimArtifact, bool, error) {
-	live, err := loadOptionalClaim(liveClaimPath(repoRoot, ticketID))
+	live, err := epos.LoadLiveClaim(repoRoot, ticketID)
 	if err != nil {
 		return nil, false, err
 	}
@@ -871,7 +871,7 @@ func reconcileTicketClaimForResume(repoRoot, runID, ticketID string, snapshot Ti
 	if live == nil && durable == nil {
 		return nil, false, nil
 	}
-	claim, err := tkmd.ReconcileClaim(live, durable, runID, isTerminalPhase(snapshot.CurrentPhase))
+	claim, err := epos.ReconcileClaim(live, durable, runID, isTerminalPhase(snapshot.CurrentPhase))
 	if err != nil {
 		return nil, false, err
 	}

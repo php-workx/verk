@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 	"time"
-	"verk/internal/adapters/ticketstore/tkmd"
+	"verk/internal/adapters/ticketstore/epos"
 	"verk/internal/state"
 )
 
@@ -617,7 +617,7 @@ func TestBuildCloseoutArtifact_WithImplementationArtifact(t *testing.T) {
 
 func baseCloseoutRequest() closeoutRequest {
 	now := fixedTime()
-	ticket := tkmd.Ticket{
+	ticket := epos.Ticket{
 		ID:    "ver-closable",
 		Title: "Closable ticket",
 		UnknownFrontmatter: map[string]any{

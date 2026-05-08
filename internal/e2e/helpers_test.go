@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 	"time"
-	"verk/internal/adapters/ticketstore/tkmd"
+	"verk/internal/adapters/ticketstore/epos"
 	"verk/internal/engine"
 	"verk/internal/policy"
 	"verk/internal/state"
@@ -72,15 +72,15 @@ func testGitEnv() []string {
 	return out
 }
 
-func saveTicket(t *testing.T, repoRoot string, ticket tkmd.Ticket) {
+func saveTicket(t *testing.T, repoRoot string, ticket epos.Ticket) {
 	t.Helper()
-	if err := tkmd.SaveTicket(filepath.Join(repoRoot, ".tickets", ticket.ID+".md"), ticket); err != nil {
+	if err := epos.SaveTicket(filepath.Join(repoRoot, ".tickets", ticket.ID+".md"), ticket); err != nil {
 		t.Fatalf("SaveTicket(%s): %v", ticket.ID, err)
 	}
 }
 
-func taskTicket(id string, status tkmd.Status, owned []string) tkmd.Ticket {
-	return tkmd.Ticket{
+func taskTicket(id string, status epos.Status, owned []string) epos.Ticket {
+	return epos.Ticket{
 		ID:                 id,
 		Title:              "Ticket " + id,
 		Status:             status,
@@ -91,11 +91,11 @@ func taskTicket(id string, status tkmd.Status, owned []string) tkmd.Ticket {
 	}
 }
 
-func epicTicket(id string, owned []string) tkmd.Ticket {
-	return tkmd.Ticket{
+func epicTicket(id string, owned []string) epos.Ticket {
+	return epos.Ticket{
 		ID:         id,
 		Title:      "Epic " + id,
-		Status:     tkmd.StatusReady,
+		Status:     epos.StatusReady,
 		OwnedPaths: append([]string(nil), owned...),
 		UnknownFrontmatter: map[string]any{
 			"type": "epic",
@@ -103,13 +103,13 @@ func epicTicket(id string, owned []string) tkmd.Ticket {
 	}
 }
 
-func epicChild(id, parent string, status tkmd.Status, owned []string) tkmd.Ticket {
+func epicChild(id, parent string, status epos.Status, owned []string) epos.Ticket {
 	ticket := taskTicket(id, status, owned)
 	ticket.UnknownFrontmatter["parent"] = parent
 	return ticket
 }
 
-func testPlanAndClaim(t *testing.T, repoRoot string, cfg policy.Config, runID string, ticket tkmd.Ticket, leaseID string, commands []string) (state.PlanArtifact, state.ClaimArtifact) {
+func testPlanAndClaim(t *testing.T, repoRoot string, cfg policy.Config, runID string, ticket epos.Ticket, leaseID string, commands []string) (state.PlanArtifact, state.ClaimArtifact) {
 	t.Helper()
 	plan, err := engine.BuildPlanArtifact(ticket, cfg)
 	if err != nil {
@@ -117,7 +117,7 @@ func testPlanAndClaim(t *testing.T, repoRoot string, cfg policy.Config, runID st
 	}
 	plan.RunID = runID
 	plan.ValidationCommands = append([]string(nil), commands...)
-	claim, err := tkmd.AcquireClaim(repoRoot, runID, ticket.ID, leaseID, 10*time.Minute, time.Now().UTC())
+	claim, err := epos.AcquireClaim(repoRoot, runID, ticket.ID, leaseID, 10*time.Minute, time.Now().UTC())
 	if err != nil {
 		t.Fatalf("AcquireClaim: %v", err)
 	}

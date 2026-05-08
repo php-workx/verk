@@ -4,7 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
-	"verk/internal/adapters/ticketstore/tkmd"
+	"verk/internal/adapters/ticketstore/epos"
 	"verk/internal/state"
 )
 
@@ -74,10 +74,10 @@ func TestDeriveStatus_UsesRunArtifactsAndClaimsOnly(t *testing.T) {
 			FailedGate:   "review",
 		},
 	})
-	writeTicketMarkdownFixture(t, repoRoot, tkmd.Ticket{
+	writeTicketMarkdownFixture(t, repoRoot, epos.Ticket{
 		ID:                 ticketID,
 		Title:              "Contradictory ticket",
-		Status:             tkmd.StatusOpen,
+		Status:             epos.StatusOpen,
 		OwnedPaths:         []string{"docs"},
 		UnknownFrontmatter: map[string]any{"type": "task"},
 	})

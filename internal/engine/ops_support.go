@@ -8,7 +8,7 @@ import (
 	"sort"
 	"time"
 	"verk/internal/adapters/repo/git"
-	"verk/internal/adapters/ticketstore/tkmd"
+	"verk/internal/adapters/ticketstore/epos"
 	"verk/internal/state"
 )
 
@@ -449,10 +449,10 @@ func findWaveForTicket(waves map[string]state.WaveArtifact, ticketID string) (st
 }
 
 func setTicketReady(repoRoot, ticketID string) error {
-	ticket, err := tkmd.LoadTicket(ticketMarkdownPath(repoRoot, ticketID))
+	ticket, err := epos.LoadTicket(ticketMarkdownPath(repoRoot, ticketID))
 	if err != nil {
 		return err
 	}
-	ticket.Status = tkmd.StatusOpen
-	return tkmd.SaveTicket(ticketMarkdownPath(repoRoot, ticketID), ticket)
+	ticket.Status = epos.StatusOpen
+	return epos.SaveTicket(ticketMarkdownPath(repoRoot, ticketID), ticket)
 }

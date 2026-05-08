@@ -10,7 +10,7 @@ import (
 	"strings"
 	"testing"
 	"time"
-	"verk/internal/adapters/ticketstore/tkmd"
+	"verk/internal/adapters/ticketstore/epos"
 	"verk/internal/cli"
 	"verk/internal/state"
 )
@@ -105,10 +105,10 @@ func TestReopen_ValidatesTargetPhase(t *testing.T) {
 		"verification_attempts":   1,
 		"review_attempts":         1,
 	})
-	if err := tkmd.SaveTicket(filepath.Join(repoRoot, ".tickets", ticketID+".md"), tkmd.Ticket{
+	if err := epos.SaveTicket(filepath.Join(repoRoot, ".tickets", ticketID+".md"), epos.Ticket{
 		ID:                 ticketID,
 		Title:              "Blocked ticket",
-		Status:             tkmd.StatusBlocked,
+		Status:             epos.StatusBlocked,
 		OwnedPaths:         []string{"internal/app"},
 		UnknownFrontmatter: map[string]any{"type": "task"},
 	}); err != nil {
@@ -344,10 +344,10 @@ func TestRunTicket_AdapterFailure_ReleasesClaim(t *testing.T) {
 	writeCLIRepo(t, repoRoot)
 
 	ticketID := "ver-adapter-fail"
-	if err := tkmd.SaveTicket(filepath.Join(repoRoot, ".tickets", ticketID+".md"), tkmd.Ticket{
+	if err := epos.SaveTicket(filepath.Join(repoRoot, ".tickets", ticketID+".md"), epos.Ticket{
 		ID:                 ticketID,
 		Title:              "Adapter failure ticket",
-		Status:             tkmd.StatusOpen,
+		Status:             epos.StatusOpen,
 		OwnedPaths:         []string{"internal/app"},
 		Runtime:            "unsupported_runtime_xyz",
 		UnknownFrontmatter: map[string]any{"type": "task"},
@@ -372,7 +372,7 @@ func TestRunTicket_AdapterFailure_ReleasesClaim(t *testing.T) {
 	assertCLIClaimReleased(t, repoRoot, runID, ticketID)
 
 	// Verify re-acquisition is not blocked.
-	_, err := tkmd.AcquireClaim(repoRoot, "run-retry-adapter", ticketID, "lease-retry-adapter", 10*time.Minute, time.Now().UTC())
+	_, err := epos.AcquireClaim(repoRoot, "run-retry-adapter", ticketID, "lease-retry-adapter", 10*time.Minute, time.Now().UTC())
 	if err != nil {
 		t.Fatalf("expected claim re-acquisition after adapter failure, got error: %v", err)
 	}
@@ -395,10 +395,10 @@ func TestRunTicket_GitMetadataFailure_ReleasesClaim(t *testing.T) {
 	}
 
 	ticketID := "ver-git-fail"
-	if err := tkmd.SaveTicket(filepath.Join(repoRoot, ".tickets", ticketID+".md"), tkmd.Ticket{
+	if err := epos.SaveTicket(filepath.Join(repoRoot, ".tickets", ticketID+".md"), epos.Ticket{
 		ID:                 ticketID,
 		Title:              "Git metadata failure ticket",
-		Status:             tkmd.StatusOpen,
+		Status:             epos.StatusOpen,
 		OwnedPaths:         []string{"internal/app"},
 		UnknownFrontmatter: map[string]any{"type": "task"},
 	}); err != nil {
@@ -423,7 +423,7 @@ func TestRunTicket_GitMetadataFailure_ReleasesClaim(t *testing.T) {
 	assertCLIClaimReleased(t, repoRoot, runID, ticketID)
 
 	// Verify re-acquisition is not blocked.
-	_, err := tkmd.AcquireClaim(repoRoot, "run-retry-git", ticketID, "lease-retry-git", 10*time.Minute, time.Now().UTC())
+	_, err := epos.AcquireClaim(repoRoot, "run-retry-git", ticketID, "lease-retry-git", 10*time.Minute, time.Now().UTC())
 	if err != nil {
 		t.Fatalf("expected claim re-acquisition after git metadata failure, got error: %v", err)
 	}
@@ -440,14 +440,21 @@ func extractRunID(t *testing.T, stdout string) string {
 	return ""
 }
 
-// assertCLIClaimReleased verifies that the claim was released: the live claim
-// file is removed and the durable claim has state "released".
+// assertCLIClaimReleased verifies that the claim was released: the epos runtime
+// sidecar remains present without an active claim and the durable claim has
+// state "released".
 func assertCLIClaimReleased(t *testing.T, repoRoot, runID, ticketID string) {
 	t.Helper()
-	// Live claim file should have been removed by release.
 	livePath := filepath.Join(repoRoot, ".tickets", ".claims", ticketID+".json")
-	if _, err := os.Stat(livePath); err == nil {
-		t.Fatalf("expected live claim file to be removed, but it still exists: %s", livePath)
+	if _, err := os.Stat(livePath); err != nil {
+		t.Fatalf("expected released runtime state sidecar to remain: %v", err)
+	}
+	live, err := epos.LoadLiveClaim(repoRoot, ticketID)
+	if err != nil {
+		t.Fatalf("LoadLiveClaim: %v", err)
+	}
+	if live != nil {
+		t.Fatalf("expected no active live claim after release, got %#v", live)
 	}
 	// Durable claim should be in released state.
 	durablePath := filepath.Join(repoRoot, ".verk", "runs", runID, "claims", "claim-"+ticketID+".json")

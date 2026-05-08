@@ -7,7 +7,7 @@ import (
 	"strings"
 	"time"
 	"verk/internal/adapters/runtime"
-	"verk/internal/adapters/ticketstore/tkmd"
+	"verk/internal/adapters/ticketstore/epos"
 	"verk/internal/state"
 )
 
@@ -29,7 +29,7 @@ const (
 )
 
 type closeoutRequest struct {
-	ticket            tkmd.Ticket
+	ticket            epos.Ticket
 	plan              state.PlanArtifact
 	verification      *state.VerificationArtifact
 	review            *state.ReviewFindingsArtifact
@@ -274,9 +274,9 @@ func parseCloseoutRequest(args ...any) (closeoutRequest, error) {
 
 	for _, arg := range args {
 		switch v := arg.(type) {
-		case tkmd.Ticket:
+		case epos.Ticket:
 			req.ticket = v
-		case *tkmd.Ticket:
+		case *epos.Ticket:
 			if v != nil {
 				req.ticket = *v
 			}

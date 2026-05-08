@@ -8,7 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
-	"verk/internal/adapters/ticketstore/tkmd"
+	"verk/internal/adapters/ticketstore/epos"
 )
 
 // initCLITestRepo creates a minimal git repository in dir with a single
@@ -48,12 +48,12 @@ func TestDoRunTicket_CurrentPointerNotSetOnSaveFailure(t *testing.T) {
 	if err := os.MkdirAll(ticketsDir, 0o755); err != nil {
 		t.Fatalf("mkdir .tickets: %v", err)
 	}
-	ticket := tkmd.Ticket{
+	ticket := epos.Ticket{
 		ID:     "ver-ptr-test",
 		Title:  "Pointer ordering test ticket",
-		Status: tkmd.StatusReady,
+		Status: epos.StatusReady,
 	}
-	if err := tkmd.SaveTicket(filepath.Join(ticketsDir, "ver-ptr-test.md"), ticket); err != nil {
+	if err := epos.SaveTicket(filepath.Join(ticketsDir, "ver-ptr-test.md"), ticket); err != nil {
 		t.Fatalf("save ticket: %v", err)
 	}
 
@@ -101,18 +101,18 @@ func TestDoRunTicket_CurrentPointerNotSetOnTicketSaveFailure(t *testing.T) {
 	if err := os.MkdirAll(ticketsDir, 0o755); err != nil {
 		t.Fatalf("mkdir .tickets: %v", err)
 	}
-	ticket := tkmd.Ticket{
+	ticket := epos.Ticket{
 		ID:     "ver-ticket-save",
 		Title:  "Ticket save failure test",
-		Status: tkmd.StatusReady,
+		Status: epos.StatusReady,
 	}
-	if err := tkmd.SaveTicket(filepath.Join(ticketsDir, "ver-ticket-save.md"), ticket); err != nil {
+	if err := epos.SaveTicket(filepath.Join(ticketsDir, "ver-ticket-save.md"), ticket); err != nil {
 		t.Fatalf("save ticket: %v", err)
 	}
 
 	origSaveTicket := saveTicket
 	defer func() { saveTicket = origSaveTicket }()
-	saveTicket = func(_ string, _ tkmd.Ticket) error {
+	saveTicket = func(_ string, _ epos.Ticket) error {
 		return errors.New("injected ticket save error")
 	}
 
@@ -183,27 +183,27 @@ func TestDoRunEpic_CurrentPointerSetForPersistedBlockedRun(t *testing.T) {
 	if err := os.MkdirAll(ticketsDir, 0o755); err != nil {
 		t.Fatalf("mkdir .tickets: %v", err)
 	}
-	epic := tkmd.Ticket{
+	epic := epos.Ticket{
 		ID:     "ver-current-epic",
 		Title:  "Current pointer epic",
-		Status: tkmd.StatusReady,
+		Status: epos.StatusReady,
 		UnknownFrontmatter: map[string]any{
 			"type": "epic",
 		},
 	}
-	child := tkmd.Ticket{
+	child := epos.Ticket{
 		ID:     "ver-current-child",
 		Title:  "Blocked child",
-		Status: tkmd.StatusBlocked,
+		Status: epos.StatusBlocked,
 		UnknownFrontmatter: map[string]any{
 			"parent": epic.ID,
 			"type":   "task",
 		},
 	}
-	if err := tkmd.SaveTicket(filepath.Join(ticketsDir, epic.ID+".md"), epic); err != nil {
+	if err := epos.SaveTicket(filepath.Join(ticketsDir, epic.ID+".md"), epic); err != nil {
 		t.Fatalf("save epic: %v", err)
 	}
-	if err := tkmd.SaveTicket(filepath.Join(ticketsDir, child.ID+".md"), child); err != nil {
+	if err := epos.SaveTicket(filepath.Join(ticketsDir, child.ID+".md"), child); err != nil {
 		t.Fatalf("save child: %v", err)
 	}
 

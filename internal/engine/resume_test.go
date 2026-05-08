@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 	"verk/internal/adapters/runtime"
-	"verk/internal/adapters/ticketstore/tkmd"
+	"verk/internal/adapters/ticketstore/epos"
 	"verk/internal/policy"
 	"verk/internal/state"
 
@@ -36,8 +36,8 @@ func TestResumeRun_DoesNotOverwriteExistingWaveArtifactAfterCursorCrash(t *testi
 	}
 
 	root := epicTicket("epic-resume-wave-cursor-lag")
-	first := epicChildTicket("ticket-prior-wave", root.ID, tkmd.StatusClosed, nil, []string{"prior.txt"})
-	second := epicChildTicket("ticket-after-crash", root.ID, tkmd.StatusReady, nil, []string{"after.txt"})
+	first := epicChildTicket("ticket-prior-wave", root.ID, epos.StatusClosed, nil, []string{"prior.txt"})
+	second := epicChildTicket("ticket-after-crash", root.ID, epos.StatusReady, nil, []string{"after.txt"})
 	mustSaveTicket(t, repoRoot, root)
 	mustSaveTicket(t, repoRoot, first)
 	mustSaveTicket(t, repoRoot, second)
@@ -140,7 +140,7 @@ func TestResumeRun_CompletesPendingWaveIntegrationTransaction(t *testing.T) {
 	runID := "run-pending-wave-transaction"
 
 	root := epicTicket("epic-pending-wave-transaction")
-	child := epicChildTicket("ticket-pending-wave-transaction", root.ID, tkmd.StatusClosed, nil, []string{"integrated.txt"})
+	child := epicChildTicket("ticket-pending-wave-transaction", root.ID, epos.StatusClosed, nil, []string{"integrated.txt"})
 	mustSaveTicket(t, repoRoot, root)
 	mustSaveTicket(t, repoRoot, child)
 
@@ -231,7 +231,7 @@ func TestResumeRun_PendingVerificationPassedDoesNotClearBeforeCommitAndMainApply
 	runID := "run-pending-wave-missing-transaction"
 
 	root := epicTicket("epic-pending-wave-missing-transaction")
-	child := epicChildTicket("ticket-pending-wave-missing-transaction", root.ID, tkmd.StatusClosed, nil, []string{"integrated.txt"})
+	child := epicChildTicket("ticket-pending-wave-missing-transaction", root.ID, epos.StatusClosed, nil, []string{"integrated.txt"})
 	mustSaveTicket(t, repoRoot, root)
 	mustSaveTicket(t, repoRoot, child)
 
@@ -322,10 +322,10 @@ func TestResumeRun_BlocksOnClaimDivergence(t *testing.T) {
 		TicketID:                 ticketID,
 		EffectiveReviewThreshold: state.SeverityP2,
 	})
-	writeTicketMarkdownFixture(t, repoRoot, tkmd.Ticket{
+	writeTicketMarkdownFixture(t, repoRoot, epos.Ticket{
 		ID:                 ticketID,
 		Title:              "Diverged ticket",
-		Status:             tkmd.StatusInProgress,
+		Status:             epos.StatusInProgress,
 		OwnedPaths:         []string{"internal/app"},
 		UnknownFrontmatter: map[string]any{"type": "task"},
 	})
@@ -384,10 +384,10 @@ func TestResumeRun_RepairsCommittedTransitionAfterCrash(t *testing.T) {
 		CurrentPhase: state.TicketPhaseClosed,
 		TicketIDs:    []string{ticketID},
 	})
-	writeTicketMarkdownFixture(t, repoRoot, tkmd.Ticket{
+	writeTicketMarkdownFixture(t, repoRoot, epos.Ticket{
 		ID:                 ticketID,
 		Title:              "Recovered ticket",
-		Status:             tkmd.StatusClosed,
+		Status:             epos.StatusClosed,
 		OwnedPaths:         []string{"internal/app"},
 		AcceptanceCriteria: []string{"all checks pass"},
 		ValidationCommands: []string{"go test ./..."},
@@ -464,10 +464,10 @@ func TestResumeRun_ClosedPhase_NonClosable_BecomesBlocked(t *testing.T) {
 		CurrentPhase: state.TicketPhaseClosed,
 		TicketIDs:    []string{ticketID},
 	})
-	writeTicketMarkdownFixture(t, repoRoot, tkmd.Ticket{
+	writeTicketMarkdownFixture(t, repoRoot, epos.Ticket{
 		ID:                 ticketID,
 		Title:              "Non-closable ticket",
-		Status:             tkmd.StatusClosed,
+		Status:             epos.StatusClosed,
 		OwnedPaths:         []string{"internal/app"},
 		AcceptanceCriteria: []string{"all checks pass"},
 		ValidationCommands: []string{"go test ./..."},
@@ -553,10 +553,10 @@ func TestResumeRun_ClosedPhase_Closable_StaysClosed(t *testing.T) {
 		CurrentPhase: state.TicketPhaseClosed,
 		TicketIDs:    []string{ticketID},
 	})
-	writeTicketMarkdownFixture(t, repoRoot, tkmd.Ticket{
+	writeTicketMarkdownFixture(t, repoRoot, epos.Ticket{
 		ID:                 ticketID,
 		Title:              "Closable ticket",
-		Status:             tkmd.StatusClosed,
+		Status:             epos.StatusClosed,
 		OwnedPaths:         []string{"internal/app"},
 		AcceptanceCriteria: []string{"all checks pass"},
 		ValidationCommands: []string{"go test ./..."},
@@ -640,10 +640,10 @@ func TestResumeRun_CloseoutPhase_Closable_BecomesClosed(t *testing.T) {
 		CurrentPhase: state.TicketPhaseCloseout,
 		TicketIDs:    []string{ticketID},
 	})
-	writeTicketMarkdownFixture(t, repoRoot, tkmd.Ticket{
+	writeTicketMarkdownFixture(t, repoRoot, epos.Ticket{
 		ID:                 ticketID,
 		Title:              "Closeout phase ticket",
-		Status:             tkmd.StatusInProgress,
+		Status:             epos.StatusInProgress,
 		OwnedPaths:         []string{"internal/app"},
 		AcceptanceCriteria: []string{"all checks pass"},
 		ValidationCommands: []string{"go test ./..."},
@@ -723,10 +723,10 @@ func TestResumeRun_ResumeFromVerifyPhase_UsesSavedVerificationCoverage(t *testin
 		CurrentPhase: state.TicketPhaseVerify,
 		TicketIDs:    []string{ticketID},
 	})
-	writeTicketMarkdownFixture(t, repoRoot, tkmd.Ticket{
+	writeTicketMarkdownFixture(t, repoRoot, epos.Ticket{
 		ID:                 ticketID,
 		Title:              "Verify phase ticket",
-		Status:             tkmd.StatusInProgress,
+		Status:             epos.StatusInProgress,
 		OwnedPaths:         []string{"internal/app"},
 		AcceptanceCriteria: []string{"all checks pass"},
 		ValidationCommands: []string{"echo resume verify"},
@@ -925,11 +925,11 @@ func TestResumeRun_BlockedTicketIsReset_EpicMode(t *testing.T) {
 	mustSaveTicket(t, repoRoot, epic)
 
 	// blocked child: should be reset and re-run
-	blocked := epicChildTicket("ticket-blocked", epic.ID, tkmd.StatusBlocked, nil, []string{"internal/app"})
+	blocked := epicChildTicket("ticket-blocked", epic.ID, epos.StatusBlocked, nil, []string{"internal/app"})
 	mustSaveTicket(t, repoRoot, blocked)
 
 	// closed child: should not be reset or re-run
-	closed := epicChildTicket("ticket-closed", epic.ID, tkmd.StatusClosed, nil, []string{"docs"})
+	closed := epicChildTicket("ticket-closed", epic.ID, epos.StatusClosed, nil, []string{"docs"})
 	mustSaveTicket(t, repoRoot, closed)
 
 	writeOpRunFixture(t, repoRoot, runID, state.RunArtifact{
@@ -1035,8 +1035,8 @@ func TestResumeRun_IntegratesClosedSiblingWhenWaveHasBlockedTicket(t *testing.T)
 	cfg.Verification.WaveCommands = nil
 
 	epic := epicTicket("epic-resume-partial")
-	closed := epicChildTicket("ticket-resume-closed", epic.ID, tkmd.StatusBlocked, nil, []string{"closed.txt"})
-	blocked := epicChildTicket("ticket-resume-blocked", epic.ID, tkmd.StatusBlocked, nil, []string{"blocked.txt"})
+	closed := epicChildTicket("ticket-resume-closed", epic.ID, epos.StatusBlocked, nil, []string{"closed.txt"})
+	blocked := epicChildTicket("ticket-resume-blocked", epic.ID, epos.StatusBlocked, nil, []string{"blocked.txt"})
 	mustSaveTicket(t, repoRoot, epic)
 	mustSaveTicket(t, repoRoot, closed)
 	mustSaveTicket(t, repoRoot, blocked)
@@ -1149,7 +1149,7 @@ func TestResumeRun_CleansIntegrationWorktreeAfterWaveIntegration(t *testing.T) {
 	cfg.Verification.WaveCommands = nil
 
 	epic := epicTicket("epic-resume-clean-integration")
-	child := epicChildTicket("ticket-resume-clean-integration", epic.ID, tkmd.StatusBlocked, nil, []string{"resumed.txt"})
+	child := epicChildTicket("ticket-resume-clean-integration", epic.ID, epos.StatusBlocked, nil, []string{"resumed.txt"})
 	mustSaveTicket(t, repoRoot, epic)
 	mustSaveTicket(t, repoRoot, child)
 
@@ -1238,7 +1238,7 @@ func TestResumeRun_BlocksWhenFailedTicketDiffPersistenceFails(t *testing.T) {
 	cfg.Verification.WaveCommands = nil
 
 	epic := epicTicket("epic-resume-diff-persist-fail")
-	blocked := epicChildTicket("ticket-resume-diff-persist-fail", epic.ID, tkmd.StatusBlocked, nil, []string{"blocked.txt"})
+	blocked := epicChildTicket("ticket-resume-diff-persist-fail", epic.ID, epos.StatusBlocked, nil, []string{"blocked.txt"})
 	mustSaveTicket(t, repoRoot, epic)
 	mustSaveTicket(t, repoRoot, blocked)
 
@@ -1309,7 +1309,7 @@ func TestResumeRun_DoesNotMutateMainWhenWaveCommitFails(t *testing.T) {
 	cfg.Verification.WaveCommands = nil
 
 	epic := epicTicket("epic-resume-commit-fail")
-	child := epicChildTicket("ticket-resume-commit-fail", epic.ID, tkmd.StatusBlocked, nil, []string{"integrated.txt"})
+	child := epicChildTicket("ticket-resume-commit-fail", epic.ID, epos.StatusBlocked, nil, []string{"integrated.txt"})
 	mustSaveTicket(t, repoRoot, epic)
 	mustSaveTicket(t, repoRoot, child)
 
@@ -1395,7 +1395,7 @@ func TestResumeRun_DoesNotAdvanceHiddenBaseWhenMainApplyFails(t *testing.T) {
 	cfg.Verification.WaveCommands = nil
 
 	epic := epicTicket("epic-resume-main-apply-fail")
-	child := epicChildTicket("ticket-resume-main-apply-fail", epic.ID, tkmd.StatusBlocked, nil, []string{"integrated.txt"})
+	child := epicChildTicket("ticket-resume-main-apply-fail", epic.ID, epos.StatusBlocked, nil, []string{"integrated.txt"})
 	mustSaveTicket(t, repoRoot, epic)
 	mustSaveTicket(t, repoRoot, child)
 
@@ -1500,7 +1500,7 @@ func TestResumeRun_AppliesPostRepairFilesToMain(t *testing.T) {
 	cfg.Policy.MaxWaveRepairCycles = 1
 
 	epic := epicTicket("epic-resume-post-repair-main")
-	child := epicChildTicket("ticket-resume-post-repair-main", epic.ID, tkmd.StatusBlocked, nil, []string{"primary.txt"})
+	child := epicChildTicket("ticket-resume-post-repair-main", epic.ID, epos.StatusBlocked, nil, []string{"primary.txt"})
 	mustSaveTicket(t, repoRoot, epic)
 	mustSaveTicket(t, repoRoot, child)
 
@@ -1599,8 +1599,8 @@ func TestResumeRun_ReconstructsHiddenIntegrationBaseAndLaterWaveSeesAcceptedFile
 
 	epic := epicTicket("epic-resume-hidden-base")
 	mustSaveTicket(t, repoRoot, epic)
-	first := epicChildTicket("ticket-resume-wave-1", epic.ID, tkmd.StatusClosed, nil, []string{"wave1.txt"})
-	second := epicChildTicket("ticket-resume-wave-2", epic.ID, tkmd.StatusBlocked, []string{first.ID}, []string{"wave2.txt"})
+	first := epicChildTicket("ticket-resume-wave-1", epic.ID, epos.StatusClosed, nil, []string{"wave1.txt"})
+	second := epicChildTicket("ticket-resume-wave-2", epic.ID, epos.StatusBlocked, []string{first.ID}, []string{"wave2.txt"})
 	mustSaveTicket(t, repoRoot, first)
 	mustSaveTicket(t, repoRoot, second)
 
@@ -1732,8 +1732,8 @@ func TestResumeRun_FailsWhenIntegrationBaseCannotBeReconstructed(t *testing.T) {
 
 	epic := epicTicket("epic-resume-missing-hidden-base")
 	mustSaveTicket(t, repoRoot, epic)
-	first := epicChildTicket("ticket-missing-base-closed", epic.ID, tkmd.StatusClosed, nil, []string{"wave1.txt"})
-	second := epicChildTicket("ticket-missing-base-blocked", epic.ID, tkmd.StatusBlocked, []string{first.ID}, []string{"wave2.txt"})
+	first := epicChildTicket("ticket-missing-base-closed", epic.ID, epos.StatusClosed, nil, []string{"wave1.txt"})
+	second := epicChildTicket("ticket-missing-base-blocked", epic.ID, epos.StatusBlocked, []string{first.ID}, []string{"wave2.txt"})
 	mustSaveTicket(t, repoRoot, first)
 	mustSaveTicket(t, repoRoot, second)
 

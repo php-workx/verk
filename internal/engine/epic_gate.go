@@ -27,7 +27,7 @@ import (
 	"strings"
 	"time"
 	"verk/internal/adapters/runtime"
-	"verk/internal/adapters/ticketstore/tkmd"
+	"verk/internal/adapters/ticketstore/epos"
 	"verk/internal/policy"
 	"verk/internal/state"
 
@@ -59,7 +59,7 @@ func runEpicClosureGate(
 	ctx context.Context,
 	req RunEpicRequest,
 	cfg policy.Config,
-	children []tkmd.Ticket,
+	children []epos.Ticket,
 	changedFiles []string,
 ) error {
 	childIDs := sortedChildIDs(children)
@@ -715,7 +715,7 @@ func epicDerivedHasCommand(checks []state.ValidationCheck) bool {
 }
 
 // sortedChildIDs extracts ticket IDs from the children slice in sorted order.
-func sortedChildIDs(children []tkmd.Ticket) []string {
+func sortedChildIDs(children []epos.Ticket) []string {
 	ids := make([]string, 0, len(children))
 	for _, c := range children {
 		ids = append(ids, c.ID)
@@ -736,7 +736,7 @@ func runEpicReviewerAttempt(
 	reviewProfile policy.RoleProfile,
 	childIDs []string,
 	childSnapshots map[string]TicketRunSnapshot,
-	children []tkmd.Ticket,
+	children []epos.Ticket,
 	changedFiles []string,
 	checksAllPassed bool,
 	broadResults []verifycommand.CommandResult,
@@ -781,7 +781,7 @@ func runEpicReviewerAttempt(
 func buildEpicReviewExtra(
 	childIDs []string,
 	childSnapshots map[string]TicketRunSnapshot,
-	children []tkmd.Ticket,
+	children []epos.Ticket,
 	changedFiles []string,
 	checksAllPassed bool,
 	broadResults []verifycommand.CommandResult,
@@ -940,7 +940,7 @@ func collectEpicVerificationOutput(
 func mapReviewToEpicFindings(
 	result runtime.ReviewResult,
 	threshold state.Severity,
-	children []tkmd.Ticket,
+	children []epos.Ticket,
 ) []state.EpicClosureFinding {
 	var out []state.EpicClosureFinding
 	for _, f := range result.Findings {
@@ -1252,7 +1252,7 @@ func epicCheckFindingID(source, key string) string {
 
 // findOwningTicketByFile returns the ID of the child ticket whose owned paths
 // contain the given file. Returns "" when no match is found.
-func findOwningTicketByFile(file string, children []tkmd.Ticket) string {
+func findOwningTicketByFile(file string, children []epos.Ticket) string {
 	if file == "" {
 		return ""
 	}

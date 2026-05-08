@@ -11,7 +11,7 @@ import (
 	"context"
 	"strings"
 	"testing"
-	"verk/internal/adapters/ticketstore/tkmd"
+	"verk/internal/adapters/ticketstore/epos"
 	verifycommand "verk/internal/adapters/verify/command"
 	"verk/internal/policy"
 	"verk/internal/state"
@@ -451,7 +451,7 @@ func newVerificationTestState(t *testing.T, runID, ticketID string, cfg policy.C
 		ctx: context.Background(),
 		req: RunTicketRequest{
 			RunID:  runID,
-			Ticket: tkmd.Ticket{ID: ticketID},
+			Ticket: epos.Ticket{ID: ticketID},
 			Plan: state.PlanArtifact{
 				TicketID:                 ticketID,
 				EffectiveReviewThreshold: state.SeverityP2,

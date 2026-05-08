@@ -17,7 +17,7 @@ import (
 	"time"
 	"verk/internal/adapters/repo/git"
 	"verk/internal/adapters/runtime"
-	"verk/internal/adapters/ticketstore/tkmd"
+	"verk/internal/adapters/ticketstore/epos"
 	"verk/internal/policy"
 	"verk/internal/state"
 )
@@ -38,7 +38,7 @@ type BlockedTicket struct {
 	// Title is the human-readable ticket title, empty when unavailable.
 	Title string
 	// Status is the ticket-store status at the moment the run stopped.
-	Status tkmd.Status
+	Status epos.Status
 	// Phase is the ticket run phase from the latest snapshot, when available.
 	Phase state.TicketPhase
 	// RetryPhase is the default phase this ticket may be reopened to. Empty
@@ -112,10 +112,10 @@ func (e *BlockedRunError) Unwrap() error { return ErrEpicBlocked }
 // Snapshot read errors are silently ignored: in those cases the structural
 // description is used instead, so CLI output still names the ticket even when
 // its snapshot artifact is missing or malformed.
-func collectBlockedTickets(repoRoot, runID string, children []tkmd.Ticket) []BlockedTicket {
+func collectBlockedTickets(repoRoot, runID string, children []epos.Ticket) []BlockedTicket {
 	var out []BlockedTicket
 	for _, child := range children {
-		if child.Status == tkmd.StatusClosed {
+		if child.Status == epos.StatusClosed {
 			continue
 		}
 		reason := describeNotReady(child)
@@ -214,8 +214,8 @@ func RunEpic(ctx context.Context, req RunEpicRequest) (RunEpicResult, error) { /
 	// Reset orphaned in_progress tickets (from crashed prior runs) to ready
 	// so the wave scheduler can pick them up.
 	for _, child := range children {
-		if child.Status == tkmd.StatusInProgress {
-			if err := updateTicketStoreStatus(req.RepoRoot, child.ID, tkmd.StatusOpen); err != nil {
+		if child.Status == epos.StatusInProgress {
+			if err := updateTicketStoreStatus(req.RepoRoot, child.ID, epos.StatusOpen); err != nil {
 				return RunEpicResult{}, fmt.Errorf("reset orphaned ticket %s: %w", child.ID, err)
 			}
 			SendProgress(ctx, req.Progress, ProgressEvent{
@@ -274,7 +274,7 @@ func RunEpic(ctx context.Context, req RunEpicRequest) (RunEpicResult, error) { /
 			return result, err
 		}
 
-		ready, err := tkmd.ListReadyChildren(req.RepoRoot, req.RootTicketID, req.RunID)
+		ready, err := epos.ListReadyChildren(req.RepoRoot, req.RootTicketID, req.RunID)
 		if err != nil {
 			return result, err
 		}
@@ -467,7 +467,7 @@ func RunEpic(ctx context.Context, req RunEpicRequest) (RunEpicResult, error) { /
 						TicketID: ticketID,
 						Detail:   fmt.Sprintf("worker crashed (attempt %d/%d), retrying: %v", attempt+1, maxCrashRetries+1, outcome.err),
 					})
-					_ = tkmd.ReleaseClaim(req.RepoRoot, req.RunID, ticketID, "crash recovery")
+					_ = epos.ReleaseClaim(req.RepoRoot, req.RunID, ticketID, "crash recovery")
 					if attempt == maxCrashRetries {
 						outcome.phase = state.TicketPhaseBlocked
 						outcomes[i] = outcome
@@ -651,7 +651,7 @@ func RunEpic(ctx context.Context, req RunEpicRequest) (RunEpicResult, error) { /
 		// Only handle crashed tickets (panicked goroutines that never entered RunTicket).
 		for i, outcome := range outcomes {
 			if outcome.err != nil && outcome.phase != state.TicketPhaseClosed && outcome.phase != state.TicketPhaseBlocked {
-				_ = updateTicketStoreStatus(req.RepoRoot, wave.TicketIDs[i], tkmd.StatusOpen)
+				_ = updateTicketStoreStatus(req.RepoRoot, wave.TicketIDs[i], epos.StatusOpen)
 			}
 		}
 
@@ -874,11 +874,11 @@ func normalizeEpicConfig(cfg policy.Config) policy.Config {
 	return cfg
 }
 
-func listEpicChildren(repoRoot, parentID string) ([]tkmd.Ticket, error) {
-	return tkmd.ListAllChildren(repoRoot, parentID)
+func listEpicChildren(repoRoot, parentID string) ([]epos.Ticket, error) {
+	return epos.ListAllChildren(repoRoot, parentID)
 }
 
-func ticketIDs(tickets []tkmd.Ticket) []string {
+func ticketIDs(tickets []epos.Ticket) []string {
 	ids := make([]string, 0, len(tickets))
 	for _, ticket := range tickets {
 		ids = append(ids, ticket.ID)
@@ -887,13 +887,13 @@ func ticketIDs(tickets []tkmd.Ticket) []string {
 	return ids
 }
 
-func epicCompletionStatus(children []tkmd.Ticket) state.EpicRunStatus {
+func epicCompletionStatus(children []epos.Ticket) state.EpicRunStatus {
 	anyReady := false
 	anyBlocked := false
 	for _, ticket := range children {
 		switch ticket.Status {
-		case tkmd.StatusClosed:
-		case tkmd.StatusBlocked:
+		case epos.StatusClosed:
+		case epos.StatusBlocked:
 			anyBlocked = true
 		default:
 			anyReady = true
@@ -909,18 +909,18 @@ func epicCompletionStatus(children []tkmd.Ticket) state.EpicRunStatus {
 	}
 }
 
-func updateTicketStoreStatus(repoRoot, ticketID string, status tkmd.Status) error {
+func updateTicketStoreStatus(repoRoot, ticketID string, status epos.Status) error {
 	path := filepath.Join(repoRoot, ".tickets", ticketID+".md")
 	return updateTicketStatus(path, status)
 }
 
-func updateTicketStatus(path string, status tkmd.Status) error {
-	ticket, err := tkmd.LoadTicket(path)
+func updateTicketStatus(path string, status epos.Status) error {
+	ticket, err := epos.LoadTicket(path)
 	if err != nil {
 		return err
 	}
 	ticket.Status = status
-	return tkmd.SaveTicket(path, ticket)
+	return epos.SaveTicket(path, ticket)
 }
 
 func persistTicketBlockedSnapshot(repoRoot, runID, ticketID, reason string) error {
@@ -955,11 +955,11 @@ func persistTicketBlockedSnapshot(repoRoot, runID, ticketID, reason string) erro
 	)
 }
 
-func loadEpicTicket(repoRoot, ticketID string) (tkmd.Ticket, error) {
-	return tkmd.LoadTicket(filepath.Join(repoRoot, ".tickets", ticketID+".md"))
+func loadEpicTicket(repoRoot, ticketID string) (epos.Ticket, error) {
+	return epos.LoadTicket(filepath.Join(repoRoot, ".tickets", ticketID+".md"))
 }
 
-func verificationCommandsFor(req RunEpicRequest, ticket tkmd.Ticket) []string {
+func verificationCommandsFor(req RunEpicRequest, ticket epos.Ticket) []string {
 	if commands, ok := req.VerificationByTicket[ticket.ID]; ok && len(commands) > 0 {
 		return append([]string(nil), commands...)
 	}
@@ -1117,7 +1117,7 @@ func (r *subEpicRegistrar) clearPendingSubWaveVerification() error {
 
 // buildTicketScopes creates a map of ticket ID -> owned paths from a ticket list.
 // This is used for per-ticket scope validation during wave acceptance.
-func buildTicketScopes(tickets []tkmd.Ticket) map[string][]string {
+func buildTicketScopes(tickets []epos.Ticket) map[string][]string {
 	scopes := make(map[string][]string, len(tickets))
 	for _, t := range tickets {
 		scopes[t.ID] = t.OwnedPaths
@@ -1154,7 +1154,7 @@ func runChildWithRetry(ctx context.Context, req RunEpicRequest, cfg policy.Confi
 			TicketID: childID,
 			Detail:   fmt.Sprintf("sub-ticket worker crashed (attempt %d/%d), retrying: %v", attempt+1, maxCrashRetries+1, childOutcome.err),
 		})
-		_ = tkmd.ReleaseClaim(req.RepoRoot, req.RunID, childID, "crash recovery")
+		_ = epos.ReleaseClaim(req.RepoRoot, req.RunID, childID, "crash recovery")
 		if attempt == maxCrashRetries {
 			return waveTicketOutcome{ticketID: childID, phase: state.TicketPhaseBlocked}
 		}
@@ -1164,10 +1164,10 @@ func runChildWithRetry(ctx context.Context, req RunEpicRequest, cfg policy.Confi
 
 // resetOrphanedChildren resets any children left in_progress from a prior crashed run
 // back to open so they are eligible for rescheduling.
-func resetOrphanedChildren(repoRoot string, children []tkmd.Ticket) error {
+func resetOrphanedChildren(repoRoot string, children []epos.Ticket) error {
 	for _, child := range children {
-		if child.Status == tkmd.StatusInProgress {
-			if err := updateTicketStoreStatus(repoRoot, child.ID, tkmd.StatusOpen); err != nil {
+		if child.Status == epos.StatusInProgress {
+			if err := updateTicketStoreStatus(repoRoot, child.ID, epos.StatusOpen); err != nil {
 				return fmt.Errorf("reset orphaned child %s: %w", child.ID, err)
 			}
 		}
@@ -1198,7 +1198,7 @@ func runSubEpic(ctx context.Context, req RunEpicRequest, cfg policy.Config, pare
 	// Cycle guard: if this ticket already appears in the ancestor chain we have
 	// a circular epic-child relationship. Return a blocked outcome immediately so
 	// the engine can record the state without recursing.
-	if err := tkmd.DetectEpicCycle(parentTicketID, ancestors); err != nil {
+	if err := epos.DetectEpicCycle(parentTicketID, ancestors); err != nil {
 		outcome.err = fmt.Errorf("runSubEpic blocked: %w", err)
 		return outcome
 	}
@@ -1217,7 +1217,7 @@ func runSubEpic(ctx context.Context, req RunEpicRequest, cfg policy.Config, pare
 		Detail:   fmt.Sprintf("running sub-tickets at depth %d", depth+1),
 	})
 
-	children, err := tkmd.ListAllChildren(req.RepoRoot, parentTicketID)
+	children, err := epos.ListAllChildren(req.RepoRoot, parentTicketID)
 	if err != nil {
 		outcome.err = fmt.Errorf("list children of %s: %w", parentTicketID, err)
 		return outcome
@@ -1250,7 +1250,7 @@ func runSubEpic(ctx context.Context, req RunEpicRequest, cfg policy.Config, pare
 			return outcome
 		}
 
-		ready, err := tkmd.ListReadyChildren(req.RepoRoot, parentTicketID, req.RunID)
+		ready, err := epos.ListReadyChildren(req.RepoRoot, parentTicketID, req.RunID)
 		if err != nil {
 			outcome.err = fmt.Errorf("list ready children of %s: %w", parentTicketID, err)
 			return outcome
@@ -1258,7 +1258,7 @@ func runSubEpic(ctx context.Context, req RunEpicRequest, cfg policy.Config, pare
 		ticketScopes := buildTicketScopes(ready)
 		if len(ready) == 0 {
 			// Check completion status of all children.
-			currentChildren, err := tkmd.ListAllChildren(req.RepoRoot, parentTicketID)
+			currentChildren, err := epos.ListAllChildren(req.RepoRoot, parentTicketID)
 			if err != nil {
 				outcome.err = err
 				return outcome
@@ -1485,7 +1485,7 @@ func executeEpicTicket(ctx context.Context, req RunEpicRequest, cfg policy.Confi
 	// cfg has already been run through normalizeEpicConfig at the top of RunEpic,
 	// so cfg.Scheduler.MaxDepth is guaranteed positive here.
 	maxDepth := cfg.Scheduler.MaxDepth
-	hasChildren, err := tkmd.HasChildren(req.RepoRoot, ticketID)
+	hasChildren, err := epos.HasChildren(req.RepoRoot, ticketID)
 	if err != nil {
 		outcome.err = fmt.Errorf("check children of %s: %w", ticketID, err)
 		outcome.phase = snapshotPhaseOrImplement(req.RepoRoot, req.RunID, ticketID)
@@ -1499,7 +1499,7 @@ func executeEpicTicket(ctx context.Context, req RunEpicRequest, cfg policy.Confi
 		// unresolved. Without this, the outer run loop would find the parent
 		// still open/ready and schedule it again, creating a repeated-wave loop.
 		if subOutcome.err != nil || subOutcome.phase != state.TicketPhaseClosed {
-			if updateErr := updateTicketStoreStatus(req.RepoRoot, ticketID, tkmd.StatusBlocked); updateErr != nil {
+			if updateErr := updateTicketStoreStatus(req.RepoRoot, ticketID, epos.StatusBlocked); updateErr != nil {
 				subOutcome.err = fmt.Errorf("persist blocked status for %s: %w", ticketID, updateErr)
 			}
 			blockReason := ""
@@ -1528,7 +1528,7 @@ func executeEpicTicket(ctx context.Context, req RunEpicRequest, cfg policy.Confi
 		outcome.phase = snapshotPhaseOrImplement(req.RepoRoot, req.RunID, ticketID)
 		return outcome
 	}
-	claim, err := tkmd.AcquireClaim(req.RepoRoot, req.RunID, ticket.ID, fmt.Sprintf("lease-%s-%s-%s", req.RunID, ticket.ID, wave.WaveID), wave.WaveID, 10*time.Minute, time.Now().UTC())
+	claim, err := epos.AcquireClaim(req.RepoRoot, req.RunID, ticket.ID, fmt.Sprintf("lease-%s-%s-%s", req.RunID, ticket.ID, wave.WaveID), wave.WaveID, 10*time.Minute, time.Now().UTC())
 	if err != nil {
 		outcome.err = err
 		outcome.phase = snapshotPhaseOrImplement(req.RepoRoot, req.RunID, ticketID)
@@ -1536,7 +1536,7 @@ func executeEpicTicket(ctx context.Context, req RunEpicRequest, cfg policy.Confi
 	}
 	adapter, err := adapterForEpicTicket(req, plan)
 	if err != nil {
-		_ = tkmd.ReleaseClaim(req.RepoRoot, req.RunID, ticket.ID, claim.LeaseID, "runtime adapter selection failed")
+		_ = epos.ReleaseClaim(req.RepoRoot, req.RunID, ticket.ID, claim.LeaseID, "runtime adapter selection failed")
 		outcome.err = err
 		outcome.phase = snapshotPhaseOrImplement(req.RepoRoot, req.RunID, ticketID)
 		return outcome
@@ -1620,13 +1620,13 @@ func subtractFiles(changed, baseline []string) []string {
 	return out
 }
 
-func describeNotReady(ticket tkmd.Ticket) string {
+func describeNotReady(ticket epos.Ticket) string {
 	switch ticket.Status {
-	case tkmd.StatusClosed:
+	case epos.StatusClosed:
 		return "closed"
-	case tkmd.StatusBlocked:
+	case epos.StatusBlocked:
 		return "blocked"
-	case tkmd.StatusInProgress:
+	case epos.StatusInProgress:
 		return "in_progress"
 	}
 	// Status is open/ready — must be deps not resolved
@@ -1745,13 +1745,13 @@ func waveBlockedTicketEvents(blockedIDs []string, ticketPhases []state.TicketPha
 // EventTicketDetail lines still describe each child individually; this
 // additional one-line summary makes the terminating state visible at a glance
 // even when those per-ticket lines have scrolled off the activity log.
-func emitBlockedEpicSummary(ctx context.Context, ch chan<- ProgressEvent, children []tkmd.Ticket) {
+func emitBlockedEpicSummary(ctx context.Context, ch chan<- ProgressEvent, children []epos.Ticket) {
 	if ch == nil {
 		return
 	}
 	var parts []string
 	for _, child := range children {
-		if child.Status == tkmd.StatusClosed {
+		if child.Status == epos.StatusClosed {
 			continue
 		}
 		parts = append(parts, fmt.Sprintf("%s (%s)", child.ID, describeNotReady(child)))

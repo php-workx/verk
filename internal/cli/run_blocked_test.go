@@ -9,7 +9,7 @@ import (
 	"strings"
 	"testing"
 	"time"
-	"verk/internal/adapters/ticketstore/tkmd"
+	"verk/internal/adapters/ticketstore/epos"
 	"verk/internal/engine"
 	"verk/internal/state"
 )
@@ -26,7 +26,7 @@ func fakeBlocked() *engine.BlockedRunError {
 			{
 				ID:         "ver-uqs5",
 				Title:      "Example ticket",
-				Status:     tkmd.StatusBlocked,
+				Status:     epos.StatusBlocked,
 				Phase:      state.TicketPhaseBlocked,
 				RetryPhase: state.TicketPhaseImplement,
 				Reason:     "needs context: reviewer asked for missing fixture details",
@@ -34,7 +34,7 @@ func fakeBlocked() *engine.BlockedRunError {
 			{
 				ID:         "ver-abcd",
 				Title:      "Second ticket",
-				Status:     tkmd.StatusBlocked,
+				Status:     epos.StatusBlocked,
 				Phase:      state.TicketPhaseBlocked,
 				RetryPhase: state.TicketPhaseImplement,
 				Reason:     "repair limit exceeded",
@@ -92,13 +92,13 @@ func TestPrintBlockedRunGuidance_SkipsNonRetryableDependencyWaiters(t *testing.T
 		BlockedTickets: []engine.BlockedTicket{
 			{
 				ID:     "mm-4for",
-				Status: tkmd.StatusOpen,
+				Status: epos.StatusOpen,
 				Phase:  state.TicketPhaseIntake,
 				Reason: "waiting on 7 deps",
 			},
 			{
 				ID:         "mm-e7e1",
-				Status:     tkmd.StatusBlocked,
+				Status:     epos.StatusBlocked,
 				Phase:      state.TicketPhaseBlocked,
 				RetryPhase: state.TicketPhaseImplement,
 				Reason:     "verification artifact passed flag contradicts derived verification outcome",
@@ -169,8 +169,8 @@ func TestPromptBlockedRetry_SkipsNonRetryableTickets(t *testing.T) {
 		RunID:  "run-x",
 		Status: state.EpicRunStatusBlocked,
 		BlockedTickets: []engine.BlockedTicket{
-			{ID: "mm-4for", Status: tkmd.StatusOpen, Phase: state.TicketPhaseIntake, Reason: "waiting on 7 deps"},
-			{ID: "mm-e7e1", Status: tkmd.StatusBlocked, Phase: state.TicketPhaseBlocked, RetryPhase: state.TicketPhaseImplement, Reason: "blocked"},
+			{ID: "mm-4for", Status: epos.StatusOpen, Phase: state.TicketPhaseIntake, Reason: "waiting on 7 deps"},
+			{ID: "mm-e7e1", Status: epos.StatusBlocked, Phase: state.TicketPhaseBlocked, RetryPhase: state.TicketPhaseImplement, Reason: "blocked"},
 		},
 	}
 	in := strings.NewReader("y\n")

@@ -13,7 +13,7 @@ import (
 	"time"
 	"verk/internal/adapters/repo/git"
 	"verk/internal/adapters/runtime"
-	"verk/internal/adapters/ticketstore/tkmd"
+	"verk/internal/adapters/ticketstore/epos"
 	"verk/internal/policy"
 	"verk/internal/state"
 
@@ -36,7 +36,7 @@ type RunTicketRequest struct {
 	WorktreePath         string
 	RunID                string
 	BaseCommit           string
-	Ticket               tkmd.Ticket
+	Ticket               epos.Ticket
 	Plan                 state.PlanArtifact
 	Claim                state.ClaimArtifact
 	Adapter              runtime.Adapter
@@ -187,14 +187,14 @@ func RunTicket(ctx context.Context, req RunTicketRequest) (result RunTicketResul
 	// Update ticket store on exit — the ticket's own phase determines its store status.
 	defer func() {
 		ticketPath := filepath.Join(absRepoRoot, ".tickets", req.Ticket.ID+".md")
-		var targetStatus tkmd.Status
+		var targetStatus epos.Status
 		switch st.currentPhase {
 		case state.TicketPhaseClosed:
-			targetStatus = tkmd.StatusClosed
+			targetStatus = epos.StatusClosed
 		case state.TicketPhaseBlocked:
-			targetStatus = tkmd.StatusBlocked
+			targetStatus = epos.StatusBlocked
 		default:
-			targetStatus = tkmd.StatusOpen
+			targetStatus = epos.StatusOpen
 		}
 		if err := updateTicketStatus(ticketPath, targetStatus); err != nil {
 			if errors.Is(err, os.ErrNotExist) {
@@ -483,7 +483,7 @@ func handleImplementResult(st *ticketRunState, result runtime.WorkerResult, req 
 	if err := result.Validate(); err != nil {
 		return err
 	}
-	if err := tkmd.ValidateLeaseFence(st.req.Claim.LeaseID, result.LeaseID); err != nil {
+	if err := epos.ValidateLeaseFence(st.req.Claim.LeaseID, result.LeaseID); err != nil {
 		return err
 	}
 
@@ -873,7 +873,7 @@ func handleReviewOutcome(st *ticketRunState, result runtime.ReviewResult, req ru
 	if err := result.Validate(st.req.Plan.EffectiveReviewThreshold); err != nil {
 		return err
 	}
-	if err := tkmd.ValidateLeaseFence(st.req.Claim.LeaseID, result.LeaseID); err != nil {
+	if err := epos.ValidateLeaseFence(st.req.Claim.LeaseID, result.LeaseID); err != nil {
 		return err
 	}
 
@@ -1293,7 +1293,7 @@ func (st *ticketRunState) startClaimRenewal(ctx context.Context) (context.Contex
 	go func() {
 		defer close(done)
 		renew := func() bool {
-			if _, err := tkmd.RenewClaim(st.repoRoot, st.req.RunID, st.req.Ticket.ID, st.req.Claim.LeaseID, ttl, time.Now().UTC()); err != nil {
+			if _, err := epos.RenewClaim(st.repoRoot, st.req.RunID, st.req.Ticket.ID, st.req.Claim.LeaseID, ttl, time.Now().UTC()); err != nil {
 				select {
 				case errCh <- err:
 				default:
@@ -1354,7 +1354,7 @@ func (st *ticketRunState) claimTTL() time.Duration {
 // renewal. Scheduling from the live expiry prevents later phases from waiting
 // past the actual lease deadline.
 func (st *ticketRunState) currentClaimRemainingTTL() (time.Duration, bool) {
-	if live, err := loadOptionalClaim(liveClaimPath(st.repoRoot, st.req.Ticket.ID)); err == nil && live != nil {
+	if live, err := epos.LoadLiveClaim(st.repoRoot, st.req.Ticket.ID); err == nil && live != nil {
 		if live.OwnerRunID == st.req.RunID && live.LeaseID == st.req.Claim.LeaseID && live.State != "released" && !live.ExpiresAt.IsZero() {
 			return live.ExpiresAt.Sub(time.Now().UTC()), true
 		}
@@ -1531,7 +1531,7 @@ func (st *ticketRunState) releaseClaim() error {
 	if reason == "" {
 		reason = "released"
 	}
-	return tkmd.ReleaseClaim(st.repoRoot, st.req.RunID, st.req.Ticket.ID, st.req.Claim.LeaseID, reason)
+	return epos.ReleaseClaim(st.repoRoot, st.req.RunID, st.req.Ticket.ID, st.req.Claim.LeaseID, reason)
 }
 
 func buildTicketRunPaths(repoRoot, runID, ticketID string) ticketRunPaths {

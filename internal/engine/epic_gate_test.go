@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 	"verk/internal/adapters/runtime"
-	"verk/internal/adapters/ticketstore/tkmd"
+	"verk/internal/adapters/ticketstore/epos"
 	verifycommand "verk/internal/adapters/verify/command"
 	"verk/internal/policy"
 	"verk/internal/state"
@@ -112,18 +112,18 @@ func makeEpicGateReq(repoRoot, epicID string, adapter runtime.Adapter) RunEpicRe
 // makeEpicGateChildren builds a minimal child ticket slice used to populate
 // the gate's child context. Each child has non-overlapping owned paths so the
 // file→ticket mapping tests work correctly.
-func makeEpicGateChildren() []tkmd.Ticket {
-	return []tkmd.Ticket{
+func makeEpicGateChildren() []epos.Ticket {
+	return []epos.Ticket{
 		{
 			ID:         "child-a",
 			Title:      "Child A",
-			Status:     tkmd.StatusClosed,
+			Status:     epos.StatusClosed,
 			OwnedPaths: []string{"internal/api"},
 		},
 		{
 			ID:         "child-b",
 			Title:      "Child B",
-			Status:     tkmd.StatusClosed,
+			Status:     epos.StatusClosed,
 			OwnedPaths: []string{"internal/worker"},
 		},
 	}
@@ -1001,9 +1001,9 @@ func TestRunEpicClosureGate_FindingsMappedToChildTicket(t *testing.T) {
 	req := makeEpicGateReq(repoRoot, epicID, adapter)
 	req.Config = cfg
 
-	children := []tkmd.Ticket{
-		{ID: "child-a", Title: "API child", Status: tkmd.StatusClosed, OwnedPaths: []string{"internal/api"}},
-		{ID: "child-b", Title: "Worker child", Status: tkmd.StatusClosed, OwnedPaths: []string{"internal/worker"}},
+	children := []epos.Ticket{
+		{ID: "child-a", Title: "API child", Status: epos.StatusClosed, OwnedPaths: []string{"internal/api"}},
+		{ID: "child-b", Title: "Worker child", Status: epos.StatusClosed, OwnedPaths: []string{"internal/worker"}},
 	}
 
 	err := runEpicClosureGate(context.Background(), req, cfg, children, nil)
@@ -1106,10 +1106,10 @@ func TestRunEpicClosureGate_ChildIDsRecorded(t *testing.T) {
 	req := makeEpicGateReq(repoRoot, epicID, adapter)
 	req.Config = cfg
 
-	children := []tkmd.Ticket{
-		{ID: "tk-alpha", Status: tkmd.StatusClosed, OwnedPaths: []string{"a"}},
-		{ID: "tk-beta", Status: tkmd.StatusClosed, OwnedPaths: []string{"b"}},
-		{ID: "tk-gamma", Status: tkmd.StatusClosed, OwnedPaths: []string{"c"}},
+	children := []epos.Ticket{
+		{ID: "tk-alpha", Status: epos.StatusClosed, OwnedPaths: []string{"a"}},
+		{ID: "tk-beta", Status: epos.StatusClosed, OwnedPaths: []string{"b"}},
+		{ID: "tk-gamma", Status: epos.StatusClosed, OwnedPaths: []string{"c"}},
 	}
 
 	if err := runEpicClosureGate(context.Background(), req, cfg, children, nil); err != nil {

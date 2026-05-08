@@ -12,7 +12,7 @@ import (
 	"syscall"
 	"time"
 	"verk/internal/adapters/runtime"
-	"verk/internal/adapters/ticketstore/tkmd"
+	"verk/internal/adapters/ticketstore/epos"
 	"verk/internal/engine"
 	"verk/internal/state"
 	"verk/internal/tui"
@@ -63,7 +63,7 @@ func writeCurrentRunIDIfArtifactExists(repoRoot, runID string, errw io.Writer) b
 // doRunTicket and for the final state update in finalizeRun.
 var (
 	saveJSONAtomic func(string, any) error                                                        = state.SaveJSONAtomic
-	saveTicket     func(string, tkmd.Ticket) error                                                = tkmd.SaveTicket
+	saveTicket     func(string, epos.Ticket) error                                                = epos.SaveTicket
 	runTicket      func(context.Context, engine.RunTicketRequest) (engine.RunTicketResult, error) = engine.RunTicket
 )
 
@@ -78,7 +78,7 @@ var (
 func finalizeRun(
 	w, errw io.Writer,
 	ticketPath, runPath string,
-	ticket tkmd.Ticket,
+	ticket epos.Ticket,
 	run state.RunArtifact,
 ) error {
 	if err := saveTicket(ticketPath, ticket); err != nil {
@@ -188,7 +188,7 @@ func doRunTicket(w, errw io.Writer, ticketID string) (runID string, err error) {
 		}
 	}
 
-	ticket, err := tkmd.LoadTicket(filepath.Join(repoRoot, ".tickets", ticketID+".md"))
+	ticket, err := epos.LoadTicket(filepath.Join(repoRoot, ".tickets", ticketID+".md"))
 	if err != nil {
 		return "", err
 	}
@@ -208,7 +208,7 @@ func doRunTicket(w, errw io.Writer, ticketID string) (runID string, err error) {
 	defer func() { _ = lock.Release() }()
 
 	leaseID := fmt.Sprintf("lease-%s-%s", runID, ticketID)
-	claim, err := tkmd.AcquireClaim(repoRoot, runID, ticketID, leaseID, 30*time.Minute, time.Now().UTC())
+	claim, err := epos.AcquireClaim(repoRoot, runID, ticketID, leaseID, 30*time.Minute, time.Now().UTC())
 	if err != nil {
 		return runID, err
 	}
@@ -218,7 +218,7 @@ func doRunTicket(w, errw io.Writer, ticketID string) (runID string, err error) {
 	claimOwned := false
 	defer func() {
 		if !claimOwned {
-			_ = tkmd.ReleaseClaim(repoRoot, runID, ticketID, leaseID, "startup_failure")
+			_ = epos.ReleaseClaim(repoRoot, runID, ticketID, leaseID, "startup_failure")
 		}
 	}()
 
@@ -257,7 +257,7 @@ func doRunTicket(w, errw io.Writer, ticketID string) (runID string, err error) {
 		return runID, err
 	}
 
-	ticket.Status = tkmd.StatusInProgress
+	ticket.Status = epos.StatusInProgress
 	if err := saveTicket(filepath.Join(repoRoot, ".tickets", ticketID+".md"), ticket); err != nil {
 		return runID, err
 	}
@@ -303,11 +303,11 @@ func doRunTicket(w, errw io.Writer, ticketID string) (runID string, err error) {
 
 	switch result.Snapshot.CurrentPhase {
 	case state.TicketPhaseClosed:
-		ticket.Status = tkmd.StatusClosed
+		ticket.Status = epos.StatusClosed
 		run.Status = state.EpicRunStatusCompleted
 		run.CurrentPhase = state.TicketPhaseClosed
 	default:
-		ticket.Status = tkmd.StatusBlocked
+		ticket.Status = epos.StatusBlocked
 		run.Status = state.EpicRunStatusBlocked
 		run.CurrentPhase = state.TicketPhaseBlocked
 	}
