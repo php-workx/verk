@@ -20,7 +20,7 @@ or ticket first, then update this file.
 | --- | --- | --- | --- | --- |
 | Core engine v1 | Reference | [done/initial_v1.md](done/initial_v1.md) | historical baseline | Deterministic engine, phase state machine, artifacts, claims, policy contract, and scope enforcement. |
 | Validation coverage artifacts | Reference / Implemented | [validation-coverage.md](validation-coverage.md) | `ver-vyag`, `ver-rcgh`, `ver-y29o`, `ver-1qru`, `ver-ssp3` | Durable record for declared, derived, executed, skipped, repaired, and blocking checks. |
-| Worker isolation | Active | [worker-isolation.md](worker-isolation.md) | `ver-wi0p`, `ver-wi01` through `ver-wi18` | Per-ticket git worktrees for parallel worker isolation, merge-back, verification CWD split, and cleanup. |
+| Worker isolation | Active | [worker-isolation.md](worker-isolation.md) | `ver-wi0p`, `ver-wi01` through `ver-wi22` | Per-ticket git worktrees for parallel worker isolation, merge-back, verification CWD split, and cleanup. |
 
 ## Feature Tracks
 

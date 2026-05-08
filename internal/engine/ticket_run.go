@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"os"
 	"path/filepath"
 	"reflect"
 	"sort"
@@ -32,6 +33,7 @@ var (
 
 type RunTicketRequest struct {
 	RepoRoot             string
+	WorktreePath         string
 	RunID                string
 	BaseCommit           string
 	Ticket               tkmd.Ticket
@@ -71,6 +73,7 @@ type ticketRunState struct {
 	cfg                    policy.Config
 	paths                  ticketRunPaths
 	repoRoot               string
+	worktreePath           string
 	currentPhase           state.TicketPhase
 	blockReason            string
 	createdAt              time.Time // set once; zero means lazy-init on first snapshot()
@@ -107,6 +110,19 @@ func RunTicket(ctx context.Context, req RunTicketRequest) (result RunTicketResul
 	if err != nil {
 		return RunTicketResult{}, fmt.Errorf("resolve repo root %q: %w", req.RepoRoot, err)
 	}
+	worktreePath := strings.TrimSpace(req.WorktreePath)
+	if worktreePath == "" {
+		worktreePath = absRepoRoot
+	} else {
+		if absWorktree, absErr := filepath.Abs(worktreePath); absErr == nil {
+			worktreePath = absWorktree
+		} else {
+			return RunTicketResult{}, fmt.Errorf("resolve worktree path %q: %w", req.WorktreePath, absErr)
+		}
+		if validateErr := validateWorktreeBelongsToRepo(absRepoRoot, worktreePath); validateErr != nil {
+			return RunTicketResult{}, validateErr
+		}
+	}
 	plan := req.Plan
 	if plan.Phase == "" {
 		plan.Phase = state.TicketPhaseIntake
@@ -125,6 +141,7 @@ func RunTicket(ctx context.Context, req RunTicketRequest) (result RunTicketResul
 		cfg:          cfg,
 		paths:        buildTicketRunPaths(absRepoRoot, req.RunID, req.Ticket.ID),
 		repoRoot:     absRepoRoot,
+		worktreePath: worktreePath,
 		currentPhase: req.Plan.Phase,
 	}
 
@@ -180,6 +197,9 @@ func RunTicket(ctx context.Context, req RunTicketRequest) (result RunTicketResul
 			targetStatus = tkmd.StatusOpen
 		}
 		if err := updateTicketStatus(ticketPath, targetStatus); err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				return
+			}
 			log.Printf("failed to update ticket %s status to %s: %v", req.Ticket.ID, targetStatus, err)
 		}
 	}()
@@ -219,7 +239,7 @@ func RunTicket(ctx context.Context, req RunTicketRequest) (result RunTicketResul
 				Runtime:         workerProfile.Runtime,
 				Model:           workerProfile.Model,
 				Reasoning:       workerProfile.Reasoning,
-				WorktreePath:    absRepoRoot,
+				WorktreePath:    st.worktreePath,
 				Instructions:    buildImplementPhaseInstructions(st, st.implementationAttempts+1),
 				ExecutionConfig: executionConfigFromPolicy(cfg),
 				OnProgress:      func(detail string) { st.progressDetail(detail) },
@@ -247,7 +267,7 @@ func RunTicket(ctx context.Context, req RunTicketRequest) (result RunTicketResul
 			}
 
 			if st.currentPhase == state.TicketPhaseVerify {
-				blocked, err := st.executeVerification(ctx, absRepoRoot)
+				blocked, err := st.executeVerification(ctx)
 				if err != nil {
 					return RunTicketResult{}, err
 				}
@@ -274,7 +294,7 @@ func RunTicket(ctx context.Context, req RunTicketRequest) (result RunTicketResul
 			}
 
 		case state.TicketPhaseReview:
-			diffForReview, err := collectDiff(absRepoRoot, req.BaseCommit)
+			diffForReview, err := collectDiff(st.worktreePath, req.BaseCommit)
 			if err != nil {
 				return RunTicketResult{}, fmt.Errorf("collect diff for review: %w", err)
 			}
@@ -287,6 +307,7 @@ func RunTicket(ctx context.Context, req RunTicketRequest) (result RunTicketResul
 				Runtime:                  reviewerProfile.Runtime,
 				Model:                    reviewerProfile.Model,
 				Reasoning:                reviewerProfile.Reasoning,
+				WorktreePath:             st.worktreePath,
 				InputArtifactPath:        st.paths.verificationPath,
 				Instructions:             renderReviewInstructions(req.Plan, st.reviewAttempts+1),
 				Diff:                     diffForReview,
@@ -337,7 +358,7 @@ func RunTicket(ctx context.Context, req RunTicketRequest) (result RunTicketResul
 			}
 
 		case state.TicketPhaseVerify:
-			blocked, err := st.executeVerification(ctx, absRepoRoot)
+			blocked, err := st.executeVerification(ctx)
 			if err != nil {
 				return RunTicketResult{}, err
 			}
@@ -391,7 +412,7 @@ func RunTicket(ctx context.Context, req RunTicketRequest) (result RunTicketResul
 				Runtime:         workerProfile.Runtime,
 				Model:           workerProfile.Model,
 				Reasoning:       workerProfile.Reasoning,
-				WorktreePath:    absRepoRoot,
+				WorktreePath:    st.worktreePath,
 				Instructions:    renderRepairInstructions(st),
 				ExecutionConfig: executionConfigFromPolicy(cfg),
 				OnProgress:      func(detail string) { st.progressDetail(detail) },
@@ -414,7 +435,7 @@ func RunTicket(ctx context.Context, req RunTicketRequest) (result RunTicketResul
 				return RunTicketResult{}, err
 			}
 			if st.currentPhase == state.TicketPhaseVerify {
-				blocked, err := st.executeVerification(ctx, absRepoRoot)
+				blocked, err := st.executeVerification(ctx)
 				if err != nil {
 					return RunTicketResult{}, err
 				}
@@ -482,24 +503,26 @@ func handleImplementResult(st *ticketRunState, result runtime.WorkerResult, req 
 			CreatedAt:     stateTime(),
 			UpdatedAt:     stateTime(),
 		},
-		TicketID:          st.req.Ticket.ID,
-		Attempt:           st.implementationAttempts,
-		Runtime:           attemptRuntime,
-		Model:             strings.TrimSpace(req.Model),
-		Reasoning:         strings.TrimSpace(req.Reasoning),
-		FallbackReason:    strings.TrimSpace(req.FallbackReason),
-		Status:            string(result.Status),
-		CompletionCode:    result.CompletionCode,
-		RetryClass:        result.RetryClass,
-		Concerns:          result.Concerns,
-		LeaseID:           result.LeaseID,
-		InputArtifactPath: req.InputArtifactPath,
-		StartedAt:         result.StartedAt,
-		FinishedAt:        result.FinishedAt,
-		Artifacts:         compactStrings([]string{result.StdoutPath, result.StderrPath, result.ResultArtifactPath}),
-		TokenUsage:        cloneRuntimeTokenUsage(result.TokenUsage),
-		ActivityStats:     cloneRuntimeActivityStats(result.ActivityStats),
-		ChangedFiles:      []string{},
+		TicketID:              st.req.Ticket.ID,
+		Attempt:               st.implementationAttempts,
+		Runtime:               attemptRuntime,
+		Model:                 strings.TrimSpace(req.Model),
+		Reasoning:             strings.TrimSpace(req.Reasoning),
+		FallbackReason:        strings.TrimSpace(req.FallbackReason),
+		Status:                string(result.Status),
+		CompletionCode:        result.CompletionCode,
+		RetryClass:            result.RetryClass,
+		Concerns:              result.Concerns,
+		LeaseID:               result.LeaseID,
+		InputArtifactPath:     req.InputArtifactPath,
+		StartedAt:             result.StartedAt,
+		FinishedAt:            result.FinishedAt,
+		Artifacts:             compactStrings([]string{result.StdoutPath, result.StderrPath, result.ResultArtifactPath}),
+		TokenUsage:            cloneRuntimeTokenUsage(result.TokenUsage),
+		ActivityStats:         cloneRuntimeActivityStats(result.ActivityStats),
+		RawChangedFiles:       []string{},
+		EffectiveChangedFiles: []string{},
+		ChangedFiles:          []string{},
 	}
 
 	switch result.Status {
@@ -509,11 +532,27 @@ func handleImplementResult(st *ticketRunState, result runtime.WorkerResult, req 
 		}
 		st.blockReason = ""
 		st.implementation.BlockReason = ""
-		changedFiles, err := collectChangedFiles(st.repoRoot, st.req.BaseCommit)
+		rawChangedFiles, err := collectRawChangedFiles(st.worktreePath, st.req.BaseCommit)
 		if err != nil {
 			return fmt.Errorf("collect changed files: %w", err)
 		}
-		st.implementation.ChangedFiles = changedFiles
+		effectiveChangedFiles := filterEngineOwnedFiles(rawChangedFiles)
+		if len(rawChangedFiles) != len(effectiveChangedFiles) {
+			engineOwned := make([]string, 0, len(rawChangedFiles)-len(effectiveChangedFiles))
+			effectiveSet := make(map[string]struct{}, len(effectiveChangedFiles))
+			for _, f := range effectiveChangedFiles {
+				effectiveSet[f] = struct{}{}
+			}
+			for _, f := range rawChangedFiles {
+				if _, ok := effectiveSet[f]; !ok {
+					engineOwned = append(engineOwned, f)
+				}
+			}
+			log.Printf("[INFO] filtered engine-owned paths from ticket %s: %s", st.req.Ticket.ID, strings.Join(engineOwned, ", "))
+		}
+		st.implementation.RawChangedFiles = rawChangedFiles
+		st.implementation.EffectiveChangedFiles = effectiveChangedFiles
+		st.implementation.ChangedFiles = effectiveChangedFiles
 	case runtime.WorkerStatusNeedsContext, runtime.WorkerStatusBlocked:
 		reason := workerBlockReason(result)
 		st.blockReason = reason
@@ -545,7 +584,7 @@ func canStartTicketRunFromPhase(phase state.TicketPhase, restoredFromSnapshot bo
 // executeVerification runs the verification gate for the current ticket and
 // transitions into review on success. A true return value indicates the ticket
 // is blocked and can be safely returned immediately by the caller.
-func (st *ticketRunState) executeVerification(ctx context.Context, repoRoot string) (bool, error) {
+func (st *ticketRunState) executeVerification(ctx context.Context) (bool, error) {
 	if err := checkSingleTicketScope(st); err != nil {
 		return false, err
 	}
@@ -556,7 +595,7 @@ func (st *ticketRunState) executeVerification(ctx context.Context, repoRoot stri
 	if err := st.persist(); err != nil {
 		return false, err
 	}
-	verifyArtifact, verifyPassed, err := st.runVerification(ctx, repoRoot)
+	verifyArtifact, verifyPassed, err := st.runVerification(ctx, st.repoRoot, st.worktreePath)
 	if err != nil {
 		return false, err
 	}
@@ -637,7 +676,17 @@ func collectDiff(repoRoot, baseCommit string) (string, error) {
 	return diff, nil
 }
 
+//nolint:unparam // retained as the backward-compatible filtered helper used by tests
 func collectChangedFiles(repoRoot, baseCommit string) ([]string, error) {
+	files, err := collectRawChangedFiles(repoRoot, baseCommit)
+	if err != nil {
+		return nil, err
+	}
+	filtered := filterEngineOwnedFiles(files)
+	return filtered, nil
+}
+
+func collectRawChangedFiles(repoRoot, baseCommit string) ([]string, error) {
 	baseCommit = strings.TrimSpace(baseCommit)
 	if baseCommit == "" {
 		return nil, nil
@@ -650,8 +699,7 @@ func collectChangedFiles(repoRoot, baseCommit string) ([]string, error) {
 	if err != nil {
 		return nil, fmt.Errorf("collect changed files against %s: %w", baseCommit, err)
 	}
-	filtered := filterEngineOwnedFiles(files)
-	return filtered, nil
+	return dedupeAndSortChanged(files), nil
 }
 
 func handleVerificationFailure(st *ticketRunState, verification state.VerificationArtifact) error {
@@ -943,7 +991,7 @@ func handleReviewOutcome(st *ticketRunState, result runtime.ReviewResult, req ru
 	return nil
 }
 
-func (st *ticketRunState) runVerification(ctx context.Context, repoRoot string) (*state.VerificationArtifact, bool, error) {
+func (st *ticketRunState) runVerification(ctx context.Context, repoRoot, workDir string) (*state.VerificationArtifact, bool, error) {
 	commands := st.req.VerificationCommands
 	if len(commands) == 0 {
 		commands = st.req.Plan.ValidationCommands
@@ -953,7 +1001,7 @@ func (st *ticketRunState) runVerification(ctx context.Context, repoRoot string) 
 	// They are prepended to the combined result set so the artifact records all runs.
 	var declaredResults []verifycommand.CommandResult
 	if len(st.cfg.Verification.QualityCommands) > 0 {
-		qualityResults, err := verifycommand.RunQualityCommands(ctx, repoRoot, st.cfg.Verification.QualityCommands, st.cfg.Verification)
+		qualityResults, err := verifycommand.RunQualityCommands(ctx, repoRoot, workDir, st.cfg.Verification.QualityCommands, st.cfg.Verification)
 		if err != nil {
 			return nil, false, fmt.Errorf("run quality commands: %w", err)
 		}
@@ -962,7 +1010,7 @@ func (st *ticketRunState) runVerification(ctx context.Context, repoRoot string) 
 
 	// Only run per-ticket validation commands when there are any declared.
 	if len(commands) > 0 {
-		validationResults, err := verifycommand.RunCommands(ctx, repoRoot, commands, st.cfg.Verification)
+		validationResults, err := verifycommand.RunCommands(ctx, repoRoot, workDir, commands, st.cfg.Verification)
 		if err != nil {
 			return nil, false, fmt.Errorf("run validation commands: %w", err)
 		}
@@ -977,7 +1025,7 @@ func (st *ticketRunState) runVerification(ctx context.Context, repoRoot string) 
 	// feed ValidationCoverage and can trigger repair routing, but they do
 	// not flip the legacy `Passed` flag unless promoted to required.
 	derivation := deriveTicketChecks(st)
-	derivedCommandResults, derivedOrdered, err := runDerivedChecks(ctx, repoRoot, derivation.Checks, st.cfg.Verification)
+	derivedCommandResults, derivedOrdered, err := runDerivedChecks(ctx, repoRoot, workDir, derivation.Checks, st.cfg.Verification)
 	if err != nil {
 		return nil, false, err
 	}

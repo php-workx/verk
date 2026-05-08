@@ -79,7 +79,11 @@ func (a *Adapter) CheckAvailability(ctx context.Context) error {
 		ctx = context.Background()
 	}
 
-	result, err := runCommand(ctx, a.binary(), []string{"--version"}, nil, runtimeCommandEnv(runtime.ExecutionConfig{}), 0)
+	env, err := runtimeCommandEnv(runtime.ExecutionConfig{}, "")
+	if err != nil {
+		return fmt.Errorf("build %s availability environment: %w", runtimeName, err)
+	}
+	result, err := runCommand(ctx, a.binary(), []string{"--version"}, nil, env, "", 0)
 	if err != nil {
 		return fmt.Errorf("%s availability check failed: %w", runtimeName, err)
 	}
@@ -96,16 +100,19 @@ func (a *Adapter) RunWorker(ctx context.Context, req runtime.WorkerRequest) (run
 
 	req.Runtime = ensureRuntime(req.Runtime, runtimeName)
 	startedAt := now().UTC()
+	env, err := runtimeCommandEnv(req.ExecutionConfig, req.WorktreePath)
+	if err != nil {
+		return runtime.WorkerResult{}, err
+	}
 
-	var err error
 	prompt := runtime.BuildWorkerPrompt(req)
 	args := buildWorkerArgs(req)
 	var execResult commandResult
 	var execErr error
 	if req.OnProgress != nil {
-		execResult, execErr = runStreamingCommand(ctx, a.binary(), args, []byte(prompt), runtimeCommandEnv(req.ExecutionConfig), runtimeCommandTimeout(req.ExecutionConfig.WorkerTimeoutMinutes), req.OnProgress)
+		execResult, execErr = runStreamingCommand(ctx, a.binary(), args, []byte(prompt), env, req.WorktreePath, runtimeCommandTimeout(req.ExecutionConfig.WorkerTimeoutMinutes), req.OnProgress)
 	} else {
-		execResult, execErr = runCommand(ctx, a.binary(), args, []byte(prompt), runtimeCommandEnv(req.ExecutionConfig), runtimeCommandTimeout(req.ExecutionConfig.WorkerTimeoutMinutes))
+		execResult, execErr = runCommand(ctx, a.binary(), args, []byte(prompt), env, req.WorktreePath, runtimeCommandTimeout(req.ExecutionConfig.WorkerTimeoutMinutes))
 	}
 	finishedAt := now().UTC()
 	if execErr != nil {
@@ -170,16 +177,18 @@ func (a *Adapter) RunReviewer(ctx context.Context, req runtime.ReviewRequest) (r
 
 	req.Runtime = ensureRuntime(req.Runtime, runtimeName)
 	startedAt := now().UTC()
-
-	var err error
+	env, err := runtimeCommandEnv(req.ExecutionConfig, req.WorktreePath)
+	if err != nil {
+		return runtime.ReviewResult{}, err
+	}
 	prompt := runtime.BuildReviewPrompt(req)
 	args := buildReviewArgs(req)
 	var execResult commandResult
 	var execErr error
 	if req.OnProgress != nil {
-		execResult, execErr = runStreamingCommand(ctx, a.binary(), args, []byte(prompt), runtimeCommandEnv(req.ExecutionConfig), runtimeCommandTimeout(req.ExecutionConfig.ReviewerTimeoutMinutes), req.OnProgress)
+		execResult, execErr = runStreamingCommand(ctx, a.binary(), args, []byte(prompt), env, req.WorktreePath, runtimeCommandTimeout(req.ExecutionConfig.ReviewerTimeoutMinutes), req.OnProgress)
 	} else {
-		execResult, execErr = runCommand(ctx, a.binary(), args, []byte(prompt), runtimeCommandEnv(req.ExecutionConfig), runtimeCommandTimeout(req.ExecutionConfig.ReviewerTimeoutMinutes))
+		execResult, execErr = runCommand(ctx, a.binary(), args, []byte(prompt), env, req.WorktreePath, runtimeCommandTimeout(req.ExecutionConfig.ReviewerTimeoutMinutes))
 	}
 	finishedAt := now().UTC()
 	if execErr != nil {
@@ -631,7 +640,7 @@ func ensureRuntime(value, fallback string) string {
 	return strings.TrimSpace(value)
 }
 
-func defaultRunCommand(ctx context.Context, binary string, args []string, stdin []byte, env []string, timeout time.Duration) (commandResult, error) {
+func defaultRunCommand(ctx context.Context, binary string, args []string, stdin []byte, env []string, workDir string, timeout time.Duration) (commandResult, error) {
 	if timeout > 0 {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, timeout)
@@ -647,6 +656,9 @@ func defaultRunCommand(ctx context.Context, binary string, args []string, stdin 
 	cmd := exec.CommandContext(ctx, binary, args...)
 	cmd.Stdin = bytes.NewReader(stdin)
 	cmd.Env = env
+	if workDir != "" {
+		cmd.Dir = workDir
+	}
 	// Put the subprocess in its own process group so that MCP helper processes
 	// spawned by the worker are also killed when the context is cancelled.
 	setupProcessGroup(cmd)
@@ -732,8 +744,9 @@ func encodeJSON(file *os.File, payload any) error {
 // Claude Code needs access to auth credentials (keychain, ~/.claude/) which
 // require the ambient environment. Config-specified AuthEnvVars are informational
 // only — they document which vars the runtime expects but don't restrict the env.
-func runtimeCommandEnv(_ runtime.ExecutionConfig) []string {
-	return nil
+func runtimeCommandEnv(_ runtime.ExecutionConfig, worktreePath string) ([]string, error) {
+	cleanEnv := runtime.StripEnvKeys(os.Environ(), runtime.GitIsolationKeys()...)
+	return runtime.BuildIsolatedProcessEnv(cleanEnv, worktreePath)
 }
 
 func runtimeCommandTimeout(minutes int) time.Duration {
@@ -770,7 +783,7 @@ type assistantMessage struct {
 
 // defaultRunStreamingCommand executes a command and processes stdout as stream-json,
 // calling onProgress for each tool-use event. Returns the collected output.
-func defaultRunStreamingCommand(ctx context.Context, binary string, args []string, stdin []byte, env []string, timeout time.Duration, onProgress func(string)) (commandResult, error) {
+func defaultRunStreamingCommand(ctx context.Context, binary string, args []string, stdin []byte, env []string, workDir string, timeout time.Duration, onProgress func(string)) (commandResult, error) {
 	if timeout > 0 {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, timeout)
@@ -786,6 +799,9 @@ func defaultRunStreamingCommand(ctx context.Context, binary string, args []strin
 	cmd := exec.CommandContext(ctx, binary, args...)
 	cmd.Stdin = bytes.NewReader(stdin)
 	cmd.Env = env
+	if workDir != "" {
+		cmd.Dir = workDir
+	}
 	// Put the subprocess in its own process group so that MCP helper processes
 	// spawned by the worker are also killed when the context is cancelled.
 	setupProcessGroup(cmd)

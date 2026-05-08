@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 	"verk/internal/adapters/runtime"
@@ -67,7 +68,7 @@ func TestRunWaveVerificationLoop_NoQualityCommands(t *testing.T) {
 	cfg := policy.DefaultConfig()
 	cfg.Verification.QualityCommands = nil
 
-	err := runWaveVerificationLoop(context.Background(), makeEpicReq(repoRoot, adapter), cfg, wave, wavePath, nil)
+	err := runWaveVerificationLoop(context.Background(), makeEpicReq(repoRoot, adapter), cfg, wave, wavePath, nil, "")
 	if err != nil {
 		t.Fatalf("expected nil error, got: %v", err)
 	}
@@ -86,7 +87,7 @@ func TestRunWaveVerificationLoop_PassesFirstTry(t *testing.T) {
 	cfg := policy.DefaultConfig()
 	cfg.Verification.QualityCommands = []policy.QualityCommand{qualityCmd("true")}
 
-	err := runWaveVerificationLoop(context.Background(), makeEpicReq(repoRoot, adapter), cfg, wave, wavePath, nil)
+	err := runWaveVerificationLoop(context.Background(), makeEpicReq(repoRoot, adapter), cfg, wave, wavePath, nil, "")
 	if err != nil {
 		t.Fatalf("expected nil error, got: %v", err)
 	}
@@ -108,7 +109,7 @@ func TestRunWaveVerificationLoop_MaxWaveRepairCyclesZero_FailsImmediately(t *tes
 	cfg.Verification.QualityCommands = []policy.QualityCommand{qualityCmd("false")}
 	cfg.Policy.MaxWaveRepairCycles = 0
 
-	err := runWaveVerificationLoop(context.Background(), makeEpicReq(repoRoot, adapter), cfg, wave, wavePath, nil)
+	err := runWaveVerificationLoop(context.Background(), makeEpicReq(repoRoot, adapter), cfg, wave, wavePath, nil, "")
 
 	if err == nil {
 		t.Fatal("expected error, got nil")
@@ -151,7 +152,7 @@ func TestRunWaveVerificationLoop_RepairSucceedsOnFirstCycle(t *testing.T) {
 	cfg.Verification.QualityCommands = []policy.QualityCommand{{Path: ".", Run: []string{toggleScript}}}
 	cfg.Policy.MaxWaveRepairCycles = 3
 
-	err := runWaveVerificationLoop(context.Background(), makeEpicReq(repoRoot, adapter), cfg, wave, wavePath, []string{"some/file.go"})
+	err := runWaveVerificationLoop(context.Background(), makeEpicReq(repoRoot, adapter), cfg, wave, wavePath, []string{"some/file.go"}, "")
 	if err != nil {
 		t.Fatalf("expected nil error after repair, got: %v", err)
 	}
@@ -186,7 +187,7 @@ func TestRunWaveVerificationLoop_ExhaustsRepairCycles(t *testing.T) {
 	cfg.Verification.QualityCommands = []policy.QualityCommand{qualityCmd("false")}
 	cfg.Policy.MaxWaveRepairCycles = 2
 
-	err := runWaveVerificationLoop(context.Background(), makeEpicReq(repoRoot, adapter), cfg, wave, wavePath, nil)
+	err := runWaveVerificationLoop(context.Background(), makeEpicReq(repoRoot, adapter), cfg, wave, wavePath, nil, "")
 
 	if err == nil {
 		t.Fatal("expected error after exhausting repair cycles, got nil")
@@ -211,7 +212,7 @@ func TestRunWaveVerificationLoop_WorkerError_Aborts(t *testing.T) {
 	cfg.Verification.QualityCommands = []policy.QualityCommand{qualityCmd("false")}
 	cfg.Policy.MaxWaveRepairCycles = 3
 
-	err := runWaveVerificationLoop(context.Background(), makeEpicReq(repoRoot, adapter), cfg, wave, wavePath, nil)
+	err := runWaveVerificationLoop(context.Background(), makeEpicReq(repoRoot, adapter), cfg, wave, wavePath, nil, "")
 
 	if err == nil {
 		t.Fatal("expected error when worker call fails, got nil")
@@ -246,7 +247,7 @@ func TestRunWaveVerificationLoop_RepairWaveIDAndLeaseID(t *testing.T) {
 	cfg := policy.DefaultConfig()
 	cfg.Verification.QualityCommands = []policy.QualityCommand{{Path: ".", Run: []string{toggleScript}}}
 
-	if err := runWaveVerificationLoop(context.Background(), makeEpicReq(repoRoot, adapter), cfg, wave, wavePath, nil); err != nil {
+	if err := runWaveVerificationLoop(context.Background(), makeEpicReq(repoRoot, adapter), cfg, wave, wavePath, nil, ""); err != nil {
 		t.Fatal(err)
 	}
 
@@ -349,7 +350,7 @@ func TestRunWaveVerificationLoop_RecordsValidationCoverage(t *testing.T) {
 	cfg := policy.DefaultConfig()
 	cfg.Verification.QualityCommands = []policy.QualityCommand{qualityCmd("true")}
 
-	if err := runWaveVerificationLoop(context.Background(), makeEpicReq(repoRoot, adapter), cfg, wave, wavePath, nil); err != nil {
+	if err := runWaveVerificationLoop(context.Background(), makeEpicReq(repoRoot, adapter), cfg, wave, wavePath, nil, ""); err != nil {
 		t.Fatalf("expected nil error, got: %v", err)
 	}
 	if wave.ValidationCoverage == nil {
@@ -405,7 +406,7 @@ func TestRunWaveVerificationLoop_ExhaustedBudget_PreservesHistory(t *testing.T) 
 	cfg.Verification.QualityCommands = []policy.QualityCommand{qualityCmd("false")}
 	cfg.Policy.MaxWaveRepairCycles = 2
 
-	err := runWaveVerificationLoop(context.Background(), makeEpicReq(repoRoot, adapter), cfg, wave, wavePath, nil)
+	err := runWaveVerificationLoop(context.Background(), makeEpicReq(repoRoot, adapter), cfg, wave, wavePath, nil, "")
 	if err == nil {
 		t.Fatal("expected error after exhausting repair cycles, got nil")
 	}
@@ -464,7 +465,7 @@ func TestRunWaveVerificationLoop_RepairDisabled_RecordsBlockerWithHistory(t *tes
 	cfg.Verification.QualityCommands = []policy.QualityCommand{qualityCmd("false")}
 	cfg.Policy.MaxWaveRepairCycles = 0
 
-	err := runWaveVerificationLoop(context.Background(), makeEpicReq(repoRoot, adapter), cfg, wave, wavePath, nil)
+	err := runWaveVerificationLoop(context.Background(), makeEpicReq(repoRoot, adapter), cfg, wave, wavePath, nil, "")
 	if err == nil {
 		t.Fatal("expected error when repair is disabled and checks fail")
 	}
@@ -539,11 +540,10 @@ func TestWaveDerivation_DocsWave_DerivesStaleWordingCheck(t *testing.T) {
 	}
 }
 
-// TestResumePendingWaveVerification_AlreadyPassed_ClearsCursorWithoutRerun
-// verifies TC5: when the pending wave already passed, resumePendingWaveVerification
-// must clear the cursor marker and return without re-running the verification loop.
-// This prevents duplicating work that completed before a process crash.
-func TestResumePendingWaveVerification_AlreadyPassed_ClearsCursorWithoutRerun(t *testing.T) {
+// TestResumePendingWaveVerification_AlreadyPassedWithoutTransactionPreservesCursor
+// verifies that a top-level wave that passed verification is not treated as
+// complete until its durable integration transaction has also completed.
+func TestResumePendingWaveVerification_AlreadyPassedWithoutTransactionPreservesCursor(t *testing.T) {
 	repoRoot, wavePath, wave := makeWaveVerifyFixture(t)
 
 	// Mark wave as already verified.
@@ -572,13 +572,17 @@ func TestResumePendingWaveVerification_AlreadyPassed_ClearsCursorWithoutRerun(t 
 	cfg.Policy.MaxWaveRepairCycles = 0
 
 	err := resumePendingWaveVerification(context.Background(), makeEpicReq(repoRoot, adapter), cfg, cursor, runPath, &run)
-	if err != nil {
-		t.Fatalf("expected nil error for already-passed wave, got: %v", err)
+	if err == nil {
+		t.Fatal("expected error for already-passed wave without integration transaction")
+	}
+	if !strings.Contains(err.Error(), "no durable integration transaction") {
+		t.Fatalf("expected durable transaction error, got: %v", err)
 	}
 
-	// Cursor must be cleared so the next resume does not repeat the check.
-	if _, ok := pendingWaveVerificationID(cursor); ok {
-		t.Error("expected pending wave verification marker to be cleared")
+	// Cursor must remain so resume does not skip a wave that has not been
+	// committed to the hidden base and applied to main.
+	if pending, ok := pendingWaveVerificationID(cursor); !ok || pending != "wave-1" {
+		t.Fatalf("expected pending wave verification marker to remain, cursor=%v", cursor)
 	}
 
 	// No worker must have been invoked — the loop was skipped entirely.
@@ -639,5 +643,59 @@ func TestResumePendingWaveVerification_NotPassedYet_RerunsAndClearsOnSuccess(t *
 	if reloadedWave.Acceptance["wave_verification_passed"] != true {
 		t.Errorf("expected wave_verification_passed=true after re-run, got %v",
 			reloadedWave.Acceptance["wave_verification_passed"])
+	}
+}
+
+// TestResumePendingWaveVerification_TerminalFailureClearsMarker verifies that
+// a pending wave marker is cleared once verification reaches a terminal failed
+// outcome. Without this, the next `verk run` re-enters the same exhausted wave
+// verification loop and never gets back to reopened blocked tickets.
+func TestResumePendingWaveVerification_TerminalFailureClearsMarker(t *testing.T) {
+	repoRoot, wavePath, wave := makeWaveVerifyFixture(t)
+	if err := state.SaveJSONAtomic(wavePath, wave); err != nil {
+		t.Fatal(err)
+	}
+
+	runPath := filepath.Join(repoRoot, ".verk", "runs", "run-test", "run.json")
+	run := state.RunArtifact{
+		ArtifactMeta: state.ArtifactMeta{RunID: "run-test"},
+		Status:       state.EpicRunStatusBlocked,
+		ResumeCursor: map[string]any{},
+	}
+	if err := state.SaveJSONAtomic(runPath, run); err != nil {
+		t.Fatal(err)
+	}
+
+	cursor := run.ResumeCursor
+	setPendingWaveVerification(cursor, "wave-1")
+
+	adapter := runtimefake.New(nil, nil)
+	cfg := policy.DefaultConfig()
+	cfg.Verification.QualityCommands = []policy.QualityCommand{qualityCmd("false")}
+	cfg.Policy.MaxWaveRepairCycles = 0
+
+	err := resumePendingWaveVerification(context.Background(), makeEpicReq(repoRoot, adapter), cfg, cursor, runPath, &run)
+	if err == nil {
+		t.Fatal("expected terminal verification failure, got nil")
+	}
+
+	if _, ok := pendingWaveVerificationID(cursor); ok {
+		t.Fatal("expected pending wave verification marker to be cleared after terminal failure")
+	}
+
+	var persisted state.RunArtifact
+	if err := state.LoadJSON(runPath, &persisted); err != nil {
+		t.Fatalf("reload run: %v", err)
+	}
+	if _, ok := pendingWaveVerificationID(persisted.ResumeCursor); ok {
+		t.Fatalf("expected persisted run cursor to have no pending wave marker, cursor=%v", persisted.ResumeCursor)
+	}
+
+	var reloadedWave state.WaveArtifact
+	if err := state.LoadJSON(wavePath, &reloadedWave); err != nil {
+		t.Fatalf("reload wave artifact: %v", err)
+	}
+	if got, ok := reloadedWave.Acceptance["wave_verification_passed"].(bool); !ok || got {
+		t.Fatalf("expected wave_verification_passed=false after terminal failure, acceptance=%v", reloadedWave.Acceptance)
 	}
 }

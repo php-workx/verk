@@ -272,6 +272,8 @@ func doRunTicket(w, errw io.Writer, ticketID string) (runID string, err error) {
 	go func() {
 		defer wg.Done()
 		defer close(ch)
+		// Direct single-ticket CLI runs intentionally leave WorktreePath empty so
+		// they continue operating in the user's main worktree.
 		result, runErr = runTicket(ctx, engine.RunTicketRequest{
 			RepoRoot:   repoRoot,
 			RunID:      runID,

@@ -37,6 +37,25 @@ type reflectingAdapter struct {
 	reviewReqs    []runtime.ReviewRequest
 }
 
+type functionAdapter struct {
+	runWorker   func(context.Context, runtime.WorkerRequest) (runtime.WorkerResult, error)
+	runReviewer func(context.Context, runtime.ReviewRequest) (runtime.ReviewResult, error)
+}
+
+func (a functionAdapter) RunWorker(ctx context.Context, req runtime.WorkerRequest) (runtime.WorkerResult, error) {
+	if a.runWorker == nil {
+		return runtime.WorkerResult{}, fmt.Errorf("functionAdapter: RunWorker not configured")
+	}
+	return a.runWorker(ctx, req)
+}
+
+func (a functionAdapter) RunReviewer(ctx context.Context, req runtime.ReviewRequest) (runtime.ReviewResult, error) {
+	if a.runReviewer == nil {
+		return runtime.ReviewResult{}, fmt.Errorf("functionAdapter: RunReviewer not configured")
+	}
+	return a.runReviewer(ctx, req)
+}
+
 func (a *reflectingAdapter) RunWorker(ctx context.Context, req runtime.WorkerRequest) (runtime.WorkerResult, error) {
 	if err := ctx.Err(); err != nil {
 		return runtime.WorkerResult{}, err
@@ -371,8 +390,8 @@ func TestRunEpicScopeViolationBlocksWave(t *testing.T) {
 		t.Fatal("expected non-nil error for scope violation, got nil")
 	}
 
-	if _, statErr := os.Stat(touchOutsideScope); statErr != nil {
-		t.Fatalf("expected scope violation fixture file to exist: %v", statErr)
+	if _, statErr := os.Stat(touchOutsideScope); !os.IsNotExist(statErr) {
+		t.Fatalf("expected scope violation fixture to stay out of main tree, got %v", statErr)
 	}
 	// Scope violation must fail closed: the wave should fail and the epic should
 	// not complete (G9: scope checks fail closed).
@@ -708,7 +727,7 @@ func TestRunEpicFailsOnScopeViolation(t *testing.T) {
 	}
 }
 
-func TestRunEpicIgnoresBaselineDirtyFilesInScopeChecks(t *testing.T) {
+func TestRunEpicBlocksWhenMainTreeDiffersFromWaveBase(t *testing.T) {
 	repoRoot := t.TempDir()
 	baseCommit := initEpicRepo(t, repoRoot)
 	cfg := policy.DefaultConfig()
@@ -765,21 +784,872 @@ func TestRunEpicIgnoresBaselineDirtyFilesInScopeChecks(t *testing.T) {
 		Adapter:      adapter,
 		Config:       cfg,
 	})
+	if err == nil {
+		t.Fatal("expected dirty main tree to block wave start, got nil error")
+	}
+	if !strings.Contains(err.Error(), "dirty main tree") {
+		t.Fatalf("expected dirty main tree error, got %v", err)
+	}
+	if result.Run.Status != state.EpicRunStatusBlocked {
+		t.Fatalf("expected blocked run status for dirty main tree, got %q", result.Run.Status)
+	}
+	if got := adapter.WorkerRequests(); len(got) != 0 {
+		t.Fatalf("expected no worker execution when main tree is dirty, got %d requests", len(got))
+	}
+}
+
+func TestRunEpicWaveTwoSeesAcceptedWaveOneChangesWithoutUserVisibleCommit(t *testing.T) {
+	repoRoot := t.TempDir()
+	baseCommit := initEpicRepo(t, repoRoot)
+	cfg := policy.DefaultConfig()
+
+	root := epicTicket("epic-two-wave")
+	mustSaveTicket(t, repoRoot, root)
+	mustSaveTicket(t, repoRoot, epicChildTicket("ticket-wave-1", root.ID, tkmd.StatusReady, nil, []string{"wave1.txt"}))
+	mustSaveTicket(t, repoRoot, epicChildTicket("ticket-wave-2", root.ID, tkmd.StatusOpen, []string{"ticket-wave-1"}, []string{"wave2.txt"}))
+
+	start := epicTestStart()
+	adapter := functionAdapter{
+		runWorker: func(ctx context.Context, req runtime.WorkerRequest) (runtime.WorkerResult, error) {
+			switch req.TicketID {
+			case "ticket-wave-1":
+				if err := os.WriteFile(filepath.Join(req.WorktreePath, "wave1.txt"), []byte("wave one\n"), 0o644); err != nil {
+					return runtime.WorkerResult{}, err
+				}
+			case "ticket-wave-2":
+				content, err := os.ReadFile(filepath.Join(req.WorktreePath, "wave1.txt"))
+				if err != nil {
+					return runtime.WorkerResult{}, fmt.Errorf("wave 2 missing accepted wave 1 output: %w", err)
+				}
+				if strings.TrimSpace(string(content)) != "wave one" {
+					return runtime.WorkerResult{}, fmt.Errorf("wave 2 saw unexpected wave1 content %q", string(content))
+				}
+				if err := os.WriteFile(filepath.Join(req.WorktreePath, "wave2.txt"), []byte("wave two\n"), 0o644); err != nil {
+					return runtime.WorkerResult{}, err
+				}
+			default:
+				return runtime.WorkerResult{}, fmt.Errorf("unexpected ticket %s", req.TicketID)
+			}
+			return runtime.WorkerResult{
+				Status:             runtime.WorkerStatusDone,
+				RetryClass:         runtime.RetryClassTerminal,
+				LeaseID:            req.LeaseID,
+				StartedAt:          start,
+				FinishedAt:         start.Add(time.Second),
+				ResultArtifactPath: filepath.Join(repoRoot, req.TicketID+".worker.json"),
+			}, nil
+		},
+		runReviewer: func(ctx context.Context, req runtime.ReviewRequest) (runtime.ReviewResult, error) {
+			return runtime.ReviewResult{
+				Status:             runtime.WorkerStatusDone,
+				RetryClass:         runtime.RetryClassTerminal,
+				LeaseID:            req.LeaseID,
+				StartedAt:          start.Add(2 * time.Second),
+				FinishedAt:         start.Add(3 * time.Second),
+				ReviewStatus:       runtime.ReviewStatusPassed,
+				Summary:            "clean",
+				ResultArtifactPath: filepath.Join(repoRoot, req.TicketID+".review.json"),
+			}, nil
+		},
+	}
+
+	result, err := RunEpic(context.Background(), RunEpicRequest{
+		RepoRoot:     repoRoot,
+		RunID:        "run-two-wave",
+		RootTicketID: root.ID,
+		BaseCommit:   baseCommit,
+		Adapter:      adapter,
+		Config:       cfg,
+	})
 	if err != nil {
 		t.Fatalf("RunEpic returned error: %v", err)
 	}
 	if result.Run.Status != state.EpicRunStatusCompleted {
-		t.Fatalf("expected completed epic despite dirty baseline, got %q", result.Run.Status)
+		t.Fatalf("expected completed epic, got %q", result.Run.Status)
 	}
-	if len(result.Waves) != 1 {
-		t.Fatalf("expected one wave, got %d", len(result.Waves))
+	if got := len(result.Waves); got != 2 {
+		t.Fatalf("expected two waves, got %d", got)
 	}
-	raw, ok := result.Waves[0].Acceptance["baseline_changed_files"].([]string)
-	if !ok {
-		t.Fatalf("expected baseline_changed_files acceptance entry, got %#v", result.Waves[0].Acceptance["baseline_changed_files"])
+	if _, err := os.Stat(filepath.Join(repoRoot, "wave1.txt")); err != nil {
+		t.Fatalf("expected wave1.txt in main tree: %v", err)
 	}
-	if !reflect.DeepEqual(raw, []string{"baseline-dirty.txt"}) {
-		t.Fatalf("expected baseline file to be recorded, got %#v", raw)
+	if _, err := os.Stat(filepath.Join(repoRoot, "wave2.txt")); err != nil {
+		t.Fatalf("expected wave2.txt in main tree: %v", err)
+	}
+
+	head, err := gitOutput(repoRoot, "rev-parse", "HEAD")
+	if err != nil {
+		t.Fatalf("git rev-parse HEAD: %v", err)
+	}
+	if strings.TrimSpace(head) != baseCommit {
+		t.Fatalf("expected user-visible HEAD to remain %q, got %q", baseCommit, strings.TrimSpace(head))
+	}
+	if _, err := gitOutput(repoRoot, "show-ref", "--verify", integrationBaseRef("run-two-wave")); err != nil {
+		t.Fatalf("expected hidden integration base ref to exist: %v", err)
+	}
+	if _, err := gitOutput(repoRoot, "show-ref", "--verify", integrationTicketRef("run-two-wave", "ticket-wave-1")); err != nil {
+		t.Fatalf("expected hidden ticket ref for wave 1 to exist: %v", err)
+	}
+	if _, err := gitOutput(repoRoot, "show-ref", "--verify", integrationTicketRef("run-two-wave", "ticket-wave-2")); err != nil {
+		t.Fatalf("expected hidden ticket ref for wave 2 to exist: %v", err)
+	}
+}
+
+func TestRunEpicCleansWaveWorktreesAfterFreshRun(t *testing.T) {
+	repoRoot := t.TempDir()
+	worktreeRoot := t.TempDir()
+	baseCommit := initEpicRepo(t, repoRoot)
+	cfg := policy.DefaultConfig()
+
+	root := epicTicket("epic-clean-fresh")
+	child := epicChildTicket("ticket-clean-fresh", root.ID, tkmd.StatusReady, nil, []string{"fresh.txt"})
+	mustSaveTicket(t, repoRoot, root)
+	mustSaveTicket(t, repoRoot, child)
+
+	start := epicTestStart()
+	var workerWorktreePath string
+	adapter := functionAdapter{
+		runWorker: func(ctx context.Context, req runtime.WorkerRequest) (runtime.WorkerResult, error) {
+			workerWorktreePath = req.WorktreePath
+			if strings.TrimSpace(workerWorktreePath) == "" {
+				return runtime.WorkerResult{}, fmt.Errorf("worker did not receive worktree path")
+			}
+			if err := os.WriteFile(filepath.Join(workerWorktreePath, "fresh.txt"), []byte("fresh output\n"), 0o644); err != nil {
+				return runtime.WorkerResult{}, err
+			}
+			return runtime.WorkerResult{
+				Status:             runtime.WorkerStatusDone,
+				RetryClass:         runtime.RetryClassTerminal,
+				LeaseID:            req.LeaseID,
+				StartedAt:          start,
+				FinishedAt:         start.Add(time.Second),
+				ResultArtifactPath: filepath.Join(repoRoot, req.TicketID+".worker.json"),
+			}, nil
+		},
+		runReviewer: func(ctx context.Context, req runtime.ReviewRequest) (runtime.ReviewResult, error) {
+			return runtime.ReviewResult{
+				Status:             runtime.WorkerStatusDone,
+				RetryClass:         runtime.RetryClassTerminal,
+				LeaseID:            req.LeaseID,
+				StartedAt:          start.Add(2 * time.Second),
+				FinishedAt:         start.Add(3 * time.Second),
+				ReviewStatus:       runtime.ReviewStatusPassed,
+				Summary:            "clean",
+				ResultArtifactPath: filepath.Join(repoRoot, req.TicketID+".review.json"),
+			}, nil
+		},
+	}
+
+	result, err := RunEpic(context.Background(), RunEpicRequest{
+		RepoRoot:     repoRoot,
+		WorktreeRoot: worktreeRoot,
+		RunID:        "run-clean-fresh",
+		RootTicketID: root.ID,
+		BaseCommit:   baseCommit,
+		Adapter:      adapter,
+		Config:       cfg,
+	})
+	if err != nil {
+		t.Fatalf("RunEpic returned error: %v", err)
+	}
+	if result.Run.Status != state.EpicRunStatusCompleted {
+		t.Fatalf("expected completed epic, got %q", result.Run.Status)
+	}
+	if _, statErr := os.Stat(workerWorktreePath); !os.IsNotExist(statErr) {
+		t.Fatalf("expected ticket worktree to be removed, got %q: %v", workerWorktreePath, statErr)
+	}
+	integrationPath := filepath.Join(worktreeRoot, "run-clean-fresh", "_integration")
+	if _, statErr := os.Stat(integrationPath); !os.IsNotExist(statErr) {
+		t.Fatalf("expected integration worktree to be removed, got %q: %v", integrationPath, statErr)
+	}
+}
+
+func TestRunEpicDoesNotMutateMainWhenFreshWaveCommitFails(t *testing.T) {
+	repoRoot := t.TempDir()
+	baseCommit := initEpicRepo(t, repoRoot)
+	cfg := policy.DefaultConfig()
+
+	root := epicTicket("epic-commit-fail")
+	child := epicChildTicket("ticket-commit-fail", root.ID, tkmd.StatusReady, nil, []string{"integrated.txt"})
+	mustSaveTicket(t, repoRoot, root)
+	mustSaveTicket(t, repoRoot, child)
+
+	start := epicTestStart()
+	adapter := functionAdapter{
+		runWorker: func(ctx context.Context, req runtime.WorkerRequest) (runtime.WorkerResult, error) {
+			if err := os.WriteFile(filepath.Join(req.WorktreePath, "integrated.txt"), []byte("integrated\n"), 0o644); err != nil {
+				return runtime.WorkerResult{}, err
+			}
+			lockPath := filepath.Join(repoRoot, ".git", "refs", "verk", "runs", "run-commit-fail", "base.lock")
+			if err := os.WriteFile(lockPath, []byte("locked\n"), 0o644); err != nil {
+				return runtime.WorkerResult{}, err
+			}
+			return runtime.WorkerResult{
+				Status:             runtime.WorkerStatusDone,
+				RetryClass:         runtime.RetryClassTerminal,
+				LeaseID:            req.LeaseID,
+				StartedAt:          start,
+				FinishedAt:         start.Add(time.Second),
+				ResultArtifactPath: filepath.Join(repoRoot, req.TicketID+".worker.json"),
+			}, nil
+		},
+		runReviewer: func(ctx context.Context, req runtime.ReviewRequest) (runtime.ReviewResult, error) {
+			return runtime.ReviewResult{
+				Status:             runtime.WorkerStatusDone,
+				RetryClass:         runtime.RetryClassTerminal,
+				LeaseID:            req.LeaseID,
+				StartedAt:          start.Add(2 * time.Second),
+				FinishedAt:         start.Add(3 * time.Second),
+				ReviewStatus:       runtime.ReviewStatusPassed,
+				Summary:            "clean",
+				ResultArtifactPath: filepath.Join(repoRoot, req.TicketID+".review.json"),
+			}, nil
+		},
+	}
+
+	_, err := RunEpic(context.Background(), RunEpicRequest{
+		RepoRoot:     repoRoot,
+		RunID:        "run-commit-fail",
+		RootTicketID: root.ID,
+		BaseCommit:   baseCommit,
+		Adapter:      adapter,
+		Config:       cfg,
+	})
+	if err == nil {
+		t.Fatal("expected RunEpic to fail when hidden base ref cannot advance")
+	}
+	if _, statErr := os.Stat(filepath.Join(repoRoot, "integrated.txt")); !os.IsNotExist(statErr) {
+		t.Fatalf("main tree was mutated before hidden base advanced: %v", statErr)
+	}
+}
+
+func TestRunEpic_DoesNotAdvanceHiddenBaseWhenMainApplyFails(t *testing.T) {
+	repoRoot := t.TempDir()
+	baseCommit := initEpicRepo(t, repoRoot)
+	runID := "run-main-apply-fail"
+	cfg := policy.DefaultConfig()
+	cfg.Verification.QualityCommands = nil
+	cfg.Verification.WaveCommands = nil
+
+	root := epicTicket("epic-main-apply-fail")
+	child := epicChildTicket("ticket-main-apply-fail", root.ID, tkmd.StatusReady, nil, []string{"integrated.txt"})
+	mustSaveTicket(t, repoRoot, root)
+	mustSaveTicket(t, repoRoot, child)
+
+	start := epicTestStart()
+	lockPath := filepath.Join(repoRoot, ".git", "index.lock")
+	t.Cleanup(func() { _ = os.Remove(lockPath) })
+	adapter := functionAdapter{
+		runWorker: func(ctx context.Context, req runtime.WorkerRequest) (runtime.WorkerResult, error) {
+			if err := os.WriteFile(filepath.Join(req.WorktreePath, "integrated.txt"), []byte("integrated\n"), 0o644); err != nil {
+				return runtime.WorkerResult{}, err
+			}
+			if err := os.WriteFile(lockPath, []byte("locked\n"), 0o644); err != nil {
+				return runtime.WorkerResult{}, err
+			}
+			return runtime.WorkerResult{
+				Status:             runtime.WorkerStatusDone,
+				RetryClass:         runtime.RetryClassTerminal,
+				LeaseID:            req.LeaseID,
+				StartedAt:          start,
+				FinishedAt:         start.Add(time.Second),
+				ResultArtifactPath: filepath.Join(repoRoot, req.TicketID+".worker.json"),
+			}, nil
+		},
+		runReviewer: func(ctx context.Context, req runtime.ReviewRequest) (runtime.ReviewResult, error) {
+			return runtime.ReviewResult{
+				Status:             runtime.WorkerStatusDone,
+				RetryClass:         runtime.RetryClassTerminal,
+				LeaseID:            req.LeaseID,
+				StartedAt:          start.Add(2 * time.Second),
+				FinishedAt:         start.Add(3 * time.Second),
+				ReviewStatus:       runtime.ReviewStatusPassed,
+				Summary:            "clean",
+				ResultArtifactPath: filepath.Join(repoRoot, req.TicketID+".review.json"),
+			}, nil
+		},
+	}
+
+	_, err := RunEpic(context.Background(), RunEpicRequest{
+		RepoRoot:     repoRoot,
+		RunID:        runID,
+		RootTicketID: root.ID,
+		BaseCommit:   baseCommit,
+		Adapter:      adapter,
+		Config:       cfg,
+	})
+	if err == nil {
+		t.Fatal("expected RunEpic to fail when applying integrated delta to main")
+	}
+	if _, statErr := os.Stat(filepath.Join(repoRoot, "integrated.txt")); !os.IsNotExist(statErr) {
+		t.Fatalf("main tree was mutated despite apply failure: %v", statErr)
+	}
+	newBaseHead, parseErr := gitRevParse(repoRoot, integrationBaseRef(runID))
+	if parseErr != nil {
+		t.Fatalf("expected hidden base ref to remain available: %v", parseErr)
+	}
+	if newBaseHead != baseCommit {
+		t.Fatalf("hidden base advanced before main apply succeeded: got %s, want %s", newBaseHead, baseCommit)
+	}
+
+	var run state.RunArtifact
+	if err := state.LoadJSON(runJSONPath(repoRoot, runID), &run); err != nil {
+		t.Fatalf("load run artifact: %v", err)
+	}
+	if pending, ok := pendingWaveVerificationID(run.ResumeCursor); !ok || pending != "wave-1" {
+		t.Fatalf("expected pending wave verification to remain for retry, cursor=%v", run.ResumeCursor)
+	}
+	if got, ok := run.ResumeCursor["last_wave_base_commit"].(string); ok && got != baseCommit {
+		t.Fatalf("last_wave_base_commit advanced before main apply succeeded: %q", got)
+	}
+}
+
+func TestRunEpic_FinalRunSaveFailureAfterMainApplyIsRecoverable(t *testing.T) {
+	repoRoot := t.TempDir()
+	baseCommit := initEpicRepo(t, repoRoot)
+	worktreeRoot := t.TempDir()
+	runID := "run-final-save-recoverable"
+	cfg := policy.DefaultConfig()
+	cfg.Verification.QualityCommands = nil
+	cfg.Verification.WaveCommands = nil
+
+	root := epicTicket("epic-final-save-recoverable")
+	child := epicChildTicket("ticket-final-save-recoverable", root.ID, tkmd.StatusReady, nil, []string{"docs/final-save.txt"})
+	mustSaveTicket(t, repoRoot, root)
+	mustSaveTicket(t, repoRoot, child)
+
+	integration, err := prepareWaveIntegration(context.Background(), repoRoot, runID, worktreeRoot, baseCommit)
+	if err != nil {
+		t.Fatalf("prepare wave integration: %v", err)
+	}
+	t.Cleanup(func() { _ = integration.Cleanup() })
+
+	acceptedCommit := createDetachedWorktreeCommit(t, repoRoot, baseCommit, map[string]string{
+		"docs/final-save.txt": "final save\n",
+	})
+	acceptedRef := integrationTicketRef(runID, child.ID)
+	if err := gitUpdateRef(repoRoot, acceptedRef, acceptedCommit); err != nil {
+		t.Fatalf("seed accepted ref: %v", err)
+	}
+	if err := integration.ApplyAcceptedTicketRefs(context.Background(), []string{acceptedRef}); err != nil {
+		t.Fatalf("apply accepted ref: %v", err)
+	}
+
+	runPath := runJSONPath(repoRoot, runID)
+	wavePath := waveArtifactPath(repoRoot, runID, "wave-1")
+	wave := state.WaveArtifact{
+		ArtifactMeta:   state.ArtifactMeta{SchemaVersion: 1, RunID: runID},
+		WaveID:         "wave-1",
+		Ordinal:        1,
+		Status:         state.WaveStatusAccepted,
+		TicketIDs:      []string{child.ID},
+		PlannedScope:   []string{"docs/final-save.txt"},
+		ActualScope:    []string{"docs/final-save.txt"},
+		Acceptance:     map[string]any{"wave_verification_passed": true},
+		WaveBaseCommit: baseCommit,
+	}
+	if err := state.SaveJSONAtomic(wavePath, wave); err != nil {
+		t.Fatalf("save wave artifact: %v", err)
+	}
+
+	run := state.RunArtifact{
+		ArtifactMeta: state.ArtifactMeta{SchemaVersion: 1, RunID: runID},
+		Mode:         "epic",
+		RootTicketID: root.ID,
+		Status:       state.EpicRunStatusRunning,
+		CurrentPhase: state.TicketPhaseImplement,
+		WaveIDs:      []string{wave.WaveID},
+		TicketIDs:    []string{child.ID},
+		BaseCommit:   baseCommit,
+		ResumeCursor: map[string]any{"wave_ordinal": 1},
+	}
+	tx := pendingWaveIntegrationTransaction{
+		WaveID:       wave.WaveID,
+		BaseCommit:   baseCommit,
+		AcceptedRefs: []string{acceptedRef},
+		ChangedFiles: []string{"docs/final-save.txt"},
+		WorktreePath: integration.WorktreePath(),
+	}
+	setPendingWaveIntegration(run.ResumeCursor, tx)
+	if err := state.SaveJSONAtomic(runPath, run); err != nil {
+		t.Fatalf("save initial run artifact: %v", err)
+	}
+
+	badRunPath := filepath.Join(repoRoot, "tracked.txt", "run.json")
+	err = completePendingWaveIntegrationTransaction(
+		RunEpicRequest{RepoRoot: repoRoot, RunID: runID, WorktreeRoot: worktreeRoot, Config: cfg},
+		run.ResumeCursor,
+		badRunPath,
+		&run,
+		&wave,
+		wavePath,
+		tx,
+		integration,
+	)
+	if err == nil {
+		t.Fatal("expected final run save failure")
+	}
+	if !strings.Contains(err.Error(), "persist run state") {
+		t.Fatalf("expected final save error to mention persist run state, got %v", err)
+	}
+	if got, readErr := os.ReadFile(filepath.Join(repoRoot, "docs", "final-save.txt")); readErr != nil || string(got) != "final save\n" {
+		t.Fatalf("expected integrated file on main after failed final save, got %q err=%v", string(got), readErr)
+	}
+
+	if err := integration.Cleanup(); err != nil {
+		t.Fatalf("cleanup integration worktree: %v", err)
+	}
+	var durableRun state.RunArtifact
+	if err := state.LoadJSON(runPath, &durableRun); err != nil {
+		t.Fatalf("load durable pending run: %v", err)
+	}
+	err = resumePendingWaveVerification(
+		context.Background(),
+		RunEpicRequest{RepoRoot: repoRoot, RunID: runID, WorktreeRoot: worktreeRoot, Config: cfg},
+		cfg,
+		durableRun.ResumeCursor,
+		runPath,
+		&durableRun,
+	)
+	if err != nil {
+		t.Fatalf("resume pending already-applied integration: %v", err)
+	}
+	if _, ok := pendingWaveVerificationID(durableRun.ResumeCursor); ok {
+		t.Fatalf("expected pending wave verification to clear after recovery, cursor=%v", durableRun.ResumeCursor)
+	}
+	if _, ok := durableRun.ResumeCursor["pending_wave_integration"]; ok {
+		t.Fatalf("expected pending wave integration to clear after recovery, cursor=%v", durableRun.ResumeCursor)
+	}
+	if got, ok := durableRun.ResumeCursor["last_wave_base_commit"].(string); !ok || got == "" || got == baseCommit {
+		t.Fatalf("expected recovered last_wave_base_commit to advance, got %q cursor=%v", got, durableRun.ResumeCursor)
+	}
+}
+
+func TestRunEpic_AppliesPostRepairFilesToMain(t *testing.T) {
+	repoRoot := t.TempDir()
+	baseCommit := initEpicRepo(t, repoRoot)
+	runID := "run-post-repair-main"
+	cfg := policy.DefaultConfig()
+	cfg.Verification.QualityCommands = nil
+	cfg.Verification.WaveCommands = []policy.QualityCommand{{Path: ".", Run: []string{"test -f repair.txt"}}}
+	cfg.Policy.MaxWaveRepairCycles = 1
+
+	root := epicTicket("epic-post-repair-main")
+	child := epicChildTicket("ticket-post-repair-main", root.ID, tkmd.StatusReady, nil, []string{"primary.txt"})
+	mustSaveTicket(t, repoRoot, root)
+	mustSaveTicket(t, repoRoot, child)
+
+	start := epicTestStart()
+	adapter := functionAdapter{
+		runWorker: func(ctx context.Context, req runtime.WorkerRequest) (runtime.WorkerResult, error) {
+			if req.WaveID != "" {
+				if err := os.WriteFile(filepath.Join(req.WorktreePath, "repair.txt"), []byte("repair\n"), 0o644); err != nil {
+					return runtime.WorkerResult{}, err
+				}
+				return runtime.WorkerResult{
+					Status:             runtime.WorkerStatusDone,
+					RetryClass:         runtime.RetryClassTerminal,
+					LeaseID:            req.LeaseID,
+					StartedAt:          start,
+					FinishedAt:         start.Add(time.Second),
+					ResultArtifactPath: filepath.Join(repoRoot, "wave-repair.worker.json"),
+				}, nil
+			}
+			if req.TicketID != child.ID {
+				return runtime.WorkerResult{}, fmt.Errorf("unexpected worker ticket %q", req.TicketID)
+			}
+			if err := os.WriteFile(filepath.Join(req.WorktreePath, "primary.txt"), []byte("primary\n"), 0o644); err != nil {
+				return runtime.WorkerResult{}, err
+			}
+			return runtime.WorkerResult{
+				Status:             runtime.WorkerStatusDone,
+				RetryClass:         runtime.RetryClassTerminal,
+				LeaseID:            req.LeaseID,
+				StartedAt:          start,
+				FinishedAt:         start.Add(time.Second),
+				ResultArtifactPath: filepath.Join(repoRoot, child.ID+".worker.json"),
+			}, nil
+		},
+		runReviewer: func(ctx context.Context, req runtime.ReviewRequest) (runtime.ReviewResult, error) {
+			return runtime.ReviewResult{
+				Status:             runtime.WorkerStatusDone,
+				RetryClass:         runtime.RetryClassTerminal,
+				LeaseID:            req.LeaseID,
+				StartedAt:          start.Add(2 * time.Second),
+				FinishedAt:         start.Add(3 * time.Second),
+				ReviewStatus:       runtime.ReviewStatusPassed,
+				Summary:            "clean",
+				ResultArtifactPath: filepath.Join(repoRoot, "review.json"),
+			}, nil
+		},
+	}
+
+	result, err := RunEpic(context.Background(), RunEpicRequest{
+		RepoRoot:     repoRoot,
+		RunID:        runID,
+		RootTicketID: root.ID,
+		BaseCommit:   baseCommit,
+		Adapter:      adapter,
+		Config:       cfg,
+	})
+	if err != nil {
+		t.Fatalf("RunEpic returned error: %v", err)
+	}
+	if result.Run.Status != state.EpicRunStatusCompleted {
+		t.Fatalf("expected completed run, got %q", result.Run.Status)
+	}
+	for _, path := range []string{"primary.txt", "repair.txt"} {
+		if _, err := os.Stat(filepath.Join(repoRoot, path)); err != nil {
+			t.Fatalf("expected %s applied to main: %v", path, err)
+		}
+	}
+}
+
+func TestRunEpic_PersistsWaveOrdinalBeforeWaveArtifact(t *testing.T) {
+	repoRoot := t.TempDir()
+	baseCommit := initEpicRepo(t, repoRoot)
+	runID := "run-wave-cursor-before-artifact"
+	cfg := policy.DefaultConfig()
+	cfg.Verification.QualityCommands = nil
+	cfg.Verification.WaveCommands = nil
+
+	root := epicTicket("epic-wave-cursor-before-artifact")
+	child := epicChildTicket("ticket-wave-cursor-before-artifact", root.ID, tkmd.StatusReady, nil, []string{"tracked.txt"})
+	mustSaveTicket(t, repoRoot, root)
+	mustSaveTicket(t, repoRoot, child)
+
+	adapter := newBlockingEpicAdapter(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	type runOutcome struct {
+		result RunEpicResult
+		err    error
+	}
+	done := make(chan runOutcome, 1)
+	go func() {
+		result, err := RunEpic(ctx, RunEpicRequest{
+			RepoRoot:     repoRoot,
+			RunID:        runID,
+			RootTicketID: root.ID,
+			BaseCommit:   baseCommit,
+			Adapter:      adapter,
+			Config:       cfg,
+		})
+		done <- runOutcome{result: result, err: err}
+	}()
+
+	select {
+	case got := <-adapter.started:
+		if got != child.ID {
+			t.Fatalf("unexpected worker ticket %q", got)
+		}
+	case <-time.After(5 * time.Second):
+		cancel()
+		t.Fatal("timed out waiting for worker to start")
+	}
+
+	var duringWave state.RunArtifact
+	if err := state.LoadJSON(runJSONPath(repoRoot, runID), &duringWave); err != nil {
+		close(adapter.release)
+		t.Fatalf("load run while wave is active: %v", err)
+	}
+
+	close(adapter.release)
+	select {
+	case outcome := <-done:
+		if outcome.err != nil {
+			t.Fatalf("RunEpic returned error after releasing worker: %v", outcome.err)
+		}
+	case <-time.After(5 * time.Second):
+		cancel()
+		t.Fatal("timed out waiting for RunEpic to finish")
+	}
+
+	if got := resumeCursorWaveOrdinal(duringWave.ResumeCursor); got != 1 {
+		t.Fatalf("expected wave_ordinal to be durable before worker started, got %d in cursor %#v", got, duringWave.ResumeCursor)
+	}
+	foundWaveID := false
+	for _, waveID := range duringWave.WaveIDs {
+		if waveID == "wave-1" {
+			foundWaveID = true
+			break
+		}
+	}
+	if !foundWaveID {
+		t.Fatalf("expected wave-1 in durable WaveIDs before worker started, got %#v", duringWave.WaveIDs)
+	}
+}
+
+func TestRunEpicBlockedTicketKeepsMainTreeCleanAndPersistsDiffArtifact(t *testing.T) {
+	repoRoot := t.TempDir()
+	baseCommit := initEpicRepo(t, repoRoot)
+	cfg := policy.DefaultConfig()
+
+	root := epicTicket("epic-blocked-artifact")
+	mustSaveTicket(t, repoRoot, root)
+	mustSaveTicket(t, repoRoot, epicChildTicket("ticket-blocked-artifact", root.ID, tkmd.StatusReady, nil, []string{"tracked.txt"}))
+
+	start := epicTestStart()
+	adapter := functionAdapter{
+		runWorker: func(ctx context.Context, req runtime.WorkerRequest) (runtime.WorkerResult, error) {
+			if err := os.WriteFile(filepath.Join(req.WorktreePath, "tracked.txt"), []byte("blocked output\n"), 0o644); err != nil {
+				return runtime.WorkerResult{}, err
+			}
+			return runtime.WorkerResult{
+				Status:             runtime.WorkerStatusBlocked,
+				RetryClass:         runtime.RetryClassRetryable,
+				BlockReason:        "worker blocked after writing candidate output",
+				LeaseID:            req.LeaseID,
+				StartedAt:          start,
+				FinishedAt:         start.Add(time.Second),
+				ResultArtifactPath: filepath.Join(repoRoot, "ticket-blocked-artifact.worker.json"),
+			}, nil
+		},
+		runReviewer: func(ctx context.Context, req runtime.ReviewRequest) (runtime.ReviewResult, error) {
+			return runtime.ReviewResult{
+				Status:             runtime.WorkerStatusDone,
+				RetryClass:         runtime.RetryClassTerminal,
+				LeaseID:            req.LeaseID,
+				StartedAt:          start.Add(2 * time.Second),
+				FinishedAt:         start.Add(3 * time.Second),
+				ReviewStatus:       runtime.ReviewStatusPassed,
+				Summary:            "clean",
+				ResultArtifactPath: filepath.Join(repoRoot, req.TicketID+".review.json"),
+			}, nil
+		},
+	}
+
+	result, err := RunEpic(context.Background(), RunEpicRequest{
+		RepoRoot:     repoRoot,
+		RunID:        "run-blocked-artifact",
+		RootTicketID: root.ID,
+		BaseCommit:   baseCommit,
+		Adapter:      adapter,
+		Config:       cfg,
+	})
+	if err == nil {
+		t.Fatal("expected blocked epic result, got nil error")
+	}
+	if result.Run.Status != state.EpicRunStatusBlocked {
+		t.Fatalf("expected blocked epic run, got %q", result.Run.Status)
+	}
+	mainContent, err := os.ReadFile(filepath.Join(repoRoot, "tracked.txt"))
+	if err != nil {
+		t.Fatalf("read main tracked.txt: %v", err)
+	}
+	if string(mainContent) != "base\n" {
+		t.Fatalf("expected main tree tracked.txt to remain unchanged, got %q", string(mainContent))
+	}
+	diffPath := filepath.Join(repoRoot, ".verk", "runs", "run-blocked-artifact", "tickets", "ticket-blocked-artifact", "worktree.diff")
+	diffContent, err := os.ReadFile(diffPath)
+	if err != nil {
+		t.Fatalf("expected persisted diff artifact at %s: %v", diffPath, err)
+	}
+	if !strings.Contains(string(diffContent), "tracked.txt") {
+		t.Fatalf("expected diff artifact to mention tracked.txt, got %q", string(diffContent))
+	}
+}
+
+func TestRunEpic_BlocksWhenFailedTicketDiffPersistenceFails(t *testing.T) {
+	repoRoot := t.TempDir()
+	baseCommit := initEpicRepo(t, repoRoot)
+	runID := "run-blocked-diff-persist-fail"
+	cfg := policy.DefaultConfig()
+	cfg.Verification.QualityCommands = nil
+	cfg.Verification.WaveCommands = nil
+
+	root := epicTicket("epic-blocked-diff-persist-fail")
+	child := epicChildTicket("ticket-blocked-diff-persist-fail", root.ID, tkmd.StatusReady, nil, []string{"tracked.txt"})
+	mustSaveTicket(t, repoRoot, root)
+	mustSaveTicket(t, repoRoot, child)
+
+	diffPath := filepath.Join(repoRoot, ".verk", "runs", runID, "tickets", child.ID, "worktree.diff")
+	if err := os.MkdirAll(diffPath, 0o755); err != nil {
+		t.Fatalf("seed unwritable diff artifact path: %v", err)
+	}
+
+	start := epicTestStart()
+	adapter := functionAdapter{
+		runWorker: func(ctx context.Context, req runtime.WorkerRequest) (runtime.WorkerResult, error) {
+			if err := os.WriteFile(filepath.Join(req.WorktreePath, "tracked.txt"), []byte("blocked output\n"), 0o644); err != nil {
+				return runtime.WorkerResult{}, err
+			}
+			return runtime.WorkerResult{
+				Status:             runtime.WorkerStatusBlocked,
+				RetryClass:         runtime.RetryClassRetryable,
+				BlockReason:        "blocked after writing candidate output",
+				LeaseID:            req.LeaseID,
+				StartedAt:          start,
+				FinishedAt:         start.Add(time.Second),
+				ResultArtifactPath: filepath.Join(repoRoot, child.ID+".worker.json"),
+			}, nil
+		},
+		runReviewer: func(ctx context.Context, req runtime.ReviewRequest) (runtime.ReviewResult, error) {
+			return runtime.ReviewResult{
+				Status:             runtime.WorkerStatusDone,
+				RetryClass:         runtime.RetryClassTerminal,
+				LeaseID:            req.LeaseID,
+				StartedAt:          start.Add(2 * time.Second),
+				FinishedAt:         start.Add(3 * time.Second),
+				ReviewStatus:       runtime.ReviewStatusPassed,
+				Summary:            "clean",
+				ResultArtifactPath: filepath.Join(repoRoot, req.TicketID+".review.json"),
+			}, nil
+		},
+	}
+
+	_, err := RunEpic(context.Background(), RunEpicRequest{
+		RepoRoot:     repoRoot,
+		RunID:        runID,
+		RootTicketID: root.ID,
+		BaseCommit:   baseCommit,
+		Adapter:      adapter,
+		Config:       cfg,
+	})
+	if err == nil {
+		t.Fatal("expected blocked epic result with diff artifact persistence failure")
+	}
+	if !strings.Contains(err.Error(), "persist diff artifact") {
+		t.Fatalf("expected error to mention persist diff artifact, got %v", err)
+	}
+}
+
+func TestWaveIsolation_LintInOneTicketDoesNotBlockOther(t *testing.T) {
+	repoRoot := t.TempDir()
+	baseCommit := initEpicRepo(t, repoRoot)
+	cfg := policy.DefaultConfig()
+	cfg.Scheduler.MaxConcurrency = 2
+	cfg.Policy.MaxImplementationAttempts = 1
+	cfg.Verification.QualityCommands = nil
+	cfg.Verification.WaveCommands = nil
+
+	root := epicTicket("epic-wave-isolation")
+	mustSaveTicket(t, repoRoot, root)
+
+	ticketA := epicChildTicket("ticket-a", root.ID, tkmd.StatusReady, nil, []string{"a.go"})
+	ticketA.ValidationCommands = []string{
+		`test -f a.go && test ! -f b.go && printf 'ticket-a verified\n'`,
+	}
+	mustSaveTicket(t, repoRoot, ticketA)
+
+	ticketB := epicChildTicket("ticket-b", root.ID, tkmd.StatusReady, nil, []string{"b.go"})
+	ticketB.ValidationCommands = []string{
+		`test -f b.go && printf 'lint failure: b.go\n' >&2 && exit 1`,
+	}
+	mustSaveTicket(t, repoRoot, ticketB)
+
+	start := epicTestStart()
+	adapter := functionAdapter{
+		runWorker: func(ctx context.Context, req runtime.WorkerRequest) (runtime.WorkerResult, error) {
+			if strings.TrimSpace(req.WorktreePath) == "" {
+				return runtime.WorkerResult{}, fmt.Errorf("worker %s did not receive worktree path", req.TicketID)
+			}
+			switch req.TicketID {
+			case ticketA.ID:
+				if err := os.WriteFile(filepath.Join(req.WorktreePath, "a.go"), []byte("package main\n"), 0o644); err != nil {
+					return runtime.WorkerResult{}, err
+				}
+			case ticketB.ID:
+				if err := os.WriteFile(filepath.Join(req.WorktreePath, "b.go"), []byte("package main\n\nimport \"fmt\"\n"), 0o644); err != nil {
+					return runtime.WorkerResult{}, err
+				}
+			default:
+				return runtime.WorkerResult{}, fmt.Errorf("unexpected worker ticket %q", req.TicketID)
+			}
+			return runtime.WorkerResult{
+				Status:             runtime.WorkerStatusDone,
+				RetryClass:         runtime.RetryClassTerminal,
+				LeaseID:            req.LeaseID,
+				StartedAt:          start,
+				FinishedAt:         start.Add(time.Second),
+				ResultArtifactPath: filepath.Join(t.TempDir(), req.TicketID+".worker.json"),
+			}, nil
+		},
+		runReviewer: func(ctx context.Context, req runtime.ReviewRequest) (runtime.ReviewResult, error) {
+			if req.TicketID != ticketA.ID {
+				return runtime.ReviewResult{}, fmt.Errorf("unexpected review for %q", req.TicketID)
+			}
+			if strings.TrimSpace(req.WorktreePath) == "" {
+				return runtime.ReviewResult{}, fmt.Errorf("reviewer %s did not receive worktree path", req.TicketID)
+			}
+			return runtime.ReviewResult{
+				Status:             runtime.WorkerStatusDone,
+				RetryClass:         runtime.RetryClassTerminal,
+				LeaseID:            req.LeaseID,
+				StartedAt:          start.Add(2 * time.Second),
+				FinishedAt:         start.Add(3 * time.Second),
+				ReviewStatus:       runtime.ReviewStatusPassed,
+				Summary:            "clean",
+				ResultArtifactPath: filepath.Join(t.TempDir(), req.TicketID+".review.json"),
+			}, nil
+		},
+	}
+
+	result, err := RunEpic(context.Background(), RunEpicRequest{
+		RepoRoot:     repoRoot,
+		RunID:        "run-wave-isolation",
+		RootTicketID: root.ID,
+		BaseCommit:   baseCommit,
+		Adapter:      adapter,
+		Config:       cfg,
+	})
+	if !errors.Is(err, ErrEpicBlocked) {
+		t.Fatalf("expected blocked epic because ticket-b failed verification, got %v", err)
+	}
+	if result.Run.Status != state.EpicRunStatusBlocked {
+		t.Fatalf("expected blocked run, got %q", result.Run.Status)
+	}
+
+	var snapshotA TicketRunSnapshot
+	if err := state.LoadJSON(ticketSnapshotPath(repoRoot, "run-wave-isolation", ticketA.ID), &snapshotA); err != nil {
+		t.Fatalf("load ticket-a snapshot: %v", err)
+	}
+	if snapshotA.CurrentPhase != state.TicketPhaseClosed {
+		t.Fatalf("expected ticket-a closed, got %q", snapshotA.CurrentPhase)
+	}
+	if snapshotA.Verification == nil || !snapshotA.Verification.Passed {
+		t.Fatalf("expected ticket-a verification to pass, got %#v", snapshotA.Verification)
+	}
+	for _, result := range snapshotA.Verification.Results {
+		for _, path := range []string{result.StdoutPath, result.StderrPath} {
+			if strings.TrimSpace(path) == "" {
+				continue
+			}
+			content, readErr := os.ReadFile(path)
+			if readErr != nil {
+				t.Fatalf("read ticket-a verification log %s: %v", path, readErr)
+			}
+			if strings.Contains(string(content), "b.go") {
+				t.Fatalf("ticket-a verification output referenced ticket-b file in %s: %q", path, string(content))
+			}
+		}
+	}
+
+	var snapshotB TicketRunSnapshot
+	if err := state.LoadJSON(ticketSnapshotPath(repoRoot, "run-wave-isolation", ticketB.ID), &snapshotB); err != nil {
+		t.Fatalf("load ticket-b snapshot: %v", err)
+	}
+	if snapshotB.CurrentPhase != state.TicketPhaseBlocked {
+		t.Fatalf("expected ticket-b blocked, got %q", snapshotB.CurrentPhase)
+	}
+	if snapshotB.Verification == nil || snapshotB.Verification.Passed {
+		t.Fatalf("expected ticket-b verification to fail, got %#v", snapshotB.Verification)
+	}
+
+	if _, err := os.Stat(filepath.Join(repoRoot, "a.go")); err != nil {
+		t.Fatalf("expected accepted ticket-a output in main tree: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(repoRoot, "b.go")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("expected failed ticket-b output to stay out of main tree, stat err=%v", err)
+	}
+
+	diffPath := filepath.Join(repoRoot, ".verk", "runs", "run-wave-isolation", "tickets", ticketB.ID, "worktree.diff")
+	diffContent, err := os.ReadFile(diffPath)
+	if err != nil {
+		t.Fatalf("expected failed ticket diff artifact at %s: %v", diffPath, err)
+	}
+	if !strings.Contains(string(diffContent), "b.go") {
+		t.Fatalf("expected failed ticket diff to mention b.go, got %q", string(diffContent))
 	}
 }
 
@@ -941,7 +1811,7 @@ func mustRunGit(t *testing.T, dir string, args ...string) {
 
 	cmd := exec.Command("git", args...)
 	cmd.Dir = dir
-	cmd.Env = append(os.Environ(), "GIT_OPTIONAL_LOCKS=0")
+	cmd.Env = engineGitEnv()
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("git %v failed: %v\n%s", args, err, string(out))
@@ -951,7 +1821,7 @@ func mustRunGit(t *testing.T, dir string, args ...string) {
 func gitOutput(dir string, args ...string) (string, error) {
 	cmd := exec.Command("git", args...)
 	cmd.Dir = dir
-	cmd.Env = append(os.Environ(), "GIT_OPTIONAL_LOCKS=0")
+	cmd.Env = engineGitEnv()
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return "", err
@@ -1074,7 +1944,7 @@ func TestWaveClaimsReleased(t *testing.T) {
 	})
 }
 
-func TestRunEpicRecursesIntoSubTickets(t *testing.T) {
+func TestRunEpicNestedSubEpicIsExplicitlyUnsupported(t *testing.T) {
 	repoRoot := t.TempDir()
 	baseCommit := initEpicRepo(t, repoRoot)
 	cfg := policy.DefaultConfig()
@@ -1097,7 +1967,7 @@ func TestRunEpicRecursesIntoSubTickets(t *testing.T) {
 	sub2 := epicChildTicket("sub-2", ticket1.ID, tkmd.StatusOpen, nil, []string{"internal/app/sub2"})
 	mustSaveTicket(t, repoRoot, sub2)
 
-	adapter := newReflectingAdapter(4)
+	adapter := newReflectingAdapter(1)
 
 	result, err := RunEpic(context.Background(), RunEpicRequest{
 		RepoRoot:     repoRoot,
@@ -1108,24 +1978,29 @@ func TestRunEpicRecursesIntoSubTickets(t *testing.T) {
 		Config:       cfg,
 	})
 
-	// All tickets including sub-tickets should have been dispatched
+	if err == nil {
+		t.Fatal("expected nested sub-epic to be rejected inside isolated epic run")
+	}
+	if !strings.Contains(err.Error(), "sub-epic isolation is not implemented yet") {
+		t.Fatalf("expected explicit unsupported isolation error, got %v", err)
+	}
+	if result.Run.Status != state.EpicRunStatusBlocked {
+		t.Fatalf("expected blocked epic, got status %s", result.Run.Status)
+	}
+
+	// Direct descendants of the nested parent must not be dispatched.
 	workerReqs := adapter.WorkerRequests()
 	startedSet := make(map[string]bool)
 	for _, req := range workerReqs {
 		startedSet[req.TicketID] = true
 	}
-	for _, id := range []string{"sub-1", "sub-2", "ticket-1", "ticket-2"} {
-		if !startedSet[id] {
-			t.Errorf("expected ticket %q to be started, got started: %v", id, keys(startedSet))
+	for _, id := range []string{"sub-1", "sub-2", "ticket-1"} {
+		if startedSet[id] {
+			t.Errorf("did not expect nested ticket %q to be started, got started: %v", id, keys(startedSet))
 		}
 	}
-
-	// Epic should complete since all tickets pass
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if result.Run.Status != state.EpicRunStatusCompleted {
-		t.Fatalf("expected completed epic, got status %s", result.Run.Status)
+	if !startedSet["ticket-2"] {
+		t.Fatalf("expected non-nested sibling ticket to still run, got started: %v", keys(startedSet))
 	}
 }
 
@@ -1238,70 +2113,6 @@ func TestRunSubEpicBasic(t *testing.T) {
 	}
 }
 
-// TestRunEpicSubWaveVerificationFailureBlocks verifies that when wave-level
-// quality commands fail for a sub-wave, the parent epic blocks instead of
-// silently accepting nested work. This guards against sub-epic behavior being
-// weaker than top-level waves (no verification gate).
-//
-// We use a counter-based quality command that passes the first time (so the
-// single sub-ticket's ticket-level verification succeeds) and fails on all
-// subsequent calls (so the wave-level verification for the sub-wave fails).
-func TestRunEpicSubWaveVerificationFailureBlocks(t *testing.T) {
-	repoRoot := t.TempDir()
-	baseCommit := initEpicRepo(t, repoRoot)
-	cfg := policy.DefaultConfig()
-	cfg.Scheduler.MaxDepth = 3
-	// Disable wave repair so verification failure is immediate and deterministic.
-	cfg.Policy.MaxWaveRepairCycles = 0
-
-	counterFile := filepath.Join(repoRoot, ".verk", "verify-counter")
-	// Use /bin/sh: pass on first invocation, fail on any later invocation.
-	// Sub-wave verification is the 2nd call after the grandchild's
-	// ticket-level verification succeeds.
-	script := fmt.Sprintf(
-		"COUNT=$(cat %s 2>/dev/null || echo 0); NEXT=$((COUNT+1)); printf %%s $NEXT > %s; if [ \"$COUNT\" -ge 1 ]; then exit 1; fi",
-		counterFile, counterFile,
-	)
-	cfg.Verification.QualityCommands = []policy.QualityCommand{{Path: ".", Run: []string{script}}}
-
-	epic := epicTicket("epic-subwave-verify-fail")
-	mustSaveTicket(t, repoRoot, epic)
-
-	parentTask := epicChildTicket("parent-verify-fail", epic.ID, tkmd.StatusOpen, nil, []string{"internal/app"})
-	mustSaveTicket(t, repoRoot, parentTask)
-
-	grandchild := epicChildTicket("grandchild-verify-fail", parentTask.ID, tkmd.StatusOpen, nil, []string{"internal/app/sub"})
-	mustSaveTicket(t, repoRoot, grandchild)
-
-	adapter := newReflectingAdapter(2)
-
-	runID := "run-subwave-verify-fail"
-	result, err := RunEpic(context.Background(), RunEpicRequest{
-		RepoRoot:     repoRoot,
-		RunID:        runID,
-		RootTicketID: epic.ID,
-		BaseCommit:   baseCommit,
-		Adapter:      adapter,
-		Config:       cfg,
-	})
-	if err == nil {
-		t.Fatal("expected error when sub-wave verification fails, got nil")
-	}
-
-	if result.Run.Status != state.EpicRunStatusBlocked {
-		t.Fatalf("expected blocked run after sub-wave verification failure, got %q", result.Run.Status)
-	}
-
-	subWaveID := fmt.Sprintf("sub-%s-wave-1", parentTask.ID)
-	var subWave state.WaveArtifact
-	if err := state.LoadJSON(waveArtifactPath(repoRoot, runID, subWaveID), &subWave); err != nil {
-		t.Fatalf("load sub-wave artifact: %v", err)
-	}
-	if got, ok := subWave.Acceptance["wave_verification_passed"].(bool); !ok || got {
-		t.Fatalf("expected sub-wave verification_passed=false, acceptance=%v", subWave.Acceptance)
-	}
-}
-
 // TestRunSubEpicClaimCheckErrorBlocksParent verifies that if the sub-wave's
 // claim-release check returns an error (e.g., corrupted claim artifact), the
 // sub-epic returns a blocked outcome with the underlying error rather than
@@ -1335,16 +2146,10 @@ func TestRunSubEpicClaimCheckErrorBlocksParent(t *testing.T) {
 	}
 }
 
-// TestRunEpicBlockedGrandchildTerminatesRun is a regression test for the bug
-// where a blocked descendant left the parent sub-epic ticket in open/ready state,
-// causing the outer RunEpic loop to reschedule the same parent repeatedly and
-// create accepted waves forever without making progress.
-//
-// Topology: epic -> parent-task (has children) -> grandchild
-// The grandchild's worker returns needs_context, which becomes TicketPhaseBlocked.
-// The fix: executeEpicTicket persists blocked state on the parent ticket so the
-// outer loop cannot reschedule it.
-func TestRunEpicBlockedGrandchildTerminatesRun(t *testing.T) {
+// TestRunEpicNestedSubEpicBlocksParentTicket verifies that once worktree
+// isolation is active, a nested sub-epic blocks explicitly instead of silently
+// falling back to shared-workspace execution.
+func TestRunEpicNestedSubEpicBlocksParentTicket(t *testing.T) {
 	repoRoot := t.TempDir()
 	baseCommit := initEpicRepo(t, repoRoot)
 	cfg := policy.DefaultConfig()
@@ -1357,25 +2162,11 @@ func TestRunEpicBlockedGrandchildTerminatesRun(t *testing.T) {
 	parentTask := epicChildTicket("parent-task", epic.ID, tkmd.StatusOpen, nil, []string{"internal/app"})
 	mustSaveTicket(t, repoRoot, parentTask)
 
-	// grandchild is a leaf; its worker will return needs_context (blocked).
+	// grandchild exists purely to trigger the nested sub-epic path.
 	grandchild := epicChildTicket("grandchild", parentTask.ID, tkmd.StatusOpen, nil, []string{"internal/app/sub"})
 	mustSaveTicket(t, repoRoot, grandchild)
 
-	// Script the grandchild worker to return needs_context. The reflectingAdapter
-	// overrides LeaseID from the request, so no pre-computed lease ID is needed.
-	adapter := &reflectingAdapter{
-		workerResults: []runtime.WorkerResult{
-			{
-				Status:             runtime.WorkerStatusNeedsContext,
-				RetryClass:         runtime.RetryClassBlockedByOperatorInput,
-				LeaseID:            "placeholder", // overwritten by reflectingAdapter.RunWorker
-				StartedAt:          epicTestStart(),
-				FinishedAt:         epicTestStart().Add(time.Second),
-				ResultArtifactPath: "artifact.json",
-			},
-		},
-		reviewResults: []runtime.ReviewResult{}, // no review: grandchild blocked at implement
-	}
+	adapter := newReflectingAdapter(0)
 
 	result, err := RunEpic(context.Background(), RunEpicRequest{
 		RepoRoot:     repoRoot,
@@ -1386,31 +2177,32 @@ func TestRunEpicBlockedGrandchildTerminatesRun(t *testing.T) {
 		Config:       cfg,
 	})
 
-	// RunEpic must terminate with ErrEpicBlocked, not loop forever.
 	if err == nil {
-		t.Fatal("expected ErrEpicBlocked, got nil error — regression: blocked grandchild did not stop the run")
+		t.Fatal("expected nested sub-epic to block isolated epic run")
 	}
 	if !errors.Is(err, ErrEpicBlocked) {
 		t.Fatalf("expected ErrEpicBlocked, got: %v", err)
 	}
+	if !strings.Contains(err.Error(), "sub-epic isolation is not implemented yet") {
+		t.Fatalf("expected explicit unsupported isolation message, got: %v", err)
+	}
 
-	// The parent sub-epic ticket must be persisted as blocked so it cannot be
-	// rescheduled in a future wave for the same run.
 	parentTicket, loadErr := loadEpicTicket(repoRoot, parentTask.ID)
 	if loadErr != nil {
 		t.Fatalf("load parent-task ticket: %v", loadErr)
 	}
 	if parentTicket.Status != tkmd.StatusBlocked {
-		t.Fatalf("expected parent-task to be blocked in ticket store, got %q — "+
-			"parent will be rescheduled until it is explicitly marked blocked", parentTicket.Status)
+		t.Fatalf("expected parent-task to be blocked in ticket store, got %q", parentTicket.Status)
 	}
 
-	// Only one wave must have been created: parent-task must not be rescheduled
-	// after its grandchild blocked. Repeated accepted waves for the same parent
-	// indicate the looping regression is still present.
 	if len(result.Waves) != 1 {
-		t.Fatalf("expected exactly 1 wave (parent not rescheduled after grandchild blocked), "+
-			"got %d waves — regression: same blocked parent accepted into multiple waves", len(result.Waves))
+		t.Fatalf("expected exactly 1 wave, got %d", len(result.Waves))
+	}
+
+	for _, req := range adapter.WorkerRequests() {
+		if req.TicketID == grandchild.ID || req.TicketID == parentTask.ID {
+			t.Fatalf("did not expect nested ticket %q to be dispatched during unsupported path", req.TicketID)
+		}
 	}
 }
 
@@ -1554,21 +2346,10 @@ func TestRunEpicLinkedSiblingsNotEachOthersChildren(t *testing.T) {
 	}
 }
 
-// workerTicketIDs extracts the TicketID from each WorkerRequest for readable assertions.
-func workerTicketIDs(reqs []runtime.WorkerRequest) []string {
-	ids := make([]string, len(reqs))
-	for i, req := range reqs {
-		ids[i] = req.TicketID
-	}
-	return ids
-}
-
-// TestResumeRun_InProgressDescendantIsResumed verifies that a descendant ticket
-// which was in_progress when the prior run crashed is reset to ready and re-executed
-// by the resume path. The sub-wave artifact persisted by runSubEpic lets
-// loadRunArtifacts find the wave; the descendant's presence in run.TicketIDs
-// ensures the reset loop resets it before the wave loop re-enters the sub-epic.
-func TestResumeRun_InProgressDescendantIsResumed(t *testing.T) {
+// TestResumeRun_NestedSubEpicIsolationIsExplicitlyUnsupported verifies that a
+// resumed epic with a nested child wave blocks explicitly instead of
+// re-entering shared-workspace descendant execution.
+func TestResumeRun_NestedSubEpicIsolationIsExplicitlyUnsupported(t *testing.T) {
 	repoRoot := t.TempDir()
 	baseCommit := initEpicRepo(t, repoRoot)
 	runID := "run-desc-inprog"
@@ -1595,7 +2376,10 @@ func TestResumeRun_InProgressDescendantIsResumed(t *testing.T) {
 		BaseCommit:   baseCommit,
 		TicketIDs:    []string{parentTask.ID, grandchild.ID},
 		WaveIDs:      []string{subWaveID},
-		ResumeCursor: map[string]any{"wave_ordinal": 0},
+		ResumeCursor: map[string]any{
+			"wave_ordinal":          0,
+			"last_wave_base_commit": baseCommit,
+		},
 	})
 	writeTicketRunFixture(t, repoRoot, runID, TicketRunSnapshot{
 		ArtifactMeta: state.ArtifactMeta{SchemaVersion: 1, RunID: runID},
@@ -1625,21 +2409,7 @@ func TestResumeRun_InProgressDescendantIsResumed(t *testing.T) {
 		TicketIDs:      []string{grandchild.ID},
 	})
 
-	// Adapter returns needs_context for grandchild so execution terminates
-	// predictably without requiring full review/verification machinery.
-	adapter := &reflectingAdapter{
-		workerResults: []runtime.WorkerResult{
-			{
-				Status:             runtime.WorkerStatusNeedsContext,
-				RetryClass:         runtime.RetryClassBlockedByOperatorInput,
-				LeaseID:            "placeholder",
-				StartedAt:          epicTestStart(),
-				FinishedAt:         epicTestStart().Add(time.Second),
-				ResultArtifactPath: "artifact.json",
-			},
-		},
-		reviewResults: []runtime.ReviewResult{},
-	}
+	adapter := newReflectingAdapter(0)
 
 	cfg := policy.DefaultConfig()
 	cfg.Verification.QualityCommands = nil
@@ -1651,136 +2421,37 @@ func TestResumeRun_InProgressDescendantIsResumed(t *testing.T) {
 		Config:   cfg,
 	})
 	if err != nil {
-		t.Fatalf("ResumeRun returned error: %v", err)
+		t.Fatalf("expected blocked resume report, got error: %v", err)
 	}
 
-	// Grandchild must have been dispatched: the resume path must have re-entered
-	// the sub-epic loop for parent-task and scheduled the in-progress grandchild.
 	reqs := adapter.WorkerRequests()
-	dispatched := false
 	for _, req := range reqs {
 		if req.TicketID == grandchild.ID {
-			dispatched = true
-			break
+			t.Fatalf("did not expect nested grandchild %q to be dispatched on resume", grandchild.ID)
 		}
 	}
-	if !dispatched {
-		t.Errorf("expected in-progress grandchild %q to be dispatched on resume, got dispatched: %v",
-			grandchild.ID, workerTicketIDs(reqs))
-	}
 
-	// Run ends blocked because grandchild returned needs_context.
 	if report.Run.Status != state.EpicRunStatusBlocked {
-		t.Errorf("expected blocked run after grandchild needs_context, got %q", report.Run.Status)
+		t.Errorf("expected blocked run after unsupported nested sub-epic, got %q", report.Run.Status)
 	}
-}
-
-// TestResumeRun_BlockedDescendantIsResumed verifies that a descendant ticket
-// that was blocked when the prior run stopped is reset to ready and re-executed
-// by the resume path. Blocked is not a terminal phase for resume purposes — the
-// engine treats it as "needs another attempt" and resets the ticket to open.
-func TestResumeRun_BlockedDescendantIsResumed(t *testing.T) {
-	repoRoot := t.TempDir()
-	baseCommit := initEpicRepo(t, repoRoot)
-	runID := "run-desc-blocked"
-
-	// Hierarchy: epic -> parent-task -> grandchild (blocked)
-	epic := epicTicket("epic-desc-blocked")
-	mustSaveTicket(t, repoRoot, epic)
-
-	parentTask := epicChildTicket("parent-task-blocked", epic.ID, tkmd.StatusBlocked, nil, []string{"internal/app"})
-	mustSaveTicket(t, repoRoot, parentTask)
-
-	grandchild := epicChildTicket("grandchild-blocked", parentTask.ID, tkmd.StatusBlocked, nil, []string{"internal/app/sub"})
-	mustSaveTicket(t, repoRoot, grandchild)
-
-	subWaveID := fmt.Sprintf("sub-%s-wave-1", parentTask.ID)
-	writeOpRunFixture(t, repoRoot, runID, state.RunArtifact{
-		ArtifactMeta: state.ArtifactMeta{SchemaVersion: 1, RunID: runID},
-		Mode:         "epic",
-		RootTicketID: epic.ID,
-		Status:       state.EpicRunStatusBlocked,
-		CurrentPhase: state.TicketPhaseBlocked,
-		BaseCommit:   baseCommit,
-		TicketIDs:    []string{parentTask.ID, grandchild.ID},
-		WaveIDs:      []string{subWaveID},
-		ResumeCursor: map[string]any{"wave_ordinal": 0},
-	})
-	writeTicketRunFixture(t, repoRoot, runID, TicketRunSnapshot{
-		ArtifactMeta: state.ArtifactMeta{SchemaVersion: 1, RunID: runID},
-		TicketID:     parentTask.ID,
-		CurrentPhase: state.TicketPhaseBlocked,
-		BlockReason:  "sub-epic blocked: grandchild needs_context",
-	})
-	writeTicketRunFixture(t, repoRoot, runID, TicketRunSnapshot{
-		ArtifactMeta: state.ArtifactMeta{SchemaVersion: 1, RunID: runID},
-		TicketID:     grandchild.ID,
-		CurrentPhase: state.TicketPhaseBlocked,
-		BlockReason:  "needs_context",
-	})
-	writePlanFixture(t, repoRoot, runID, state.PlanArtifact{
-		ArtifactMeta:             state.ArtifactMeta{SchemaVersion: 1, RunID: runID},
-		TicketID:                 parentTask.ID,
-		EffectiveReviewThreshold: state.SeverityP2,
-	})
-	writePlanFixture(t, repoRoot, runID, state.PlanArtifact{
-		ArtifactMeta:             state.ArtifactMeta{SchemaVersion: 1, RunID: runID},
-		TicketID:                 grandchild.ID,
-		EffectiveReviewThreshold: state.SeverityP2,
-	})
-	writeWaveFixture(t, repoRoot, runID, state.WaveArtifact{
-		WaveID:         subWaveID,
-		ParentTicketID: parentTask.ID,
-		Status:         state.WaveStatusFailed,
-		TicketIDs:      []string{grandchild.ID},
-	})
-
-	// On resume, grandchild is reset to open and gets another chance.
-	// The adapter blocks it again (needs_context) to keep the test deterministic.
-	adapter := &reflectingAdapter{
-		workerResults: []runtime.WorkerResult{
-			{
-				Status:             runtime.WorkerStatusNeedsContext,
-				RetryClass:         runtime.RetryClassBlockedByOperatorInput,
-				LeaseID:            "placeholder",
-				StartedAt:          epicTestStart(),
-				FinishedAt:         epicTestStart().Add(time.Second),
-				ResultArtifactPath: "artifact.json",
-			},
-		},
-		reviewResults: []runtime.ReviewResult{},
+	if report.Run.CurrentPhase != state.TicketPhaseBlocked {
+		t.Errorf("expected blocked current phase, got %q", report.Run.CurrentPhase)
 	}
 
-	cfg := policy.DefaultConfig()
-	cfg.Verification.QualityCommands = nil
-
-	report, err := ResumeRun(context.Background(), ResumeRequest{
-		RepoRoot: repoRoot,
-		RunID:    runID,
-		Adapter:  adapter,
-		Config:   cfg,
-	})
-	if err != nil {
-		t.Fatalf("ResumeRun returned error: %v", err)
+	parentTicket, loadErr := tkmd.LoadTicket(ticketMarkdownPath(repoRoot, parentTask.ID))
+	if loadErr != nil {
+		t.Fatalf("load parent ticket: %v", loadErr)
+	}
+	if parentTicket.Status != tkmd.StatusBlocked {
+		t.Fatalf("expected parent ticket to persist blocked status, got %q", parentTicket.Status)
 	}
 
-	// Blocked grandchild must be re-executed on resume.
-	reqs := adapter.WorkerRequests()
-	dispatched := false
-	for _, req := range reqs {
-		if req.TicketID == grandchild.ID {
-			dispatched = true
-			break
-		}
+	var wave state.WaveArtifact
+	if err := state.LoadJSON(filepath.Join(repoRoot, ".verk", "runs", runID, "waves", "wave-1.json"), &wave); err != nil {
+		t.Fatalf("load resumed top-level wave: %v", err)
 	}
-	if !dispatched {
-		t.Errorf("expected blocked grandchild %q to be dispatched on resume, got dispatched: %v",
-			grandchild.ID, workerTicketIDs(reqs))
-	}
-
-	// Epic ends blocked because grandchild is still stuck on needs_context.
-	if report.Run.Status != state.EpicRunStatusBlocked {
-		t.Errorf("expected blocked run after grandchild still needs_context, got %q", report.Run.Status)
+	if got := wave.Acceptance["crash_reason"]; !strings.Contains(fmt.Sprint(got), "sub-epic isolation is not implemented yet") {
+		t.Fatalf("expected wave crash_reason to record unsupported nested isolation, got %#v", got)
 	}
 }
 
@@ -1811,6 +2482,7 @@ func TestResumeRun_PendingVerificationSubWaveIsCompleted(t *testing.T) {
 		ResumeCursor: map[string]any{
 			"wave_ordinal":              0,
 			"pending_wave_verification": subWaveID,
+			"last_wave_base_commit":     baseCommit,
 		},
 	})
 	writeTicketRunFixture(t, repoRoot, runID, TicketRunSnapshot{

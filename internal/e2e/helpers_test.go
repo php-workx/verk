@@ -34,7 +34,7 @@ func runGit(t *testing.T, dir string, args ...string) {
 	t.Helper()
 	cmd := exec.Command("git", args...)
 	cmd.Dir = dir
-	cmd.Env = append(os.Environ(), "GIT_OPTIONAL_LOCKS=0")
+	cmd.Env = testGitEnv()
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("git %v failed: %v\n%s", args, err, string(out))
@@ -44,12 +44,32 @@ func runGit(t *testing.T, dir string, args ...string) {
 func gitOutput(dir string, args ...string) (string, error) {
 	cmd := exec.Command("git", args...)
 	cmd.Dir = dir
-	cmd.Env = append(os.Environ(), "GIT_OPTIONAL_LOCKS=0")
+	cmd.Env = testGitEnv()
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return "", err
 	}
 	return string(out), nil
+}
+
+func testGitEnv() []string {
+	env := os.Environ()
+	out := make([]string, 0, len(env)+1)
+	for _, entry := range env {
+		key, _, found := strings.Cut(entry, "=")
+		if !found {
+			out = append(out, entry)
+			continue
+		}
+		switch key {
+		case "GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_PREFIX", "GIT_SUPER_PREFIX", "GIT_OPTIONAL_LOCKS":
+			continue
+		default:
+			out = append(out, entry)
+		}
+	}
+	out = append(out, "GIT_OPTIONAL_LOCKS=0")
+	return out
 }
 
 func saveTicket(t *testing.T, repoRoot string, ticket tkmd.Ticket) {

@@ -35,7 +35,11 @@ func runWaveVerificationLoop(
 	wave *state.WaveArtifact,
 	wavePath string,
 	changedFiles []string,
+	workDir string,
 ) error {
+	if strings.TrimSpace(workDir) == "" {
+		workDir = req.RepoRoot
+	}
 	plan := waveDerivationPlan(*wave, changedFiles)
 	derivation := DeriveChecks(DeriveChecksInput{
 		Plan:                   plan,
@@ -59,7 +63,7 @@ func runWaveVerificationLoop(
 	wave.ValidationCoverage = coverage
 	syncWaveAcceptanceFromCoverage(wave, coverage)
 
-	qualityResults, derivedResults, err := executeWaveChecks(ctx, req.RepoRoot, cfg.Verification, waveCommands, derivedChecks)
+	qualityResults, derivedResults, err := executeWaveChecks(ctx, req.RepoRoot, workDir, cfg.Verification, waveCommands, derivedChecks)
 	if err != nil {
 		return fmt.Errorf("wave verification: run checks: %w", err)
 	}
@@ -120,7 +124,7 @@ func runWaveVerificationLoop(
 			Runtime:         workerProfile.Runtime,
 			Model:           workerProfile.Model,
 			Reasoning:       workerProfile.Reasoning,
-			WorktreePath:    req.RepoRoot,
+			WorktreePath:    workDir,
 			Instructions:    instructions,
 			ExecutionConfig: executionConfigFromPolicy(cfg),
 			OnProgress: func(detail string) {
@@ -144,7 +148,7 @@ func runWaveVerificationLoop(
 		// Re-run only the previously failing derived checks plus the configured
 		// wave gate, not the entire derived set.
 		retryDerivedChecks := derivedChecksByIDs(derivedChecks, failingIDs)
-		qualityResults, derivedResults, err = executeWaveChecks(ctx, req.RepoRoot, cfg.Verification, waveCommands, retryDerivedChecks)
+		qualityResults, derivedResults, err = executeWaveChecks(ctx, req.RepoRoot, workDir, cfg.Verification, waveCommands, retryDerivedChecks)
 		if err != nil {
 			return fmt.Errorf("wave verification: run checks after repair cycle %d: %w", cycle, err)
 		}
@@ -358,13 +362,14 @@ func buildWaveQualityChecks(runID, waveID string, cmds []policy.QualityCommand) 
 func executeWaveChecks(
 	ctx context.Context,
 	repoRoot string,
+	workDir string,
 	cfg policy.VerificationConfig,
 	waveCommands []policy.QualityCommand,
 	derivedChecks []state.ValidationCheck,
 ) ([]verifycommand.CommandResult, map[string]verifycommand.CommandResult, error) {
 	var qualityResults []verifycommand.CommandResult
 	if len(waveCommands) > 0 {
-		results, err := verifycommand.RunQualityCommands(ctx, repoRoot, waveCommands, cfg)
+		results, err := verifycommand.RunQualityCommands(ctx, repoRoot, workDir, waveCommands, cfg)
 		if err != nil {
 			return nil, nil, fmt.Errorf("run wave gate commands: %w", err)
 		}
@@ -384,7 +389,7 @@ func executeWaveChecks(
 			ids = append(ids, c.ID)
 		}
 		if len(commands) > 0 {
-			results, err := verifycommand.RunCommands(ctx, repoRoot, commands, cfg)
+			results, err := verifycommand.RunCommands(ctx, repoRoot, workDir, commands, cfg)
 			if err != nil {
 				return nil, nil, fmt.Errorf("run derived wave checks: %w", err)
 			}
@@ -848,10 +853,38 @@ func setPendingWaveVerification(cursor map[string]any, waveID string) {
 	}
 }
 
+type pendingWaveIntegrationTransaction struct {
+	WaveID       string
+	BaseCommit   string
+	AcceptedRefs []string
+	ChangedFiles []string
+	WorktreePath string
+}
+
+func setPendingWaveIntegration(cursor map[string]any, tx pendingWaveIntegrationTransaction) {
+	if cursor == nil {
+		return
+	}
+	setPendingWaveVerification(cursor, tx.WaveID)
+	cursor["pending_wave_integration"] = map[string]any{
+		"wave_id":       tx.WaveID,
+		"base_commit":   tx.BaseCommit,
+		"accepted_refs": append([]string(nil), tx.AcceptedRefs...),
+		"changed_files": append([]string(nil), tx.ChangedFiles...),
+		"worktree_path": tx.WorktreePath,
+	}
+}
+
 // clearPendingWaveVerification removes the pending wave verification marker.
 func clearPendingWaveVerification(cursor map[string]any) {
 	if cursor != nil {
 		delete(cursor, "pending_wave_verification")
+	}
+}
+
+func clearPendingWaveIntegration(cursor map[string]any) {
+	if cursor != nil {
+		delete(cursor, "pending_wave_integration")
 	}
 }
 
@@ -862,6 +895,88 @@ func pendingWaveVerificationID(cursor map[string]any) (string, bool) {
 	}
 	id, ok := cursor["pending_wave_verification"].(string)
 	return id, ok && id != ""
+}
+
+func pendingWaveIntegration(cursor map[string]any, waveID string) (pendingWaveIntegrationTransaction, bool, error) {
+	if cursor == nil {
+		return pendingWaveIntegrationTransaction{}, false, nil
+	}
+	raw, ok := cursor["pending_wave_integration"]
+	if !ok {
+		return pendingWaveIntegrationTransaction{}, false, nil
+	}
+	m, ok := raw.(map[string]any)
+	if !ok {
+		return pendingWaveIntegrationTransaction{}, false, fmt.Errorf("pending wave integration transaction has invalid shape")
+	}
+	tx := pendingWaveIntegrationTransaction{
+		WaveID:       stringFromMap(m, "wave_id"),
+		BaseCommit:   stringFromMap(m, "base_commit"),
+		AcceptedRefs: stringsFromMap(m, "accepted_refs"),
+		ChangedFiles: stringsFromMap(m, "changed_files"),
+		WorktreePath: stringFromMap(m, "worktree_path"),
+	}
+	if tx.WaveID == "" {
+		tx.WaveID = waveID
+	}
+	if tx.WaveID != waveID {
+		return pendingWaveIntegrationTransaction{}, false, fmt.Errorf("pending wave integration transaction for %q does not match pending wave %q", tx.WaveID, waveID)
+	}
+	if tx.BaseCommit == "" {
+		return pendingWaveIntegrationTransaction{}, false, fmt.Errorf("pending wave integration transaction for %q is missing base_commit", waveID)
+	}
+	return tx, true, nil
+}
+
+func stringFromMap(m map[string]any, key string) string {
+	value, _ := m[key].(string)
+	return strings.TrimSpace(value)
+}
+
+func stringsFromMap(m map[string]any, key string) []string {
+	raw, ok := m[key]
+	if !ok {
+		return nil
+	}
+	switch v := raw.(type) {
+	case []string:
+		return append([]string(nil), v...)
+	case []any:
+		out := make([]string, 0, len(v))
+		for _, item := range v {
+			s, ok := item.(string)
+			if !ok {
+				continue
+			}
+			if strings.TrimSpace(s) != "" {
+				out = append(out, s)
+			}
+		}
+		return out
+	default:
+		return nil
+	}
+}
+
+func waveVerificationReachedTerminalFailure(wave *state.WaveArtifact) bool {
+	if wave == nil || wave.Acceptance == nil {
+		return false
+	}
+	passed, ok := wave.Acceptance["wave_verification_passed"].(bool)
+	return ok && !passed
+}
+
+func clearPendingWaveVerificationOnTerminalFailure(cursor map[string]any, runPath string, run *state.RunArtifact, wave *state.WaveArtifact) error {
+	if !waveVerificationReachedTerminalFailure(wave) {
+		return nil
+	}
+	clearPendingWaveVerification(cursor)
+	clearPendingWaveIntegration(cursor)
+	if run == nil || strings.TrimSpace(runPath) == "" {
+		return nil
+	}
+	run.UpdatedAt = time.Now().UTC()
+	return state.SaveJSONAtomic(runPath, run)
 }
 
 // resumePendingWaveVerification checks if a prior wave is still pending
@@ -885,12 +1000,34 @@ func resumePendingWaveVerification(
 	if err := state.LoadJSON(wavePath, &pendingWave); err != nil {
 		return fmt.Errorf("load pending wave %s for re-verification: %w", pendingWaveID, err)
 	}
+	tx, hasTx, txErr := pendingWaveIntegration(cursor, pendingWaveID)
+	if txErr != nil {
+		return txErr
+	}
 
 	// Skip if a prior verification already passed for this wave (resume after
-	// a transient marker that was never cleared). The Acceptance flag is the
-	// authoritative outcome; if it's true we just clear the cursor and move
-	// on so we don't repeat completed work.
+	// a crash after the verification gate). The Acceptance flag is the
+	// authoritative outcome, but a top-level integration wave still needs the
+	// durable commit/apply transaction completed before the cursor is cleared.
 	if passed, _ := pendingWave.Acceptance["wave_verification_passed"].(bool); passed {
+		if hasTx {
+			oldBaseHead, err := gitRevParse(req.RepoRoot, tx.BaseCommit)
+			if err != nil {
+				return err
+			}
+			completed, err := completeAlreadyAppliedPendingWaveIntegration(req, cursor, runPath, run, &pendingWave, wavePath, tx, oldBaseHead)
+			if err != nil || completed {
+				return err
+			}
+			integration, err := integrationManagerForPendingTransaction(req, tx, true)
+			if err != nil {
+				return err
+			}
+			return completePendingWaveIntegrationTransaction(req, cursor, runPath, run, &pendingWave, wavePath, tx, integration)
+		}
+		if pendingWave.ParentTicketID == "" {
+			return fmt.Errorf("pending wave %s already passed verification but has no durable integration transaction", pendingWaveID)
+		}
 		clearPendingWaveVerification(cursor)
 		run.UpdatedAt = time.Now().UTC()
 		return state.SaveJSONAtomic(runPath, run)
@@ -902,11 +1039,193 @@ func resumePendingWaveVerification(
 		Detail:   fmt.Sprintf("re-running wave verification for %s", pendingWaveID),
 	})
 
-	if err := runWaveVerificationLoop(ctx, req, cfg, &pendingWave, wavePath, pendingWave.ActualScope); err != nil {
+	workDir := req.WorktreePath
+	changedFiles := pendingWave.ActualScope
+	var integration *WaveIntegrationManager
+	if hasTx {
+		var err error
+		integration, err = integrationManagerForPendingTransaction(req, tx, true)
+		if err != nil {
+			return err
+		}
+		defer func() {
+			if integration != nil {
+				_ = integration.Cleanup()
+			}
+		}()
+		workDir = integration.WorktreePath()
+		changedFiles = tx.ChangedFiles
+	}
+
+	if err := runWaveVerificationLoop(ctx, req, cfg, &pendingWave, wavePath, changedFiles, workDir); err != nil {
+		if clearErr := clearPendingWaveVerificationOnTerminalFailure(cursor, runPath, run, &pendingWave); clearErr != nil {
+			return errors.Join(err, fmt.Errorf("clear terminal pending wave verification: %w", clearErr))
+		}
 		return err
+	}
+
+	if hasTx {
+		return completePendingWaveIntegrationTransaction(req, cursor, runPath, run, &pendingWave, wavePath, tx, integration)
 	}
 
 	clearPendingWaveVerification(cursor)
 	run.UpdatedAt = time.Now().UTC()
 	return state.SaveJSONAtomic(runPath, run)
+}
+
+func integrationManagerForPendingTransaction(req RunEpicRequest, tx pendingWaveIntegrationTransaction, allowRehydrate bool) (*WaveIntegrationManager, error) {
+	if strings.TrimSpace(tx.WorktreePath) != "" {
+		if _, err := os.Stat(tx.WorktreePath); err == nil {
+			refName, refErr := ensureIntegrationBaseRef(req.RepoRoot, req.RunID, tx.BaseCommit)
+			if refErr != nil {
+				return nil, refErr
+			}
+			return &WaveIntegrationManager{
+				repoRoot:     strings.TrimSpace(req.RepoRoot),
+				runID:        strings.TrimSpace(req.RunID),
+				baseRef:      refName,
+				worktreePath: tx.WorktreePath,
+			}, nil
+		} else if !os.IsNotExist(err) {
+			return nil, fmt.Errorf("stat pending integration worktree %q: %w", tx.WorktreePath, err)
+		}
+	}
+	if !allowRehydrate {
+		return nil, fmt.Errorf("pending wave %s passed verification but integration worktree %q is missing", tx.WaveID, tx.WorktreePath)
+	}
+	integration, err := prepareWaveIntegration(context.Background(), req.RepoRoot, req.RunID, req.WorktreeRoot, tx.BaseCommit)
+	if err != nil {
+		return nil, err
+	}
+	if err := integration.ApplyAcceptedTicketRefs(context.Background(), tx.AcceptedRefs); err != nil {
+		_ = integration.Cleanup()
+		return nil, err
+	}
+	return integration, nil
+}
+
+func completePendingWaveIntegrationTransaction(
+	req RunEpicRequest,
+	cursor map[string]any,
+	runPath string,
+	run *state.RunArtifact,
+	wave *state.WaveArtifact,
+	wavePath string,
+	tx pendingWaveIntegrationTransaction,
+	integration *WaveIntegrationManager,
+) error {
+	oldBaseHead, err := gitRevParse(req.RepoRoot, tx.BaseCommit)
+	if err != nil {
+		return err
+	}
+	completed, err := completeAlreadyAppliedPendingWaveIntegration(req, cursor, runPath, run, wave, wavePath, tx, oldBaseHead)
+	if err != nil || completed {
+		return err
+	}
+	if integration == nil {
+		return fmt.Errorf("pending wave %s integration manager is missing", tx.WaveID)
+	}
+	newBaseHead, err := integration.CommitWave(wave.WaveID)
+	if err != nil {
+		return err
+	}
+	finalChangedFiles, err := finalIntegratedChangedFiles(req.RepoRoot, oldBaseHead, newBaseHead)
+	if err != nil {
+		return rollbackIntegrationBaseOrJoin(err, integration, oldBaseHead, newBaseHead)
+	}
+	syncAcceptedWaveChangedFiles(wave, finalChangedFiles)
+	if err := state.SaveJSONAtomic(wavePath, *wave); err != nil {
+		return rollbackIntegrationBaseOrJoin(fmt.Errorf("persist accepted wave state: %w", err), integration, oldBaseHead, newBaseHead)
+	}
+	if err := applyIntegrationCommitToMain(req.RepoRoot, oldBaseHead, newBaseHead, finalChangedFiles); err != nil {
+		return rollbackIntegrationBaseOrJoin(err, integration, oldBaseHead, newBaseHead)
+	}
+	if cursor != nil {
+		cursor["last_wave_base_commit"] = newBaseHead
+	}
+	clearPendingWaveVerification(cursor)
+	clearPendingWaveIntegration(cursor)
+	if run != nil {
+		run.UpdatedAt = time.Now().UTC()
+		if err := state.SaveJSONAtomic(runPath, *run); err != nil {
+			return fmt.Errorf("persist run state: %w", err)
+		}
+	}
+	return nil
+}
+
+func completeAlreadyAppliedPendingWaveIntegration(
+	req RunEpicRequest,
+	cursor map[string]any,
+	runPath string,
+	run *state.RunArtifact,
+	wave *state.WaveArtifact,
+	wavePath string,
+	tx pendingWaveIntegrationTransaction,
+	oldBaseHead string,
+) (bool, error) {
+	currentBaseHead, err := gitRevParse(req.RepoRoot, integrationBaseRef(req.RunID))
+	if err != nil {
+		return false, nil //nolint:nilerr // Missing/unreadable hidden ref means the normal transaction path should run.
+	}
+	if currentBaseHead == oldBaseHead {
+		return false, nil
+	}
+	if err := assertMainTreeMatchesWaveBase(req.RepoRoot, currentBaseHead); err != nil {
+		return false, nil //nolint:nilerr // A non-matching main tree means this transaction is not already completed.
+	}
+	finalChangedFiles, err := finalIntegratedChangedFiles(req.RepoRoot, oldBaseHead, currentBaseHead)
+	if err != nil {
+		return true, err
+	}
+	if !samePathSet(finalChangedFiles, tx.ChangedFiles) {
+		return false, nil
+	}
+	return true, persistCompletedPendingWaveIntegration(cursor, runPath, run, wave, wavePath, currentBaseHead, finalChangedFiles)
+}
+
+func samePathSet(a, b []string) bool {
+	left := filterEngineOwnedFiles(a)
+	right := filterEngineOwnedFiles(b)
+	if len(left) != len(right) {
+		return false
+	}
+	sort.Strings(left)
+	sort.Strings(right)
+	for i := range left {
+		if left[i] != right[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func persistCompletedPendingWaveIntegration(
+	cursor map[string]any,
+	runPath string,
+	run *state.RunArtifact,
+	wave *state.WaveArtifact,
+	wavePath string,
+	newBaseHead string,
+	finalChangedFiles []string,
+) error {
+	if wave != nil && strings.TrimSpace(wavePath) != "" {
+		syncAcceptedWaveChangedFiles(wave, finalChangedFiles)
+		if err := state.SaveJSONAtomic(wavePath, *wave); err != nil {
+			return fmt.Errorf("persist accepted wave state: %w", err)
+		}
+	}
+	if cursor != nil {
+		cursor["last_wave_base_commit"] = newBaseHead
+	}
+	clearPendingWaveVerification(cursor)
+	clearPendingWaveIntegration(cursor)
+	if run == nil || strings.TrimSpace(runPath) == "" {
+		return nil
+	}
+	run.UpdatedAt = time.Now().UTC()
+	if err := state.SaveJSONAtomic(runPath, *run); err != nil {
+		return fmt.Errorf("persist run state: %w", err)
+	}
+	return nil
 }

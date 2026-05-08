@@ -12,6 +12,8 @@ import (
 	"strings"
 	"time"
 	"verk/internal/policy"
+
+	runtimeenv "verk/internal/adapters/runtime"
 )
 
 const defaultVerificationTimeout = 15 * time.Minute
@@ -43,7 +45,7 @@ type CommandResult struct { //nolint:revive // stuttering name is intentional fo
 	FinishedAt time.Time `json:"finished_at"`
 }
 
-func RunCommands(ctx context.Context, repoRoot string, cmds []string, cfg policy.VerificationConfig) ([]CommandResult, error) {
+func RunCommands(ctx context.Context, repoRoot, workDir string, cmds []string, cfg policy.VerificationConfig) ([]CommandResult, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -54,6 +56,15 @@ func RunCommands(ctx context.Context, repoRoot string, cmds []string, cfg policy
 	}
 	absRepoRoot = filepath.Clean(absRepoRoot)
 
+	if workDir = strings.TrimSpace(workDir); workDir == "" {
+		workDir = repoRoot
+	}
+	absWorkDir, err := filepath.Abs(workDir)
+	if err != nil {
+		return nil, fmt.Errorf("resolve work dir %q: %w", workDir, err)
+	}
+	absWorkDir = filepath.Clean(absWorkDir)
+
 	info, err := os.Stat(absRepoRoot)
 	if err != nil {
 		return nil, fmt.Errorf("stat repo root %q: %w", absRepoRoot, err)
@@ -62,7 +73,10 @@ func RunCommands(ctx context.Context, repoRoot string, cmds []string, cfg policy
 		return nil, fmt.Errorf("repo root %q is not a directory", absRepoRoot)
 	}
 
-	env := verificationEnv(cfg.EnvPassthrough)
+	env, err := runtimeenv.BuildIsolatedProcessEnv(verificationEnv(cfg.EnvPassthrough), absRepoRoot)
+	if err != nil {
+		return nil, fmt.Errorf("build verification environment: %w", err)
+	}
 	timeout := time.Duration(cfg.DefaultTimeoutMinutes) * time.Minute
 	if timeout <= 0 {
 		timeout = defaultVerificationTimeout
@@ -116,7 +130,7 @@ func RunCommands(ctx context.Context, repoRoot string, cmds []string, cfg policy
 			// bounded cwd, timeout, and allowlisted environment.
 			// nosemgrep: go.lang.security.audit.dangerous-exec-command.dangerous-exec-command
 			cmd := exec.CommandContext(cmdCtx, "/bin/sh", "-c", command)
-			cmd.Dir = absRepoRoot
+			cmd.Dir = absWorkDir
 			cmd.Env = env
 			cmd.Stdout = stdoutFile
 			cmd.Stderr = stderrFile
@@ -146,7 +160,7 @@ func RunCommands(ctx context.Context, repoRoot string, cmds []string, cfg policy
 
 			return CommandResult{
 				Command:    command,
-				Cwd:        absRepoRoot,
+				Cwd:        absWorkDir,
 				ExitCode:   exitCode,
 				TimedOut:   timedOut,
 				DurationMS: finishedAt.Sub(startedAt).Milliseconds(),
@@ -169,7 +183,7 @@ func RunCommands(ctx context.Context, repoRoot string, cmds []string, cfg policy
 // subdirectories. Each QualityCommand specifies a path relative to repoRoot and
 // one or more shell commands to run sequentially from that directory. This
 // supports monorepo setups where different packages have different gates.
-func RunQualityCommands(ctx context.Context, repoRoot string, cmds []policy.QualityCommand, cfg policy.VerificationConfig) ([]CommandResult, error) {
+func RunQualityCommands(ctx context.Context, repoRoot, workDir string, cmds []policy.QualityCommand, cfg policy.VerificationConfig) ([]CommandResult, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -182,6 +196,14 @@ func RunQualityCommands(ctx context.Context, repoRoot string, cmds []policy.Qual
 		return nil, fmt.Errorf("resolve repo root %q: %w", repoRoot, err)
 	}
 	absRepoRoot = filepath.Clean(absRepoRoot)
+	if workDir = strings.TrimSpace(workDir); workDir == "" {
+		workDir = repoRoot
+	}
+	absWorkDir, err := filepath.Abs(workDir)
+	if err != nil {
+		return nil, fmt.Errorf("resolve work dir %q: %w", workDir, err)
+	}
+	absWorkDir = filepath.Clean(absWorkDir)
 
 	info, err := os.Stat(absRepoRoot)
 	if err != nil {
@@ -191,7 +213,10 @@ func RunQualityCommands(ctx context.Context, repoRoot string, cmds []policy.Qual
 		return nil, fmt.Errorf("repo root %q is not a directory", absRepoRoot)
 	}
 
-	env := verificationEnv(cfg.EnvPassthrough)
+	env, err := runtimeenv.BuildIsolatedProcessEnv(verificationEnv(cfg.EnvPassthrough), absRepoRoot)
+	if err != nil {
+		return nil, fmt.Errorf("build verification environment: %w", err)
+	}
 	timeout := time.Duration(cfg.DefaultTimeoutMinutes) * time.Minute
 	if timeout <= 0 {
 		timeout = defaultVerificationTimeout
@@ -209,12 +234,22 @@ func RunQualityCommands(ctx context.Context, repoRoot string, cmds []policy.Qual
 	var results []CommandResult
 	cmdIndex := 0
 	for _, qc := range cmds {
-		workDir := absRepoRoot
+		cmdWorkDir := absWorkDir
 		if qc.Path != "" {
-			workDir = filepath.Join(absRepoRoot, filepath.Clean(qc.Path))
-			if !strings.HasPrefix(workDir+string(filepath.Separator), absRepoRoot+string(filepath.Separator)) {
+			candidate := filepath.Join(absWorkDir, filepath.Clean(qc.Path))
+			resolvedBase, err := filepath.EvalSymlinks(absWorkDir)
+			if err != nil {
+				return results, fmt.Errorf("resolve quality command base %q: %w", absWorkDir, err)
+			}
+			resolvedCandidate, err := filepath.EvalSymlinks(candidate)
+			if err != nil {
+				return results, fmt.Errorf("resolve quality command path %q: %w", qc.Path, err)
+			}
+			rel, err := filepath.Rel(resolvedBase, resolvedCandidate)
+			if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
 				return results, fmt.Errorf("quality command path %q escapes repo root", qc.Path)
 			}
+			cmdWorkDir = resolvedCandidate
 		}
 
 		for _, rawCmd := range qc.Run {
@@ -223,81 +258,7 @@ func RunQualityCommands(ctx context.Context, repoRoot string, cmds []policy.Qual
 				return results, fmt.Errorf("quality command %d is empty", cmdIndex+1)
 			}
 
-			stdoutPath := filepath.Join(runDir, fmt.Sprintf("command-%02d.stdout.log", cmdIndex+1))
-			stderrPath := filepath.Join(runDir, fmt.Sprintf("command-%02d.stderr.log", cmdIndex+1))
-
-			// Capture cmdIndex for use in the closure; it is mutated after this block.
-			idx := cmdIndex
-			result, err := func() (r CommandResult, retErr error) {
-				stdoutFile, err := createArtifactFile(stdoutPath)
-				if err != nil {
-					return r, fmt.Errorf("create stdout artifact for quality command %d: %w", idx+1, err)
-				}
-				defer func() {
-					if cerr := stdoutFile.Close(); cerr != nil && retErr == nil {
-						retErr = fmt.Errorf("close stdout artifact for quality command %d: %w", idx+1, cerr)
-					}
-				}()
-				stderrFile, err := createArtifactFile(stderrPath)
-				if err != nil {
-					return r, fmt.Errorf("create stderr artifact for quality command %d: %w", idx+1, err)
-				}
-				defer func() {
-					if cerr := stderrFile.Close(); cerr != nil && retErr == nil {
-						retErr = fmt.Errorf("close stderr artifact for quality command %d: %w", idx+1, cerr)
-					}
-				}()
-
-				startedAt := time.Now().UTC()
-				cmdCtx, cancel := context.WithTimeout(ctx, timeout)
-				defer cancel()
-				// Quality commands are explicit project policy inputs and
-				// intentionally run through a shell to support normal developer
-				// checks such as "just lint" and compound commands. The working
-				// directory is constrained to the repo and the environment is
-				// allowlisted.
-				// nosemgrep: go.lang.security.audit.dangerous-exec-command.dangerous-exec-command
-				cmd := exec.CommandContext(cmdCtx, "/bin/sh", "-c", command)
-				cmd.Dir = workDir
-				cmd.Env = env
-				cmd.Stdout = stdoutFile
-				cmd.Stderr = stderrFile
-				// Put the subprocess in its own process group so that any processes
-				// spawned by the shell command are also killed on context cancellation.
-				setupProcessGroup(cmd)
-
-				execErr := cmd.Run()
-				finishedAt := time.Now().UTC()
-				cmdErr := cmdCtx.Err()
-				parentErr := ctx.Err()
-
-				timedOut := errors.Is(cmdErr, context.DeadlineExceeded) || errors.Is(parentErr, context.DeadlineExceeded)
-				if execErr != nil && !timedOut && !isExpectedExecutionFailure(execErr) {
-					return r, fmt.Errorf("run quality command %d: %w", idx+1, execErr)
-				}
-
-				exitCode := 0
-				switch {
-				case timedOut:
-					exitCode = -1
-				case cmd.ProcessState != nil:
-					exitCode = cmd.ProcessState.ExitCode()
-				case execErr != nil:
-					exitCode = exitCodeFromError(execErr)
-				}
-
-				return CommandResult{
-					Command:    command,
-					Cwd:        workDir,
-					ExitCode:   exitCode,
-					TimedOut:   timedOut,
-					DurationMS: finishedAt.Sub(startedAt).Milliseconds(),
-					StdoutPath: stdoutPath,
-					StderrPath: stderrPath,
-					StartedAt:  startedAt,
-					FinishedAt: finishedAt,
-				}, nil
-			}()
+			result, err := runSingleQualityCommand(ctx, cmdWorkDir, command, cmdIndex, runDir, env, timeout)
 			if err != nil {
 				return results, err
 			}
@@ -307,6 +268,83 @@ func RunQualityCommands(ctx context.Context, repoRoot string, cmds []policy.Qual
 	}
 
 	return results, nil
+}
+
+// runSingleQualityCommand executes one quality command and returns its result.
+// runSingleQualityCommand executes one quality command and returns its result.
+// Extracted from RunQualityCommands to keep cognitive complexity within lint limits.
+func runSingleQualityCommand(ctx context.Context, cmdWorkDir, command string, cmdIndex int, runDir string, env []string, timeout time.Duration) (result CommandResult, retErr error) {
+	stdoutPath := filepath.Join(runDir, fmt.Sprintf("command-%02d.stdout.log", cmdIndex+1))
+	stderrPath := filepath.Join(runDir, fmt.Sprintf("command-%02d.stderr.log", cmdIndex+1))
+
+	stdoutFile, err := createArtifactFile(stdoutPath)
+	if err != nil {
+		return result, fmt.Errorf("create stdout artifact for quality command %d: %w", cmdIndex+1, err)
+	}
+	defer func() {
+		if cerr := stdoutFile.Close(); cerr != nil && retErr == nil {
+			retErr = fmt.Errorf("close stdout artifact for quality command %d: %w", cmdIndex+1, cerr)
+		}
+	}()
+	stderrFile, err := createArtifactFile(stderrPath)
+	if err != nil {
+		return result, fmt.Errorf("create stderr artifact for quality command %d: %w", cmdIndex+1, err)
+	}
+	defer func() {
+		if cerr := stderrFile.Close(); cerr != nil && retErr == nil {
+			retErr = fmt.Errorf("close stderr artifact for quality command %d: %w", cmdIndex+1, cerr)
+		}
+	}()
+
+	startedAt := time.Now().UTC()
+	cmdCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	// Quality commands are explicit project policy inputs and
+	// intentionally run through a shell to support normal developer
+	// checks such as "just lint" and compound commands. The working
+	// directory is constrained to the repo and the environment is
+	// allowlisted.
+	// nosemgrep: go.lang.security.audit.dangerous-exec-command.dangerous-exec-command
+	cmd := exec.CommandContext(cmdCtx, "/bin/sh", "-c", command)
+	cmd.Dir = cmdWorkDir
+	cmd.Env = env
+	cmd.Stdout = stdoutFile
+	cmd.Stderr = stderrFile
+	// Put the subprocess in its own process group so that any processes
+	// spawned by the shell command are also killed on context cancellation.
+	setupProcessGroup(cmd)
+
+	execErr := cmd.Run()
+	finishedAt := time.Now().UTC()
+	cmdErr := cmdCtx.Err()
+	parentErr := ctx.Err()
+
+	timedOut := errors.Is(cmdErr, context.DeadlineExceeded) || errors.Is(parentErr, context.DeadlineExceeded)
+	if execErr != nil && !timedOut && !isExpectedExecutionFailure(execErr) {
+		return result, fmt.Errorf("run quality command %d: %w", cmdIndex+1, execErr)
+	}
+
+	exitCode := 0
+	switch {
+	case timedOut:
+		exitCode = -1
+	case cmd.ProcessState != nil:
+		exitCode = cmd.ProcessState.ExitCode()
+	case execErr != nil:
+		exitCode = exitCodeFromError(execErr)
+	}
+
+	return CommandResult{
+		Command:    command,
+		Cwd:        cmdWorkDir,
+		ExitCode:   exitCode,
+		TimedOut:   timedOut,
+		DurationMS: finishedAt.Sub(startedAt).Milliseconds(),
+		StdoutPath: stdoutPath,
+		StderrPath: stderrPath,
+		StartedAt:  startedAt,
+		FinishedAt: finishedAt,
+	}, nil
 }
 
 func DeriveVerificationPassed(results []CommandResult) bool {

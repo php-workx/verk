@@ -187,7 +187,8 @@ func DetectEpicCycle(epicID string, ancestors map[string]struct{}) error {
 }
 
 // HasChildren reports whether the ticket with the given ID has any children.
-// A child is a ticket whose parent field or deps reference the given ID.
+// A child is a ticket whose parent field points to the given ID, or whose ID
+// appears in the given epic ticket's deps list.
 func HasChildren(rootDir, ticketID string) (bool, error) {
 	ticketsDir := resolveTicketsDir(rootDir)
 	paths, err := filepath.Glob(filepath.Join(ticketsDir, "*.md"))
@@ -274,15 +275,28 @@ func extractHeadingTitle(body string) string {
 	return ""
 }
 
+func hasEpicType(ticket Ticket) bool {
+	if ticket.UnknownFrontmatter == nil {
+		return false
+	}
+	typeValue, _ := ticket.UnknownFrontmatter["type"].(string)
+	return strings.EqualFold(strings.TrimSpace(typeValue), "epic")
+}
+
 // loadEpicChildren loads an epic ticket's deps list as a set for child
-// discovery. Only deps are considered as child edges; tk links are navigation
-// aids and must not be treated as child relationships.
+// discovery. Only epic tickets contribute deps-backed child edges; normal task
+// dependency links remain scheduling edges and must not be reinterpreted as
+// child relationships. tk links are navigation aids and must not be treated as
+// child relationships.
 func loadEpicChildren(ticketsDir, epicID string) (map[string]struct{}, error) {
 	children := make(map[string]struct{})
 	path := filepath.Join(ticketsDir, epicID+".md")
 	ticket, err := LoadTicket(path)
 	if err != nil {
 		return children, err
+	}
+	if !hasEpicType(ticket) {
+		return children, nil
 	}
 	for _, dep := range ticket.Deps {
 		children[dep] = struct{}{}

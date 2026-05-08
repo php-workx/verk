@@ -585,7 +585,7 @@ func executeEpicChecks(
 ) ([]verifycommand.CommandResult, map[string]verifycommand.CommandResult, error) {
 	var broadResults []verifycommand.CommandResult
 	if hasClosureCmds {
-		results, err := verifycommand.RunQualityCommands(ctx, repoRoot, cfg.EpicClosureCommands, cfg)
+		results, err := verifycommand.RunQualityCommands(ctx, repoRoot, "", cfg.EpicClosureCommands, cfg)
 		if err != nil {
 			return nil, nil, fmt.Errorf("run epic closure commands: %w", err)
 		}
@@ -605,7 +605,7 @@ func executeEpicChecks(
 			ids = append(ids, c.ID)
 		}
 		if len(commands) > 0 {
-			results, err := verifycommand.RunCommands(ctx, repoRoot, commands, cfg)
+			results, err := verifycommand.RunCommands(ctx, repoRoot, "", commands, cfg)
 			if err != nil {
 				return nil, nil, fmt.Errorf("run derived epic checks: %w", err)
 			}
@@ -759,6 +759,7 @@ func runEpicReviewerAttempt(
 		Runtime:                  reviewProfile.Runtime,
 		Model:                    reviewProfile.Model,
 		Reasoning:                reviewProfile.Reasoning,
+		WorktreePath:             req.RepoRoot,
 		Instructions:             instructions,
 		EffectiveReviewThreshold: cfg.Policy.ReviewThreshold,
 		ExecutionConfig:          executionConfigFromPolicy(cfg),

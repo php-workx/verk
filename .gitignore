@@ -3,6 +3,7 @@
 .tickets/
 .serena/
 .verk/
+.worktree/
 bin/
 .DS_Store
 
@@ -12,6 +13,7 @@ bin/
 # Coverage
 coverage.out
 coverage.html
+.gocache/
 
 # Secrets
 .env

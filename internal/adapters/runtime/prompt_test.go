@@ -387,6 +387,20 @@ func TestBuildReviewPrompt_ContainsThreshold(t *testing.T) {
 	}
 }
 
+func TestBuildReviewPrompt_ContainsNoCommitNoEditDirective(t *testing.T) {
+	prompt := BuildReviewPrompt(ReviewRequest{
+		TicketID:                 "VER-003",
+		LeaseID:                  "lease-3",
+		EffectiveReviewThreshold: "P2",
+	})
+	if !strings.Contains(prompt, "Do not commit, merge, rebase, or edit files") {
+		t.Fatal("expected reviewer no-commit/no-edit directive in review prompt")
+	}
+	if !strings.Contains(prompt, "Return review findings only") {
+		t.Fatal("expected findings-only requirement in review prompt")
+	}
+}
+
 func TestWorkerSystemPrompt_JSONOnly(t *testing.T) {
 	prompt := WorkerSystemPrompt()
 	if !strings.Contains(prompt, "ONLY a JSON object") {
@@ -417,6 +431,27 @@ func TestWorkerSystemPrompt_ExternalReviewReadiness(t *testing.T) {
 	}
 	if !strings.Contains(prompt, "robust") {
 		t.Fatalf("expected robust-implementation language in worker system prompt:\n%s", prompt)
+	}
+}
+
+func TestWorkerSystemPrompt_AllowsOnlySafeLocalCommits(t *testing.T) {
+	prompt := WorkerSystemPrompt()
+	if strings.Contains(prompt, "Do not commit changes") {
+		t.Fatalf("prompt still forbids all commits:\n%s", prompt)
+	}
+	for _, phrase := range []string{
+		"local commits",
+		"assigned worktree only",
+		"Do not push",
+		"Do not merge",
+		"Do not rebase",
+		"Do not amend shared refs",
+		"Do not move branches",
+		"Do not touch the main worktree",
+	} {
+		if !strings.Contains(prompt, phrase) {
+			t.Fatalf("expected worker prompt to contain %q:\n%s", phrase, prompt)
+		}
 	}
 }
 

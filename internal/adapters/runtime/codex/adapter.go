@@ -77,7 +77,11 @@ func (a *Adapter) CheckAvailability(ctx context.Context) error {
 		ctx = context.Background()
 	}
 
-	result, err := runCommand(ctx, a.binary(), []string{"--version"}, nil, runtimeCommandEnv(runtime.ExecutionConfig{}), 0)
+	env, err := runtimeCommandEnv(runtime.ExecutionConfig{}, "")
+	if err != nil {
+		return fmt.Errorf("build %s availability environment: %w", runtimeName, err)
+	}
+	result, err := runCommand(ctx, a.binary(), []string{"--version"}, nil, env, "", 0)
 	if err != nil {
 		return fmt.Errorf("%s availability check failed: %w", runtimeName, err)
 	}
@@ -97,7 +101,11 @@ func (a *Adapter) RunWorker(ctx context.Context, req runtime.WorkerRequest) (run
 
 	prompt := runtime.BuildWorkerPrompt(req)
 	args := buildWorkerArgs(req, prompt)
-	execResult, err := runCommand(ctx, a.binary(), args, nil, runtimeCommandEnv(req.ExecutionConfig), runtimeCommandTimeout(req.ExecutionConfig.WorkerTimeoutMinutes))
+	env, err := runtimeCommandEnv(req.ExecutionConfig, req.WorktreePath)
+	if err != nil {
+		return runtime.WorkerResult{}, err
+	}
+	execResult, err := runCommand(ctx, a.binary(), args, nil, env, "", runtimeCommandTimeout(req.ExecutionConfig.WorkerTimeoutMinutes))
 	finishedAt := now().UTC()
 	if err != nil {
 		return runtime.WorkerResult{}, fmt.Errorf("run %s worker: %w", runtimeName, err)
@@ -107,11 +115,11 @@ func (a *Adapter) RunWorker(ctx context.Context, req runtime.WorkerRequest) (run
 	resultBlock, blockFound := runtime.ParseResultBlock(resultText)
 
 	result := runtime.WorkerResult{
-		Status:         deriveWorkerStatus(resultBlock, blockFound, execResult.exitCode, execResult.stderr),
+		Status:         deriveWorkerStatus(resultBlock, blockFound, execResult.exitCode, execResult.stdout, execResult.stderr),
 		CompletionCode: deriveWorkerCompletionCode(resultBlock, blockFound, execResult.exitCode),
 		Concerns:       deriveWorkerConcerns(resultBlock, blockFound),
-		BlockReason:    deriveWorkerBlockReason(resultBlock, blockFound, resultText, execResult.exitCode),
-		RetryClass:     deriveWorkerRetryClass(resultBlock, blockFound, execResult.exitCode, execResult.stderr),
+		BlockReason:    deriveWorkerBlockReason(resultBlock, blockFound, resultText, execResult.exitCode, execResult.stdout, execResult.stderr),
+		RetryClass:     deriveWorkerRetryClass(resultBlock, blockFound, execResult.exitCode, execResult.stdout, execResult.stderr),
 		LeaseID:        req.LeaseID,
 		StartedAt:      startedAt,
 		FinishedAt:     finishedAt,
@@ -165,7 +173,11 @@ func (a *Adapter) RunReviewer(ctx context.Context, req runtime.ReviewRequest) (r
 
 	prompt := runtime.BuildReviewPrompt(req)
 	args := buildReviewArgs(req, prompt)
-	execResult, err := runCommand(ctx, a.binary(), args, nil, runtimeCommandEnv(req.ExecutionConfig), runtimeCommandTimeout(req.ExecutionConfig.ReviewerTimeoutMinutes))
+	env, err := runtimeCommandEnv(req.ExecutionConfig, req.WorktreePath)
+	if err != nil {
+		return runtime.ReviewResult{}, err
+	}
+	execResult, err := runCommand(ctx, a.binary(), args, nil, env, "", runtimeCommandTimeout(req.ExecutionConfig.ReviewerTimeoutMinutes))
 	finishedAt := now().UTC()
 	if err != nil {
 		return runtime.ReviewResult{}, fmt.Errorf("run %s reviewer: %w", runtimeName, err)
@@ -180,9 +192,9 @@ func (a *Adapter) RunReviewer(ctx context.Context, req runtime.ReviewRequest) (r
 	}
 
 	normalized := runtime.ReviewResult{
-		Status:         deriveReviewWorkerStatus(reviewBlock, blockFound, findings, req.EffectiveReviewThreshold, execResult.exitCode, execResult.stderr),
+		Status:         deriveReviewWorkerStatus(reviewBlock, blockFound, findings, req.EffectiveReviewThreshold, execResult.exitCode, execResult.stdout, execResult.stderr),
 		CompletionCode: deriveReviewCompletionCode(reviewBlock, blockFound, execResult.exitCode),
-		RetryClass:     deriveReviewRetryClass(reviewBlock, blockFound, execResult.exitCode, execResult.stderr),
+		RetryClass:     deriveReviewRetryClass(reviewBlock, blockFound, execResult.exitCode, execResult.stdout, execResult.stderr),
 		LeaseID:        req.LeaseID,
 		StartedAt:      startedAt,
 		FinishedAt:     finishedAt,
@@ -326,6 +338,7 @@ func buildWorkerArgs(req runtime.WorkerRequest, prompt string) []string {
 	args = appendModelArgs(args, req.Model)
 	args = appendReasoningArgs(args, req.Reasoning)
 	if req.WorktreePath != "" {
+		// ver-wi10: keep process cwd unset because Codex uses `-C/--cd` for worktree/config resolution.
 		args = append(args, "-C", req.WorktreePath)
 	}
 	args = append(args, prompt)
@@ -342,6 +355,11 @@ func buildReviewArgs(req runtime.ReviewRequest, prompt string) []string {
 	)
 	args = appendModelArgs(args, req.Model)
 	args = appendReasoningArgs(args, req.Reasoning)
+	if req.WorktreePath != "" {
+		// Verifier parity with ver-wi10: keep process cwd unset and route all
+		// filesystem access through Codex's `-C/--cd` flag.
+		args = append(args, "-C", req.WorktreePath)
+	}
 	args = append(args, prompt)
 	return args
 }
@@ -372,7 +390,7 @@ func appendReasoningArgs(args []string, reasoning string) []string {
 
 // --- Status derivation from verk protocol blocks ---
 
-func deriveWorkerStatus(block runtime.VerkResultBlock, found bool, exitCode int, stderr []byte) runtime.WorkerStatus {
+func deriveWorkerStatus(block runtime.VerkResultBlock, found bool, exitCode int, stdout, stderr []byte) runtime.WorkerStatus {
 	if found {
 		if status, ok := normalizeWorkerStatusString(block.Status); ok {
 			return status
@@ -381,7 +399,10 @@ func deriveWorkerStatus(block runtime.VerkResultBlock, found bool, exitCode int,
 	if exitCode == 0 {
 		return runtime.WorkerStatusDone
 	}
-	if looksLikeMissingContext(stderr) {
+	if looksLikeQuotaOrAvailabilityFailure(stdout, stderr) {
+		return runtime.WorkerStatusBlocked
+	}
+	if looksLikeMissingContext(stdout, stderr) {
 		return runtime.WorkerStatusNeedsContext
 	}
 	return runtime.WorkerStatusBlocked
@@ -404,9 +425,12 @@ func deriveWorkerConcerns(block runtime.VerkResultBlock, found bool) []string {
 	return nil
 }
 
-func deriveWorkerBlockReason(block runtime.VerkResultBlock, found bool, resultText string, exitCode int) string {
+func deriveWorkerBlockReason(block runtime.VerkResultBlock, found bool, resultText string, exitCode int, stdout, stderr []byte) string {
 	if found && strings.TrimSpace(block.BlockReason) != "" {
 		return strings.TrimSpace(block.BlockReason)
+	}
+	if message := extractCodexFailureMessage(stdout, stderr); exitCode != 0 && message != "" {
+		return message
 	}
 	if exitCode != 0 && resultText != "" {
 		reason := strings.TrimSpace(resultText)
@@ -418,33 +442,39 @@ func deriveWorkerBlockReason(block runtime.VerkResultBlock, found bool, resultTe
 	return ""
 }
 
-func deriveWorkerRetryClass(block runtime.VerkResultBlock, found bool, exitCode int, stderr []byte) runtime.RetryClass {
+func deriveWorkerRetryClass(block runtime.VerkResultBlock, found bool, exitCode int, stdout, stderr []byte) runtime.RetryClass {
 	if found {
 		status, ok := normalizeWorkerStatusString(block.Status)
 		if ok {
-			return retryClassForStatus(status, exitCode, stderr)
+			return retryClassForStatus(status, exitCode, stdout, stderr)
 		}
 	}
 	if exitCode == 0 {
 		return runtime.RetryClassTerminal
 	}
+	if looksLikeQuotaOrAvailabilityFailure(stdout, stderr) {
+		return runtime.RetryClassRetryable
+	}
 	if looksLikeTransientFailure(stderr) {
 		return runtime.RetryClassRetryable
 	}
-	if looksLikeMissingContext(stderr) {
+	if looksLikeMissingContext(stdout, stderr) {
 		return runtime.RetryClassBlockedByOperatorInput
 	}
 	return runtime.RetryClassRetryable
 }
 
-func deriveReviewWorkerStatus(block runtime.VerkReviewBlock, found bool, findings []runtime.ReviewFinding, threshold runtime.Severity, exitCode int, stderr []byte) runtime.WorkerStatus {
+func deriveReviewWorkerStatus(block runtime.VerkReviewBlock, found bool, findings []runtime.ReviewFinding, threshold runtime.Severity, exitCode int, stdout, stderr []byte) runtime.WorkerStatus {
 	if exitCode == 0 {
 		if deriveReviewStatus(findings, threshold) == runtime.ReviewStatusFindings {
 			return runtime.WorkerStatusDoneWithConcerns
 		}
 		return runtime.WorkerStatusDone
 	}
-	if looksLikeMissingContext(stderr) {
+	if looksLikeQuotaOrAvailabilityFailure(stdout, stderr) {
+		return runtime.WorkerStatusBlocked
+	}
+	if looksLikeMissingContext(stdout, stderr) {
 		return runtime.WorkerStatusNeedsContext
 	}
 	return runtime.WorkerStatusBlocked
@@ -457,14 +487,17 @@ func deriveReviewCompletionCode(block runtime.VerkReviewBlock, found bool, exitC
 	return fmt.Sprintf("exit_%d", exitCode)
 }
 
-func deriveReviewRetryClass(block runtime.VerkReviewBlock, found bool, exitCode int, stderr []byte) runtime.RetryClass {
+func deriveReviewRetryClass(block runtime.VerkReviewBlock, found bool, exitCode int, stdout, stderr []byte) runtime.RetryClass {
 	if exitCode == 0 {
 		return runtime.RetryClassTerminal
+	}
+	if looksLikeQuotaOrAvailabilityFailure(stdout, stderr) {
+		return runtime.RetryClassRetryable
 	}
 	if looksLikeTransientFailure(stderr) {
 		return runtime.RetryClassRetryable
 	}
-	if looksLikeMissingContext(stderr) {
+	if looksLikeMissingContext(stdout, stderr) {
 		return runtime.RetryClassBlockedByOperatorInput
 	}
 	return runtime.RetryClassRetryable
@@ -623,11 +656,14 @@ func normalizeDisposition(raw string) (runtime.ReviewDisposition, error) {
 
 // --- Shared helpers ---
 
-func retryClassForStatus(status runtime.WorkerStatus, exitCode int, stderr []byte) runtime.RetryClass {
+func retryClassForStatus(status runtime.WorkerStatus, exitCode int, stdout, stderr []byte) runtime.RetryClass {
 	switch status {
 	case runtime.WorkerStatusDone, runtime.WorkerStatusDoneWithConcerns:
 		return runtime.RetryClassTerminal
 	case runtime.WorkerStatusNeedsContext, runtime.WorkerStatusBlocked:
+		if looksLikeQuotaOrAvailabilityFailure(stdout, stderr) {
+			return runtime.RetryClassRetryable
+		}
 		if exitCode != 0 && looksLikeTransientFailure(stderr) {
 			return runtime.RetryClassRetryable
 		}
@@ -653,9 +689,65 @@ func looksLikeTransientFailure(stderr []byte) bool {
 	return strings.Contains(blob, "timeout") || strings.Contains(blob, "temporar") || strings.Contains(blob, "retry") || strings.Contains(blob, "transient")
 }
 
-func looksLikeMissingContext(stderr []byte) bool {
-	blob := strings.ToLower(string(stderr))
-	return strings.Contains(blob, "context") || strings.Contains(blob, "input") || strings.Contains(blob, "operator") || strings.Contains(blob, "lease")
+func looksLikeMissingContext(stdout, stderr []byte) bool {
+	blob := strings.ToLower(string(stderr) + "\n" + extractCodexFailureMessage(stdout, stderr))
+	return strings.Contains(blob, "missing context") ||
+		strings.Contains(blob, "need more context") ||
+		strings.Contains(blob, "needs context") ||
+		strings.Contains(blob, "missing spec") ||
+		strings.Contains(blob, "operator input")
+}
+
+func looksLikeQuotaOrAvailabilityFailure(stdout, stderr []byte) bool {
+	blob := strings.ToLower(strings.Join([]string{
+		string(stderr),
+		extractCodexFailureMessage(stdout, stderr),
+		string(stdout),
+	}, "\n"))
+	return strings.Contains(blob, "usage limit") ||
+		strings.Contains(blob, "rate limit") ||
+		strings.Contains(blob, "too many requests") ||
+		strings.Contains(blob, "quota") ||
+		strings.Contains(blob, "model unavailable") ||
+		strings.Contains(blob, "switch to another model") ||
+		strings.Contains(blob, "try again at") ||
+		strings.Contains(blob, "temporarily unavailable") ||
+		strings.Contains(blob, "capacity")
+}
+
+func extractCodexFailureMessage(stdout, stderr []byte) string {
+	scanner := bufio.NewScanner(bytes.NewReader(stdout))
+	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+		var event struct {
+			Type    string `json:"type"`
+			Message string `json:"message"`
+			Error   struct {
+				Message string `json:"message"`
+			} `json:"error"`
+		}
+		if err := json.Unmarshal([]byte(line), &event); err != nil {
+			continue
+		}
+		switch event.Type {
+		case "error":
+			if msg := strings.TrimSpace(event.Message); msg != "" {
+				return msg
+			}
+		case "turn.failed":
+			if msg := strings.TrimSpace(event.Error.Message); msg != "" {
+				return msg
+			}
+		}
+	}
+	if msg := strings.TrimSpace(string(stderr)); msg != "" {
+		return msg
+	}
+	return ""
 }
 
 func ensureRuntime(value, fallback string) string {
@@ -665,7 +757,7 @@ func ensureRuntime(value, fallback string) string {
 	return strings.TrimSpace(value)
 }
 
-func defaultRunCommand(ctx context.Context, binary string, args []string, stdin []byte, env []string, timeout time.Duration) (commandResult, error) {
+func defaultRunCommand(ctx context.Context, binary string, args []string, stdin []byte, env []string, _workDir string, timeout time.Duration) (commandResult, error) {
 	if timeout > 0 {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, timeout)
@@ -764,8 +856,9 @@ func encodeJSON(file *os.File, payload any) error {
 	return encoder.Encode(payload)
 }
 
-func runtimeCommandEnv(_ runtime.ExecutionConfig) []string {
-	return nil
+func runtimeCommandEnv(_ runtime.ExecutionConfig, worktreePath string) ([]string, error) {
+	cleanEnv := runtime.StripEnvKeys(os.Environ(), runtime.GitIsolationKeys()...)
+	return runtime.BuildIsolatedProcessEnv(cleanEnv, worktreePath)
 }
 
 func runtimeCommandTimeout(minutes int) time.Duration {
