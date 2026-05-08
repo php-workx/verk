@@ -3,5 +3,10 @@ set -euo pipefail
 
 export PATH="/opt/homebrew/bin:/usr/local/bin:$HOME/go/bin:$HOME/.cargo/bin:$PATH"
 
-cd "$(git rev-parse --show-toplevel)"
+repo_root="$(git rev-parse --show-toplevel)"
+while IFS= read -r name; do
+    unset "$name"
+done < <(git rev-parse --local-env-vars)
+
+cd "$repo_root"
 exec just pre-commit

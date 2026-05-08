@@ -257,10 +257,60 @@ func runGit(t *testing.T, dir string, args ...string) {
 	t.Helper()
 	cmd := exec.Command("git", args...)
 	cmd.Dir = dir
-	cmd.Env = append(os.Environ(), "GIT_OPTIONAL_LOCKS=0")
+	cmd.Env = testGitEnv()
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("git %v failed: %v\n%s", args, err, string(out))
+	}
+}
+
+func testGitEnv() []string {
+	env := os.Environ()
+	out := make([]string, 0, len(env)+4)
+	for _, entry := range env {
+		key, _, found := strings.Cut(entry, "=")
+		if !found {
+			out = append(out, entry)
+			continue
+		}
+		if isGitLocalEnv(key) {
+			continue
+		}
+		out = append(out, entry)
+	}
+	out = append(out,
+		"GIT_OPTIONAL_LOCKS=0",
+		"GIT_CONFIG_COUNT=1",
+		"GIT_CONFIG_KEY_0=core.hooksPath",
+		"GIT_CONFIG_VALUE_0=/dev/null",
+	)
+	return out
+}
+
+func isGitLocalEnv(key string) bool {
+	if strings.HasPrefix(key, "GIT_CONFIG_KEY_") || strings.HasPrefix(key, "GIT_CONFIG_VALUE_") {
+		return true
+	}
+	switch key {
+	case "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+		"GIT_COMMON_DIR",
+		"GIT_CONFIG",
+		"GIT_CONFIG_COUNT",
+		"GIT_CONFIG_PARAMETERS",
+		"GIT_DIR",
+		"GIT_GRAFT_FILE",
+		"GIT_IMPLICIT_WORK_TREE",
+		"GIT_INDEX_FILE",
+		"GIT_NO_REPLACE_OBJECTS",
+		"GIT_OBJECT_DIRECTORY",
+		"GIT_PREFIX",
+		"GIT_REPLACE_REF_BASE",
+		"GIT_SHALLOW_FILE",
+		"GIT_SUPER_PREFIX",
+		"GIT_WORK_TREE":
+		return true
+	default:
+		return false
 	}
 }
 
