@@ -8,6 +8,47 @@ import (
 	"strings"
 )
 
+// gitIsolationKeys lists environment variables that must be stripped from the
+// parent process before spawning isolated worker subprocesses. Without this, a
+// host running verk inside a git worktree or with GIT_DIR set would leak that
+// state into workers, defeating worktree isolation.
+// GitIsolationKeys returns the list of environment variable keys that must be
+// stripped before spawning isolated worker subprocesses.
+func GitIsolationKeys() []string {
+	return gitIsolationKeys
+}
+
+var gitIsolationKeys = []string{
+	"GIT_DIR",
+	"GIT_WORK_TREE",
+	"GIT_INDEX_FILE",
+	"GIT_OBJECT_DIRECTORY",
+	"GIT_COMMON_DIR",
+	"GIT_ALTERNATE_OBJECT_DIRECTORIES",
+	"GIT_PREFIX",
+	"GIT_SUPER_PREFIX",
+}
+
+// StripEnvKeys removes entries whose key matches any of blockedKeys from env.
+// The returned slice has no duplicate keys; the first occurrence wins.
+func StripEnvKeys(env []string, blockedKeys ...string) []string {
+	blocked := make(map[string]struct{}, len(blockedKeys))
+	for _, k := range blockedKeys {
+		blocked[k] = struct{}{}
+	}
+	out := make([]string, 0, len(env))
+	for _, pair := range env {
+		key, _, ok := strings.Cut(pair, "=")
+		if ok {
+			if _, skip := blocked[key]; skip {
+				continue
+			}
+		}
+		out = append(out, pair)
+	}
+	return out
+}
+
 // BuildIsolatedProcessEnv overlays common temp/cache variables onto baseEnv so
 // worker, reviewer, and verification subprocesses keep ephemeral outputs under
 // Verk-managed state instead of polluting the repo or ticket worktree.
@@ -86,6 +127,12 @@ func resolveProcessStateRoot(stateHint string) (string, error) {
 	verkPath := filepath.Join(absHint, ".verk")
 	if resolved, err := filepath.EvalSymlinks(verkPath); err == nil {
 		return filepath.Clean(resolved), nil
+	}
+	// If the hint points at a linked worktree (.git is a file, not a directory),
+	// a missing .verk link means the cache-root is broken — fail fast instead of
+	// silently creating a disposable .verk under the worktree.
+	if gitInfo, err := os.Lstat(filepath.Join(absHint, ".git")); err == nil && !gitInfo.IsDir() {
+		return "", fmt.Errorf("linked worktree %q is missing a usable .verk symlink", absHint)
 	}
 	if err := os.MkdirAll(verkPath, 0o755); err != nil {
 		return "", fmt.Errorf("create process state root %q: %w", verkPath, err)

@@ -119,6 +119,9 @@ func RunTicket(ctx context.Context, req RunTicketRequest) (result RunTicketResul
 		} else {
 			return RunTicketResult{}, fmt.Errorf("resolve worktree path %q: %w", req.WorktreePath, absErr)
 		}
+		if validateErr := validateWorktreeBelongsToRepo(absRepoRoot, worktreePath); validateErr != nil {
+			return RunTicketResult{}, validateErr
+		}
 	}
 	plan := req.Plan
 	if plan.Phase == "" {
@@ -534,6 +537,19 @@ func handleImplementResult(st *ticketRunState, result runtime.WorkerResult, req 
 			return fmt.Errorf("collect changed files: %w", err)
 		}
 		effectiveChangedFiles := filterEngineOwnedFiles(rawChangedFiles)
+		if len(rawChangedFiles) != len(effectiveChangedFiles) {
+			engineOwned := make([]string, 0, len(rawChangedFiles)-len(effectiveChangedFiles))
+			effectiveSet := make(map[string]struct{}, len(effectiveChangedFiles))
+			for _, f := range effectiveChangedFiles {
+				effectiveSet[f] = struct{}{}
+			}
+			for _, f := range rawChangedFiles {
+				if _, ok := effectiveSet[f]; !ok {
+					engineOwned = append(engineOwned, f)
+				}
+			}
+			log.Printf("[INFO] filtered engine-owned paths from ticket %s: %s", st.req.Ticket.ID, strings.Join(engineOwned, ", "))
+		}
 		st.implementation.RawChangedFiles = rawChangedFiles
 		st.implementation.EffectiveChangedFiles = effectiveChangedFiles
 		st.implementation.ChangedFiles = effectiveChangedFiles

@@ -8,8 +8,9 @@ import (
 	"strings"
 	"testing"
 	"time"
-	runtimeenv "verk/internal/adapters/runtime"
 	"verk/internal/policy"
+
+	runtimeenv "verk/internal/adapters/runtime"
 )
 
 // failingCloser is an io.WriteCloser whose Close method returns a configurable

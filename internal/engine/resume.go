@@ -645,21 +645,21 @@ func resumeEpicMode(ctx context.Context, req ResumeRequest, artifacts *runArtifa
 			}
 			allResumed = appendIfMissing(allResumed, tid)
 		}
-		for i, outcome := range outcomes {
-			if outcome.phase == state.TicketPhaseClosed {
-				continue
-			}
+		for _, tid := range wave.TicketIDs {
+			// Always persist diffs, even for closed tickets — if the wave later
+			// fails, closed-ticket worktrees get cleaned up and their changes
+			// would be lost without a persisted diff.
 			if waveManager == nil {
 				continue
 			}
-			diff, diffErr := waveManager.Diff(wave.TicketIDs[i])
+			diff, diffErr := waveManager.Diff(tid)
 			if diffErr != nil {
 				cleanupWaveManager()
-				return allResumed, fmt.Errorf("persist diff artifact for %s: %w", wave.TicketIDs[i], diffErr)
+				return allResumed, fmt.Errorf("persist diff artifact for %s: %w", tid, diffErr)
 			}
-			if persistErr := persistWorktreeDiff(artifacts.RepoRoot, req.RunID, wave.TicketIDs[i], diff); persistErr != nil {
+			if persistErr := persistWorktreeDiff(artifacts.RepoRoot, req.RunID, tid, diff); persistErr != nil {
 				cleanupWaveManager()
-				return allResumed, fmt.Errorf("persist diff artifact for %s: %w", wave.TicketIDs[i], persistErr)
+				return allResumed, fmt.Errorf("persist diff artifact for %s: %w", tid, persistErr)
 			}
 		}
 

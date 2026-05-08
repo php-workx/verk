@@ -3,6 +3,7 @@
 .tickets/
 .serena/
 .verk/
+.worktree/
 bin/
 .DS_Store
 

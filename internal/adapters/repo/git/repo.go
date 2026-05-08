@@ -267,22 +267,19 @@ func (r *Repo) diffUntrackedFiles(paths []string) (string, error) {
 }
 
 func writeNewFileDiff(buf *bytes.Buffer, relPath, mode string, content []byte) {
-	lineCount := 0
-	if len(content) > 0 {
-		lineCount = bytes.Count(content, []byte("\n"))
-		if !bytes.HasSuffix(content, []byte("\n")) {
-			lineCount++
-		}
-	}
 	fmt.Fprintf(buf, "diff --git a/%s b/%s\n", relPath, relPath)
 	fmt.Fprintf(buf, "new file mode %s\n", mode)
 	fmt.Fprintf(buf, "index 0000000..0000000\n")
 	fmt.Fprintf(buf, "--- /dev/null\n")
 	fmt.Fprintf(buf, "+++ b/%s\n", relPath)
-	fmt.Fprintf(buf, "@@ -0,0 +1,%d @@\n", lineCount)
 	if len(content) == 0 {
 		return
 	}
+	lineCount := bytes.Count(content, []byte("\n"))
+	if !bytes.HasSuffix(content, []byte("\n")) {
+		lineCount++
+	}
+	fmt.Fprintf(buf, "@@ -0,0 +1,%d @@\n", lineCount)
 	lines := bytes.SplitAfter(content, []byte("\n"))
 	for _, line := range lines {
 		if len(line) == 0 {
@@ -373,6 +370,14 @@ func (r *Repo) RemoveWorktree(targetPath string) error {
 		return nil
 	} else if !isWorktreeMissingFromGit(err) && !isPathMissing(targetPath) {
 		return err
+	}
+
+	registered, checkErr := hasWorktreePath(worktreeRoot, targetPath)
+	if checkErr != nil {
+		return fmt.Errorf("verify worktree registration for %q: %w", targetPath, checkErr)
+	}
+	if !registered && !isPathMissing(targetPath) {
+		return fmt.Errorf("refusing to remove unregistered worktree path %q", targetPath)
 	}
 
 	if err := os.RemoveAll(targetPath); err != nil {

@@ -1019,7 +1019,7 @@ func resumePendingWaveVerification(
 			if err != nil || completed {
 				return err
 			}
-			integration, err := integrationManagerForPendingTransaction(req, tx, false)
+			integration, err := integrationManagerForPendingTransaction(req, tx, true)
 			if err != nil {
 				return err
 			}
@@ -1048,6 +1048,11 @@ func resumePendingWaveVerification(
 		if err != nil {
 			return err
 		}
+		defer func() {
+			if integration != nil {
+				_ = integration.Cleanup()
+			}
+		}()
 		workDir = integration.WorktreePath()
 		changedFiles = tx.ChangedFiles
 	}

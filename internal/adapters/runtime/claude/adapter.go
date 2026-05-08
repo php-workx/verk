@@ -745,7 +745,8 @@ func encodeJSON(file *os.File, payload any) error {
 // require the ambient environment. Config-specified AuthEnvVars are informational
 // only — they document which vars the runtime expects but don't restrict the env.
 func runtimeCommandEnv(_ runtime.ExecutionConfig, worktreePath string) ([]string, error) {
-	return runtime.BuildIsolatedProcessEnv(os.Environ(), worktreePath)
+	cleanEnv := runtime.StripEnvKeys(os.Environ(), runtime.GitIsolationKeys()...)
+	return runtime.BuildIsolatedProcessEnv(cleanEnv, worktreePath)
 }
 
 func runtimeCommandTimeout(minutes int) time.Duration {

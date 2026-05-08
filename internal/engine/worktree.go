@@ -89,6 +89,9 @@ func (wm *WorktreeManager) CreateWorktree(ctx context.Context, ticketID string) 
 	if ticketID == "" {
 		return "", fmt.Errorf("ticket id is required")
 	}
+	if strings.Contains(ticketID, "/") || strings.Contains(ticketID, "..") || strings.Contains(ticketID, "\\") {
+		return "", fmt.Errorf("ticket id %q contains invalid path characters", ticketID)
+	}
 	if wm.mainRoot == "" {
 		return "", fmt.Errorf("main root is required")
 	}
@@ -1362,16 +1365,28 @@ func resolveWithinRoot(root, rel string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("resolve root %q: %w", root, err)
 	}
+	resolvedRoot, err := filepath.EvalSymlinks(absRoot)
+	if err != nil {
+		return "", fmt.Errorf("resolve symlinks in root %q: %w", absRoot, err)
+	}
 	absTarget := filepath.Join(absRoot, rel)
-	absTarget = filepath.Clean(absTarget)
-	relToRoot, err := filepath.Rel(absRoot, absTarget)
+	// Resolve symlinks in the parent directory — the target itself may not
+	// exist yet (new files during merge-to-main). Walk up until we find an
+	// existing ancestor.
+	parent := filepath.Dir(absTarget)
+	resolvedParent, err := filepath.EvalSymlinks(parent)
+	if err != nil {
+		return "", fmt.Errorf("resolve symlinks in parent of target %q: %w", absTarget, err)
+	}
+	resolvedTarget := filepath.Join(resolvedParent, filepath.Base(absTarget))
+	relToRoot, err := filepath.Rel(resolvedRoot, resolvedTarget)
 	if err != nil {
 		return "", fmt.Errorf("resolve target %q in %q: %w", rel, root, err)
 	}
 	if relToRoot == ".." || strings.HasPrefix(relToRoot, ".."+string(filepath.Separator)) {
 		return "", fmt.Errorf("target %q is outside root %q", rel, root)
 	}
-	return absTarget, nil
+	return resolvedTarget, nil
 }
 
 func mergeToMainPreflight(worktreeRoot, mainRoot string, changes []mergeToMainChange) ([]mergeToMainChange, error) {
@@ -1508,12 +1523,16 @@ func ensureWriteParent(mainRoot, rel string) error {
 	if err != nil {
 		return err
 	}
+	resolvedRoot, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		return fmt.Errorf("resolve symlinks in root %q: %w", root, err)
+	}
 	current := parent
 	for {
 		if current == "" || current == "." {
 			return fmt.Errorf("invalid destination path for %q", rel)
 		}
-		info, err := os.Stat(current)
+		info, err := os.Lstat(current)
 		if err != nil {
 			if os.IsNotExist(err) {
 				current = filepath.Dir(current)
@@ -1521,10 +1540,21 @@ func ensureWriteParent(mainRoot, rel string) error {
 			}
 			return err
 		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("symlink in write path %q is not allowed", current)
+		}
 		if !info.IsDir() {
 			return fmt.Errorf("destination parent %q is not a directory", current)
 		}
-		if current == root {
+		resolved, err := filepath.EvalSymlinks(current)
+		if err != nil {
+			return fmt.Errorf("resolve parent %q: %w", current, err)
+		}
+		relToRoot, err := filepath.Rel(resolvedRoot, resolved)
+		if err != nil || relToRoot == ".." || strings.HasPrefix(relToRoot, ".."+string(filepath.Separator)) {
+			return fmt.Errorf("destination parent %q escapes root %q", current, root)
+		}
+		if current == root || resolved == resolvedRoot {
 			return nil
 		}
 		return nil
@@ -1799,4 +1829,48 @@ func filterEngineOwnedFilesInternal(changed []string) []string {
 		out = append(out, file)
 	}
 	return out
+}
+
+// validateWorktreeBelongsToRepo checks that a worktree path belongs to the same
+// git repository as repoRoot by comparing their main worktree roots.
+// It skips validation when the worktree is the repo root itself or is a main
+// worktree (.git is a directory), since those are inherently same-repo.
+func validateWorktreeBelongsToRepo(repoRoot, worktreePath string) error {
+	if repoRoot == worktreePath {
+		return nil
+	}
+	// Only validate linked worktrees (.git is a file, not a directory).
+	// If .git doesn't exist, path-level safety is already ensured by
+	// resolveWithinRoot, so skip git-level validation entirely.
+	gitInfo, err := os.Lstat(filepath.Join(worktreePath, ".git"))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("stat worktree git dir: %w", err)
+	}
+	// Main worktree (regular .git directory) is always valid.
+	if gitInfo.IsDir() {
+		return nil
+	}
+	repo, err := git.New(repoRoot)
+	if err != nil {
+		return fmt.Errorf("open repo at %q: %w", repoRoot, err)
+	}
+	repoMain, err := repo.MainWorktreeRoot()
+	if err != nil {
+		return fmt.Errorf("resolve repo main root: %w", err)
+	}
+	wtRepo, err := git.New(worktreePath)
+	if err != nil {
+		return fmt.Errorf("open worktree at %q: %w", worktreePath, err)
+	}
+	wtMain, err := wtRepo.MainWorktreeRoot()
+	if err != nil {
+		return fmt.Errorf("resolve worktree main root: %w", err)
+	}
+	if repoMain != wtMain {
+		return fmt.Errorf("worktree %q belongs to a different repository (main root %q vs %q)", worktreePath, wtMain, repoMain)
+	}
+	return nil
 }
