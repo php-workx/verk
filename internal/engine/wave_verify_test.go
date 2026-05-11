@@ -91,6 +91,9 @@ func TestPathSetIncludesAllowsAdditionalFinalFiles(t *testing.T) {
 	if pathSetIncludes([]string{"docs/b.md"}, []string{"docs/a.md"}) {
 		t.Fatal("expected missing original transaction file to be rejected")
 	}
+	if pathSetIncludes([]string{"docs/a.md"}, nil) {
+		t.Fatal("expected empty transaction file list to be rejected")
+	}
 }
 
 func TestRunWaveVerificationLoop_NoQualityCommands(t *testing.T) {

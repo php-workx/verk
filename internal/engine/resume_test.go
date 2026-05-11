@@ -27,6 +27,20 @@ func TestResumeRun_EmptyRepoRoot(t *testing.T) {
 	}
 }
 
+func TestReleaseClaimForResumeIgnoresOnlyMissingClaim(t *testing.T) {
+	repoRoot := t.TempDir()
+
+	if err := releaseClaimForResume(repoRoot, "run-a", "ticket-1", "resume_reacquisition"); err != nil {
+		t.Fatalf("expected missing claim to be ignored, got %v", err)
+	}
+	if _, err := epos.AcquireClaim(repoRoot, "run-owner", "ticket-1", "lease-owner", 10*time.Minute); err != nil {
+		t.Fatalf("AcquireClaim: %v", err)
+	}
+	if err := releaseClaimForResume(repoRoot, "run-a", "ticket-1", "resume_reacquisition"); err == nil {
+		t.Fatal("expected non-missing release error to propagate")
+	}
+}
+
 func TestResumeRun_DoesNotOverwriteExistingWaveArtifactAfterCursorCrash(t *testing.T) {
 	repoRoot := t.TempDir()
 	baseCommit := initEpicRepo(t, repoRoot)

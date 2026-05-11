@@ -545,6 +545,15 @@ func TestReleaseClaim_ReasonOnlyCallStillWorks(t *testing.T) {
 	}
 }
 
+func TestReleaseClaim_MissingClaimReturnsSentinel(t *testing.T) {
+	dir := t.TempDir()
+
+	err := ReleaseClaim(dir, "run-a", "ticket-1", "resume_reacquisition")
+	if !errors.Is(err, ErrClaimNotFound) {
+		t.Fatalf("ReleaseClaim missing error = %v, want ErrClaimNotFound", err)
+	}
+}
+
 func TestReleaseClaim_DurableOnlyWritesReleasedRuntimeState(t *testing.T) {
 	dir := t.TempDir()
 	now := time.Now().UTC()

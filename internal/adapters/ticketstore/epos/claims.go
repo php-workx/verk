@@ -20,6 +20,8 @@ const (
 	defaultClaimTTL    = 30 * time.Minute
 )
 
+var ErrClaimNotFound = errors.New("claim not found")
+
 // saveAtomic is the atomic JSON save function used by claim flows.
 // Package-internal; overridable in tests.
 var saveAtomic = state.SaveJSONAtomic
@@ -198,7 +200,7 @@ func ReleaseClaim(rootDir string, args ...any) error {
 		current = durable
 	}
 	if current == nil {
-		return fmt.Errorf("claim %s not found for release", req.ticketID)
+		return fmt.Errorf("%w: %s", ErrClaimNotFound, req.ticketID)
 	}
 	if current.OwnerRunID != req.runID {
 		return fmt.Errorf("claim %s belongs to run %s", req.ticketID, current.OwnerRunID)

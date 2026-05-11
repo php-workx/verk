@@ -1182,13 +1182,16 @@ func completeAlreadyAppliedPendingWaveIntegration(
 	if err != nil {
 		return true, err
 	}
-	if !pathSetIncludes(finalChangedFiles, tx.ChangedFiles) {
+	if len(tx.ChangedFiles) == 0 || !pathSetIncludes(finalChangedFiles, tx.ChangedFiles) {
 		return false, nil
 	}
 	return true, persistCompletedPendingWaveIntegration(cursor, runPath, run, wave, wavePath, currentBaseHead, finalChangedFiles)
 }
 
 func pathSetIncludes(haystack, needles []string) bool {
+	if len(filterEngineOwnedFiles(needles)) == 0 {
+		return false
+	}
 	available := make(map[string]struct{}, len(haystack))
 	for _, path := range filterEngineOwnedFiles(haystack) {
 		available[path] = struct{}{}

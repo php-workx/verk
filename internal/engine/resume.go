@@ -215,7 +215,9 @@ func resumeTicketMode(ctx context.Context, req ResumeRequest, artifacts *runArti
 		}
 
 		// Release existing claim so we can re-acquire
-		_ = epos.ReleaseClaim(artifacts.RepoRoot, req.RunID, ticketID, "resume_reacquisition")
+		if err := releaseClaimForResume(artifacts.RepoRoot, req.RunID, ticketID, "resume_reacquisition"); err != nil {
+			return resumed, err
+		}
 
 		// Re-acquire claim
 		leaseID := fmt.Sprintf("lease-resume-%s-%d", req.RunID, time.Now().UTC().UnixNano())
@@ -296,6 +298,13 @@ func resumeTicketMode(ctx context.Context, req ResumeRequest, artifacts *runArti
 	return resumed, nil
 }
 
+func releaseClaimForResume(repoRoot, runID, ticketID, reason string) error {
+	if err := epos.ReleaseClaim(repoRoot, runID, ticketID, reason); err != nil && !errors.Is(err, epos.ErrClaimNotFound) {
+		return fmt.Errorf("release claim for ticket %s: %w", ticketID, err)
+	}
+	return nil
+}
+
 // resumeEpicMode re-enters the wave loop for an epic-mode run,
 // skipping already-completed waves.
 func resumeEpicMode(ctx context.Context, req ResumeRequest, artifacts *runArtifacts) ([]string, error) { //nolint:gocognit,cyclop // complex resume orchestration; refactor into sub-functions
@@ -330,7 +339,9 @@ func resumeEpicMode(ctx context.Context, req ResumeRequest, artifacts *runArtifa
 			continue
 		}
 		// Release existing claim
-		_ = epos.ReleaseClaim(artifacts.RepoRoot, req.RunID, ticketID, "resume_reacquisition")
+		if err := releaseClaimForResume(artifacts.RepoRoot, req.RunID, ticketID, "resume_reacquisition"); err != nil {
+			return nil, err
+		}
 		// Reset ticket store status to ready
 		if err := setTicketReady(artifacts.RepoRoot, ticketID); err != nil {
 			return nil, fmt.Errorf("reset ticket %s to ready: %w", ticketID, err)
@@ -490,7 +501,12 @@ func resumeEpicMode(ctx context.Context, req ResumeRequest, artifacts *runArtifa
 						TicketID: ticketID,
 						Detail:   fmt.Sprintf("worker crashed (attempt %d/%d), retrying: %v", attempt+1, maxCrashRetries+1, outcome.err),
 					})
-					_ = epos.ReleaseClaim(artifacts.RepoRoot, req.RunID, ticketID, "crash recovery")
+					if releaseErr := releaseClaimForResume(artifacts.RepoRoot, req.RunID, ticketID, "crash recovery"); releaseErr != nil {
+						outcome.err = releaseErr
+						outcome.phase = state.TicketPhaseBlocked
+						outcomes[i] = outcome
+						return
+					}
 					if attempt == maxCrashRetries {
 						outcome.phase = state.TicketPhaseBlocked
 						outcomes[i] = outcome
