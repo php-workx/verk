@@ -619,6 +619,29 @@ func TestWorktreeManager_CreateWorktreeAndSymlink(t *testing.T) {
 	}
 }
 
+func TestWorktreeManager_CreateWorktreeRejectsUnsafeIDs(t *testing.T) {
+	mainRoot := t.TempDir()
+	baseCommit := initEpicRepo(t, mainRoot)
+
+	for _, tc := range []struct {
+		name     string
+		runID    string
+		ticketID string
+	}{
+		{name: "run path traversal", runID: "../run", ticketID: "ticket-a"},
+		{name: "run ref syntax", runID: "run@{bad", ticketID: "ticket-a"},
+		{name: "ticket path separator", runID: "run-safe", ticketID: "ticket/a"},
+		{name: "ticket ref suffix", runID: "run-safe", ticketID: "ticket.lock"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			manager := NewWorktreeManager(mainRoot, baseCommit, tc.runID, t.TempDir())
+			if _, err := manager.CreateWorktree(context.Background(), tc.ticketID); err == nil {
+				t.Fatalf("expected unsafe IDs to be rejected")
+			}
+		})
+	}
+}
+
 func TestWorktreeManager_CreateWorktreeReusesExistingWorktree(t *testing.T) {
 	mainRoot := t.TempDir()
 	baseCommit := initEpicRepo(t, mainRoot)
@@ -1266,7 +1289,7 @@ func TestReconcile_StaleCacheDirWorktree_Removed(t *testing.T) {
 	mainRoot := t.TempDir()
 	baseCommit := initEpicRepo(t, mainRoot)
 	workRoot := filepath.Join(t.TempDir(), repoWorktreeHash(mainRoot))
-	now := time.Date(2026, 4, 2, 12, 0, 0, 0, time.UTC)
+	now := time.Now().UTC()
 
 	staleRunID := "run-stale-no-activity"
 	staleTicketID := "ticket-a"
@@ -1361,7 +1384,7 @@ func TestReconcile_ActiveRun_NotTouched(t *testing.T) {
 	mainRoot := t.TempDir()
 	baseCommit := initEpicRepo(t, mainRoot)
 	workRoot := filepath.Join(t.TempDir(), repoWorktreeHash(mainRoot))
-	now := time.Now().UTC().Add(24 * time.Hour)
+	now := time.Now().UTC()
 
 	runID := "run-active-claim"
 	ticketID := "ticket-active"

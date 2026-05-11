@@ -1,7 +1,7 @@
 package epos
 
 import (
-	"path/filepath"
+	"path"
 	"verk/internal/state"
 
 	eposticket "github.com/php-workx/epos/ticket"
@@ -32,5 +32,5 @@ func RuntimeStateToClaimArtifact(runtimeState *eposticket.RuntimeState) *state.C
 }
 
 func liveClaimRelativePath(ticketID string) string {
-	return filepath.Join(".tickets", ".claims", ticketID+".json")
+	return path.Join(".tickets", ".claims", ticketID+".json")
 }

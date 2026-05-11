@@ -348,22 +348,24 @@ interactive behavior.
 
 ## Verification
 
-1. Unit tests for git worktree creation/removal.
-2. Unit tests for cache-root resolution and stale reconciliation.
-3. Unit tests for engine-owned path filtering.
-4. Unit tests for merge-back cases: modified, added, deleted, renamed,
+1. Run `just pre-commit` before merging engine/worktree changes.
+2. Run `just test-race` for orchestration, isolation, and cleanup semantics.
+3. Unit tests for git worktree creation/removal.
+4. Unit tests for cache-root resolution and stale reconciliation.
+5. Unit tests for engine-owned path filtering.
+6. Unit tests for merge-back cases: modified, added, deleted, renamed,
    type change, mode-only, symlink, nested paths, and engine-owned rejection.
-5. Unit tests for hidden integration base materialization across at least two
+7. Unit tests for hidden integration base materialization across at least two
    waves.
-6. Runtime adapter tests proving worker and reviewer commands use the worktree.
-7. Verification runner tests proving artifacts land in `repoRoot` while commands
+8. Runtime adapter tests proving worker and reviewer commands use the worktree.
+9. Verification runner tests proving artifacts land in `repoRoot` while commands
    run in `workDir`.
-8. Unit tests proving worker commits are allowed but only orchestrator-created
+10. Unit tests proving worker commits are allowed but only orchestrator-created
    internal ticket refs feed wave integration.
-9. Integration test: two tickets in one wave, one leaves a lint error, the other
+11. Integration test: two tickets in one wave, one leaves a lint error, the other
    still verifies and merges.
-10. Resume test: a blocked/resumed epic continues with isolated worktrees.
-11. Sub-epic test or explicit unsupported-path test.
+12. Resume test: a blocked/resumed epic continues with isolated worktrees.
+13. Sub-epic test or explicit unsupported-path test.
 
 ## Critical Files
 

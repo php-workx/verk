@@ -3,6 +3,7 @@ package epos
 import (
 	"errors"
 	"os"
+	"path"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -722,7 +723,7 @@ func TestLoadLiveClaim_ConvertsActiveRuntimeState(t *testing.T) {
 	if !claim.ExpiresAt.After(claim.LeasedAt) {
 		t.Fatalf("ExpiresAt = %s, LeasedAt = %s", claim.ExpiresAt, claim.LeasedAt)
 	}
-	if claim.LastSeenLiveClaimPath != filepath.Join(".tickets", ".claims", "ticket-1.json") {
+	if claim.LastSeenLiveClaimPath != path.Join(".tickets", ".claims", "ticket-1.json") {
 		t.Fatalf("LastSeenLiveClaimPath = %q", claim.LastSeenLiveClaimPath)
 	}
 }

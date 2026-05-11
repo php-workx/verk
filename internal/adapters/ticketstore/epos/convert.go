@@ -3,6 +3,8 @@ package epos
 import (
 	"fmt"
 	"reflect"
+	"strconv"
+	"strings"
 
 	eposticket "github.com/php-workx/epos/ticket"
 	"gopkg.in/yaml.v3"
@@ -298,13 +300,49 @@ func asString(v any) string {
 }
 
 func asInt(v any) int {
+	maxInt := uint64(^uint(0) >> 1)
+	minInt := -int64(maxInt) - 1
 	switch t := v.(type) {
 	case int:
 		return t
+	case int8:
+		return int(t)
+	case int16:
+		return int(t)
+	case int32:
+		return int(t)
 	case int64:
+		if t > int64(maxInt) || t < minInt {
+			return 0
+		}
+		return int(t)
+	case uint:
+		if uint64(t) > maxInt {
+			return 0
+		}
+		return int(t)
+	case uint8:
+		return int(t)
+	case uint16:
+		return int(t)
+	case uint32:
+		if uint64(t) > maxInt {
+			return 0
+		}
+		return int(t)
+	case uint64:
+		if t > maxInt {
+			return 0
+		}
 		return int(t)
 	case float64:
 		return int(t)
+	case string:
+		parsed, err := strconv.Atoi(strings.TrimSpace(t))
+		if err != nil {
+			return 0
+		}
+		return parsed
 	default:
 		return 0
 	}

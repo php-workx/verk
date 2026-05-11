@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -246,8 +247,9 @@ func TestRunTicket_ReviewDiffIncludesWorktreeOnlyFile(t *testing.T) {
 	}
 	baseCommit := strings.TrimSpace(headOut)
 
-	worktreePath := filepath.Join(repoRoot, "worktree-review")
+	worktreePath := filepath.Join(t.TempDir(), "worktree-review")
 	mustRunGit(t, repoRoot, "worktree", "add", worktreePath, "HEAD")
+	t.Cleanup(func() { _ = exec.Command("git", "-C", repoRoot, "worktree", "remove", "--force", worktreePath).Run() })
 	if err := os.WriteFile(filepath.Join(worktreePath, "ticket-only.txt"), []byte("worktree file\n"), 0o644); err != nil {
 		t.Fatalf("write worktree-only file: %v", err)
 	}

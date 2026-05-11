@@ -271,8 +271,10 @@ func closeoutBlockReason(gates map[string]state.GateResult, failedGate string, c
 
 func parseCloseoutRequest(args ...any) (closeoutRequest, error) {
 	var req closeoutRequest
+	gotTypes := make([]string, 0, len(args))
 
 	for _, arg := range args {
+		gotTypes = append(gotTypes, fmt.Sprintf("%T", arg))
 		switch v := arg.(type) {
 		case epos.Ticket:
 			req.ticket = v
@@ -309,7 +311,7 @@ func parseCloseoutRequest(args ...any) (closeoutRequest, error) {
 	}
 
 	if req.ticket.ID == "" {
-		return closeoutRequest{}, fmt.Errorf("closeout requires ticket metadata")
+		return closeoutRequest{}, fmt.Errorf("closeout requires ticket metadata; received arg types: %s", strings.Join(gotTypes, ", "))
 	}
 	if req.plan.TicketID == "" {
 		return closeoutRequest{}, fmt.Errorf("closeout requires plan artifact")

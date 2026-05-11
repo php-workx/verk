@@ -54,21 +54,31 @@ func gitOutput(dir string, args ...string) (string, error) {
 
 func testGitEnv() []string {
 	env := os.Environ()
-	out := make([]string, 0, len(env)+1)
+	out := make([]string, 0, len(env)+6)
 	for _, entry := range env {
 		key, _, found := strings.Cut(entry, "=")
 		if !found {
 			out = append(out, entry)
 			continue
 		}
+		if strings.HasPrefix(key, "GIT_CONFIG_KEY_") || strings.HasPrefix(key, "GIT_CONFIG_VALUE_") {
+			continue
+		}
 		switch key {
-		case "GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_PREFIX", "GIT_SUPER_PREFIX", "GIT_OPTIONAL_LOCKS":
+		case "GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_PREFIX", "GIT_SUPER_PREFIX", "GIT_OPTIONAL_LOCKS", "GIT_CONFIG", "GIT_CONFIG_COUNT", "GIT_CONFIG_GLOBAL", "GIT_CONFIG_NOSYSTEM", "GIT_CONFIG_PARAMETERS":
 			continue
 		default:
 			out = append(out, entry)
 		}
 	}
-	out = append(out, "GIT_OPTIONAL_LOCKS=0")
+	out = append(out,
+		"GIT_OPTIONAL_LOCKS=0",
+		"GIT_CONFIG_GLOBAL="+os.DevNull,
+		"GIT_CONFIG_NOSYSTEM=1",
+		"GIT_CONFIG_COUNT=1",
+		"GIT_CONFIG_KEY_0=core.hooksPath",
+		"GIT_CONFIG_VALUE_0="+os.DevNull,
+	)
 	return out
 }
 

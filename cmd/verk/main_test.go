@@ -266,7 +266,7 @@ func runGit(t *testing.T, dir string, args ...string) {
 
 func testGitEnv() []string {
 	env := os.Environ()
-	out := make([]string, 0, len(env)+4)
+	out := make([]string, 0, len(env)+6)
 	for _, entry := range env {
 		key, _, found := strings.Cut(entry, "=")
 		if !found {
@@ -280,9 +280,11 @@ func testGitEnv() []string {
 	}
 	out = append(out,
 		"GIT_OPTIONAL_LOCKS=0",
+		"GIT_CONFIG_GLOBAL="+os.DevNull,
+		"GIT_CONFIG_NOSYSTEM=1",
 		"GIT_CONFIG_COUNT=1",
 		"GIT_CONFIG_KEY_0=core.hooksPath",
-		"GIT_CONFIG_VALUE_0=/dev/null",
+		"GIT_CONFIG_VALUE_0="+os.DevNull,
 	)
 	return out
 }
@@ -296,6 +298,8 @@ func isGitLocalEnv(key string) bool {
 		"GIT_COMMON_DIR",
 		"GIT_CONFIG",
 		"GIT_CONFIG_COUNT",
+		"GIT_CONFIG_GLOBAL",
+		"GIT_CONFIG_NOSYSTEM",
 		"GIT_CONFIG_PARAMETERS",
 		"GIT_DIR",
 		"GIT_GRAFT_FILE",
@@ -307,6 +311,7 @@ func isGitLocalEnv(key string) bool {
 		"GIT_REPLACE_REF_BASE",
 		"GIT_SHALLOW_FILE",
 		"GIT_SUPER_PREFIX",
+		"GIT_OPTIONAL_LOCKS",
 		"GIT_WORK_TREE":
 		return true
 	default:

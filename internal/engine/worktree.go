@@ -81,16 +81,40 @@ func NewWorktreeManager(mainRoot, baseRef, runID, workRoot string) *WorktreeMana
 	}
 }
 
+func validateWorktreeID(id, label string) (string, error) {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return "", fmt.Errorf("%s is required", label)
+	}
+	if id == "." || id == ".." || strings.Contains(id, "..") {
+		return "", fmt.Errorf("%s %q contains invalid path traversal", label, id)
+	}
+	if strings.ContainsAny(id, `/\`) {
+		return "", fmt.Errorf("%s %q contains invalid path separators", label, id)
+	}
+	if strings.HasPrefix(id, ".") || strings.HasSuffix(id, ".") {
+		return "", fmt.Errorf("%s %q is not safe for git refs", label, id)
+	}
+	if strings.ContainsAny(id, " \t\r\n~^:?*[") {
+		return "", fmt.Errorf("%s %q contains invalid git ref characters", label, id)
+	}
+	if strings.HasSuffix(id, ".lock") || strings.Contains(id, "@{") {
+		return "", fmt.Errorf("%s %q is not safe for git refs", label, id)
+	}
+	return id, nil
+}
+
 func (wm *WorktreeManager) CreateWorktree(ctx context.Context, ticketID string) (string, error) {
 	if wm == nil {
 		return "", fmt.Errorf("worktree manager is nil")
 	}
-	ticketID = strings.TrimSpace(ticketID)
-	if ticketID == "" {
-		return "", fmt.Errorf("ticket id is required")
+	runID, err := validateWorktreeID(wm.runID, "run id")
+	if err != nil {
+		return "", err
 	}
-	if strings.Contains(ticketID, "/") || strings.Contains(ticketID, "..") || strings.Contains(ticketID, "\\") {
-		return "", fmt.Errorf("ticket id %q contains invalid path characters", ticketID)
+	ticketID, err = validateWorktreeID(ticketID, "ticket id")
+	if err != nil {
+		return "", err
 	}
 	if wm.mainRoot == "" {
 		return "", fmt.Errorf("main root is required")
@@ -106,7 +130,7 @@ func (wm *WorktreeManager) CreateWorktree(ctx context.Context, ticketID string) 
 	wm.mu.Lock()
 	defer wm.mu.Unlock()
 
-	worktreePath := filepath.Join(wm.workRoot, wm.runID, ticketID)
+	worktreePath := filepath.Join(wm.workRoot, runID, ticketID)
 	repo, err := git.New(wm.mainRoot)
 	if err != nil {
 		return "", fmt.Errorf("open main repo %q: %w", wm.mainRoot, err)
@@ -346,6 +370,11 @@ func integrationTicketRef(runID, ticketID string) string {
 }
 
 func ensureIntegrationBaseRef(repoRoot, runID, baseCommit string) (string, error) {
+	var err error
+	runID, err = validateWorktreeID(runID, "run id")
+	if err != nil {
+		return "", err
+	}
 	refName := integrationBaseRef(runID)
 	if _, err := gitRevParse(repoRoot, refName); err == nil {
 		return refName, nil
@@ -357,6 +386,11 @@ func ensureIntegrationBaseRef(repoRoot, runID, baseCommit string) (string, error
 }
 
 func prepareWaveIntegration(ctx context.Context, repoRoot, runID, workRoot, baseRef string) (*WaveIntegrationManager, error) {
+	var err error
+	runID, err = validateWorktreeID(runID, "run id")
+	if err != nil {
+		return nil, err
+	}
 	if strings.TrimSpace(workRoot) == "" {
 		resolvedRoot, err := ResolveWorktreeRoot(repoRoot)
 		if err != nil {
@@ -421,10 +455,18 @@ func (m *WaveIntegrationManager) FreezeAcceptedTicket(ticketID, worktreePath str
 	if m == nil {
 		return "", fmt.Errorf("wave integration manager is nil")
 	}
+	runID, err := validateWorktreeID(m.runID, "run id")
+	if err != nil {
+		return "", err
+	}
+	ticketID, err = validateWorktreeID(ticketID, "ticket id")
+	if err != nil {
+		return "", err
+	}
 	if strings.TrimSpace(worktreePath) == "" {
 		return "", fmt.Errorf("accepted ticket %q worktree path is required", ticketID)
 	}
-	refName := integrationTicketRef(m.runID, ticketID)
+	refName := integrationTicketRef(runID, ticketID)
 
 	if len(changedFiles) > 0 {
 		if err := gitAddAllPaths(worktreePath, changedFiles); err != nil {

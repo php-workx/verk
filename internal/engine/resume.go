@@ -706,6 +706,10 @@ func resumeEpicMode(ctx context.Context, req ResumeRequest, artifacts *runArtifa
 			cleanupWaveManager()
 		}
 		if len(mergeEligibleTicketIDs) > 0 && conflictErr == nil && acceptErr == nil {
+			if waveManager == nil {
+				cleanupWaveResources()
+				return allResumed, fmt.Errorf("wave %s requires prepared worktrees to integrate accepted tickets", waveID)
+			}
 			mergeChangedFiles, changedErr := changedFilesFromManager(waveManager, mergeEligibleTicketIDs)
 			if changedErr != nil {
 				cleanupWaveResources()
@@ -721,9 +725,6 @@ func resumeEpicMode(ctx context.Context, req ResumeRequest, artifacts *runArtifa
 			}
 			acceptedRefs := make([]string, 0, len(mergeEligibleTicketIDs))
 			for _, ticketID := range mergeEligibleTicketIDs {
-				if waveManager == nil {
-					continue
-				}
 				effectiveFiles, changedErr := waveManager.ChangedFiles(ticketID)
 				if changedErr != nil {
 					cleanupWaveResources()

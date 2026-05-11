@@ -1097,6 +1097,10 @@ func integrationManagerForPendingTransaction(req RunEpicRequest, tx pendingWaveI
 	if err != nil {
 		return nil, err
 	}
+	if len(tx.AcceptedRefs) == 0 {
+		_ = integration.Cleanup()
+		return nil, fmt.Errorf("pending wave %s is missing accepted_refs for rehydrate", tx.WaveID)
+	}
 	if err := integration.ApplyAcceptedTicketRefs(context.Background(), tx.AcceptedRefs); err != nil {
 		_ = integration.Cleanup()
 		return nil, err
@@ -1178,22 +1182,19 @@ func completeAlreadyAppliedPendingWaveIntegration(
 	if err != nil {
 		return true, err
 	}
-	if !samePathSet(finalChangedFiles, tx.ChangedFiles) {
+	if !pathSetIncludes(finalChangedFiles, tx.ChangedFiles) {
 		return false, nil
 	}
 	return true, persistCompletedPendingWaveIntegration(cursor, runPath, run, wave, wavePath, currentBaseHead, finalChangedFiles)
 }
 
-func samePathSet(a, b []string) bool {
-	left := filterEngineOwnedFiles(a)
-	right := filterEngineOwnedFiles(b)
-	if len(left) != len(right) {
-		return false
+func pathSetIncludes(haystack, needles []string) bool {
+	available := make(map[string]struct{}, len(haystack))
+	for _, path := range filterEngineOwnedFiles(haystack) {
+		available[path] = struct{}{}
 	}
-	sort.Strings(left)
-	sort.Strings(right)
-	for i := range left {
-		if left[i] != right[i] {
+	for _, path := range filterEngineOwnedFiles(needles) {
+		if _, ok := available[path]; !ok {
 			return false
 		}
 	}

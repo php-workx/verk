@@ -180,9 +180,10 @@ func RunCommands(ctx context.Context, repoRoot, workDir string, cmds []string, c
 }
 
 // RunQualityCommands runs structured verification commands from optional
-// subdirectories. Each QualityCommand specifies a path relative to repoRoot and
-// one or more shell commands to run sequentially from that directory. This
-// supports monorepo setups where different packages have different gates.
+// subdirectories. Each QualityCommand specifies a path relative to workDir (or
+// repoRoot when workDir is empty) and one or more shell commands to run
+// sequentially from that directory. This supports monorepo setups where
+// different packages have different gates.
 func RunQualityCommands(ctx context.Context, repoRoot, workDir string, cmds []policy.QualityCommand, cfg policy.VerificationConfig) ([]CommandResult, error) {
 	if ctx == nil {
 		ctx = context.Background()

@@ -311,7 +311,7 @@ func TestRunCommands_DefaultEnvIncludesPath(t *testing.T) {
 
 func TestVerificationEnv_IsolatesToolCachesOutsideWorkingTreeOutputs(t *testing.T) {
 	repoRoot := t.TempDir()
-	workDir := filepath.Join(t.TempDir(), "worktree")
+	workDir := filepath.Join(repoRoot, "worktree")
 	if err := os.MkdirAll(workDir, 0o755); err != nil {
 		t.Fatalf("prepare work dir: %v", err)
 	}

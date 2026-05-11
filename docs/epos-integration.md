@@ -3,7 +3,7 @@
 **Status:** revised after pre-mortem. Ready to execute once epos `v0.2.0` is published with the required pre-flight commits.
 **Scope:** Replace `verk/internal/adapters/ticketstore/tkmd` (3107 LOC, 28 call sites) with a new `verk/internal/adapters/ticketstore/epos` package backed by the `github.com/php-workx/epos` library.
 **Source ADR:** `fabrikk-kb/decisions/0004-shared-ticket-system-architecture.md` (Phase 5)
-**Source plan:** `/Users/runger/workspaces/epos/IMPLEMENTATION_PLAN.md` Epic E6.
+**Source plan:** `$EPOS_ROOT/IMPLEMENTATION_PLAN.md` Epic E6.
 
 ---
 
@@ -215,19 +215,19 @@ Port verk's symlink-aware containment helpers (`assertPathUnderBase`, `resolveBa
 
 ## Phase Breakdown
 
-Estimate: **6 sessions, ~3–6 hours of agent time each**. Each phase ends in a green CI gate (`just check` or `go test ./...`).
+Estimate: **6 sessions, ~3–6 hours of agent time each**. Each phase ends in a green repo gate: `just pre-commit` for focused changes, `just test-race` for orchestration/isolation changes, and `just check` before merge.
 
 ### Phase 1 — Pre-flight + dependency add (~1 session)
 
 1. Stash/commit verk's pending `AGENTS.md` change.
 2. Confirm `github.com/php-workx/epos@v0.2.0` is published and contains commits `65248f2`, `56a310e`, and `f9ecd4f`. Do not start implementation against `v0.1.0`.
-3. `cd /Users/runger/workspaces/verk && go get github.com/php-workx/epos@v0.2.0`.
+3. `cd $VERK_ROOT && go get github.com/php-workx/epos@v0.2.0`.
 4. Add a sentinel import in `verk/internal/adapters/ticketstore/epos/doc.go` (new file, just `_ "github.com/php-workx/epos/ticket"` blank import) so `go mod tidy` keeps the dep until real usage exists.
-5. `go mod tidy && go build ./...` — must stay green.
+5. `go mod tidy`, then `just pre-commit` — must stay green.
 6. Create new package directory `verk/internal/adapters/ticketstore/epos/` with stub files: `doc.go`, `types.go`, `store.go`, `claims.go`, `convert.go`, `containment.go`, `live.go`. No exported behavior yet beyond compile-safe stubs if needed.
 7. Commit: `chore(deps): add epos v0.2.0 + adapter package skeleton`.
 
-**Exit:** `go build ./...` + `go test ./...` green; new package compiles; tkmd untouched.
+**Exit:** `just pre-commit` green; new package compiles; tkmd untouched.
 
 ### Phase 2 — Types, conversion, schema tests (~1 session)
 
@@ -333,12 +333,12 @@ The epos `ticket/internal/safepath` package is unreachable from outside the epos
    - `internal/engine/resume.go` `reconcileTicketClaimForResume`: replace `loadOptionalClaim(liveClaimPath(...))` with `epos.LoadLiveClaim(repoRoot, ticketID)`.
    - Keep durable reads through `loadOptionalClaim(durableClaimPath(...))`.
 3. Update `pkg/verk/types.go:65` from `type Ticket = tkmd.Ticket` to `type Ticket = epos.Ticket`. Same struct shape, alias preserved.
-4. Run full verk test suite: `cd /Users/runger/workspaces/verk && go test ./...`. All ~250 integration tests must pass without tkmd.
+4. Run the repo gate from `$VERK_ROOT`: `just pre-commit`. All integration tests must pass without tkmd.
 5. If any test pulls tkmd-internal helpers (`decodeFrontMatter`, `asInt`, etc.), it must be either:
    - rewritten to test public behavior, or
    - deleted because the new adapter doesn't expose them (per Phase 1 inventory: only tkmd's own tests do this, not engine/cli/e2e tests — should be a no-op).
 6. Delete `verk/internal/adapters/ticketstore/tkmd/` entirely (4 source files + 2 test files + 2 lock files = 8 files).
-7. Run `go vet ./...`, `go build ./...`, `golangci-lint run ./...` — clean.
+7. Run `just test-race` because this migration touches orchestration and isolation behavior.
 8. Run `just check` (verk's full quality gate).
 9. Commit: `refactor!: replace tkmd with epos adapter`. Mention BREAKING in body if external consumers depend on tkmd directly (none expected, but worth a `go doc verk` sanity check before merge).
 
@@ -349,21 +349,21 @@ The epos `ticket/internal/safepath` package is unreachable from outside the epos
 ## Critical Files
 
 ### epos library (read-only, reuse heavily)
-- `/Users/runger/workspaces/epos/ticket/tickets.go` — canonical Ticket struct + functional options + Status constants
-- `/Users/runger/workspaces/epos/ticket/markdown/frontmatter.go` — `MarshalTicket`, `UnmarshalTicket`, `UpdateFrontmatter`, `UpdateBody`
-- `/Users/runger/workspaces/epos/ticket/markdown/body.go` — `ExtractHeadingTitle`, `RenderSections`, `AddNote`
-- `/Users/runger/workspaces/epos/ticket/markdown/compat.go` — `StatusToTK`, `StatusFromTK`, `StatusToExtended` — use where compatible, but preserve verk's explicit normalization tests if mappings differ
-- `/Users/runger/workspaces/epos/ticket/store/store.go` — `FileStore`, `Create`/`Read`/`Update`/`Delete`/`List`/`ResolveID`/`AddNote`/`AddDep`/`RemoveDep`/`Link`/`Unlink`/`ListAllChildren`/`FilterReadyChildren`. Use read/CRUD primitives, but do not blindly wrap child/ready filters where verk compatibility differs.
-- `/Users/runger/workspaces/epos/ticket/store/claims.go` — `ActiveClaimSet`, `ListReady`
-- `/Users/runger/workspaces/epos/ticket/runtime/claim.go` — `Claim`/`Release`/`Renew`/`ReclaimExpired`/`ReadClaimsForRun`/`ClaimAllowsReady`/`ReadRuntimeState`/`WriteRuntimeState`
-- `/Users/runger/workspaces/epos/ticket/runtime.go` — `RuntimeState`, `Claim`, `Lease`, `Heartbeat`; source shape for `LoadLiveClaim`
-- `/Users/runger/workspaces/epos/ticket/graph/deps.go` — `ReadyFilter`/`BlockedFilter`/`DetectCycles`/`FilterChildren`/`FilterReadyChildren`. Use as reference only where it preserves verk behavior.
+- `$EPOS_ROOT/ticket/tickets.go` — canonical Ticket struct + functional options + Status constants
+- `$EPOS_ROOT/ticket/markdown/frontmatter.go` — `MarshalTicket`, `UnmarshalTicket`, `UpdateFrontmatter`, `UpdateBody`
+- `$EPOS_ROOT/ticket/markdown/body.go` — `ExtractHeadingTitle`, `RenderSections`, `AddNote`
+- `$EPOS_ROOT/ticket/markdown/compat.go` — `StatusToTK`, `StatusFromTK`, `StatusToExtended` — use where compatible, but preserve verk's explicit normalization tests if mappings differ
+- `$EPOS_ROOT/ticket/store/store.go` — `FileStore`, `Create`/`Read`/`Update`/`Delete`/`List`/`ResolveID`/`AddNote`/`AddDep`/`RemoveDep`/`Link`/`Unlink`/`ListAllChildren`/`FilterReadyChildren`. Use read/CRUD primitives, but do not blindly wrap child/ready filters where verk compatibility differs.
+- `$EPOS_ROOT/ticket/store/claims.go` — `ActiveClaimSet`, `ListReady`
+- `$EPOS_ROOT/ticket/runtime/claim.go` — `Claim`/`Release`/`Renew`/`ReclaimExpired`/`ReadClaimsForRun`/`ClaimAllowsReady`/`ReadRuntimeState`/`WriteRuntimeState`
+- `$EPOS_ROOT/ticket/runtime.go` — `RuntimeState`, `Claim`, `Lease`, `Heartbeat`; source shape for `LoadLiveClaim`
+- `$EPOS_ROOT/ticket/graph/deps.go` — `ReadyFilter`/`BlockedFilter`/`DetectCycles`/`FilterChildren`/`FilterReadyChildren`. Use as reference only where it preserves verk behavior.
 
 ### verk source (modify)
-- `/Users/runger/workspaces/verk/go.mod` — add epos dep (Phase 1)
-- `/Users/runger/workspaces/verk/internal/adapters/ticketstore/epos/` — new package (Phases 1–5)
-- `/Users/runger/workspaces/verk/internal/adapters/ticketstore/tkmd/` — delete (Phase 6)
-- `/Users/runger/workspaces/verk/pkg/verk/types.go:65` — update type alias (Phase 6)
+- `$VERK_ROOT/go.mod` — add epos dep (Phase 1)
+- `$VERK_ROOT/internal/adapters/ticketstore/epos/` — new package (Phases 1–5)
+- `$VERK_ROOT/internal/adapters/ticketstore/tkmd/` — delete (Phase 6)
+- `$VERK_ROOT/pkg/verk/types.go:65` — update type alias (Phase 6)
 - 28 call sites for import-path rename (Phase 6). Current inventory from `rg -l "internal/adapters/ticketstore/tkmd" --glob '*.go' .`; refresh before cutover. Top-volume files:
   - `internal/cli/run.go`
   - `internal/engine/ticket_run.go` (1280, 1518)
@@ -377,19 +377,19 @@ The epos `ticket/internal/safepath` package is unreachable from outside the epos
   - `cmd/verk/main_test.go`, `internal/cli/run_*_test.go`
 
 ### verk source (read-only, source of truth for porting)
-- `/Users/runger/workspaces/verk/internal/state/types.go:388-400` — `state.ClaimArtifact` definition
-- `/Users/runger/workspaces/verk/internal/adapters/ticketstore/tkmd/claims.go` — claim/lease state machine; port AcquireClaim/RenewClaim/ReleaseClaim/ReconcileClaim
-- `/Users/runger/workspaces/verk/internal/adapters/ticketstore/tkmd/store.go` — frontmatter codec (mostly replaceable by epos), raw body/path contract (must preserve), `extractHeadingTitle` (parity check vs epos), `validateOwnedPath` (port), `isChildOf`/`loadEpicChildren`/`depsClosed` (port semantics), `claimAllowsReady` (replace with epos live claim set plus durable archive logic)
-- `/Users/runger/workspaces/verk/internal/adapters/ticketstore/tkmd/types.go` — Ticket + Status; mirror in new package
+- `$VERK_ROOT/internal/state/types.go:388-400` — `state.ClaimArtifact` definition
+- `$VERK_ROOT/internal/adapters/ticketstore/tkmd/claims.go` — claim/lease state machine; port AcquireClaim/RenewClaim/ReleaseClaim/ReconcileClaim
+- `$VERK_ROOT/internal/adapters/ticketstore/tkmd/store.go` — frontmatter codec (mostly replaceable by epos), raw body/path contract (must preserve), `extractHeadingTitle` (parity check vs epos), `validateOwnedPath` (port), `isChildOf`/`loadEpicChildren`/`depsClosed` (port semantics), `claimAllowsReady` (replace with epos live claim set plus durable archive logic)
+- `$VERK_ROOT/internal/adapters/ticketstore/tkmd/types.go` — Ticket + Status; mirror in new package
 
 ---
 
 ## Verification
 
 ### Per-phase
-- `cd /Users/runger/workspaces/verk && go build ./...` after every change.
-- `go test ./internal/adapters/ticketstore/epos/...` after Phases 2–5.
-- Full suite `go test ./...` after Phase 6.
+- `just pre-commit` after each phase.
+- `go test ./internal/adapters/ticketstore/epos/...` after Phases 2–5 for fast adapter feedback.
+- `just test-race` after Phase 6 because the cutover touches orchestration and isolation behavior.
 - After Phase 3, explicitly inspect a saved fixture to confirm arbitrary raw body text is unchanged and the file path did not change.
 - After Phase 4, run focused tests for both parent-backed and epic-deps-backed child discovery.
 - After Phase 6, run resume/status focused tests that exercise live epos RuntimeState sidecars.
@@ -422,7 +422,7 @@ The epos `ticket/internal/safepath` package is unreachable from outside the epos
 ## Handoff Notes for Fresh Agent
 
 - **Start here:** read `IMPLEMENTATION_PLAN.md` E6, then this file, then the pre-mortem report at `.agents/council/2026-05-08-pre-mortem-epos-integration.md`. Refresh the tkmd call-site inventory with `rg` before Phase 6.
-- **Per-session checkpoint:** at the end of each phase, run `git log --oneline -5` in both repos to confirm clean commit boundaries; run `go test ./...` in verk to confirm green.
+- **Per-session checkpoint:** at the end of each phase, run `git log --oneline -5` in both repos to confirm clean commit boundaries; run `just pre-commit` in verk to confirm green.
 - **Don't merge phases.** Each commit must be revertible.
 - **Don't touch fabrikk** during this migration. fabrikk integration is a separate epic.
 - **Don't expand epos `RuntimeState`.** User-approved decision: keep epos lean, durable archive stays in verk. Only revisit if Phase 5 surfaces a hard blocker.

@@ -97,6 +97,28 @@ func TestDiffAgainstIncludesUntrackedFiles(t *testing.T) {
 	}
 }
 
+func TestDiffAgainstHandlesEmptyAndBinaryUntrackedFiles(t *testing.T) {
+	repo, root, baseCommit := newTestRepo(t)
+
+	if err := os.WriteFile(filepath.Join(root, "empty.txt"), nil, 0o644); err != nil {
+		t.Fatalf("write empty file: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "blob.bin"), []byte{0x00, 0x01, 0x02}, 0o644); err != nil {
+		t.Fatalf("write binary file: %v", err)
+	}
+
+	diff, err := repo.DiffAgainst(baseCommit)
+	if err != nil {
+		t.Fatalf("DiffAgainst: %v", err)
+	}
+	if strings.Contains(diff, "@@ -0,0 +1,0 @@") {
+		t.Fatalf("empty untracked file emitted invalid hunk:\n%s", diff)
+	}
+	if !strings.Contains(diff, "Binary files /dev/null and b/blob.bin differ") {
+		t.Fatalf("expected binary placeholder in diff, got:\n%s", diff)
+	}
+}
+
 func TestDiffAgainstSkipsDisappearedUntrackedFiles(t *testing.T) {
 	repo, root, _ := newTestRepo(t)
 
@@ -311,21 +333,31 @@ func runGitOutput(t *testing.T, dir string, args ...string) string {
 
 func testGitEnv() []string {
 	env := os.Environ()
-	out := make([]string, 0, len(env)+1)
+	out := make([]string, 0, len(env)+6)
 	for _, entry := range env {
 		key, _, found := strings.Cut(entry, "=")
 		if !found {
 			out = append(out, entry)
 			continue
 		}
+		if strings.HasPrefix(key, "GIT_CONFIG_KEY_") || strings.HasPrefix(key, "GIT_CONFIG_VALUE_") {
+			continue
+		}
 		switch key {
-		case "GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_PREFIX", "GIT_SUPER_PREFIX", "GIT_OPTIONAL_LOCKS":
+		case "GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_PREFIX", "GIT_SUPER_PREFIX", "GIT_OPTIONAL_LOCKS", "GIT_CONFIG", "GIT_CONFIG_COUNT", "GIT_CONFIG_GLOBAL", "GIT_CONFIG_NOSYSTEM", "GIT_CONFIG_PARAMETERS":
 			continue
 		default:
 			out = append(out, entry)
 		}
 	}
-	out = append(out, "GIT_OPTIONAL_LOCKS=0")
+	out = append(out,
+		"GIT_OPTIONAL_LOCKS=0",
+		"GIT_CONFIG_GLOBAL="+os.DevNull,
+		"GIT_CONFIG_NOSYSTEM=1",
+		"GIT_CONFIG_COUNT=1",
+		"GIT_CONFIG_KEY_0=core.hooksPath",
+		"GIT_CONFIG_VALUE_0="+os.DevNull,
+	)
 	return out
 }
 
