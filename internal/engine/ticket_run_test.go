@@ -2046,6 +2046,374 @@ func TestTicketRunState_snapshotOutcome(t *testing.T) {
 	}
 }
 
+// TestClassifyTicketStop covers the deterministic outcome rules.
+func TestClassifyTicketStop(t *testing.T) {
+	cases := []struct {
+		name  string
+		phase state.TicketPhase
+		kind  stopKind
+		want  state.TicketOutcome
+	}{
+		{
+			name:  "cancelled_kind",
+			phase: state.TicketPhaseImplement,
+			kind:  stopKindCancelled,
+			want:  state.TicketOutcomeCancelled,
+		},
+		{
+			name:  "needs_context_kind",
+			phase: state.TicketPhaseImplement,
+			kind:  stopKindNeedsContext,
+			want:  state.TicketOutcomeBlocked,
+		},
+		{
+			name:  "claim_lost_kind",
+			phase: state.TicketPhaseReview,
+			kind:  stopKindClaimLost,
+			want:  state.TicketOutcomeBlocked,
+		},
+		{
+			name:  "budget_exhausted_kind",
+			phase: state.TicketPhaseVerify,
+			kind:  stopKindBudgetExhausted,
+			want:  state.TicketOutcomeNeedsDecision,
+		},
+		{
+			name:  "scope_violation_kind",
+			phase: state.TicketPhaseVerify,
+			kind:  stopKindScopeViolation,
+			want:  state.TicketOutcomeNeedsDecision,
+		},
+		{
+			name:  "generic_kind_falls_back_to_blocked",
+			phase: state.TicketPhaseImplement,
+			kind:  stopKindGeneric,
+			want:  state.TicketOutcomeBlocked,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := classifyTicketStop(tc.phase, tc.kind)
+			if got != tc.want {
+				t.Fatalf("classifyTicketStop(%q, %d) = %q, want %q", tc.phase, tc.kind, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestTicketRunState_snapshotPrefersCurrentOutcome verifies that an explicitly
+// set currentOutcome wins over the phase-derived fallback.
+func TestTicketRunState_snapshotPrefersCurrentOutcome(t *testing.T) {
+	st := &ticketRunState{
+		req: RunTicketRequest{
+			RunID:  "run-outcome-pref",
+			Ticket: epos.Ticket{ID: "ver-outcome-pref"},
+		},
+		currentPhase:   state.TicketPhaseBlocked,
+		currentOutcome: state.TicketOutcomeNeedsDecision,
+	}
+	snap := st.snapshot()
+	if snap.Outcome != state.TicketOutcomeNeedsDecision {
+		t.Fatalf("expected needs_decision outcome, got %q", snap.Outcome)
+	}
+}
+
+// TestRunTicket_VerificationBudgetExhaustionIsNeedsDecision verifies that when
+// the implementation attempt budget runs out, the outcome is needs_decision (not
+// the generic blocked).
+func TestRunTicket_VerificationBudgetExhaustionIsNeedsDecision(t *testing.T) {
+	repoRoot := t.TempDir()
+	cfg := policy.DefaultConfig()
+	cfg.Policy.MaxImplementationAttempts = 1
+	ticket := testTicket("ver-budget-exhausted")
+	plan, claim := testPlanAndClaim(t, repoRoot, ticket, cfg, "run-budget-exhausted", "lease-budget-exhausted", []string{`exit 1`})
+
+	started, finished := testRunTimes()
+	adapter := runtimefake.New(
+		[]runtime.WorkerResult{
+			{
+				Status:             runtime.WorkerStatusDone,
+				RetryClass:         runtime.RetryClassTerminal,
+				LeaseID:            claim.LeaseID,
+				StartedAt:          started,
+				FinishedAt:         finished,
+				ResultArtifactPath: filepath.Join(repoRoot, "worker.json"),
+			},
+		},
+		nil,
+	)
+
+	result, err := RunTicket(context.Background(), RunTicketRequest{
+		RepoRoot: repoRoot,
+		RunID:    "run-budget-exhausted",
+		Ticket:   ticket,
+		Plan:     plan,
+		Claim:    claim,
+		Adapter:  adapter,
+		Config:   cfg,
+	})
+	if err != nil {
+		t.Fatalf("RunTicket returned error: %v", err)
+	}
+	if result.Snapshot.CurrentPhase != state.TicketPhaseBlocked {
+		t.Fatalf("expected blocked phase, got %q", result.Snapshot.CurrentPhase)
+	}
+	if result.Snapshot.Outcome != state.TicketOutcomeNeedsDecision {
+		t.Fatalf("expected needs_decision outcome for budget exhaustion, got %q", result.Snapshot.Outcome)
+	}
+}
+
+// TestRunTicket_RepairBudgetExhaustionIsNeedsDecision verifies that when the
+// repair cycle budget runs out, the outcome is needs_decision.
+func TestRunTicket_RepairBudgetExhaustionIsNeedsDecision(t *testing.T) {
+	repoRoot := t.TempDir()
+	cfg := policy.DefaultConfig()
+	cfg.Policy.MaxRepairCycles = 1
+	ticket := testTicket("ver-repair-budget")
+	plan, claim := testPlanAndClaim(t, repoRoot, ticket, cfg, "run-repair-budget", "lease-repair-budget", []string{`true`})
+
+	started, finished := testRunTimes()
+	blockingFinding := runtime.ReviewFinding{
+		ID:          "finding-1",
+		Severity:    runtime.SeverityP2,
+		Title:       "blocking issue",
+		Body:        "blocking issue",
+		File:        "internal/example.go",
+		Line:        12,
+		Disposition: runtime.ReviewDispositionOpen,
+	}
+	adapter := runtimefake.New(
+		[]runtime.WorkerResult{
+			{
+				Status:             runtime.WorkerStatusDone,
+				RetryClass:         runtime.RetryClassTerminal,
+				LeaseID:            claim.LeaseID,
+				StartedAt:          started,
+				FinishedAt:         finished,
+				ResultArtifactPath: filepath.Join(repoRoot, "worker-1.json"),
+			},
+			{
+				Status:             runtime.WorkerStatusDone,
+				RetryClass:         runtime.RetryClassTerminal,
+				LeaseID:            claim.LeaseID,
+				StartedAt:          finished.Add(3 * time.Second),
+				FinishedAt:         finished.Add(4 * time.Second),
+				ResultArtifactPath: filepath.Join(repoRoot, "worker-2.json"),
+			},
+		},
+		[]runtime.ReviewResult{
+			{
+				Status:             runtime.WorkerStatusDone,
+				RetryClass:         runtime.RetryClassTerminal,
+				LeaseID:            claim.LeaseID,
+				StartedAt:          finished.Add(5 * time.Second),
+				FinishedAt:         finished.Add(6 * time.Second),
+				ReviewStatus:       runtime.ReviewStatusFindings,
+				Summary:            "needs repair",
+				Findings:           []runtime.ReviewFinding{blockingFinding},
+				ResultArtifactPath: filepath.Join(repoRoot, "review-1.json"),
+			},
+			{
+				Status:             runtime.WorkerStatusDone,
+				RetryClass:         runtime.RetryClassTerminal,
+				LeaseID:            claim.LeaseID,
+				StartedAt:          finished.Add(7 * time.Second),
+				FinishedAt:         finished.Add(8 * time.Second),
+				ReviewStatus:       runtime.ReviewStatusFindings,
+				Summary:            "still blocked",
+				Findings:           []runtime.ReviewFinding{blockingFinding},
+				ResultArtifactPath: filepath.Join(repoRoot, "review-2.json"),
+			},
+		},
+	)
+
+	result, err := RunTicket(context.Background(), RunTicketRequest{
+		RepoRoot: repoRoot,
+		RunID:    "run-repair-budget",
+		Ticket:   ticket,
+		Plan:     plan,
+		Claim:    claim,
+		Adapter:  adapter,
+		Config:   cfg,
+	})
+	if err != nil {
+		t.Fatalf("RunTicket returned error: %v", err)
+	}
+	if result.Snapshot.CurrentPhase != state.TicketPhaseBlocked {
+		t.Fatalf("expected blocked phase, got %q", result.Snapshot.CurrentPhase)
+	}
+	if result.Snapshot.Outcome != state.TicketOutcomeNeedsDecision {
+		t.Fatalf("expected needs_decision outcome for repair budget exhaustion, got %q", result.Snapshot.Outcome)
+	}
+}
+
+// TestRunTicket_NeedsContextOutcomeIsBlocked verifies that worker needs_context
+// sets outcome=blocked.
+func TestRunTicket_NeedsContextOutcomeIsBlocked(t *testing.T) {
+	repoRoot := t.TempDir()
+	cfg := policy.DefaultConfig()
+	ticket := testTicket("ver-needs-ctx-outcome")
+	plan, claim := testPlanAndClaim(t, repoRoot, ticket, cfg, "run-needs-ctx-outcome", "lease-needs-ctx-outcome", []string{`true`})
+
+	started, finished := testRunTimes()
+	adapter := runtimefake.New(
+		[]runtime.WorkerResult{
+			{
+				Status:             runtime.WorkerStatusNeedsContext,
+				CompletionCode:     "needs_context",
+				BlockReason:        "missing API key",
+				RetryClass:         runtime.RetryClassTerminal,
+				LeaseID:            claim.LeaseID,
+				StartedAt:          started,
+				FinishedAt:         finished,
+				ResultArtifactPath: filepath.Join(repoRoot, "worker.json"),
+			},
+		},
+		nil,
+	)
+
+	result, err := RunTicket(context.Background(), RunTicketRequest{
+		RepoRoot: repoRoot,
+		RunID:    "run-needs-ctx-outcome",
+		Ticket:   ticket,
+		Plan:     plan,
+		Claim:    claim,
+		Adapter:  adapter,
+		Config:   cfg,
+	})
+	if err != nil {
+		t.Fatalf("RunTicket returned error: %v", err)
+	}
+	if result.Snapshot.CurrentPhase != state.TicketPhaseBlocked {
+		t.Fatalf("expected blocked phase, got %q", result.Snapshot.CurrentPhase)
+	}
+	if result.Snapshot.Outcome != state.TicketOutcomeBlocked {
+		t.Fatalf("expected blocked outcome for needs_context, got %q", result.Snapshot.Outcome)
+	}
+}
+
+// TestRunTicket_ScopeViolationOutcomeIsNeedsDecision verifies that scope
+// violations produce needs_decision, not the generic blocked.
+func TestRunTicket_ScopeViolationOutcomeIsNeedsDecision(t *testing.T) {
+	repoRoot := t.TempDir()
+
+	mustRunGit(t, repoRoot, "init")
+	if err := os.WriteFile(filepath.Join(repoRoot, "tracked.txt"), []byte("base\n"), 0o644); err != nil {
+		t.Fatalf("seed repo: %v", err)
+	}
+	mustRunGit(t, repoRoot, "add", "tracked.txt")
+	mustRunGit(t, repoRoot, "commit", "-m", "base")
+
+	headOut, err := gitOutput(repoRoot, "rev-parse", "HEAD")
+	if err != nil {
+		t.Fatalf("rev-parse HEAD: %v", err)
+	}
+	baseCommit := strings.TrimSpace(headOut)
+
+	outsideDir := filepath.Join(repoRoot, "outside")
+	if err := os.MkdirAll(outsideDir, 0o755); err != nil {
+		t.Fatalf("mkdir outside: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(outsideDir, "violation.go"), []byte("package outside\n"), 0o644); err != nil {
+		t.Fatalf("write violation file: %v", err)
+	}
+	mustRunGit(t, repoRoot, "add", "outside/violation.go")
+	mustRunGit(t, repoRoot, "commit", "-m", "out-of-scope change")
+
+	cfg := policy.DefaultConfig()
+	ticket := epos.Ticket{
+		ID:         "ver-scope-outcome",
+		Title:      "Ticket ver-scope-outcome",
+		OwnedPaths: []string{"internal/engine"},
+		UnknownFrontmatter: map[string]any{
+			"type": "task",
+		},
+	}
+	plan, claim := testPlanAndClaim(t, repoRoot, ticket, cfg, "run-scope-outcome", "lease-scope-outcome", []string{`true`})
+
+	started, finished := testRunTimes()
+	adapter := runtimefake.New(
+		[]runtime.WorkerResult{
+			{
+				Status:             runtime.WorkerStatusDone,
+				RetryClass:         runtime.RetryClassTerminal,
+				LeaseID:            claim.LeaseID,
+				StartedAt:          started,
+				FinishedAt:         finished,
+				ResultArtifactPath: filepath.Join(repoRoot, "worker.json"),
+			},
+		},
+		nil,
+	)
+
+	result, err := RunTicket(context.Background(), RunTicketRequest{
+		RepoRoot:           repoRoot,
+		RunID:              "run-scope-outcome",
+		BaseCommit:         baseCommit,
+		Ticket:             ticket,
+		Plan:               plan,
+		Claim:              claim,
+		Adapter:            adapter,
+		Config:             cfg,
+		EnforceSingleScope: true,
+	})
+	if err != nil {
+		t.Fatalf("RunTicket returned error: %v", err)
+	}
+	if result.Snapshot.CurrentPhase != state.TicketPhaseBlocked {
+		t.Fatalf("expected blocked phase, got %q", result.Snapshot.CurrentPhase)
+	}
+	if result.Snapshot.Outcome != state.TicketOutcomeNeedsDecision {
+		t.Fatalf("expected needs_decision outcome for scope violation, got %q", result.Snapshot.Outcome)
+	}
+}
+
+// TestRunTicket_OperatorCancellationIsOutcomeCancelled verifies that when a
+// worker returns RetryClassBlockedByOperatorInput, the outcome is cancelled.
+func TestRunTicket_OperatorCancellationIsOutcomeCancelled(t *testing.T) {
+	repoRoot := t.TempDir()
+	cfg := policy.DefaultConfig()
+	ticket := testTicket("ver-op-cancel")
+	plan, claim := testPlanAndClaim(t, repoRoot, ticket, cfg, "run-op-cancel", "lease-op-cancel", []string{`true`})
+
+	started, finished := testRunTimes()
+	adapter := runtimefake.New(
+		[]runtime.WorkerResult{
+			{
+				Status:             runtime.WorkerStatusBlocked,
+				CompletionCode:     "operator_cancelled",
+				BlockReason:        "operator cancelled the run",
+				RetryClass:         runtime.RetryClassBlockedByOperatorInput,
+				LeaseID:            claim.LeaseID,
+				StartedAt:          started,
+				FinishedAt:         finished,
+				ResultArtifactPath: filepath.Join(repoRoot, "worker.json"),
+			},
+		},
+		nil,
+	)
+
+	result, err := RunTicket(context.Background(), RunTicketRequest{
+		RepoRoot: repoRoot,
+		RunID:    "run-op-cancel",
+		Ticket:   ticket,
+		Plan:     plan,
+		Claim:    claim,
+		Adapter:  adapter,
+		Config:   cfg,
+	})
+	if err != nil {
+		t.Fatalf("RunTicket returned error: %v", err)
+	}
+	if result.Snapshot.CurrentPhase != state.TicketPhaseBlocked {
+		t.Fatalf("expected blocked phase, got %q", result.Snapshot.CurrentPhase)
+	}
+	if result.Snapshot.Outcome != state.TicketOutcomeCancelled {
+		t.Fatalf("expected cancelled outcome for operator input block, got %q", result.Snapshot.Outcome)
+	}
+}
+
 func TestTicketRunState_snapshotPreservesRestoredCreatedAt(t *testing.T) {
 	repoRoot := t.TempDir()
 	runID := "run-snapshot-restore"

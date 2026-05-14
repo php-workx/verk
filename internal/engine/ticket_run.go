@@ -67,6 +67,35 @@ type TicketRunSnapshot struct {
 	Closeout               *state.CloseoutArtifact       `json:"closeout,omitempty"`
 }
 
+// stopKind classifies the reason a ticket stopped, allowing the engine to
+// assign a precise outcome without needing LLM input.
+type stopKind int
+
+const (
+	stopKindGeneric         stopKind = iota
+	stopKindBudgetExhausted          // repair or impl budget exhausted
+	stopKindNeedsContext             // worker explicitly needs context
+	stopKindClaimLost                // claim renewal lost mid-execution
+	stopKindScopeViolation           // changed files outside owned scope
+	stopKindCancelled                // operator-initiated cancellation
+)
+
+// classifyTicketStop maps a stop phase and reason kind to the correct
+// TicketOutcome. All rules are deterministic; no LLM is involved.
+func classifyTicketStop(phase state.TicketPhase, kind stopKind) state.TicketOutcome {
+	switch kind {
+	case stopKindCancelled:
+		return state.TicketOutcomeCancelled
+	case stopKindNeedsContext, stopKindClaimLost:
+		return state.TicketOutcomeBlocked
+	case stopKindBudgetExhausted, stopKindScopeViolation:
+		return state.TicketOutcomeNeedsDecision
+	default:
+		_ = phase // reserved for future phase-specific rules
+		return state.TicketOutcomeBlocked
+	}
+}
+
 type ticketRunState struct {
 	ctx                    context.Context
 	req                    RunTicketRequest
@@ -75,6 +104,7 @@ type ticketRunState struct {
 	repoRoot               string
 	worktreePath           string
 	currentPhase           state.TicketPhase
+	currentOutcome         state.TicketOutcome
 	blockReason            string
 	createdAt              time.Time // set once; zero means lazy-init on first snapshot()
 	implementation         *state.ImplementationArtifact
@@ -581,6 +611,7 @@ func handleImplementResult(st *ticketRunState, result runtime.WorkerResult, req 
 		reason := workerBlockReason(result)
 		st.blockReason = reason
 		st.implementation.BlockReason = reason
+		st.currentOutcome = classifyTicketStop(st.currentPhase, stopKindNeedsContext)
 		if err := st.transitionTo(state.TicketPhaseBlocked); err != nil {
 			return err
 		}
@@ -668,6 +699,7 @@ func checkSingleTicketScope(st *ticketRunState) error {
 	ownedPaths := st.req.Ticket.OwnedPaths
 	if len(ownedPaths) == 0 {
 		st.blockReason = fmt.Sprintf("single-ticket scope violation: ticket %q has no scope declarations", st.req.Ticket.ID)
+		st.currentOutcome = classifyTicketStop(st.currentPhase, stopKindScopeViolation)
 		return st.transitionTo(state.TicketPhaseBlocked)
 	}
 	var changedFiles []string
@@ -679,6 +711,7 @@ func checkSingleTicketScope(st *ticketRunState) error {
 	}
 	if err := CheckScopeViolation(changedFiles, ownedPaths); err != nil {
 		st.blockReason = fmt.Sprintf("single-ticket scope violation: %v", err)
+		st.currentOutcome = classifyTicketStop(st.currentPhase, stopKindScopeViolation)
 		return st.transitionTo(state.TicketPhaseBlocked)
 	}
 	return nil
@@ -732,6 +765,7 @@ func handleVerificationFailure(st *ticketRunState, verification state.Verificati
 	failingIDs := verificationFailingCheckIDs(st.verification)
 	if st.implementationAttempts >= st.cfg.Policy.MaxImplementationAttempts {
 		st.blockReason = buildVerificationBlockReason(st.implementationAttempts, failingIDs)
+		st.currentOutcome = classifyTicketStop(st.currentPhase, stopKindBudgetExhausted)
 		if err := st.transitionTo(state.TicketPhaseBlocked); err != nil {
 			return err
 		}
@@ -1002,6 +1036,7 @@ func handleReviewOutcome(st *ticketRunState, result runtime.ReviewResult, req ru
 			Reason:    st.blockReason,
 			PolicyRef: "policy.max_repair_cycles",
 		}
+		st.currentOutcome = classifyTicketStop(st.currentPhase, stopKindBudgetExhausted)
 		if err := st.transitionTo(state.TicketPhaseBlocked); err != nil {
 			return err
 		}
@@ -1139,6 +1174,7 @@ func (st *ticketRunState) runWorkerWithRuntimeControls(ctx context.Context, req 
 		result, err := st.runWorkerWithClaimRenewal(ctx, effectiveReq)
 		if err != nil {
 			if errors.Is(err, errClaimRenewalLost) {
+				st.currentOutcome = classifyTicketStop(st.currentPhase, stopKindClaimLost)
 				if err := st.blockRuntimeExecution(fmt.Sprintf("claim renewal lost during worker execution: %v", err)); err != nil {
 					return runtime.WorkerResult{}, effectiveReq, err
 				}
@@ -1173,6 +1209,7 @@ func (st *ticketRunState) runWorkerWithRuntimeControls(ctx context.Context, req 
 				BlockReason:    result.BlockReason,
 				RetryClass:     result.RetryClass,
 			}))
+			st.currentOutcome = classifyTicketStop(st.currentPhase, stopKindCancelled)
 			if err := st.blockRuntimeExecution(reason); err != nil {
 				return runtime.WorkerResult{}, effectiveReq, err
 			}
@@ -1192,6 +1229,7 @@ func (st *ticketRunState) runWorkerWithRuntimeControls(ctx context.Context, req 
 	if !shouldRetryRuntimeError(lastErr) {
 		return runtime.WorkerResult{}, effectiveReq, lastErr
 	}
+	st.currentOutcome = classifyTicketStop(st.currentPhase, stopKindGeneric)
 	if err := st.blockRuntimeExecution(fmt.Sprintf("retryable worker failure after %d retries: %v", maxRuntimeRetryAttempts, lastErr)); err != nil {
 		return runtime.WorkerResult{}, effectiveReq, err
 	}
@@ -1218,6 +1256,7 @@ func (st *ticketRunState) runReviewerWithRuntimeControls(ctx context.Context, re
 		result, err := st.runReviewerWithClaimRenewal(ctx, effectiveReq)
 		if err != nil {
 			if errors.Is(err, errClaimRenewalLost) {
+				st.currentOutcome = classifyTicketStop(st.currentPhase, stopKindClaimLost)
 				if err := st.blockRuntimeExecution(fmt.Sprintf("claim renewal lost during reviewer execution: %v", err)); err != nil {
 					return runtime.ReviewResult{}, effectiveReq, err
 				}
@@ -1250,6 +1289,7 @@ func (st *ticketRunState) runReviewerWithRuntimeControls(ctx context.Context, re
 				CompletionCode: result.CompletionCode,
 				RetryClass:     result.RetryClass,
 			}))
+			st.currentOutcome = classifyTicketStop(st.currentPhase, stopKindCancelled)
 			if err := st.blockRuntimeExecution(reason); err != nil {
 				return runtime.ReviewResult{}, effectiveReq, err
 			}
@@ -1269,6 +1309,7 @@ func (st *ticketRunState) runReviewerWithRuntimeControls(ctx context.Context, re
 	if !shouldRetryRuntimeError(lastErr) {
 		return runtime.ReviewResult{}, effectiveReq, lastErr
 	}
+	st.currentOutcome = classifyTicketStop(st.currentPhase, stopKindGeneric)
 	if err := st.blockRuntimeExecution(fmt.Sprintf("retryable reviewer failure after %d retries: %v", maxRuntimeRetryAttempts, lastErr)); err != nil {
 		return runtime.ReviewResult{}, effectiveReq, err
 	}
@@ -1504,6 +1545,10 @@ func (st *ticketRunState) snapshot() TicketRunSnapshot {
 	if st.createdAt.IsZero() {
 		st.createdAt = stateTime()
 	}
+	outcome := st.currentOutcome
+	if outcome == "" {
+		outcome = ticketOutcomeForPhase(st.currentPhase)
+	}
 	snapshot := TicketRunSnapshot{
 		ArtifactMeta: state.ArtifactMeta{
 			SchemaVersion: artifactSchemaVersion,
@@ -1513,7 +1558,7 @@ func (st *ticketRunState) snapshot() TicketRunSnapshot {
 		},
 		TicketID:               st.req.Ticket.ID,
 		CurrentPhase:           st.currentPhase,
-		Outcome:                ticketOutcomeForPhase(st.currentPhase),
+		Outcome:                outcome,
 		BlockReason:            st.blockReason,
 		ImplementationAttempts: st.implementationAttempts,
 		VerificationAttempts:   st.verificationAttempts,
