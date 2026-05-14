@@ -511,3 +511,82 @@ func readFile(t *testing.T, path string) []byte {
 	}
 	return data
 }
+
+// stubDecisionPrompter is a test double for decisionPrompter that returns
+// preset answers in order, one per ChooseTicketDecision call.
+type stubDecisionPrompter struct {
+	answers []ticketDecision
+	calls   []engine.BlockedTicket
+	idx     int
+}
+
+func (s *stubDecisionPrompter) ChooseTicketDecision(ticket engine.BlockedTicket) (ticketDecision, error) {
+	s.calls = append(s.calls, ticket)
+	if s.idx >= len(s.answers) {
+		return ticketDecisionLeaveAsDecision, nil
+	}
+	d := s.answers[s.idx]
+	s.idx++
+	return d, nil
+}
+
+// fakeNeedsDecisionBlocked returns a BlockedRunError with a single
+// needs_decision ticket for use in decision prompt tests.
+func fakeNeedsDecisionBlocked() *engine.BlockedRunError {
+	return &engine.BlockedRunError{
+		RunID:  "run-nd-test",
+		Status: state.EpicRunStatusBlocked,
+		BlockedTickets: []engine.BlockedTicket{
+			{
+				ID:      "ver-nd01",
+				Status:  epos.StatusBlocked,
+				Phase:   state.TicketPhaseBlocked,
+				Outcome: state.TicketOutcomeNeedsDecision,
+				Reason:  "reviewer requires human clarification",
+			},
+		},
+	}
+}
+
+// TestRunDecision_RetryImplement verifies that when the operator chooses
+// "retry from implement" for a needs_decision ticket, the CLI prints the
+// expected action message.
+func TestRunDecision_RetryImplement(t *testing.T) {
+	stub := &stubDecisionPrompter{answers: []ticketDecision{ticketDecisionRetryImplement}}
+	var out bytes.Buffer
+	stopped := promptNeedsDecisionTickets(context.Background(), &out, stub, fakeNeedsDecisionBlocked())
+
+	if stopped {
+		t.Fatal("expected loop not to be stopped")
+	}
+	if len(stub.calls) != 1 || stub.calls[0].ID != "ver-nd01" {
+		t.Fatalf("expected prompter to be called for ver-nd01, got calls=%v", stub.calls)
+	}
+	text := out.String()
+	if !strings.Contains(text, "would reopen ver-nd01 to implement") {
+		t.Errorf("expected implement action message, got:\n%s", text)
+	}
+}
+
+// TestRunDecision_LeaveAsDecision verifies that when the operator chooses
+// "leave as needs decision" the CLI prints a leave message and does not
+// print a reopen or block action.
+func TestRunDecision_LeaveAsDecision(t *testing.T) {
+	stub := &stubDecisionPrompter{answers: []ticketDecision{ticketDecisionLeaveAsDecision}}
+	var out bytes.Buffer
+	stopped := promptNeedsDecisionTickets(context.Background(), &out, stub, fakeNeedsDecisionBlocked())
+
+	if stopped {
+		t.Fatal("expected loop not to be stopped")
+	}
+	if len(stub.calls) != 1 || stub.calls[0].ID != "ver-nd01" {
+		t.Fatalf("expected prompter to be called for ver-nd01, got calls=%v", stub.calls)
+	}
+	text := out.String()
+	if !strings.Contains(text, "leaving ver-nd01 as needs_decision") {
+		t.Errorf("expected leave message, got:\n%s", text)
+	}
+	if strings.Contains(text, "would reopen") {
+		t.Errorf("leave choice must not emit reopen message, got:\n%s", text)
+	}
+}

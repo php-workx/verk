@@ -48,6 +48,129 @@ var blockedRunInteractorFor = func() blockedRunInteractor {
 // recorded stop reason. It is a named constant to satisfy the goconst linter.
 const noReasonRecorded = "blocked (no reason recorded)"
 
+// ticketDecision represents the operator's choice for a needs_decision ticket.
+type ticketDecision int
+
+const (
+	ticketDecisionRetryImplement  ticketDecision = iota // reopen → implement
+	ticketDecisionRetryRepair                           // reopen → repair
+	ticketDecisionLeaveAsDecision                       // keep outcome=needs_decision
+	ticketDecisionMarkBlocked                           // mark as explicitly blocked
+	ticketDecisionStop                                  // abort the whole interaction
+)
+
+// decisionPrompter asks the operator what to do with a needs_decision ticket.
+// The interface exists so tests can inject stub answers without a real terminal.
+type decisionPrompter interface {
+	ChooseTicketDecision(ticket engine.BlockedTicket) (ticketDecision, error)
+}
+
+// terminalDecisionPrompter implements decisionPrompter using a real terminal.
+// It uses single-keystroke input when running in raw mode and falls back to
+// line-buffered input (e.g. for pipe-based testing without a real TTY).
+type terminalDecisionPrompter struct {
+	r io.Reader
+	w io.Writer
+}
+
+// ChooseTicketDecision presents a numbered menu for the given ticket and reads
+// a single-character reply. The menu maps:
+//
+//	1 → retry from implement
+//	2 → retry from repair
+//	3 → leave as needs_decision
+//	4 → mark blocked
+//	s → stop
+//
+// Any other character is ignored; the prompt repeats until a valid choice or
+// EOF/error is received, at which point the function returns
+// ticketDecisionLeaveAsDecision (fail-open: safest option for the ticket).
+func (p terminalDecisionPrompter) ChooseTicketDecision(ticket engine.BlockedTicket) (ticketDecision, error) {
+	reason := strings.TrimSpace(ticket.Reason)
+	if reason == "" {
+		reason = noReasonRecorded
+	}
+	_, _ = fmt.Fprintf(p.w, "\r\nDecision for %s: %s\r\n", ticket.ID, reason)
+	_, _ = fmt.Fprint(p.w, "  [1] retry from implement\r\n")
+	_, _ = fmt.Fprint(p.w, "  [2] retry from repair\r\n")
+	_, _ = fmt.Fprint(p.w, "  [3] leave as needs decision\r\n")
+	_, _ = fmt.Fprint(p.w, "  [4] mark blocked\r\n")
+	_, _ = fmt.Fprint(p.w, "  [s] stop\r\n")
+
+	ctx := context.Background()
+	for {
+		_, _ = fmt.Fprint(p.w, "  Choice: ")
+		b, ok, cancelled := readPromptByte(ctx, p.r)
+		if cancelled || !ok {
+			_, _ = fmt.Fprint(p.w, "\r\n")
+			return ticketDecisionLeaveAsDecision, nil
+		}
+		_, _ = fmt.Fprintf(p.w, "%c\r\n", b)
+		switch b {
+		case '1':
+			return ticketDecisionRetryImplement, nil
+		case '2':
+			return ticketDecisionRetryRepair, nil
+		case '3':
+			return ticketDecisionLeaveAsDecision, nil
+		case '4':
+			return ticketDecisionMarkBlocked, nil
+		case 's', 'S':
+			return ticketDecisionStop, nil
+		case 0x03, 0x18: // Ctrl+C, Ctrl+X
+			return ticketDecisionStop, nil
+		default:
+			// Unknown key — show menu again.
+		}
+	}
+}
+
+// promptNeedsDecisionTickets asks the operator, one ticket at a time, what to
+// do with each needs_decision ticket. It records each decision and prints what
+// it would do (ticket writes are deferred to a later task). Returns true if the
+// loop was stopped early by the operator.
+func promptNeedsDecisionTickets(ctx context.Context, w io.Writer, prompter decisionPrompter, blocked *engine.BlockedRunError) (stopped bool) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	var ndTickets []engine.BlockedTicket
+	for _, t := range blocked.BlockedTickets {
+		if t.Outcome == state.TicketOutcomeNeedsDecision {
+			ndTickets = append(ndTickets, t)
+		}
+	}
+	if len(ndTickets) == 0 {
+		return false
+	}
+	_, _ = fmt.Fprintln(w)
+	_, _ = fmt.Fprintln(w, "Tickets needing your decision:")
+	for _, t := range ndTickets {
+		select {
+		case <-ctx.Done():
+			return true
+		default:
+		}
+		decision, err := prompter.ChooseTicketDecision(t)
+		if err != nil {
+			return false
+		}
+		switch decision {
+		case ticketDecisionRetryImplement:
+			_, _ = fmt.Fprintf(w, "  → would reopen %s to implement\r\n", t.ID)
+		case ticketDecisionRetryRepair:
+			_, _ = fmt.Fprintf(w, "  → would reopen %s to repair\r\n", t.ID)
+		case ticketDecisionLeaveAsDecision:
+			_, _ = fmt.Fprintf(w, "  → leaving %s as needs_decision\r\n", t.ID)
+		case ticketDecisionMarkBlocked:
+			_, _ = fmt.Fprintf(w, "  → would mark %s as blocked\r\n", t.ID)
+		case ticketDecisionStop:
+			_, _ = fmt.Fprintf(w, "  → stopping at %s\r\n", t.ID)
+			return true
+		}
+	}
+	return false
+}
+
 // printBlockedRunGuidance writes a stable, testable representation of a blocked
 // epic run to w. Tickets are grouped into three distinct sections based on
 // their outcome:
@@ -404,6 +527,21 @@ func handleBlockedEpicRun(
 	interactor := blockedRunInteractorFor()
 	if !interactor.isTTY() {
 		return false, nil
+	}
+
+	// Handle needs_decision tickets interactively before retrying retryable ones.
+	var hasNeedsDecision bool
+	for _, t := range blocked.BlockedTickets {
+		if t.Outcome == state.TicketOutcomeNeedsDecision {
+			hasNeedsDecision = true
+			break
+		}
+	}
+	if hasNeedsDecision {
+		prompter := terminalDecisionPrompter{r: interactor.in, w: interactor.out}
+		if stopped := promptNeedsDecisionTickets(ctx, interactor.out, prompter, blocked); stopped {
+			return false, context.Canceled
+		}
 	}
 
 	selected, cancelled := promptBlockedRetryTTY(ctx, interactor.in, interactor.out, blocked)
