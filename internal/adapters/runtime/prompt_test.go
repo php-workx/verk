@@ -537,3 +537,23 @@ func TestBuildReviewPrompt_NoDiffWhenEmpty(t *testing.T) {
 		t.Fatal("expected no diff block when diff is empty")
 	}
 }
+
+func TestBuildReviewPrompt_IncludesFilesUnderReview(t *testing.T) {
+	prompt := BuildReviewPrompt(ReviewRequest{
+		TicketID:                 "VER-001",
+		LeaseID:                  "lease-1",
+		EffectiveReviewThreshold: "P2",
+		ChangedFiles:             []string{"src/app.go", "docs/readme.md"},
+		Diff:                     "diff --git a/src/app.go b/src/app.go\n",
+	})
+
+	for _, want := range []string{
+		"### Files Under Review",
+		"- src/app.go",
+		"- docs/readme.md",
+	} {
+		if !strings.Contains(prompt, want) {
+			t.Fatalf("expected %q in prompt:\n%s", want, prompt)
+		}
+	}
+}

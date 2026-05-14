@@ -186,6 +186,13 @@ func BuildReviewPrompt(req ReviewRequest) string {
 		b.WriteString("\n")
 	}
 
+	if len(req.ChangedFiles) > 0 {
+		b.WriteString("\n### Files Under Review\n\n")
+		for _, file := range req.ChangedFiles {
+			fmt.Fprintf(&b, "- %s\n", file)
+		}
+	}
+
 	if req.Diff != "" {
 		b.WriteString("\n### Diff\n\n")
 		b.WriteString("```diff\n")
