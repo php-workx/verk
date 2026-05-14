@@ -41,6 +41,9 @@ type BlockedTicket struct {
 	Status epos.Status
 	// Phase is the ticket run phase from the latest snapshot, when available.
 	Phase state.TicketPhase
+	// Outcome is the terminal outcome recorded in the ticket snapshot, when
+	// available. Empty means no outcome has been persisted (legacy snapshots).
+	Outcome state.TicketOutcome
 	// RetryPhase is the default phase this ticket may be reopened to. Empty
 	// means the ticket is not automatically retryable from its current phase.
 	RetryPhase state.TicketPhase
@@ -121,23 +124,36 @@ func collectBlockedTickets(repoRoot, runID string, children []epos.Ticket) []Blo
 		reason := describeNotReady(repoRoot, runID, child)
 		claimReason := isClaimWaitReason(reason)
 		phase := state.TicketPhaseIntake
+		var outcome state.TicketOutcome
+		var snapLoaded bool
 		if runID != "" {
 			var snap TicketRunSnapshot
 			if err := loadTicketSnapshot(repoRoot, runID, child.ID, &snap); err == nil {
+				snapLoaded = true
 				if snap.CurrentPhase != "" {
 					phase = snap.CurrentPhase
 				}
+				outcome = snap.Outcome
 				if trimmed := ticketStatusReason(snap); trimmed != "" && !claimReason {
 					reason = trimmed
 				}
 			}
 		}
-		retryPhase, _ := DefaultReopenTargetForPhase(phase)
+		var retryPhase state.TicketPhase
+		if snapLoaded {
+			retryPhase, _ = DefaultReopenTargetForSnapshot(TicketRunSnapshot{
+				ArtifactMeta: state.ArtifactMeta{},
+				TicketID:     child.ID,
+				CurrentPhase: phase,
+				Outcome:      outcome,
+			})
+		}
 		out = append(out, BlockedTicket{
 			ID:         child.ID,
 			Title:      child.Title,
 			Status:     child.Status,
 			Phase:      phase,
+			Outcome:    outcome,
 			RetryPhase: retryPhase,
 			Reason:     reason,
 		})

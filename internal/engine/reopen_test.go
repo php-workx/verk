@@ -598,6 +598,126 @@ func TestReopenTicket_MultiTicket_BothReopened_MostAdvancedPhaseWins(t *testing.
 	}
 }
 
+// TestDefaultReopenTargetForSnapshot_FailedRetryable verifies that a snapshot
+// with Outcome=failed_retryable is retryable and defaults to implement.
+func TestDefaultReopenTargetForSnapshot_FailedRetryable(t *testing.T) {
+	snap := TicketRunSnapshot{
+		ArtifactMeta: state.ArtifactMeta{SchemaVersion: 1},
+		TicketID:     "ticket-fr",
+		CurrentPhase: state.TicketPhaseBlocked,
+		Outcome:      state.TicketOutcomeFailedRetryable,
+	}
+	target, ok := DefaultReopenTargetForSnapshot(snap)
+	if !ok {
+		t.Fatal("expected failed_retryable to be automatically retryable")
+	}
+	if target != state.TicketPhaseImplement {
+		t.Fatalf("expected implement retry target, got %q", target)
+	}
+}
+
+// TestDefaultReopenTargetForSnapshot_FailedRetryableVerifyPhase verifies that
+// failed_retryable always reopens to implement regardless of CurrentPhase.
+func TestDefaultReopenTargetForSnapshot_FailedRetryableVerifyPhase(t *testing.T) {
+	snap := TicketRunSnapshot{
+		ArtifactMeta: state.ArtifactMeta{SchemaVersion: 1},
+		TicketID:     "ticket-fr-verify",
+		CurrentPhase: state.TicketPhaseVerify,
+		Outcome:      state.TicketOutcomeFailedRetryable,
+	}
+	target, ok := DefaultReopenTargetForSnapshot(snap)
+	if !ok {
+		t.Fatal("expected failed_retryable in verify phase to be automatically retryable")
+	}
+	if target != state.TicketPhaseImplement {
+		t.Fatalf("expected implement retry target for verify phase, got %q", target)
+	}
+}
+
+// TestDefaultReopenTargetForSnapshot_NeedsDecision verifies that
+// needs_decision outcome is not automatically retryable.
+func TestDefaultReopenTargetForSnapshot_NeedsDecision(t *testing.T) {
+	snap := TicketRunSnapshot{
+		ArtifactMeta: state.ArtifactMeta{SchemaVersion: 1},
+		TicketID:     "ticket-nd",
+		CurrentPhase: state.TicketPhaseBlocked,
+		Outcome:      state.TicketOutcomeNeedsDecision,
+	}
+	target, ok := DefaultReopenTargetForSnapshot(snap)
+	if ok {
+		t.Fatalf("expected needs_decision to NOT be automatically retryable, got target %q", target)
+	}
+	if target != "" {
+		t.Fatalf("expected empty target for needs_decision, got %q", target)
+	}
+}
+
+// TestDefaultReopenTargetForSnapshot_Blocked verifies that outcome=blocked is
+// not automatically retryable.
+func TestDefaultReopenTargetForSnapshot_Blocked(t *testing.T) {
+	snap := TicketRunSnapshot{
+		ArtifactMeta: state.ArtifactMeta{SchemaVersion: 1},
+		TicketID:     "ticket-blk",
+		CurrentPhase: state.TicketPhaseBlocked,
+		Outcome:      state.TicketOutcomeBlocked,
+	}
+	target, ok := DefaultReopenTargetForSnapshot(snap)
+	if ok {
+		t.Fatalf("expected outcome=blocked to NOT be automatically retryable, got target %q", target)
+	}
+	if target != "" {
+		t.Fatalf("expected empty target for outcome=blocked, got %q", target)
+	}
+}
+
+// TestDefaultReopenTargetForSnapshot_EmptyOutcomeFallback verifies that when
+// no outcome is set, the function falls back to DefaultReopenTargetForPhase.
+// This is the backward-compatibility path for legacy snapshots.
+func TestDefaultReopenTargetForSnapshot_EmptyOutcomeFallback(t *testing.T) {
+	tests := []struct {
+		name        string
+		phase       state.TicketPhase
+		wantTarget  state.TicketPhase
+		wantRetryOK bool
+	}{
+		{
+			name:        "blocked phase falls back to implement",
+			phase:       state.TicketPhaseBlocked,
+			wantTarget:  state.TicketPhaseImplement,
+			wantRetryOK: true,
+		},
+		{
+			name:        "closed phase falls back to repair",
+			phase:       state.TicketPhaseClosed,
+			wantTarget:  state.TicketPhaseRepair,
+			wantRetryOK: true,
+		},
+		{
+			name:        "implement phase is not retryable by default",
+			phase:       state.TicketPhaseImplement,
+			wantTarget:  "",
+			wantRetryOK: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			snap := TicketRunSnapshot{
+				ArtifactMeta: state.ArtifactMeta{SchemaVersion: 1},
+				TicketID:     "ticket-legacy",
+				CurrentPhase: tt.phase,
+				Outcome:      "", // legacy: no outcome
+			}
+			target, ok := DefaultReopenTargetForSnapshot(snap)
+			if ok != tt.wantRetryOK {
+				t.Fatalf("retryable=%v, want %v", ok, tt.wantRetryOK)
+			}
+			if target != tt.wantTarget {
+				t.Fatalf("target=%q, want %q", target, tt.wantTarget)
+			}
+		})
+	}
+}
+
 func writeTicketMarkdownFixture(t *testing.T, repoRoot string, ticket epos.Ticket) {
 	t.Helper()
 	if err := epos.SaveTicket(filepath.Join(repoRoot, ".tickets", ticket.ID+".md"), ticket); err != nil {

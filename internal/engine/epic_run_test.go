@@ -379,6 +379,131 @@ func TestCollectBlockedTicketsOffersRetryForBlockedSnapshot(t *testing.T) {
 	}
 }
 
+// TestCollectBlockedTickets_FailedRetryableOffersRetryToImplement verifies that
+// a snapshot with Outcome=failed_retryable sets RetryPhase to implement,
+// regardless of which phase the ticket was in (e.g. verify).
+func TestCollectBlockedTickets_FailedRetryableOffersRetryToImplement(t *testing.T) {
+	repoRoot := t.TempDir()
+	runID := "run-fr"
+	child := epos.Ticket{
+		ID:     "ticket-fr",
+		Title:  "Failed retryable ticket",
+		Status: epos.StatusBlocked,
+	}
+	writeTicketRunFixture(t, repoRoot, runID, TicketRunSnapshot{
+		ArtifactMeta: state.ArtifactMeta{SchemaVersion: artifactSchemaVersion, RunID: runID},
+		TicketID:     child.ID,
+		CurrentPhase: state.TicketPhaseVerify,
+		Outcome:      state.TicketOutcomeFailedRetryable,
+		BlockReason:  "verification failed",
+	})
+
+	blocked := collectBlockedTickets(repoRoot, runID, []epos.Ticket{child})
+	if len(blocked) != 1 {
+		t.Fatalf("expected one blocked ticket, got %d", len(blocked))
+	}
+	if blocked[0].Outcome != state.TicketOutcomeFailedRetryable {
+		t.Fatalf("expected failed_retryable outcome, got %q", blocked[0].Outcome)
+	}
+	if blocked[0].RetryPhase != state.TicketPhaseImplement {
+		t.Fatalf("expected implement retry phase for failed_retryable, got %q", blocked[0].RetryPhase)
+	}
+}
+
+// TestCollectBlockedTickets_NeedsDecisionHasNoAutoRetry verifies that a snapshot
+// with Outcome=needs_decision is listed but does not produce a retry command.
+func TestCollectBlockedTickets_NeedsDecisionHasNoAutoRetry(t *testing.T) {
+	repoRoot := t.TempDir()
+	runID := "run-nd"
+	child := epos.Ticket{
+		ID:     "ticket-nd",
+		Title:  "Needs decision ticket",
+		Status: epos.StatusBlocked,
+	}
+	writeTicketRunFixture(t, repoRoot, runID, TicketRunSnapshot{
+		ArtifactMeta: state.ArtifactMeta{SchemaVersion: artifactSchemaVersion, RunID: runID},
+		TicketID:     child.ID,
+		CurrentPhase: state.TicketPhaseBlocked,
+		Outcome:      state.TicketOutcomeNeedsDecision,
+		BlockReason:  "ambiguous requirements",
+	})
+
+	blocked := collectBlockedTickets(repoRoot, runID, []epos.Ticket{child})
+	if len(blocked) != 1 {
+		t.Fatalf("expected one blocked ticket, got %d", len(blocked))
+	}
+	if blocked[0].Outcome != state.TicketOutcomeNeedsDecision {
+		t.Fatalf("expected needs_decision outcome, got %q", blocked[0].Outcome)
+	}
+	if blocked[0].RetryPhase != "" {
+		t.Fatalf("expected no auto retry for needs_decision, got RetryPhase=%q", blocked[0].RetryPhase)
+	}
+}
+
+// TestCollectBlockedTickets_OutcomeBlockedHasNoAutoRetry verifies that a
+// snapshot with Outcome=blocked is listed as blocked but does not produce an
+// automatic retry command. An operator must explicitly choose a legal reopen
+// target.
+func TestCollectBlockedTickets_OutcomeBlockedHasNoAutoRetry(t *testing.T) {
+	repoRoot := t.TempDir()
+	runID := "run-ob"
+	child := epos.Ticket{
+		ID:     "ticket-ob",
+		Title:  "Outcome blocked ticket",
+		Status: epos.StatusBlocked,
+	}
+	writeTicketRunFixture(t, repoRoot, runID, TicketRunSnapshot{
+		ArtifactMeta: state.ArtifactMeta{SchemaVersion: artifactSchemaVersion, RunID: runID},
+		TicketID:     child.ID,
+		CurrentPhase: state.TicketPhaseBlocked,
+		Outcome:      state.TicketOutcomeBlocked,
+		BlockReason:  "external dependency unavailable",
+	})
+
+	blocked := collectBlockedTickets(repoRoot, runID, []epos.Ticket{child})
+	if len(blocked) != 1 {
+		t.Fatalf("expected one blocked ticket, got %d", len(blocked))
+	}
+	if blocked[0].Outcome != state.TicketOutcomeBlocked {
+		t.Fatalf("expected blocked outcome, got %q", blocked[0].Outcome)
+	}
+	if blocked[0].RetryPhase != "" {
+		t.Fatalf("expected no auto retry for outcome=blocked, got RetryPhase=%q", blocked[0].RetryPhase)
+	}
+}
+
+// TestCollectBlockedTickets_LegacyBlockedPhaseNoOutcomeKeepsRetry verifies
+// backward compatibility: an old snapshot with CurrentPhase=blocked and empty
+// Outcome still gets RetryPhase=implement via the phase-based fallback.
+func TestCollectBlockedTickets_LegacyBlockedPhaseNoOutcomeKeepsRetry(t *testing.T) {
+	repoRoot := t.TempDir()
+	runID := "run-legacy"
+	child := epos.Ticket{
+		ID:     "ticket-legacy",
+		Title:  "Legacy blocked ticket",
+		Status: epos.StatusBlocked,
+	}
+	writeTicketRunFixture(t, repoRoot, runID, TicketRunSnapshot{
+		ArtifactMeta: state.ArtifactMeta{SchemaVersion: artifactSchemaVersion, RunID: runID},
+		TicketID:     child.ID,
+		CurrentPhase: state.TicketPhaseBlocked,
+		Outcome:      "", // old snapshot: no outcome
+		BlockReason:  "legacy block reason",
+	})
+
+	blocked := collectBlockedTickets(repoRoot, runID, []epos.Ticket{child})
+	if len(blocked) != 1 {
+		t.Fatalf("expected one blocked ticket, got %d", len(blocked))
+	}
+	if blocked[0].Outcome != "" {
+		t.Fatalf("expected empty outcome for legacy snapshot, got %q", blocked[0].Outcome)
+	}
+	// Legacy: CurrentPhase=blocked with no outcome → fallback to implement.
+	if blocked[0].RetryPhase != state.TicketPhaseImplement {
+		t.Fatalf("expected implement retry for legacy blocked phase, got %q", blocked[0].RetryPhase)
+	}
+}
+
 func TestRunEpicSchedulesOpenAndReadyTickets(t *testing.T) {
 	repoRoot := t.TempDir()
 	baseCommit := initEpicRepo(t, repoRoot)
