@@ -676,7 +676,6 @@ func collectDiff(repoRoot, baseCommit string) (string, error) {
 	return diff, nil
 }
 
-//nolint:unparam // retained as the backward-compatible filtered helper used by tests
 func collectChangedFiles(repoRoot, baseCommit string) ([]string, error) {
 	files, err := collectRawChangedFiles(repoRoot, baseCommit)
 	if err != nil {
