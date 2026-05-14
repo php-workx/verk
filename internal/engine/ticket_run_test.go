@@ -3296,3 +3296,157 @@ func TestRunTicket_ReviewChangedFilesMatchesWorkerDelta(t *testing.T) {
 		}
 	}
 }
+
+// TestRunTicket_RepairReviewDiffOnlyIncludesRepairDelta verifies that the
+// second review request (post-repair) contains only files changed by the repair
+// worker, not files changed by the initial implementation worker unless the
+// repair worker also touched them.
+//
+// Flow:
+//  1. Initial worker creates docs/impl.md (impl delta).
+//  2. First reviewer returns a blocking finding.
+//  3. Repair worker creates docs/repair-notes.md only (repair delta).
+//  4. Second reviewer request must contain docs/repair-notes.md.
+//  5. Second reviewer request must NOT contain docs/impl.md (impl worker did it).
+//
+// Note: .md files are used to avoid triggering Go-package derived checks which
+// would run go test in the temp dir and cause advisory repair loops.
+func TestRunTicket_RepairReviewDiffOnlyIncludesRepairDelta(t *testing.T) {
+	repoRoot := t.TempDir()
+	baseCommit := initEpicRepo(t, repoRoot)
+	stubToolSignals(t, ToolSignals{}) // no derived checks — keeps verify deterministic
+
+	cfg := policy.DefaultConfig()
+	ticket := testTicket("ver-repair-delta")
+	plan, claim := testPlanAndClaim(t, repoRoot, ticket, cfg, "run-repair-delta", "lease-repair-delta", []string{`true`})
+
+	started, finished := testRunTimes()
+
+	implFile := filepath.Join(repoRoot, "docs", "impl.md")
+	repairFile := filepath.Join(repoRoot, "docs", "repair-notes.md")
+
+	blockingFinding := runtime.ReviewFinding{
+		ID:          "finding-repair-delta",
+		Severity:    runtime.SeverityP2,
+		Title:       "missing repair notes",
+		Body:        "docs/impl.md has no accompanying repair notes.",
+		File:        "docs/impl.md",
+		Line:        1,
+		Disposition: runtime.ReviewDispositionOpen,
+	}
+
+	workerCallCount := 0
+	base := runtimefake.New(
+		[]runtime.WorkerResult{
+			// Initial implementation worker result.
+			{
+				Status:             runtime.WorkerStatusDone,
+				RetryClass:         runtime.RetryClassTerminal,
+				LeaseID:            claim.LeaseID,
+				StartedAt:          started,
+				FinishedAt:         finished,
+				ResultArtifactPath: filepath.Join(repoRoot, "worker-1.json"),
+			},
+			// Repair worker result.
+			{
+				Status:             runtime.WorkerStatusDone,
+				RetryClass:         runtime.RetryClassTerminal,
+				LeaseID:            claim.LeaseID,
+				StartedAt:          finished.Add(5 * time.Second),
+				FinishedAt:         finished.Add(6 * time.Second),
+				ResultArtifactPath: filepath.Join(repoRoot, "worker-repair.json"),
+			},
+		},
+		[]runtime.ReviewResult{
+			// First review: blocking finding triggers repair.
+			{
+				Status:             runtime.WorkerStatusDone,
+				RetryClass:         runtime.RetryClassTerminal,
+				LeaseID:            claim.LeaseID,
+				StartedAt:          finished.Add(2 * time.Second),
+				FinishedAt:         finished.Add(3 * time.Second),
+				ReviewStatus:       runtime.ReviewStatusFindings,
+				Summary:            "needs repair notes",
+				Findings:           []runtime.ReviewFinding{blockingFinding},
+				ResultArtifactPath: filepath.Join(repoRoot, "review-1.json"),
+			},
+			// Second review: passes after repair.
+			{
+				Status:             runtime.WorkerStatusDone,
+				RetryClass:         runtime.RetryClassTerminal,
+				LeaseID:            claim.LeaseID,
+				StartedAt:          finished.Add(7 * time.Second),
+				FinishedAt:         finished.Add(8 * time.Second),
+				ReviewStatus:       runtime.ReviewStatusPassed,
+				Summary:            "clean after repair",
+				ResultArtifactPath: filepath.Join(repoRoot, "review-2.json"),
+			},
+		},
+	)
+
+	adapter := &mutatingRuntimeAdapter{
+		Adapter: base,
+		onWorker: func() {
+			workerCallCount++
+			switch workerCallCount {
+			case 1:
+				// Initial worker: creates docs/impl.md.
+				if err := os.MkdirAll(filepath.Join(repoRoot, "docs"), 0o755); err != nil {
+					t.Errorf("mkdir docs: %v", err)
+					return
+				}
+				if err := os.WriteFile(implFile, []byte("# Implementation\n"), 0o644); err != nil {
+					t.Errorf("write impl.md: %v", err)
+				}
+			case 2:
+				// Repair worker: creates docs/repair-notes.md only — does NOT touch impl.md.
+				if err := os.WriteFile(repairFile, []byte("# Repair Notes\n"), 0o644); err != nil {
+					t.Errorf("write repair-notes.md: %v", err)
+				}
+			}
+		},
+	}
+
+	result, err := RunTicket(context.Background(), RunTicketRequest{
+		RepoRoot:   repoRoot,
+		RunID:      "run-repair-delta",
+		BaseCommit: baseCommit,
+		Ticket:     ticket,
+		Plan:       plan,
+		Claim:      claim,
+		Adapter:    adapter,
+		Config:     cfg,
+	})
+	if err != nil {
+		t.Fatalf("RunTicket returned error: %v", err)
+	}
+	if result.Snapshot.CurrentPhase != state.TicketPhaseClosed {
+		t.Fatalf("expected closed phase after repair, got %q (block=%q)",
+			result.Snapshot.CurrentPhase, result.Snapshot.BlockReason)
+	}
+	if len(adapter.ReviewRequests()) != 2 {
+		t.Fatalf("expected 2 review requests (initial + post-repair), got %d", len(adapter.ReviewRequests()))
+	}
+
+	// First review: should contain docs/impl.md (initial implementation delta).
+	firstReview := adapter.ReviewRequests()[0]
+	if !strings.Contains(firstReview.Diff, "docs/impl.md") {
+		t.Errorf("expected docs/impl.md in first review diff; diff:\n%s", firstReview.Diff)
+	}
+
+	// Second review: should contain docs/repair-notes.md (repair delta only).
+	secondReview := adapter.ReviewRequests()[1]
+	if !strings.Contains(secondReview.Diff, "docs/repair-notes.md") {
+		t.Errorf("expected docs/repair-notes.md in second (repair) review diff; diff:\n%s", secondReview.Diff)
+	}
+	// docs/impl.md was not touched by the repair worker — it must NOT appear in the repair delta.
+	if strings.Contains(secondReview.Diff, "docs/impl.md") {
+		t.Errorf("docs/impl.md must not appear in repair review diff (was only changed by initial worker); diff:\n%s", secondReview.Diff)
+	}
+
+	// ChangedFiles in the repair review must be exactly [docs/repair-notes.md].
+	repairChangedFiles := secondReview.ChangedFiles
+	if len(repairChangedFiles) != 1 || repairChangedFiles[0] != "docs/repair-notes.md" {
+		t.Errorf("expected repair review ChangedFiles=[docs/repair-notes.md], got %v", repairChangedFiles)
+	}
+}
