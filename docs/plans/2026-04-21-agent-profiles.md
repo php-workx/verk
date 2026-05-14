@@ -241,9 +241,9 @@ Rationalizations are ~6–11% of the full prompt. The system prompt + standards 
 ### Task 1: Schema — Add `profile` to ticket frontmatter
 
 **Files:**
-- `internal/adapters/ticketstore/tkmd/types.go`
-- `internal/adapters/ticketstore/tkmd/store.go`
-- `internal/adapters/ticketstore/tkmd/store_test.go`
+- `internal/adapters/ticketstore/epos/types.go`
+- `internal/adapters/ticketstore/epos/store.go`
+- `internal/adapters/ticketstore/epos/store_test.go`
 
 Add `Profile string` to `Ticket` struct. Add `profile` to the known frontmatter key set in `assignField` and `encodeFrontMatter`. Add `ProfileBackend`, `ProfileContract`, `ProfileFrontend`, `ProfileSecurity` constants. Add `ValidateProfile(p string) error` returning an error for unknown values.
 
@@ -257,8 +257,8 @@ Write failing tests first:
 ### Task 2: Detection — `DetectProfile` function
 
 **Files:**
-- `internal/adapters/ticketstore/tkmd/profile.go` (new)
-- `internal/adapters/ticketstore/tkmd/profile_test.go` (new)
+- `internal/adapters/ticketstore/epos/profile.go` (new)
+- `internal/adapters/ticketstore/epos/profile_test.go` (new)
 
 Implement `DetectProfile(ticket Ticket) Profile` with the priority-ordered matcher. Detection returns one of the enum-like constants (`ProfileSecurity`, `ProfileContract`, `ProfileFrontend`, `ProfileBackend`) and is a pure function — no I/O, no LLM, no file reads beyond what the ticket struct already contains.
 

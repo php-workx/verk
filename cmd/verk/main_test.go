@@ -10,7 +10,7 @@ import (
 	"strings"
 	"testing"
 	"time"
-	"verk/internal/adapters/ticketstore/tkmd"
+	"verk/internal/adapters/ticketstore/epos"
 	"verk/internal/cli"
 	"verk/internal/state"
 )
@@ -105,10 +105,10 @@ func TestReopen_ValidatesTargetPhase(t *testing.T) {
 		"verification_attempts":   1,
 		"review_attempts":         1,
 	})
-	if err := tkmd.SaveTicket(filepath.Join(repoRoot, ".tickets", ticketID+".md"), tkmd.Ticket{
+	if err := epos.SaveTicket(filepath.Join(repoRoot, ".tickets", ticketID+".md"), epos.Ticket{
 		ID:                 ticketID,
 		Title:              "Blocked ticket",
-		Status:             tkmd.StatusBlocked,
+		Status:             epos.StatusBlocked,
 		OwnedPaths:         []string{"internal/app"},
 		UnknownFrontmatter: map[string]any{"type": "task"},
 	}); err != nil {
@@ -121,6 +121,63 @@ func TestReopen_ValidatesTargetPhase(t *testing.T) {
 	}
 	if !strings.Contains(stderr, "must be one of") {
 		t.Fatalf("expected validation error, got %s", stderr)
+	}
+}
+
+func TestRunEpic_RejectsUnsafeTicketIDBeforeRunLockPathEscape(t *testing.T) {
+	repoRoot := t.TempDir()
+	writeCLIRepo(t, repoRoot)
+
+	stdout, stderr, code := runCLIFromDir(t, repoRoot, "run", "epic", "../escaped")
+	if code == 0 {
+		t.Fatal("expected non-zero exit for unsafe epic ticket id")
+	}
+	if strings.Contains(stdout, "run_id=") {
+		t.Fatalf("unsafe ticket id printed bogus run id: %s", stdout)
+	}
+	if !strings.Contains(stderr, "invalid ticket id") {
+		t.Fatalf("expected invalid ticket id error, got: %s", stderr)
+	}
+	if _, statErr := os.Stat(filepath.Join(repoRoot, ".verk", "escaped", "run.lock")); !os.IsNotExist(statErr) {
+		t.Fatalf("unsafe ticket id created escaped lock path: %v", statErr)
+	}
+}
+
+func TestRunTicket_RejectsUnsafeTicketIDBeforeTicketRead(t *testing.T) {
+	repoRoot := t.TempDir()
+	writeCLIRepo(t, repoRoot)
+	if err := os.WriteFile(filepath.Join(repoRoot, "escaped.md"), []byte("---\nid: escaped\nstatus: open\n---\n"), 0o644); err != nil {
+		t.Fatalf("write escaped ticket bait: %v", err)
+	}
+
+	stdout, stderr, code := runCLIFromDir(t, repoRoot, "run", "ticket", "../escaped")
+	if code == 0 {
+		t.Fatal("expected non-zero exit for unsafe ticket id")
+	}
+	if strings.Contains(stdout, "run_id=") {
+		t.Fatalf("unsafe ticket id printed bogus run id: %s", stdout)
+	}
+	if !strings.Contains(stderr, "invalid ticket id") {
+		t.Fatalf("expected invalid ticket id error, got: %s", stderr)
+	}
+	if _, statErr := os.Stat(filepath.Join(repoRoot, ".verk", "escaped")); !os.IsNotExist(statErr) {
+		t.Fatalf("unsafe ticket id created escaped artifact path: %v", statErr)
+	}
+}
+
+func TestStatus_RejectsUnsafeRunIDBeforeArtifactRead(t *testing.T) {
+	repoRoot := t.TempDir()
+	writeCLIRepo(t, repoRoot)
+
+	_, stderr, code := runCLIFromDir(t, repoRoot, "status", "../escaped")
+	if code == 0 {
+		t.Fatal("expected non-zero exit for unsafe run id")
+	}
+	if !strings.Contains(stderr, "invalid run id") {
+		t.Fatalf("expected invalid run id error, got: %s", stderr)
+	}
+	if _, statErr := os.Stat(filepath.Join(repoRoot, ".verk", "escaped")); !os.IsNotExist(statErr) {
+		t.Fatalf("unsafe run id read escaped artifact path: %v", statErr)
 	}
 }
 
@@ -217,8 +274,6 @@ func TestRunCLIFromDir_LargeOutput_NoDeadlock(t *testing.T) {
 func writeCLIRepo(t *testing.T, repoRoot string) {
 	t.Helper()
 	runGit(t, repoRoot, "init")
-	runGit(t, repoRoot, "config", "user.email", "test@example.com")
-	runGit(t, repoRoot, "config", "user.name", "Test User")
 	if err := os.MkdirAll(filepath.Join(repoRoot, ".tickets", ".claims"), 0o755); err != nil {
 		t.Fatalf("mkdir .tickets: %v", err)
 	}
@@ -257,10 +312,73 @@ func runGit(t *testing.T, dir string, args ...string) {
 	t.Helper()
 	cmd := exec.Command("git", args...)
 	cmd.Dir = dir
-	cmd.Env = append(os.Environ(), "GIT_OPTIONAL_LOCKS=0")
+	cmd.Env = testGitEnv()
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("git %v failed: %v\n%s", args, err, string(out))
+	}
+}
+
+func testGitEnv() []string {
+	env := os.Environ()
+	out := make([]string, 0, len(env)+6)
+	for _, entry := range env {
+		key, _, found := strings.Cut(entry, "=")
+		if !found {
+			out = append(out, entry)
+			continue
+		}
+		if isGitLocalEnv(key) {
+			continue
+		}
+		out = append(out, entry)
+	}
+	out = append(out,
+		"GIT_OPTIONAL_LOCKS=0",
+		"GIT_CONFIG_GLOBAL="+os.DevNull,
+		"GIT_CONFIG_NOSYSTEM=1",
+		"GIT_AUTHOR_NAME=Test User",
+		"GIT_AUTHOR_EMAIL=test@example.com",
+		"GIT_COMMITTER_NAME=Test User",
+		"GIT_COMMITTER_EMAIL=test@example.com",
+		"GIT_CONFIG_COUNT=1",
+		"GIT_CONFIG_KEY_0=core.hooksPath",
+		"GIT_CONFIG_VALUE_0="+os.DevNull,
+	)
+	return out
+}
+
+func isGitLocalEnv(key string) bool {
+	if strings.HasPrefix(key, "GIT_CONFIG_KEY_") || strings.HasPrefix(key, "GIT_CONFIG_VALUE_") {
+		return true
+	}
+	switch key {
+	case "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+		"GIT_AUTHOR_EMAIL",
+		"GIT_AUTHOR_NAME",
+		"GIT_COMMON_DIR",
+		"GIT_COMMITTER_EMAIL",
+		"GIT_COMMITTER_NAME",
+		"GIT_CONFIG",
+		"GIT_CONFIG_COUNT",
+		"GIT_CONFIG_GLOBAL",
+		"GIT_CONFIG_NOSYSTEM",
+		"GIT_CONFIG_PARAMETERS",
+		"GIT_DIR",
+		"GIT_GRAFT_FILE",
+		"GIT_IMPLICIT_WORK_TREE",
+		"GIT_INDEX_FILE",
+		"GIT_NO_REPLACE_OBJECTS",
+		"GIT_OBJECT_DIRECTORY",
+		"GIT_PREFIX",
+		"GIT_REPLACE_REF_BASE",
+		"GIT_SHALLOW_FILE",
+		"GIT_SUPER_PREFIX",
+		"GIT_OPTIONAL_LOCKS",
+		"GIT_WORK_TREE":
+		return true
+	default:
+		return false
 	}
 }
 
@@ -344,10 +462,10 @@ func TestRunTicket_AdapterFailure_ReleasesClaim(t *testing.T) {
 	writeCLIRepo(t, repoRoot)
 
 	ticketID := "ver-adapter-fail"
-	if err := tkmd.SaveTicket(filepath.Join(repoRoot, ".tickets", ticketID+".md"), tkmd.Ticket{
+	if err := epos.SaveTicket(filepath.Join(repoRoot, ".tickets", ticketID+".md"), epos.Ticket{
 		ID:                 ticketID,
 		Title:              "Adapter failure ticket",
-		Status:             tkmd.StatusOpen,
+		Status:             epos.StatusOpen,
 		OwnedPaths:         []string{"internal/app"},
 		Runtime:            "unsupported_runtime_xyz",
 		UnknownFrontmatter: map[string]any{"type": "task"},
@@ -372,7 +490,7 @@ func TestRunTicket_AdapterFailure_ReleasesClaim(t *testing.T) {
 	assertCLIClaimReleased(t, repoRoot, runID, ticketID)
 
 	// Verify re-acquisition is not blocked.
-	_, err := tkmd.AcquireClaim(repoRoot, "run-retry-adapter", ticketID, "lease-retry-adapter", 10*time.Minute, time.Now().UTC())
+	_, err := epos.AcquireClaim(repoRoot, "run-retry-adapter", ticketID, "lease-retry-adapter", 10*time.Minute, time.Now().UTC())
 	if err != nil {
 		t.Fatalf("expected claim re-acquisition after adapter failure, got error: %v", err)
 	}
@@ -385,8 +503,6 @@ func TestRunTicket_GitMetadataFailure_ReleasesClaim(t *testing.T) {
 	repoRoot := t.TempDir()
 	// Create a git repo with NO commits — HeadCommit will fail.
 	runGit(t, repoRoot, "init")
-	runGit(t, repoRoot, "config", "user.email", "test@example.com")
-	runGit(t, repoRoot, "config", "user.name", "Test User")
 	if err := os.MkdirAll(filepath.Join(repoRoot, ".tickets", ".claims"), 0o755); err != nil {
 		t.Fatalf("mkdir .tickets: %v", err)
 	}
@@ -395,10 +511,10 @@ func TestRunTicket_GitMetadataFailure_ReleasesClaim(t *testing.T) {
 	}
 
 	ticketID := "ver-git-fail"
-	if err := tkmd.SaveTicket(filepath.Join(repoRoot, ".tickets", ticketID+".md"), tkmd.Ticket{
+	if err := epos.SaveTicket(filepath.Join(repoRoot, ".tickets", ticketID+".md"), epos.Ticket{
 		ID:                 ticketID,
 		Title:              "Git metadata failure ticket",
-		Status:             tkmd.StatusOpen,
+		Status:             epos.StatusOpen,
 		OwnedPaths:         []string{"internal/app"},
 		UnknownFrontmatter: map[string]any{"type": "task"},
 	}); err != nil {
@@ -423,7 +539,7 @@ func TestRunTicket_GitMetadataFailure_ReleasesClaim(t *testing.T) {
 	assertCLIClaimReleased(t, repoRoot, runID, ticketID)
 
 	// Verify re-acquisition is not blocked.
-	_, err := tkmd.AcquireClaim(repoRoot, "run-retry-git", ticketID, "lease-retry-git", 10*time.Minute, time.Now().UTC())
+	_, err := epos.AcquireClaim(repoRoot, "run-retry-git", ticketID, "lease-retry-git", 10*time.Minute, time.Now().UTC())
 	if err != nil {
 		t.Fatalf("expected claim re-acquisition after git metadata failure, got error: %v", err)
 	}
@@ -440,14 +556,21 @@ func extractRunID(t *testing.T, stdout string) string {
 	return ""
 }
 
-// assertCLIClaimReleased verifies that the claim was released: the live claim
-// file is removed and the durable claim has state "released".
+// assertCLIClaimReleased verifies that the claim was released: the epos runtime
+// sidecar remains present without an active claim and the durable claim has
+// state "released".
 func assertCLIClaimReleased(t *testing.T, repoRoot, runID, ticketID string) {
 	t.Helper()
-	// Live claim file should have been removed by release.
 	livePath := filepath.Join(repoRoot, ".tickets", ".claims", ticketID+".json")
-	if _, err := os.Stat(livePath); err == nil {
-		t.Fatalf("expected live claim file to be removed, but it still exists: %s", livePath)
+	if _, err := os.Stat(livePath); err != nil {
+		t.Fatalf("expected released runtime state sidecar to remain: %v", err)
+	}
+	live, err := epos.LoadLiveClaim(repoRoot, ticketID)
+	if err != nil {
+		t.Fatalf("LoadLiveClaim: %v", err)
+	}
+	if live != nil {
+		t.Fatalf("expected no active live claim after release, got %#v", live)
 	}
 	// Durable claim should be in released state.
 	durablePath := filepath.Join(repoRoot, ".verk", "runs", runID, "claims", "claim-"+ticketID+".json")

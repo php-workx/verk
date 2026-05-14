@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 	"time"
-	"verk/internal/adapters/ticketstore/tkmd"
+	"verk/internal/adapters/ticketstore/epos"
 	"verk/internal/engine"
 	"verk/internal/policy"
 	"verk/internal/state"
@@ -16,8 +16,6 @@ import (
 func initRepo(t *testing.T, root string) string {
 	t.Helper()
 	runGit(t, root, "init")
-	runGit(t, root, "config", "user.email", "test@example.com")
-	runGit(t, root, "config", "user.name", "Test User")
 	if err := os.WriteFile(filepath.Join(root, "tracked.txt"), []byte("base\n"), 0o644); err != nil {
 		t.Fatalf("seed repo: %v", err)
 	}
@@ -54,33 +52,47 @@ func gitOutput(dir string, args ...string) (string, error) {
 
 func testGitEnv() []string {
 	env := os.Environ()
-	out := make([]string, 0, len(env)+1)
+	out := make([]string, 0, len(env)+6)
 	for _, entry := range env {
 		key, _, found := strings.Cut(entry, "=")
 		if !found {
 			out = append(out, entry)
 			continue
 		}
+		if strings.HasPrefix(key, "GIT_CONFIG_KEY_") || strings.HasPrefix(key, "GIT_CONFIG_VALUE_") {
+			continue
+		}
 		switch key {
-		case "GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_PREFIX", "GIT_SUPER_PREFIX", "GIT_OPTIONAL_LOCKS":
+		case "GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_PREFIX", "GIT_SUPER_PREFIX", "GIT_OPTIONAL_LOCKS", "GIT_CONFIG", "GIT_CONFIG_COUNT", "GIT_CONFIG_GLOBAL", "GIT_CONFIG_NOSYSTEM", "GIT_CONFIG_PARAMETERS", "GIT_TEMPLATE_DIR", "GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL":
 			continue
 		default:
 			out = append(out, entry)
 		}
 	}
-	out = append(out, "GIT_OPTIONAL_LOCKS=0")
+	out = append(out,
+		"GIT_OPTIONAL_LOCKS=0",
+		"GIT_CONFIG_GLOBAL="+os.DevNull,
+		"GIT_CONFIG_NOSYSTEM=1",
+		"GIT_AUTHOR_NAME=Test User",
+		"GIT_AUTHOR_EMAIL=test@example.com",
+		"GIT_COMMITTER_NAME=Test User",
+		"GIT_COMMITTER_EMAIL=test@example.com",
+		"GIT_CONFIG_COUNT=1",
+		"GIT_CONFIG_KEY_0=core.hooksPath",
+		"GIT_CONFIG_VALUE_0="+os.DevNull,
+	)
 	return out
 }
 
-func saveTicket(t *testing.T, repoRoot string, ticket tkmd.Ticket) {
+func saveTicket(t *testing.T, repoRoot string, ticket epos.Ticket) {
 	t.Helper()
-	if err := tkmd.SaveTicket(filepath.Join(repoRoot, ".tickets", ticket.ID+".md"), ticket); err != nil {
+	if err := epos.SaveTicket(filepath.Join(repoRoot, ".tickets", ticket.ID+".md"), ticket); err != nil {
 		t.Fatalf("SaveTicket(%s): %v", ticket.ID, err)
 	}
 }
 
-func taskTicket(id string, status tkmd.Status, owned []string) tkmd.Ticket {
-	return tkmd.Ticket{
+func taskTicket(id string, status epos.Status, owned []string) epos.Ticket {
+	return epos.Ticket{
 		ID:                 id,
 		Title:              "Ticket " + id,
 		Status:             status,
@@ -91,11 +103,11 @@ func taskTicket(id string, status tkmd.Status, owned []string) tkmd.Ticket {
 	}
 }
 
-func epicTicket(id string, owned []string) tkmd.Ticket {
-	return tkmd.Ticket{
+func epicTicket(id string, owned []string) epos.Ticket {
+	return epos.Ticket{
 		ID:         id,
 		Title:      "Epic " + id,
-		Status:     tkmd.StatusReady,
+		Status:     epos.StatusReady,
 		OwnedPaths: append([]string(nil), owned...),
 		UnknownFrontmatter: map[string]any{
 			"type": "epic",
@@ -103,13 +115,13 @@ func epicTicket(id string, owned []string) tkmd.Ticket {
 	}
 }
 
-func epicChild(id, parent string, status tkmd.Status, owned []string) tkmd.Ticket {
+func epicChild(id, parent string, status epos.Status, owned []string) epos.Ticket {
 	ticket := taskTicket(id, status, owned)
 	ticket.UnknownFrontmatter["parent"] = parent
 	return ticket
 }
 
-func testPlanAndClaim(t *testing.T, repoRoot string, cfg policy.Config, runID string, ticket tkmd.Ticket, leaseID string, commands []string) (state.PlanArtifact, state.ClaimArtifact) {
+func testPlanAndClaim(t *testing.T, repoRoot string, cfg policy.Config, runID string, ticket epos.Ticket, leaseID string, commands []string) (state.PlanArtifact, state.ClaimArtifact) {
 	t.Helper()
 	plan, err := engine.BuildPlanArtifact(ticket, cfg)
 	if err != nil {
@@ -117,7 +129,7 @@ func testPlanAndClaim(t *testing.T, repoRoot string, cfg policy.Config, runID st
 	}
 	plan.RunID = runID
 	plan.ValidationCommands = append([]string(nil), commands...)
-	claim, err := tkmd.AcquireClaim(repoRoot, runID, ticket.ID, leaseID, 10*time.Minute, time.Now().UTC())
+	claim, err := epos.AcquireClaim(repoRoot, runID, ticket.ID, leaseID, 10*time.Minute, time.Now().UTC())
 	if err != nil {
 		t.Fatalf("AcquireClaim: %v", err)
 	}

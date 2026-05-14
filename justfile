@@ -87,7 +87,7 @@ vuln:
 
 # Verify the project compiles (fast, no binary output)
 build-check:
-    go build ./...
+    go build -buildvcs=false ./...
 
 # Verify go.mod/go.sum and tools.mod/tools.sum are tidy (detect-only)
 mod-tidy-check:
@@ -159,11 +159,11 @@ sonar:
 # Build the verk binary with version info
 build:
     mkdir -p bin
-    go build -ldflags '{{ldflags}}' -o bin/verk ./cmd/verk
+    go build -buildvcs=false -ldflags '{{ldflags}}' -o bin/verk ./cmd/verk
 
 # Install verk to $GOPATH/bin (or $GOBIN)
 install:
-    go install -ldflags '{{ldflags}}' ./cmd/verk
+    go install -buildvcs=false -ldflags '{{ldflags}}' ./cmd/verk
 
 # --- Setup ---
 

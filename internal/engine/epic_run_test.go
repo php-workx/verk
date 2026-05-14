@@ -15,10 +15,12 @@ import (
 	"testing"
 	"time"
 	"verk/internal/adapters/runtime"
-	"verk/internal/adapters/ticketstore/tkmd"
+	"verk/internal/adapters/ticketstore/epos"
 	"verk/internal/policy"
 	"verk/internal/state"
 
+	eposticket "github.com/php-workx/epos/ticket"
+	eposruntime "github.com/php-workx/epos/ticket/runtime"
 	runtimefake "verk/internal/adapters/runtime/fake"
 )
 
@@ -147,11 +149,11 @@ func newReflectingAdapter(numTickets int) *reflectingAdapter {
 }
 
 func TestBuildWaveSerializesConflictingOwnedPaths(t *testing.T) {
-	ready := []tkmd.Ticket{
+	ready := []epos.Ticket{
 		{
 			ID:     "ticket-a",
 			Title:  "A",
-			Status: tkmd.StatusReady,
+			Status: epos.StatusReady,
 			OwnedPaths: []string{
 				"internal/app",
 			},
@@ -159,7 +161,7 @@ func TestBuildWaveSerializesConflictingOwnedPaths(t *testing.T) {
 		{
 			ID:     "ticket-b",
 			Title:  "B",
-			Status: tkmd.StatusReady,
+			Status: epos.StatusReady,
 			OwnedPaths: []string{
 				"internal/app/api",
 			},
@@ -167,7 +169,7 @@ func TestBuildWaveSerializesConflictingOwnedPaths(t *testing.T) {
 		{
 			ID:     "ticket-c",
 			Title:  "C",
-			Status: tkmd.StatusReady,
+			Status: epos.StatusReady,
 			OwnedPaths: []string{
 				"docs",
 			},
@@ -224,13 +226,13 @@ func TestAcceptWave_ScopeViolationIsFatal(t *testing.T) {
 
 func TestCollectBlockedTicketsDoesNotOfferRetryForSnapshotlessBlockedTicket(t *testing.T) {
 	repoRoot := t.TempDir()
-	child := tkmd.Ticket{
+	child := epos.Ticket{
 		ID:     "ticket-blocked",
 		Title:  "Blocked ticket",
-		Status: tkmd.StatusBlocked,
+		Status: epos.StatusBlocked,
 	}
 
-	blocked := collectBlockedTickets(repoRoot, "run-without-snapshot", []tkmd.Ticket{child})
+	blocked := collectBlockedTickets(repoRoot, "run-without-snapshot", []epos.Ticket{child})
 	if len(blocked) != 1 {
 		t.Fatalf("expected one blocked ticket, got %d", len(blocked))
 	}
@@ -242,13 +244,121 @@ func TestCollectBlockedTicketsDoesNotOfferRetryForSnapshotlessBlockedTicket(t *t
 	}
 }
 
+func TestCollectBlockedTicketsDescribesLiveClaimForOpenTicket(t *testing.T) {
+	repoRoot := t.TempDir()
+	child := epos.Ticket{
+		ID:     "ticket-claimed",
+		Title:  "Claimed ticket",
+		Status: epos.StatusOpen,
+	}
+	mustSaveTicket(t, repoRoot, child)
+	if _, err := epos.AcquireClaim(repoRoot, "run-owner", child.ID, "lease-owner", 10*time.Minute, time.Now().UTC()); err != nil {
+		t.Fatalf("acquire claim: %v", err)
+	}
+
+	blocked := collectBlockedTickets(repoRoot, "run-reporter", []epos.Ticket{child})
+	if len(blocked) != 1 {
+		t.Fatalf("expected one blocked ticket, got %d", len(blocked))
+	}
+	if blocked[0].Reason != "waiting on lease (held by run-owner)" {
+		t.Fatalf("expected claim-aware reason, got %q", blocked[0].Reason)
+	}
+}
+
+func TestCollectBlockedTicketsClaimReasonHonorsEposEligibility(t *testing.T) {
+	t.Run("same run claim falls back to status", func(t *testing.T) {
+		repoRoot := t.TempDir()
+		child := epos.Ticket{ID: "ticket-same-run", Status: epos.StatusOpen}
+		mustSaveTicket(t, repoRoot, child)
+		if _, err := epos.AcquireClaim(repoRoot, "run-current", child.ID, "lease-current", 10*time.Minute, time.Now().UTC()); err != nil {
+			t.Fatalf("acquire claim: %v", err)
+		}
+
+		blocked := collectBlockedTickets(repoRoot, "run-current", []epos.Ticket{child})
+		if blocked[0].Reason != "status=open" {
+			t.Fatalf("expected status fallback, got %q", blocked[0].Reason)
+		}
+	})
+
+	t.Run("expired lease falls back to status", func(t *testing.T) {
+		repoRoot := t.TempDir()
+		child := epos.Ticket{ID: "ticket-expired", Status: epos.StatusOpen}
+		mustSaveTicket(t, repoRoot, child)
+		writeRuntimeState(t, repoRoot, &eposticket.RuntimeState{
+			TicketID: child.ID,
+			Claim: &eposticket.Claim{
+				ClaimedBy:    "run-owner",
+				ClaimBackend: "run-owner",
+				ClaimedAt:    time.Now().Add(-2 * time.Hour),
+			},
+			Lease: &eposticket.Lease{
+				LeaseID:   "lease-expired",
+				ExpiresAt: time.Now().Add(-time.Hour),
+			},
+		})
+
+		blocked := collectBlockedTickets(repoRoot, "run-current", []epos.Ticket{child})
+		if blocked[0].Reason != "status=open" {
+			t.Fatalf("expected status fallback, got %q", blocked[0].Reason)
+		}
+	})
+
+	t.Run("deps remain the primary reason", func(t *testing.T) {
+		repoRoot := t.TempDir()
+		child := epos.Ticket{ID: "ticket-deps", Status: epos.StatusOpen, Deps: []string{"dep-open"}}
+		mustSaveTicket(t, repoRoot, child)
+		if _, err := epos.AcquireClaim(repoRoot, "run-owner", child.ID, "lease-owner", 10*time.Minute, time.Now().UTC()); err != nil {
+			t.Fatalf("acquire claim: %v", err)
+		}
+
+		blocked := collectBlockedTickets(repoRoot, "run-current", []epos.Ticket{child})
+		if blocked[0].Reason != "waiting on deps: dep-open" {
+			t.Fatalf("expected deps reason, got %q", blocked[0].Reason)
+		}
+	})
+
+	t.Run("unknown status is not masked by claim", func(t *testing.T) {
+		repoRoot := t.TempDir()
+		child := epos.Ticket{ID: "ticket-weird", Status: epos.Status("weird")}
+		if _, err := epos.AcquireClaim(repoRoot, "run-owner", child.ID, "lease-owner", 10*time.Minute, time.Now().UTC()); err != nil {
+			t.Fatalf("acquire claim: %v", err)
+		}
+
+		blocked := collectBlockedTickets(repoRoot, "run-current", []epos.Ticket{child})
+		if blocked[0].Reason != "status=weird" {
+			t.Fatalf("expected status fallback, got %q", blocked[0].Reason)
+		}
+	})
+
+	t.Run("live blocking claim wins over stale snapshot status", func(t *testing.T) {
+		repoRoot := t.TempDir()
+		runID := "run-current"
+		child := epos.Ticket{ID: "ticket-stale-snapshot", Status: epos.StatusOpen}
+		mustSaveTicket(t, repoRoot, child)
+		if _, err := epos.AcquireClaim(repoRoot, "run-owner", child.ID, "lease-owner", 10*time.Minute, time.Now().UTC()); err != nil {
+			t.Fatalf("acquire claim: %v", err)
+		}
+		writeTicketRunFixture(t, repoRoot, runID, TicketRunSnapshot{
+			ArtifactMeta: state.ArtifactMeta{SchemaVersion: artifactSchemaVersion, RunID: runID},
+			TicketID:     child.ID,
+			CurrentPhase: state.TicketPhaseImplement,
+			BlockReason:  "status=open",
+		})
+
+		blocked := collectBlockedTickets(repoRoot, runID, []epos.Ticket{child})
+		if blocked[0].Reason != "waiting on lease (held by run-owner)" {
+			t.Fatalf("expected claim-aware reason, got %q", blocked[0].Reason)
+		}
+	})
+}
+
 func TestCollectBlockedTicketsOffersRetryForBlockedSnapshot(t *testing.T) {
 	repoRoot := t.TempDir()
 	runID := "run-with-blocked-snapshot"
-	child := tkmd.Ticket{
+	child := epos.Ticket{
 		ID:     "ticket-blocked",
 		Title:  "Blocked ticket",
-		Status: tkmd.StatusBlocked,
+		Status: epos.StatusBlocked,
 	}
 	writeTicketRunFixture(t, repoRoot, runID, TicketRunSnapshot{
 		ArtifactMeta: state.ArtifactMeta{SchemaVersion: artifactSchemaVersion, RunID: runID},
@@ -257,7 +367,7 @@ func TestCollectBlockedTicketsOffersRetryForBlockedSnapshot(t *testing.T) {
 		BlockReason:  "review failed",
 	})
 
-	blocked := collectBlockedTickets(repoRoot, runID, []tkmd.Ticket{child})
+	blocked := collectBlockedTickets(repoRoot, runID, []epos.Ticket{child})
 	if len(blocked) != 1 {
 		t.Fatalf("expected one blocked ticket, got %d", len(blocked))
 	}
@@ -277,15 +387,15 @@ func TestRunEpicSchedulesOpenAndReadyTickets(t *testing.T) {
 	epic := epicTicket("epic-ready")
 	mustSaveTicket(t, repoRoot, epic)
 
-	ready := epicChildTicket("ticket-ready", epic.ID, tkmd.StatusReady, nil, []string{"internal/app"})
+	ready := epicChildTicket("ticket-ready", epic.ID, epos.StatusReady, nil, []string{"internal/app"})
 	mustSaveTicket(t, repoRoot, ready)
 
 	// Open tickets with resolved deps should also be scheduled (tk creates tickets as open)
-	open := epicChildTicket("ticket-open", epic.ID, tkmd.StatusOpen, nil, []string{"docs"})
+	open := epicChildTicket("ticket-open", epic.ID, epos.StatusOpen, nil, []string{"docs"})
 	mustSaveTicket(t, repoRoot, open)
 
 	// Blocked tickets should NOT be scheduled
-	blocked := epicChildTicket("ticket-blocked", epic.ID, tkmd.StatusBlocked, nil, []string{"config"})
+	blocked := epicChildTicket("ticket-blocked", epic.ID, epos.StatusBlocked, nil, []string{"config"})
 	mustSaveTicket(t, repoRoot, blocked)
 
 	// Use the blocking adapter which handles any ticket order (uses req.LeaseID)
@@ -335,6 +445,25 @@ func TestRunEpicSchedulesOpenAndReadyTickets(t *testing.T) {
 	}
 }
 
+func TestRunEpic_RejectsUnsafeRootTicketIDWithSafeRunID(t *testing.T) {
+	repoRoot := t.TempDir()
+	_, err := RunEpic(context.Background(), RunEpicRequest{
+		RepoRoot:     repoRoot,
+		RunID:        "run-safe",
+		RootTicketID: "../escaped",
+		Adapter:      runtimefake.New(nil, nil),
+	})
+	if err == nil {
+		t.Fatal("expected unsafe root ticket id to be rejected")
+	}
+	if !strings.Contains(err.Error(), "invalid root ticket id") {
+		t.Fatalf("expected invalid root ticket id error, got: %v", err)
+	}
+	if _, statErr := os.Stat(filepath.Join(repoRoot, ".verk", "runs", "run-safe")); !os.IsNotExist(statErr) {
+		t.Fatalf("unsafe root ticket id created run artifacts: %v", statErr)
+	}
+}
+
 func TestRunEpicScopeViolationBlocksWave(t *testing.T) {
 	repoRoot := t.TempDir()
 	baseCommit := initEpicRepo(t, repoRoot)
@@ -343,7 +472,7 @@ func TestRunEpicScopeViolationBlocksWave(t *testing.T) {
 	epic := epicTicket("epic-scope")
 	mustSaveTicket(t, repoRoot, epic)
 
-	child := epicChildTicket("ticket-scope", epic.ID, tkmd.StatusReady, nil, []string{"internal/app"})
+	child := epicChildTicket("ticket-scope", epic.ID, epos.StatusReady, nil, []string{"internal/app"})
 	mustSaveTicket(t, repoRoot, child)
 
 	adapter := runtimefake.New(
@@ -414,10 +543,10 @@ func TestRunEpicBlockedTicketPreventsFalseCompletion(t *testing.T) {
 	epic := epicTicket("epic-blocked")
 	mustSaveTicket(t, repoRoot, epic)
 
-	ready := epicChildTicket("ticket-ready", epic.ID, tkmd.StatusReady, nil, []string{"internal/app"})
+	ready := epicChildTicket("ticket-ready", epic.ID, epos.StatusReady, nil, []string{"internal/app"})
 	mustSaveTicket(t, repoRoot, ready)
 
-	blocked := epicChildTicket("ticket-blocked", epic.ID, tkmd.StatusBlocked, nil, []string{"docs"})
+	blocked := epicChildTicket("ticket-blocked", epic.ID, epos.StatusBlocked, nil, []string{"docs"})
 	mustSaveTicket(t, repoRoot, blocked)
 
 	adapter := runtimefake.New(
@@ -478,8 +607,8 @@ func TestRunEpicDispatchesSameWaveTicketsConcurrently(t *testing.T) {
 
 	root := epicTicket("epic-concurrency")
 	mustSaveTicket(t, repoRoot, root)
-	mustSaveTicket(t, repoRoot, epicChildTicket("ticket-a", root.ID, tkmd.StatusReady, nil, []string{"internal/app"}))
-	mustSaveTicket(t, repoRoot, epicChildTicket("ticket-b", root.ID, tkmd.StatusReady, nil, []string{"docs"}))
+	mustSaveTicket(t, repoRoot, epicChildTicket("ticket-a", root.ID, epos.StatusReady, nil, []string{"internal/app"}))
+	mustSaveTicket(t, repoRoot, epicChildTicket("ticket-b", root.ID, epos.StatusReady, nil, []string{"docs"}))
 
 	adapter := newBlockingEpicAdapter(t)
 	done := make(chan struct {
@@ -527,10 +656,10 @@ func TestRunEpicSelectsRuntimePerTicket(t *testing.T) {
 
 	root := epicTicket("epic-runtime")
 	mustSaveTicket(t, repoRoot, root)
-	codexTicket := epicChildTicket("ticket-codex", root.ID, tkmd.StatusReady, nil, []string{"internal/app"})
+	codexTicket := epicChildTicket("ticket-codex", root.ID, epos.StatusReady, nil, []string{"internal/app"})
 	codexTicket.Runtime = "codex"
 	mustSaveTicket(t, repoRoot, codexTicket)
-	claudeTicket := epicChildTicket("ticket-claude", root.ID, tkmd.StatusReady, nil, []string{"docs"})
+	claudeTicket := epicChildTicket("ticket-claude", root.ID, epos.StatusReady, nil, []string{"docs"})
 	claudeTicket.Runtime = "claude"
 	mustSaveTicket(t, repoRoot, claudeTicket)
 
@@ -670,7 +799,7 @@ func TestRunEpicFailsOnScopeViolation(t *testing.T) {
 	mustSaveTicket(t, repoRoot, epic)
 
 	// Ticket with a narrow scope so that writing an unrelated file triggers a violation.
-	child := epicChildTicket("ticket-failscope", epic.ID, tkmd.StatusReady, nil, []string{"internal/app"})
+	child := epicChildTicket("ticket-failscope", epic.ID, epos.StatusReady, nil, []string{"internal/app"})
 	mustSaveTicket(t, repoRoot, child)
 
 	adapter := runtimefake.New(
@@ -739,7 +868,7 @@ func TestRunEpicBlocksWhenMainTreeDiffersFromWaveBase(t *testing.T) {
 
 	root := epicTicket("epic-baseline")
 	mustSaveTicket(t, repoRoot, root)
-	mustSaveTicket(t, repoRoot, epicChildTicket("ticket-baseline", root.ID, tkmd.StatusReady, nil, []string{"internal/app"}))
+	mustSaveTicket(t, repoRoot, epicChildTicket("ticket-baseline", root.ID, epos.StatusReady, nil, []string{"internal/app"}))
 
 	adapter := runtimefake.New(
 		[]runtime.WorkerResult{
@@ -805,8 +934,8 @@ func TestRunEpicWaveTwoSeesAcceptedWaveOneChangesWithoutUserVisibleCommit(t *tes
 
 	root := epicTicket("epic-two-wave")
 	mustSaveTicket(t, repoRoot, root)
-	mustSaveTicket(t, repoRoot, epicChildTicket("ticket-wave-1", root.ID, tkmd.StatusReady, nil, []string{"wave1.txt"}))
-	mustSaveTicket(t, repoRoot, epicChildTicket("ticket-wave-2", root.ID, tkmd.StatusOpen, []string{"ticket-wave-1"}, []string{"wave2.txt"}))
+	mustSaveTicket(t, repoRoot, epicChildTicket("ticket-wave-1", root.ID, epos.StatusReady, nil, []string{"wave1.txt"}))
+	mustSaveTicket(t, repoRoot, epicChildTicket("ticket-wave-2", root.ID, epos.StatusOpen, []string{"ticket-wave-1"}, []string{"wave2.txt"}))
 
 	start := epicTestStart()
 	adapter := functionAdapter{
@@ -902,7 +1031,7 @@ func TestRunEpicCleansWaveWorktreesAfterFreshRun(t *testing.T) {
 	cfg := policy.DefaultConfig()
 
 	root := epicTicket("epic-clean-fresh")
-	child := epicChildTicket("ticket-clean-fresh", root.ID, tkmd.StatusReady, nil, []string{"fresh.txt"})
+	child := epicChildTicket("ticket-clean-fresh", root.ID, epos.StatusReady, nil, []string{"fresh.txt"})
 	mustSaveTicket(t, repoRoot, root)
 	mustSaveTicket(t, repoRoot, child)
 
@@ -970,7 +1099,7 @@ func TestRunEpicDoesNotMutateMainWhenFreshWaveCommitFails(t *testing.T) {
 	cfg := policy.DefaultConfig()
 
 	root := epicTicket("epic-commit-fail")
-	child := epicChildTicket("ticket-commit-fail", root.ID, tkmd.StatusReady, nil, []string{"integrated.txt"})
+	child := epicChildTicket("ticket-commit-fail", root.ID, epos.StatusReady, nil, []string{"integrated.txt"})
 	mustSaveTicket(t, repoRoot, root)
 	mustSaveTicket(t, repoRoot, child)
 
@@ -1032,7 +1161,7 @@ func TestRunEpic_DoesNotAdvanceHiddenBaseWhenMainApplyFails(t *testing.T) {
 	cfg.Verification.WaveCommands = nil
 
 	root := epicTicket("epic-main-apply-fail")
-	child := epicChildTicket("ticket-main-apply-fail", root.ID, tkmd.StatusReady, nil, []string{"integrated.txt"})
+	child := epicChildTicket("ticket-main-apply-fail", root.ID, epos.StatusReady, nil, []string{"integrated.txt"})
 	mustSaveTicket(t, repoRoot, root)
 	mustSaveTicket(t, repoRoot, child)
 
@@ -1114,7 +1243,7 @@ func TestRunEpic_FinalRunSaveFailureAfterMainApplyIsRecoverable(t *testing.T) {
 	cfg.Verification.WaveCommands = nil
 
 	root := epicTicket("epic-final-save-recoverable")
-	child := epicChildTicket("ticket-final-save-recoverable", root.ID, tkmd.StatusReady, nil, []string{"docs/final-save.txt"})
+	child := epicChildTicket("ticket-final-save-recoverable", root.ID, epos.StatusReady, nil, []string{"docs/final-save.txt"})
 	mustSaveTicket(t, repoRoot, root)
 	mustSaveTicket(t, repoRoot, child)
 
@@ -1235,7 +1364,7 @@ func TestRunEpic_AppliesPostRepairFilesToMain(t *testing.T) {
 	cfg.Policy.MaxWaveRepairCycles = 1
 
 	root := epicTicket("epic-post-repair-main")
-	child := epicChildTicket("ticket-post-repair-main", root.ID, tkmd.StatusReady, nil, []string{"primary.txt"})
+	child := epicChildTicket("ticket-post-repair-main", root.ID, epos.StatusReady, nil, []string{"primary.txt"})
 	mustSaveTicket(t, repoRoot, root)
 	mustSaveTicket(t, repoRoot, child)
 
@@ -1314,7 +1443,7 @@ func TestRunEpic_PersistsWaveOrdinalBeforeWaveArtifact(t *testing.T) {
 	cfg.Verification.WaveCommands = nil
 
 	root := epicTicket("epic-wave-cursor-before-artifact")
-	child := epicChildTicket("ticket-wave-cursor-before-artifact", root.ID, tkmd.StatusReady, nil, []string{"tracked.txt"})
+	child := epicChildTicket("ticket-wave-cursor-before-artifact", root.ID, epos.StatusReady, nil, []string{"tracked.txt"})
 	mustSaveTicket(t, repoRoot, root)
 	mustSaveTicket(t, repoRoot, child)
 
@@ -1387,7 +1516,7 @@ func TestRunEpicBlockedTicketKeepsMainTreeCleanAndPersistsDiffArtifact(t *testin
 
 	root := epicTicket("epic-blocked-artifact")
 	mustSaveTicket(t, repoRoot, root)
-	mustSaveTicket(t, repoRoot, epicChildTicket("ticket-blocked-artifact", root.ID, tkmd.StatusReady, nil, []string{"tracked.txt"}))
+	mustSaveTicket(t, repoRoot, epicChildTicket("ticket-blocked-artifact", root.ID, epos.StatusReady, nil, []string{"tracked.txt"}))
 
 	start := epicTestStart()
 	adapter := functionAdapter{
@@ -1459,7 +1588,7 @@ func TestRunEpic_BlocksWhenFailedTicketDiffPersistenceFails(t *testing.T) {
 	cfg.Verification.WaveCommands = nil
 
 	root := epicTicket("epic-blocked-diff-persist-fail")
-	child := epicChildTicket("ticket-blocked-diff-persist-fail", root.ID, tkmd.StatusReady, nil, []string{"tracked.txt"})
+	child := epicChildTicket("ticket-blocked-diff-persist-fail", root.ID, epos.StatusReady, nil, []string{"tracked.txt"})
 	mustSaveTicket(t, repoRoot, root)
 	mustSaveTicket(t, repoRoot, child)
 
@@ -1526,13 +1655,13 @@ func TestWaveIsolation_LintInOneTicketDoesNotBlockOther(t *testing.T) {
 	root := epicTicket("epic-wave-isolation")
 	mustSaveTicket(t, repoRoot, root)
 
-	ticketA := epicChildTicket("ticket-a", root.ID, tkmd.StatusReady, nil, []string{"a.go"})
+	ticketA := epicChildTicket("ticket-a", root.ID, epos.StatusReady, nil, []string{"a.go"})
 	ticketA.ValidationCommands = []string{
 		`test -f a.go && test ! -f b.go && printf 'ticket-a verified\n'`,
 	}
 	mustSaveTicket(t, repoRoot, ticketA)
 
-	ticketB := epicChildTicket("ticket-b", root.ID, tkmd.StatusReady, nil, []string{"b.go"})
+	ticketB := epicChildTicket("ticket-b", root.ID, epos.StatusReady, nil, []string{"b.go"})
 	ticketB.ValidationCommands = []string{
 		`test -f b.go && printf 'lint failure: b.go\n' >&2 && exit 1`,
 	}
@@ -1657,8 +1786,6 @@ func initEpicRepo(t *testing.T, root string) string {
 	t.Helper()
 
 	mustRunGit(t, root, "init")
-	mustRunGit(t, root, "config", "user.email", "test@example.com")
-	mustRunGit(t, root, "config", "user.name", "Test User")
 
 	if err := os.WriteFile(filepath.Join(root, "tracked.txt"), []byte("base\n"), 0o644); err != nil {
 		t.Fatalf("seed repo: %v", err)
@@ -1673,19 +1800,27 @@ func initEpicRepo(t *testing.T, root string) string {
 	return strings.TrimSpace(head)
 }
 
-func mustSaveTicket(t *testing.T, repoRoot string, ticket tkmd.Ticket) {
+func mustSaveTicket(t *testing.T, repoRoot string, ticket epos.Ticket) {
 	t.Helper()
 
-	if err := tkmd.SaveTicket(filepath.Join(repoRoot, ".tickets", ticket.ID+".md"), ticket); err != nil {
+	if err := epos.SaveTicket(filepath.Join(repoRoot, ".tickets", ticket.ID+".md"), ticket); err != nil {
 		t.Fatalf("SaveTicket(%s): %v", ticket.ID, err)
 	}
 }
 
-func epicTicket(id string) tkmd.Ticket {
-	return tkmd.Ticket{
+func writeRuntimeState(t *testing.T, repoRoot string, runtimeState *eposticket.RuntimeState) {
+	t.Helper()
+
+	if err := eposruntime.WriteRuntimeState(repoRoot, runtimeState); err != nil {
+		t.Fatalf("WriteRuntimeState(%s): %v", runtimeState.TicketID, err)
+	}
+}
+
+func epicTicket(id string) epos.Ticket {
+	return epos.Ticket{
 		ID:     id,
 		Title:  "Epic " + id,
-		Status: tkmd.StatusReady,
+		Status: epos.StatusReady,
 		OwnedPaths: []string{
 			"internal/app",
 			"docs",
@@ -1696,8 +1831,8 @@ func epicTicket(id string) tkmd.Ticket {
 	}
 }
 
-func epicChildTicket(id, parent string, status tkmd.Status, deps, owned []string) tkmd.Ticket {
-	return tkmd.Ticket{
+func epicChildTicket(id, parent string, status epos.Status, deps, owned []string) epos.Ticket {
+	return epos.Ticket{
 		ID:         id,
 		Title:      "Child " + id,
 		Status:     status,
@@ -1836,7 +1971,7 @@ func TestRunEpicConcurrentLockContention(t *testing.T) {
 
 	epic := epicTicket("epic-lock")
 	mustSaveTicket(t, repoRoot, epic)
-	child := epicChildTicket("ticket-lock", epic.ID, tkmd.StatusReady, nil, []string{"internal/app"})
+	child := epicChildTicket("ticket-lock", epic.ID, epos.StatusReady, nil, []string{"internal/app"})
 	mustSaveTicket(t, repoRoot, child)
 
 	// Use a slow adapter so the first RunEpic holds the lock long enough
@@ -1955,16 +2090,16 @@ func TestRunEpicNestedSubEpicIsExplicitlyUnsupported(t *testing.T) {
 	epic := epicTicket("epic-sub")
 	mustSaveTicket(t, repoRoot, epic)
 
-	ticket1 := epicChildTicket("ticket-1", epic.ID, tkmd.StatusOpen, nil, []string{"internal/app"})
+	ticket1 := epicChildTicket("ticket-1", epic.ID, epos.StatusOpen, nil, []string{"internal/app"})
 	mustSaveTicket(t, repoRoot, ticket1)
 
-	ticket2 := epicChildTicket("ticket-2", epic.ID, tkmd.StatusOpen, nil, []string{"docs"})
+	ticket2 := epicChildTicket("ticket-2", epic.ID, epos.StatusOpen, nil, []string{"docs"})
 	mustSaveTicket(t, repoRoot, ticket2)
 
-	sub1 := epicChildTicket("sub-1", ticket1.ID, tkmd.StatusOpen, nil, []string{"internal/app/sub1"})
+	sub1 := epicChildTicket("sub-1", ticket1.ID, epos.StatusOpen, nil, []string{"internal/app/sub1"})
 	mustSaveTicket(t, repoRoot, sub1)
 
-	sub2 := epicChildTicket("sub-2", ticket1.ID, tkmd.StatusOpen, nil, []string{"internal/app/sub2"})
+	sub2 := epicChildTicket("sub-2", ticket1.ID, epos.StatusOpen, nil, []string{"internal/app/sub2"})
 	mustSaveTicket(t, repoRoot, sub2)
 
 	adapter := newReflectingAdapter(1)
@@ -2025,10 +2160,10 @@ func TestRunEpicRespectsMaxDepth(t *testing.T) {
 	epic := epicTicket("epic-depth")
 	mustSaveTicket(t, repoRoot, epic)
 
-	ticket1 := epicChildTicket("ticket-1", epic.ID, tkmd.StatusOpen, nil, []string{"internal/app"})
+	ticket1 := epicChildTicket("ticket-1", epic.ID, epos.StatusOpen, nil, []string{"internal/app"})
 	mustSaveTicket(t, repoRoot, ticket1)
 
-	sub1 := epicChildTicket("sub-1", ticket1.ID, tkmd.StatusOpen, nil, []string{"internal/app/sub"})
+	sub1 := epicChildTicket("sub-1", ticket1.ID, epos.StatusOpen, nil, []string{"internal/app/sub"})
 	mustSaveTicket(t, repoRoot, sub1)
 
 	// Only 1 worker + 1 review needed: just ticket-1 (sub-1 is skipped by MaxDepth=1)
@@ -2062,13 +2197,13 @@ func TestRunSubEpicBasic(t *testing.T) {
 	cfg.Scheduler.MaxDepth = 3
 
 	// ticket-1 has children: sub-1, sub-2
-	ticket1 := epicChildTicket("ticket-1", "epic-parent", tkmd.StatusOpen, nil, []string{"internal/app"})
+	ticket1 := epicChildTicket("ticket-1", "epic-parent", epos.StatusOpen, nil, []string{"internal/app"})
 	mustSaveTicket(t, repoRoot, ticket1)
 
-	sub1 := epicChildTicket("sub-1", ticket1.ID, tkmd.StatusOpen, nil, []string{"internal/app/sub1"})
+	sub1 := epicChildTicket("sub-1", ticket1.ID, epos.StatusOpen, nil, []string{"internal/app/sub1"})
 	mustSaveTicket(t, repoRoot, sub1)
 
-	sub2 := epicChildTicket("sub-2", ticket1.ID, tkmd.StatusOpen, nil, []string{"internal/app/sub2"})
+	sub2 := epicChildTicket("sub-2", ticket1.ID, epos.StatusOpen, nil, []string{"internal/app/sub2"})
 	mustSaveTicket(t, repoRoot, sub2)
 
 	adapter := newReflectingAdapter(2)
@@ -2159,11 +2294,11 @@ func TestRunEpicNestedSubEpicBlocksParentTicket(t *testing.T) {
 	mustSaveTicket(t, repoRoot, epic)
 
 	// parent-task has children, so it triggers the sub-epic path in executeEpicTicket.
-	parentTask := epicChildTicket("parent-task", epic.ID, tkmd.StatusOpen, nil, []string{"internal/app"})
+	parentTask := epicChildTicket("parent-task", epic.ID, epos.StatusOpen, nil, []string{"internal/app"})
 	mustSaveTicket(t, repoRoot, parentTask)
 
 	// grandchild exists purely to trigger the nested sub-epic path.
-	grandchild := epicChildTicket("grandchild", parentTask.ID, tkmd.StatusOpen, nil, []string{"internal/app/sub"})
+	grandchild := epicChildTicket("grandchild", parentTask.ID, epos.StatusOpen, nil, []string{"internal/app/sub"})
 	mustSaveTicket(t, repoRoot, grandchild)
 
 	adapter := newReflectingAdapter(0)
@@ -2191,7 +2326,7 @@ func TestRunEpicNestedSubEpicBlocksParentTicket(t *testing.T) {
 	if loadErr != nil {
 		t.Fatalf("load parent-task ticket: %v", loadErr)
 	}
-	if parentTicket.Status != tkmd.StatusBlocked {
+	if parentTicket.Status != epos.StatusBlocked {
 		t.Fatalf("expected parent-task to be blocked in ticket store, got %q", parentTicket.Status)
 	}
 
@@ -2217,7 +2352,7 @@ func TestRunEpicContextCancellation(t *testing.T) {
 
 	epic := epicTicket("epic-ctx-cancel")
 	mustSaveTicket(t, repoRoot, epic)
-	child := epicChildTicket("ticket-ctx-cancel", epic.ID, tkmd.StatusReady, nil, []string{"internal/app"})
+	child := epicChildTicket("ticket-ctx-cancel", epic.ID, epos.StatusReady, nil, []string{"internal/app"})
 	mustSaveTicket(t, repoRoot, child)
 
 	// blockingEpicAdapter blocks inside RunWorker until the context is cancelled
@@ -2283,10 +2418,10 @@ func TestRunEpicLinkedSiblingsNotEachOthersChildren(t *testing.T) {
 
 	// Two siblings that cross-link each other via the tk links field.
 	// Links are stored in UnknownFrontmatter since Ticket has no native Links field.
-	sibA := tkmd.Ticket{
+	sibA := epos.Ticket{
 		ID:         "sib-linked-a",
 		Title:      "Sibling A",
-		Status:     tkmd.StatusOpen,
+		Status:     epos.StatusOpen,
 		OwnedPaths: []string{"internal/app/sib-a"},
 		UnknownFrontmatter: map[string]any{
 			"parent": epic.ID,
@@ -2296,10 +2431,10 @@ func TestRunEpicLinkedSiblingsNotEachOthersChildren(t *testing.T) {
 	}
 	mustSaveTicket(t, repoRoot, sibA)
 
-	sibB := tkmd.Ticket{
+	sibB := epos.Ticket{
 		ID:         "sib-linked-b",
 		Title:      "Sibling B",
-		Status:     tkmd.StatusOpen,
+		Status:     epos.StatusOpen,
 		OwnedPaths: []string{"internal/app/sib-b"},
 		UnknownFrontmatter: map[string]any{
 			"parent": epic.ID,
@@ -2358,10 +2493,10 @@ func TestResumeRun_NestedSubEpicIsolationIsExplicitlyUnsupported(t *testing.T) {
 	epic := epicTicket("epic-desc-inprog")
 	mustSaveTicket(t, repoRoot, epic)
 
-	parentTask := epicChildTicket("parent-task-inprog", epic.ID, tkmd.StatusInProgress, nil, []string{"internal/app"})
+	parentTask := epicChildTicket("parent-task-inprog", epic.ID, epos.StatusInProgress, nil, []string{"internal/app"})
 	mustSaveTicket(t, repoRoot, parentTask)
 
-	grandchild := epicChildTicket("grandchild-inprog", parentTask.ID, tkmd.StatusInProgress, nil, []string{"internal/app/sub"})
+	grandchild := epicChildTicket("grandchild-inprog", parentTask.ID, epos.StatusInProgress, nil, []string{"internal/app/sub"})
 	mustSaveTicket(t, repoRoot, grandchild)
 
 	// Simulate crash mid-sub-wave: grandchild added to TicketIDs by registerSubWave,
@@ -2438,11 +2573,11 @@ func TestResumeRun_NestedSubEpicIsolationIsExplicitlyUnsupported(t *testing.T) {
 		t.Errorf("expected blocked current phase, got %q", report.Run.CurrentPhase)
 	}
 
-	parentTicket, loadErr := tkmd.LoadTicket(ticketMarkdownPath(repoRoot, parentTask.ID))
+	parentTicket, loadErr := epos.LoadTicket(ticketMarkdownPath(repoRoot, parentTask.ID))
 	if loadErr != nil {
 		t.Fatalf("load parent ticket: %v", loadErr)
 	}
-	if parentTicket.Status != tkmd.StatusBlocked {
+	if parentTicket.Status != epos.StatusBlocked {
 		t.Fatalf("expected parent ticket to persist blocked status, got %q", parentTicket.Status)
 	}
 
@@ -2463,10 +2598,10 @@ func TestResumeRun_PendingVerificationSubWaveIsCompleted(t *testing.T) {
 	epic := epicTicket("epic-subwave-pending")
 	mustSaveTicket(t, repoRoot, epic)
 
-	parentTask := epicChildTicket("parent-subwave-pending", epic.ID, tkmd.StatusClosed, nil, []string{"internal/app"})
+	parentTask := epicChildTicket("parent-subwave-pending", epic.ID, epos.StatusClosed, nil, []string{"internal/app"})
 	mustSaveTicket(t, repoRoot, parentTask)
 
-	grandchild := epicChildTicket("grandchild-subwave-pending", parentTask.ID, tkmd.StatusClosed, nil, []string{"internal/app/sub"})
+	grandchild := epicChildTicket("grandchild-subwave-pending", parentTask.ID, epos.StatusClosed, nil, []string{"internal/app/sub"})
 	mustSaveTicket(t, repoRoot, grandchild)
 
 	subWaveID := fmt.Sprintf("sub-%s-wave-1", parentTask.ID)

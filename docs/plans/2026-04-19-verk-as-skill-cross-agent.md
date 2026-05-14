@@ -508,7 +508,7 @@ This section documents **known-residual** issues that the current plan does not 
 
 ## Open Questions
 
-1. **Claim reconciliation across modes.** Engine-mode and skill-mode share `.tickets/.claims/`. The Mode Interaction section rejects overlap at `/orchestrate`, but a race between the two is still possible (engine acquires lease just as orchestrator calls `/orchestrate`). Ticket claim acquisition logic in `internal/adapters/ticketstore/tkmd` handles this today; confirm skill-mode code path actually routes through it.
+1. **Claim reconciliation across modes.** Engine-mode and skill-mode share `.tickets/.claims/`. The Mode Interaction section rejects overlap at `/orchestrate`, but a race between the two is still possible (engine acquires lease just as orchestrator calls `/orchestrate`). Ticket claim acquisition logic in `internal/adapters/ticketstore/epos` handles this today; confirm skill-mode code path actually routes through it.
 
 2. **Prompt cache partition key.** One key per run is conservative (cache hits only within a run). One key per repo is aggressive (cache hits across runs but crosses trust boundaries — a run-specific prompt leaks into another run's cache). v1 uses per-run; revisit if cache-hit rate underperforms.
 

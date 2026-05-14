@@ -3,8 +3,9 @@ package engine
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
-	"verk/internal/adapters/ticketstore/tkmd"
+	"verk/internal/adapters/ticketstore/epos"
 	"verk/internal/state"
 )
 
@@ -74,10 +75,10 @@ func TestDeriveStatus_UsesRunArtifactsAndClaimsOnly(t *testing.T) {
 			FailedGate:   "review",
 		},
 	})
-	writeTicketMarkdownFixture(t, repoRoot, tkmd.Ticket{
+	writeTicketMarkdownFixture(t, repoRoot, epos.Ticket{
 		ID:                 ticketID,
 		Title:              "Contradictory ticket",
-		Status:             tkmd.StatusOpen,
+		Status:             epos.StatusOpen,
 		OwnedPaths:         []string{"docs"},
 		UnknownFrontmatter: map[string]any{"type": "task"},
 	})
@@ -110,6 +111,44 @@ func TestDeriveStatus_UsesRunArtifactsAndClaimsOnly(t *testing.T) {
 	}
 	if report.ClaimDivergence {
 		t.Fatal("expected no claim divergence")
+	}
+}
+
+func TestDeriveStatus_RejectsUnsafeRunIDBeforeArtifactRead(t *testing.T) {
+	repoRoot := t.TempDir()
+	_, err := DeriveStatus(StatusRequest{RepoRoot: repoRoot, RunID: "../escaped"})
+	if err == nil {
+		t.Fatal("expected unsafe run id to be rejected")
+	}
+	if !strings.Contains(err.Error(), "invalid run id") {
+		t.Fatalf("expected invalid run id error, got: %v", err)
+	}
+	if _, statErr := os.Stat(filepath.Join(repoRoot, ".verk", "escaped")); !os.IsNotExist(statErr) {
+		t.Fatalf("unsafe run id read escaped artifact path: %v", statErr)
+	}
+}
+
+func TestDeriveStatus_RejectsUnsafePersistedTicketIDBeforeArtifactRead(t *testing.T) {
+	repoRoot := t.TempDir()
+	runID := "run-status-unsafe-ticket"
+	writeOpRunFixture(t, repoRoot, runID, state.RunArtifact{
+		ArtifactMeta: state.ArtifactMeta{SchemaVersion: 1, RunID: runID},
+		Mode:         "ticket",
+		RootTicketID: "ticket-safe",
+		Status:       state.EpicRunStatusRunning,
+		CurrentPhase: state.TicketPhaseImplement,
+		TicketIDs:    []string{"../escaped"},
+	})
+
+	_, err := DeriveStatus(StatusRequest{RepoRoot: repoRoot, RunID: runID})
+	if err == nil {
+		t.Fatal("expected unsafe persisted ticket id to be rejected")
+	}
+	if !strings.Contains(err.Error(), "invalid ticket id") {
+		t.Fatalf("expected invalid ticket id error, got: %v", err)
+	}
+	if _, statErr := os.Stat(filepath.Join(repoRoot, ".verk", "runs", runID, "escaped")); !os.IsNotExist(statErr) {
+		t.Fatalf("unsafe persisted ticket id read escaped artifact path: %v", statErr)
 	}
 }
 

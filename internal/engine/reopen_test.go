@@ -4,9 +4,10 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
-	"verk/internal/adapters/ticketstore/tkmd"
+	"verk/internal/adapters/ticketstore/epos"
 	"verk/internal/state"
 )
 
@@ -42,10 +43,10 @@ func TestReopenTicket_BlockedToImplement(t *testing.T) {
 		TicketID:                 ticketID,
 		EffectiveReviewThreshold: state.SeverityP2,
 	})
-	writeTicketMarkdownFixture(t, repoRoot, tkmd.Ticket{
+	writeTicketMarkdownFixture(t, repoRoot, epos.Ticket{
 		ID:                 ticketID,
 		Title:              "Blocked ticket",
-		Status:             tkmd.StatusBlocked,
+		Status:             epos.StatusBlocked,
 		OwnedPaths:         []string{"internal/app"},
 		UnknownFrontmatter: map[string]any{"type": "task"},
 	})
@@ -81,12 +82,44 @@ func TestReopenTicket_BlockedToImplement(t *testing.T) {
 		t.Fatalf("expected block reason to be cleared, got %q", snapshot.BlockReason)
 	}
 
-	ticket, err := tkmd.LoadTicket(ticketMarkdownPath(repoRoot, ticketID))
+	ticket, err := epos.LoadTicket(ticketMarkdownPath(repoRoot, ticketID))
 	if err != nil {
 		t.Fatalf("load ticket markdown: %v", err)
 	}
-	if ticket.Status != tkmd.StatusOpen {
-		t.Fatalf("expected ticket markdown status open, got %q", ticket.Status)
+	if ticket.Status != epos.StatusReady {
+		t.Fatalf("expected ticket markdown status ready, got %q", ticket.Status)
+	}
+}
+
+func TestReopenTicket_RejectsUnsafeIdentifiersBeforeArtifactWrite(t *testing.T) {
+	repoRoot := t.TempDir()
+	tests := []struct {
+		name     string
+		runID    string
+		ticketID string
+		want     string
+	}{
+		{name: "run id", runID: "../escaped", ticketID: "ticket-safe", want: "invalid run id"},
+		{name: "ticket id", runID: "run-safe", ticketID: "../escaped", want: "invalid ticket id"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := ReopenTicket(context.Background(), ReopenRequest{
+				RepoRoot: repoRoot,
+				RunID:    tt.runID,
+				TicketID: tt.ticketID,
+				ToPhase:  state.TicketPhaseImplement,
+			})
+			if err == nil {
+				t.Fatal("expected unsafe identifier to be rejected")
+			}
+			if !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("expected %q error, got: %v", tt.want, err)
+			}
+			if _, statErr := os.Stat(filepath.Join(repoRoot, ".verk", "escaped")); !os.IsNotExist(statErr) {
+				t.Fatalf("unsafe identifier touched escaped artifact path: %v", statErr)
+			}
+		})
 	}
 }
 
@@ -126,10 +159,10 @@ func TestReopenTicket_ClosedRepairMarksWaveFailedReopened(t *testing.T) {
 		TicketID:                 ticketID,
 		EffectiveReviewThreshold: state.SeverityP2,
 	})
-	writeTicketMarkdownFixture(t, repoRoot, tkmd.Ticket{
+	writeTicketMarkdownFixture(t, repoRoot, epos.Ticket{
 		ID:                 ticketID,
 		Title:              "Closed ticket",
-		Status:             tkmd.StatusClosed,
+		Status:             epos.StatusClosed,
 		OwnedPaths:         []string{"internal/app"},
 		UnknownFrontmatter: map[string]any{"type": "task"},
 	})
@@ -195,10 +228,10 @@ func TestReopenTicket_UpdatesTicketStoreAfterCommit(t *testing.T) {
 		TicketID:                 ticketID,
 		EffectiveReviewThreshold: state.SeverityP2,
 	})
-	writeTicketMarkdownFixture(t, repoRoot, tkmd.Ticket{
+	writeTicketMarkdownFixture(t, repoRoot, epos.Ticket{
 		ID:                 ticketID,
 		Title:              "G7 ticket",
-		Status:             tkmd.StatusBlocked,
+		Status:             epos.StatusBlocked,
 		OwnedPaths:         []string{"internal/app"},
 		UnknownFrontmatter: map[string]any{"type": "task"},
 	})
@@ -212,13 +245,13 @@ func TestReopenTicket_UpdatesTicketStoreAfterCommit(t *testing.T) {
 		t.Fatalf("ReopenTicket returned error: %v", err)
 	}
 
-	// After successful reopen, the ticket markdown should be updated to open.
-	ticket, err := tkmd.LoadTicket(ticketMarkdownPath(repoRoot, ticketID))
+	// After successful reopen, the ticket markdown should be updated to ready.
+	ticket, err := epos.LoadTicket(ticketMarkdownPath(repoRoot, ticketID))
 	if err != nil {
 		t.Fatalf("load ticket markdown: %v", err)
 	}
-	if ticket.Status != tkmd.StatusOpen {
-		t.Fatalf("expected ticket status open after reopen, got %q", ticket.Status)
+	if ticket.Status != epos.StatusReady {
+		t.Fatalf("expected ticket status ready after reopen, got %q", ticket.Status)
 	}
 }
 
@@ -256,10 +289,10 @@ func TestReopenTicket_CommitFailureDoesNotMutateTicketStore(t *testing.T) {
 		TicketID:                 ticketID,
 		EffectiveReviewThreshold: state.SeverityP2,
 	})
-	writeTicketMarkdownFixture(t, repoRoot, tkmd.Ticket{
+	writeTicketMarkdownFixture(t, repoRoot, epos.Ticket{
 		ID:                 ticketID,
 		Title:              "Fail ticket",
-		Status:             tkmd.StatusBlocked,
+		Status:             epos.StatusBlocked,
 		OwnedPaths:         []string{"internal/app"},
 		UnknownFrontmatter: map[string]any{"type": "task"},
 	})
@@ -309,11 +342,11 @@ func TestReopenTicket_CommitFailureDoesNotMutateTicketStore(t *testing.T) {
 	_ = os.WriteFile(runPath, originalRunData, 0o644)
 
 	// The critical check: ticket markdown should still be "blocked", NOT "open".
-	ticket, err := tkmd.LoadTicket(ticketMarkdownPath(repoRoot, ticketID))
+	ticket, err := epos.LoadTicket(ticketMarkdownPath(repoRoot, ticketID))
 	if err != nil {
 		t.Fatalf("load ticket markdown after failure: %v", err)
 	}
-	if ticket.Status != tkmd.StatusBlocked {
+	if ticket.Status != epos.StatusBlocked {
 		t.Fatalf("G7 violation: ticket markdown was mutated to %q even though commit failed — should still be blocked", ticket.Status)
 	}
 }
@@ -354,10 +387,10 @@ func TestReopenTicket_MultiTicket_RunPhaseNotRolledBack(t *testing.T) {
 		TicketID:                 ticketA,
 		EffectiveReviewThreshold: state.SeverityP2,
 	})
-	writeTicketMarkdownFixture(t, repoRoot, tkmd.Ticket{
+	writeTicketMarkdownFixture(t, repoRoot, epos.Ticket{
 		ID:                 ticketA,
 		Title:              "Ticket A in review",
-		Status:             tkmd.StatusOpen,
+		Status:             epos.StatusOpen,
 		OwnedPaths:         []string{"internal/app"},
 		UnknownFrontmatter: map[string]any{"type": "task"},
 	})
@@ -373,10 +406,10 @@ func TestReopenTicket_MultiTicket_RunPhaseNotRolledBack(t *testing.T) {
 		TicketID:                 ticketB,
 		EffectiveReviewThreshold: state.SeverityP2,
 	})
-	writeTicketMarkdownFixture(t, repoRoot, tkmd.Ticket{
+	writeTicketMarkdownFixture(t, repoRoot, epos.Ticket{
 		ID:                 ticketB,
 		Title:              "Ticket B blocked",
-		Status:             tkmd.StatusBlocked,
+		Status:             epos.StatusBlocked,
 		OwnedPaths:         []string{"internal/app"},
 		UnknownFrontmatter: map[string]any{"type": "task"},
 	})
@@ -437,10 +470,10 @@ func TestReopenTicket_SingleTicket_CurrentPhaseSet(t *testing.T) {
 		TicketID:                 ticketID,
 		EffectiveReviewThreshold: state.SeverityP2,
 	})
-	writeTicketMarkdownFixture(t, repoRoot, tkmd.Ticket{
+	writeTicketMarkdownFixture(t, repoRoot, epos.Ticket{
 		ID:                 ticketID,
 		Title:              "Single ticket",
-		Status:             tkmd.StatusBlocked,
+		Status:             epos.StatusBlocked,
 		OwnedPaths:         []string{"internal/app"},
 		UnknownFrontmatter: map[string]any{"type": "task"},
 	})
@@ -502,10 +535,10 @@ func TestReopenTicket_MultiTicket_BothReopened_MostAdvancedPhaseWins(t *testing.
 		TicketID:                 ticketA,
 		EffectiveReviewThreshold: state.SeverityP2,
 	})
-	writeTicketMarkdownFixture(t, repoRoot, tkmd.Ticket{
+	writeTicketMarkdownFixture(t, repoRoot, epos.Ticket{
 		ID:                 ticketA,
 		Title:              "Ticket AA",
-		Status:             tkmd.StatusBlocked,
+		Status:             epos.StatusBlocked,
 		OwnedPaths:         []string{"internal/app"},
 		UnknownFrontmatter: map[string]any{"type": "task"},
 	})
@@ -520,10 +553,10 @@ func TestReopenTicket_MultiTicket_BothReopened_MostAdvancedPhaseWins(t *testing.
 		TicketID:                 ticketB,
 		EffectiveReviewThreshold: state.SeverityP2,
 	})
-	writeTicketMarkdownFixture(t, repoRoot, tkmd.Ticket{
+	writeTicketMarkdownFixture(t, repoRoot, epos.Ticket{
 		ID:                 ticketB,
 		Title:              "Ticket BB",
-		Status:             tkmd.StatusBlocked,
+		Status:             epos.StatusBlocked,
 		OwnedPaths:         []string{"internal/app"},
 		UnknownFrontmatter: map[string]any{"type": "task"},
 	})
@@ -565,9 +598,9 @@ func TestReopenTicket_MultiTicket_BothReopened_MostAdvancedPhaseWins(t *testing.
 	}
 }
 
-func writeTicketMarkdownFixture(t *testing.T, repoRoot string, ticket tkmd.Ticket) {
+func writeTicketMarkdownFixture(t *testing.T, repoRoot string, ticket epos.Ticket) {
 	t.Helper()
-	if err := tkmd.SaveTicket(filepath.Join(repoRoot, ".tickets", ticket.ID+".md"), ticket); err != nil {
+	if err := epos.SaveTicket(filepath.Join(repoRoot, ".tickets", ticket.ID+".md"), ticket); err != nil {
 		t.Fatalf("SaveTicket(%s): %v", ticket.ID, err)
 	}
 }

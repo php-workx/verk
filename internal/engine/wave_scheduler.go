@@ -6,7 +6,7 @@ import (
 	"strings"
 	"time"
 	"verk/internal/adapters/repo/git"
-	"verk/internal/adapters/ticketstore/tkmd"
+	"verk/internal/adapters/ticketstore/epos"
 	"verk/internal/state"
 )
 
@@ -58,7 +58,7 @@ type BlockedTicketSummary struct {
 	CanRetryAutomatically bool              `json:"can_retry_automatically"`
 }
 
-func BuildWave(ready []tkmd.Ticket, maxConcurrency int) (state.WaveArtifact, error) {
+func BuildWave(ready []epos.Ticket, maxConcurrency int) (state.WaveArtifact, error) {
 	if maxConcurrency <= 0 {
 		return state.WaveArtifact{}, fmt.Errorf("max concurrency must be greater than zero")
 	}
@@ -72,7 +72,7 @@ func BuildWave(ready []tkmd.Ticket, maxConcurrency int) (state.WaveArtifact, err
 		if len(wave.TicketIDs) >= maxConcurrency {
 			break
 		}
-		if err := tkmd.ValidateTicketSchedulingFields(ticket); err != nil {
+		if err := epos.ValidateTicketSchedulingFields(ticket); err != nil {
 			return state.WaveArtifact{}, fmt.Errorf("ticket %q is not schedulable: %w", ticket.ID, err)
 		}
 		if overlapsAny(ticket.OwnedPaths, selectedScopes) {

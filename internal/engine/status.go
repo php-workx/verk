@@ -8,7 +8,7 @@ import (
 	"sort"
 	"strings"
 	"time"
-	"verk/internal/adapters/ticketstore/tkmd"
+	"verk/internal/adapters/ticketstore/epos"
 	"verk/internal/state"
 )
 
@@ -409,7 +409,7 @@ func conciseFailures(failures []StatusFailure, limit int) string {
 }
 
 func loadTicketTitle(repoRoot, ticketID string) string {
-	ticket, err := tkmd.LoadTicket(filepath.Join(repoRoot, ".tickets", ticketID+".md"))
+	ticket, err := epos.LoadTicket(filepath.Join(repoRoot, ".tickets", ticketID+".md"))
 	if err != nil {
 		return ""
 	}
@@ -435,7 +435,7 @@ func deriveCurrentWaveID(waves map[string]state.WaveArtifact) string {
 }
 
 func deriveTicketClaim(repoRoot, runID, ticketID string, snapshot TicketRunSnapshot) (*state.ClaimArtifact, error) {
-	live, err := loadOptionalClaim(liveClaimPath(repoRoot, ticketID))
+	live, err := epos.LoadLiveClaim(repoRoot, ticketID)
 	if err != nil {
 		return nil, err
 	}
@@ -446,7 +446,7 @@ func deriveTicketClaim(repoRoot, runID, ticketID string, snapshot TicketRunSnaps
 	if live == nil && durable == nil {
 		return nil, nil //nolint:nilnil // not-found: nil value + nil error = "no data, no problem"
 	}
-	claim, err := tkmd.ReconcileClaim(live, durable, runID, isTerminalPhase(snapshot.CurrentPhase))
+	claim, err := epos.ReconcileClaim(live, durable, runID, isTerminalPhase(snapshot.CurrentPhase))
 	if err != nil {
 		return nil, err
 	}

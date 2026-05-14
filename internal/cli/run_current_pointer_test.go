@@ -8,7 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
-	"verk/internal/adapters/ticketstore/tkmd"
+	"verk/internal/adapters/ticketstore/epos"
 )
 
 // initCLITestRepo creates a minimal git repository in dir with a single
@@ -20,19 +20,80 @@ func initCLITestRepo(t *testing.T, dir string) {
 		t.Helper()
 		cmd := exec.Command("git", args...)
 		cmd.Dir = dir
-		cmd.Env = append(os.Environ(), "GIT_OPTIONAL_LOCKS=0")
+		cmd.Env = testGitEnv()
 		if out, err := cmd.CombinedOutput(); err != nil {
 			t.Fatalf("git %v failed: %v\n%s", args, err, string(out))
 		}
 	}
 	run("init")
-	run("config", "user.email", "test@example.com")
-	run("config", "user.name", "Test User")
 	if err := os.WriteFile(filepath.Join(dir, "README"), []byte("test\n"), 0o644); err != nil {
 		t.Fatalf("write README: %v", err)
 	}
 	run("add", "README")
 	run("commit", "-m", "initial")
+}
+
+func testGitEnv() []string {
+	env := os.Environ()
+	out := make([]string, 0, len(env)+6)
+	for _, entry := range env {
+		key, _, found := strings.Cut(entry, "=")
+		if !found {
+			out = append(out, entry)
+			continue
+		}
+		if isGitLocalEnv(key) {
+			continue
+		}
+		out = append(out, entry)
+	}
+	out = append(out,
+		"GIT_OPTIONAL_LOCKS=0",
+		"GIT_CONFIG_GLOBAL="+os.DevNull,
+		"GIT_CONFIG_NOSYSTEM=1",
+		"GIT_AUTHOR_NAME=Test User",
+		"GIT_AUTHOR_EMAIL=test@example.com",
+		"GIT_COMMITTER_NAME=Test User",
+		"GIT_COMMITTER_EMAIL=test@example.com",
+		"GIT_CONFIG_COUNT=1",
+		"GIT_CONFIG_KEY_0=core.hooksPath",
+		"GIT_CONFIG_VALUE_0="+os.DevNull,
+	)
+	return out
+}
+
+func isGitLocalEnv(key string) bool {
+	if strings.HasPrefix(key, "GIT_CONFIG_KEY_") || strings.HasPrefix(key, "GIT_CONFIG_VALUE_") {
+		return true
+	}
+	switch key {
+	case "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+		"GIT_AUTHOR_EMAIL",
+		"GIT_AUTHOR_NAME",
+		"GIT_COMMON_DIR",
+		"GIT_COMMITTER_EMAIL",
+		"GIT_COMMITTER_NAME",
+		"GIT_CONFIG",
+		"GIT_CONFIG_COUNT",
+		"GIT_CONFIG_GLOBAL",
+		"GIT_CONFIG_NOSYSTEM",
+		"GIT_CONFIG_PARAMETERS",
+		"GIT_DIR",
+		"GIT_GRAFT_FILE",
+		"GIT_IMPLICIT_WORK_TREE",
+		"GIT_INDEX_FILE",
+		"GIT_NO_REPLACE_OBJECTS",
+		"GIT_OBJECT_DIRECTORY",
+		"GIT_PREFIX",
+		"GIT_REPLACE_REF_BASE",
+		"GIT_SHALLOW_FILE",
+		"GIT_SUPER_PREFIX",
+		"GIT_OPTIONAL_LOCKS",
+		"GIT_WORK_TREE":
+		return true
+	default:
+		return false
+	}
 }
 
 // TestDoRunTicket_CurrentPointerNotSetOnSaveFailure verifies the ordering fix:
@@ -48,12 +109,12 @@ func TestDoRunTicket_CurrentPointerNotSetOnSaveFailure(t *testing.T) {
 	if err := os.MkdirAll(ticketsDir, 0o755); err != nil {
 		t.Fatalf("mkdir .tickets: %v", err)
 	}
-	ticket := tkmd.Ticket{
+	ticket := epos.Ticket{
 		ID:     "ver-ptr-test",
 		Title:  "Pointer ordering test ticket",
-		Status: tkmd.StatusReady,
+		Status: epos.StatusReady,
 	}
-	if err := tkmd.SaveTicket(filepath.Join(ticketsDir, "ver-ptr-test.md"), ticket); err != nil {
+	if err := epos.SaveTicket(filepath.Join(ticketsDir, "ver-ptr-test.md"), ticket); err != nil {
 		t.Fatalf("save ticket: %v", err)
 	}
 
@@ -101,18 +162,18 @@ func TestDoRunTicket_CurrentPointerNotSetOnTicketSaveFailure(t *testing.T) {
 	if err := os.MkdirAll(ticketsDir, 0o755); err != nil {
 		t.Fatalf("mkdir .tickets: %v", err)
 	}
-	ticket := tkmd.Ticket{
+	ticket := epos.Ticket{
 		ID:     "ver-ticket-save",
 		Title:  "Ticket save failure test",
-		Status: tkmd.StatusReady,
+		Status: epos.StatusReady,
 	}
-	if err := tkmd.SaveTicket(filepath.Join(ticketsDir, "ver-ticket-save.md"), ticket); err != nil {
+	if err := epos.SaveTicket(filepath.Join(ticketsDir, "ver-ticket-save.md"), ticket); err != nil {
 		t.Fatalf("save ticket: %v", err)
 	}
 
 	origSaveTicket := saveTicket
 	defer func() { saveTicket = origSaveTicket }()
-	saveTicket = func(_ string, _ tkmd.Ticket) error {
+	saveTicket = func(_ string, _ epos.Ticket) error {
 		return errors.New("injected ticket save error")
 	}
 
@@ -175,6 +236,56 @@ func TestDoRunEpic_DoesNotAdvanceCurrentOnEngineFailure(t *testing.T) {
 	}
 }
 
+func TestDoRunEpic_RejectsUnsafeTicketIDBeforeRunLockPathEscape(t *testing.T) {
+	dir := t.TempDir()
+	initCLITestRepo(t, dir)
+	if err := os.MkdirAll(filepath.Join(dir, ".tickets"), 0o755); err != nil {
+		t.Fatalf("mkdir .tickets: %v", err)
+	}
+
+	t.Chdir(dir)
+
+	var stdout, stderr bytes.Buffer
+	_, err := doRunEpic(&stdout, &stderr, "../escaped")
+	if err == nil {
+		t.Fatal("expected unsafe ticket id to be rejected")
+	}
+	if strings.Contains(stdout.String(), "run_id=") {
+		t.Fatalf("unsafe ticket id printed bogus run id: %s", stdout.String())
+	}
+	if !strings.Contains(err.Error(), "invalid ticket id") {
+		t.Fatalf("expected invalid ticket id error, got: %v", err)
+	}
+	if _, statErr := os.Stat(filepath.Join(dir, ".verk", "escaped", "run.lock")); !os.IsNotExist(statErr) {
+		t.Fatalf("unsafe ticket id created escaped lock path: %v", statErr)
+	}
+}
+
+func TestDoAutoResume_RejectsUnsafeCurrentRunBeforeArtifactRead(t *testing.T) {
+	dir := t.TempDir()
+	initCLITestRepo(t, dir)
+	if err := os.MkdirAll(filepath.Join(dir, ".verk"), 0o755); err != nil {
+		t.Fatalf("mkdir .verk: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, ".verk", "current"), []byte("../escaped\n"), 0o644); err != nil {
+		t.Fatalf("write current: %v", err)
+	}
+
+	t.Chdir(dir)
+
+	var stdout, stderr bytes.Buffer
+	err := doAutoResume(&stdout, &stderr)
+	if err == nil {
+		t.Fatal("expected unsafe current run id to be rejected")
+	}
+	if !strings.Contains(stdout.String(), "invalid current run") {
+		t.Fatalf("expected invalid current run message, got stdout=%s stderr=%s err=%v", stdout.String(), stderr.String(), err)
+	}
+	if _, statErr := os.Stat(filepath.Join(dir, ".verk", "escaped")); !os.IsNotExist(statErr) {
+		t.Fatalf("unsafe current run id read escaped artifact path: %v", statErr)
+	}
+}
+
 func TestDoRunEpic_CurrentPointerSetForPersistedBlockedRun(t *testing.T) {
 	dir := t.TempDir()
 	initCLITestRepo(t, dir)
@@ -183,27 +294,27 @@ func TestDoRunEpic_CurrentPointerSetForPersistedBlockedRun(t *testing.T) {
 	if err := os.MkdirAll(ticketsDir, 0o755); err != nil {
 		t.Fatalf("mkdir .tickets: %v", err)
 	}
-	epic := tkmd.Ticket{
+	epic := epos.Ticket{
 		ID:     "ver-current-epic",
 		Title:  "Current pointer epic",
-		Status: tkmd.StatusReady,
+		Status: epos.StatusReady,
 		UnknownFrontmatter: map[string]any{
 			"type": "epic",
 		},
 	}
-	child := tkmd.Ticket{
+	child := epos.Ticket{
 		ID:     "ver-current-child",
 		Title:  "Blocked child",
-		Status: tkmd.StatusBlocked,
+		Status: epos.StatusBlocked,
 		UnknownFrontmatter: map[string]any{
 			"parent": epic.ID,
 			"type":   "task",
 		},
 	}
-	if err := tkmd.SaveTicket(filepath.Join(ticketsDir, epic.ID+".md"), epic); err != nil {
+	if err := epos.SaveTicket(filepath.Join(ticketsDir, epic.ID+".md"), epic); err != nil {
 		t.Fatalf("save epic: %v", err)
 	}
-	if err := tkmd.SaveTicket(filepath.Join(ticketsDir, child.ID+".md"), child); err != nil {
+	if err := epos.SaveTicket(filepath.Join(ticketsDir, child.ID+".md"), child); err != nil {
 		t.Fatalf("save child: %v", err)
 	}
 

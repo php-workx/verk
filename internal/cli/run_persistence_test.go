@@ -9,7 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
-	"verk/internal/adapters/ticketstore/tkmd"
+	"verk/internal/adapters/ticketstore/epos"
 	"verk/internal/engine"
 	"verk/internal/state"
 )
@@ -25,12 +25,12 @@ func TestDoRunTicket_FinalSaveFailure(t *testing.T) {
 	if err := os.MkdirAll(ticketsDir, 0o755); err != nil {
 		t.Fatalf("mkdir .tickets: %v", err)
 	}
-	ticket := tkmd.Ticket{
+	ticket := epos.Ticket{
 		ID:     "ver-final-save",
 		Title:  "Final persistence failure test",
-		Status: tkmd.StatusReady,
+		Status: epos.StatusReady,
 	}
-	if err := tkmd.SaveTicket(filepath.Join(ticketsDir, "ver-final-save.md"), ticket); err != nil {
+	if err := epos.SaveTicket(filepath.Join(ticketsDir, "ver-final-save.md"), ticket); err != nil {
 		t.Fatalf("save ticket: %v", err)
 	}
 
@@ -53,7 +53,7 @@ func TestDoRunTicket_FinalSaveFailure(t *testing.T) {
 		}
 		return nil
 	}
-	saveTicket = func(_ string, _ tkmd.Ticket) error { return nil }
+	saveTicket = func(_ string, _ epos.Ticket) error { return nil }
 
 	errDiskFull := errors.New("disk full")
 	callCount := 0
@@ -110,7 +110,7 @@ func TestFinalizeRun_SaveJSONAtomicFailure(t *testing.T) {
 	}()
 
 	errDiskFull := errors.New("disk full")
-	saveTicket = func(_ string, _ tkmd.Ticket) error { return nil }
+	saveTicket = func(_ string, _ epos.Ticket) error { return nil }
 	saveJSONAtomic = func(_ string, _ any) error {
 		return errDiskFull
 	}
@@ -121,7 +121,7 @@ func TestFinalizeRun_SaveJSONAtomicFailure(t *testing.T) {
 	run.CurrentPhase = state.TicketPhaseClosed
 
 	// Act
-	err := finalizeRun(&stdout, &stderr, "/tmp/ticket.md", "/tmp/run.json", tkmd.Ticket{}, run)
+	err := finalizeRun(&stdout, &stderr, "/tmp/ticket.md", "/tmp/run.json", epos.Ticket{}, run)
 
 	// Assert: error is non-nil and wraps "persist run state"
 	if err == nil {
@@ -151,7 +151,7 @@ func TestFinalizeRun_SaveTicketFailure(t *testing.T) {
 		saveTicket = originalSaveTicket
 	}()
 
-	saveTicket = func(_ string, _ tkmd.Ticket) error {
+	saveTicket = func(_ string, _ epos.Ticket) error {
 		return errors.New("permission denied")
 	}
 	saveJSONAtomic = func(_ string, _ any) error { return nil }
@@ -161,7 +161,7 @@ func TestFinalizeRun_SaveTicketFailure(t *testing.T) {
 	run.Status = state.EpicRunStatusCompleted
 	run.CurrentPhase = state.TicketPhaseClosed
 
-	err := finalizeRun(&stdout, &stderr, "/tmp/ticket.md", "/tmp/run.json", tkmd.Ticket{}, run)
+	err := finalizeRun(&stdout, &stderr, "/tmp/ticket.md", "/tmp/run.json", epos.Ticket{}, run)
 
 	if err == nil {
 		t.Fatal("expected error from SaveTicket failure, got nil")
@@ -189,7 +189,7 @@ func TestFinalizeRun_BothSucceed(t *testing.T) {
 		saveTicket = originalSaveTicket
 	}()
 
-	saveTicket = func(_ string, _ tkmd.Ticket) error { return nil }
+	saveTicket = func(_ string, _ epos.Ticket) error { return nil }
 	saveJSONAtomic = func(_ string, _ any) error { return nil }
 
 	var stdout, stderr bytes.Buffer
@@ -197,7 +197,7 @@ func TestFinalizeRun_BothSucceed(t *testing.T) {
 	run.Status = state.EpicRunStatusCompleted
 	run.CurrentPhase = state.TicketPhaseClosed
 
-	err := finalizeRun(&stdout, &stderr, "/tmp/ticket.md", "/tmp/run.json", tkmd.Ticket{}, run)
+	err := finalizeRun(&stdout, &stderr, "/tmp/ticket.md", "/tmp/run.json", epos.Ticket{}, run)
 	if err != nil {
 		t.Fatalf("expected nil error, got %v", err)
 	}

@@ -6,7 +6,7 @@
 
 **Architecture:** Run deterministic ticket lint first, then an optional planner-role LLM review for semantic completeness. Persist a durable quality artifact, apply only safe ticket auto-repairs, and block before worker dispatch when unresolved findings would make the run unreliable.
 
-**Tech Stack:** Go, Cobra CLI, existing `tkmd` ticket store, existing runtime reviewer adapters, JSON artifacts under `.verk/runs/<run-id>/`, existing policy config and tests with fake runtime adapters.
+**Tech Stack:** Go, Cobra CLI, existing `epos` ticket store, existing runtime reviewer adapters, JSON artifacts under `.verk/runs/<run-id>/`, existing policy config and tests with fake runtime adapters.
 
 ---
 
@@ -229,8 +229,8 @@ git commit -m "feat: add ticket quality artifact types"
 
 - Create: `internal/engine/ticket_quality.go`
 - Test: `internal/engine/ticket_quality_test.go`
-- Reuse: `internal/adapters/ticketstore/tkmd/types.go`
-- Reuse: `internal/adapters/ticketstore/tkmd/store.go`
+- Reuse: `internal/adapters/ticketstore/epos/types.go`
+- Reuse: `internal/adapters/ticketstore/epos/store.go`
 
 **Step 1: Write failing unit tests**
 
@@ -244,7 +244,7 @@ Cover:
 - docs de-scope wording creates a planner-required finding
 - multi-surface epic without an integration ticket blocks
 
-Use `tkmd.Ticket` directly. Do not require filesystem setup for the first pass.
+Use `epos.Ticket` directly. Do not require filesystem setup for the first pass.
 
 Run:
 
@@ -260,8 +260,8 @@ Add:
 
 ```go
 type TicketQualityInput struct {
-	RootTicket tkmd.Ticket
-	Tickets    []tkmd.Ticket
+	RootTicket epos.Ticket
+	Tickets    []epos.Ticket
 	ExistingPaths map[string]bool
 	Config    policy.Config
 }
@@ -311,7 +311,7 @@ git commit -m "feat: add deterministic ticket quality lint"
 
 - Modify: `internal/engine/ticket_quality.go`
 - Test: `internal/engine/ticket_quality_test.go`
-- Modify: `internal/adapters/ticketstore/tkmd/store.go` only if save behavior needs preserving unknown frontmatter order
+- Modify: `internal/adapters/ticketstore/epos/store.go` only if save behavior needs preserving unknown frontmatter order
 
 **Safe repairs allowed:**
 
@@ -349,7 +349,7 @@ Add:
 
 ```go
 type TicketQualityRepairPlan struct {
-	Tickets map[string]tkmd.Ticket
+	Tickets map[string]epos.Ticket
 	Repairs []state.TicketQualityRepair
 }
 
@@ -411,9 +411,9 @@ Expected: FAIL.
 
 **Step 2: Implement command loading**
 
-Use `tkmd.LoadTicket` and `tkmd.ListAllChildren` for epic mode. Build
+Use `epos.LoadTicket` and `epos.ListAllChildren` for epic mode. Build
 `TicketQualityInput`, call `EvaluateTicketQuality`, optionally apply the repair
-plan with `tkmd.SaveTicket`, and print a concise table:
+plan with `epos.SaveTicket`, and print a concise table:
 
 ```text
 ticket quality: blocked
@@ -566,7 +566,7 @@ Expected: FAIL.
 Add:
 
 ```go
-func runTicketQualityGate(ctx context.Context, req RunEpicRequest, cfg policy.Config, root tkmd.Ticket, children []tkmd.Ticket) (state.TicketQualityArtifact, error)
+func runTicketQualityGate(ctx context.Context, req RunEpicRequest, cfg policy.Config, root epos.Ticket, children []epos.Ticket) (state.TicketQualityArtifact, error)
 ```
 
 Behavior:

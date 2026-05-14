@@ -112,10 +112,15 @@ func (r *Repo) MainWorktreeRoot() (string, error) {
 	}
 	commonDir, err := gitOutput(r.root, "rev-parse", "--path-format=absolute", "--git-common-dir")
 	if err != nil {
-		// Fallback: if git doesn't support --path-format, use the current root
-		return r.root, nil //nolint:nilerr // intentional fallback — error handled by returning root
+		commonDir, err = gitOutput(r.root, "rev-parse", "--git-common-dir")
+		if err != nil {
+			return "", err
+		}
 	}
 	commonDir = filepath.Clean(strings.TrimRight(commonDir, "\r\n"))
+	if !filepath.IsAbs(commonDir) {
+		commonDir = filepath.Join(r.root, commonDir)
+	}
 	// The main worktree root is the parent of the .git directory
 	mainRoot := filepath.Dir(commonDir)
 	if resolved, err := resolvePath(mainRoot); err == nil {
@@ -273,6 +278,10 @@ func writeNewFileDiff(buf *bytes.Buffer, relPath, mode string, content []byte) {
 	fmt.Fprintf(buf, "--- /dev/null\n")
 	fmt.Fprintf(buf, "+++ b/%s\n", relPath)
 	if len(content) == 0 {
+		return
+	}
+	if mode != "120000" && bytes.IndexByte(content, 0) >= 0 {
+		fmt.Fprintf(buf, "Binary files /dev/null and b/%s differ\n", relPath)
 		return
 	}
 	lineCount := bytes.Count(content, []byte("\n"))

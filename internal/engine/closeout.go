@@ -7,7 +7,7 @@ import (
 	"strings"
 	"time"
 	"verk/internal/adapters/runtime"
-	"verk/internal/adapters/ticketstore/tkmd"
+	"verk/internal/adapters/ticketstore/epos"
 	"verk/internal/state"
 )
 
@@ -29,7 +29,7 @@ const (
 )
 
 type closeoutRequest struct {
-	ticket            tkmd.Ticket
+	ticket            epos.Ticket
 	plan              state.PlanArtifact
 	verification      *state.VerificationArtifact
 	review            *state.ReviewFindingsArtifact
@@ -271,12 +271,14 @@ func closeoutBlockReason(gates map[string]state.GateResult, failedGate string, c
 
 func parseCloseoutRequest(args ...any) (closeoutRequest, error) {
 	var req closeoutRequest
+	gotTypes := make([]string, 0, len(args))
 
 	for _, arg := range args {
+		gotTypes = append(gotTypes, fmt.Sprintf("%T", arg))
 		switch v := arg.(type) {
-		case tkmd.Ticket:
+		case epos.Ticket:
 			req.ticket = v
-		case *tkmd.Ticket:
+		case *epos.Ticket:
 			if v != nil {
 				req.ticket = *v
 			}
@@ -309,7 +311,7 @@ func parseCloseoutRequest(args ...any) (closeoutRequest, error) {
 	}
 
 	if req.ticket.ID == "" {
-		return closeoutRequest{}, fmt.Errorf("closeout requires ticket metadata")
+		return closeoutRequest{}, fmt.Errorf("closeout requires ticket metadata; received arg types: %s", strings.Join(gotTypes, ", "))
 	}
 	if req.plan.TicketID == "" {
 		return closeoutRequest{}, fmt.Errorf("closeout requires plan artifact")

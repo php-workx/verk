@@ -1,4 +1,4 @@
-package tkmd
+package epos
 
 type Status string
 
@@ -30,5 +30,5 @@ type Ticket struct {
 	UnknownFrontmatter map[string]any
 
 	present      map[string]bool
-	titleDerived bool // true if Title was extracted from body heading, not frontmatter
+	titleDerived bool
 }

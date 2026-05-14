@@ -3,15 +3,18 @@ package engine
 import (
 	"context"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 	"verk/internal/adapters/runtime"
-	"verk/internal/adapters/ticketstore/tkmd"
+	"verk/internal/adapters/ticketstore/epos"
 	"verk/internal/policy"
 	"verk/internal/state"
 
+	eposticket "github.com/php-workx/epos/ticket"
+	eposruntime "github.com/php-workx/epos/ticket/runtime"
 	runtimefake "verk/internal/adapters/runtime/fake"
 )
 
@@ -138,6 +141,56 @@ func TestRunTicket_HappyPath(t *testing.T) {
 	}
 }
 
+func TestRunTicket_RejectsUnsafeRunIDBeforeArtifactPathBuild(t *testing.T) {
+	repoRoot := t.TempDir()
+	ticket := testTicket("ticket-safe")
+	plan := state.PlanArtifact{TicketID: ticket.ID}
+	claim := state.ClaimArtifact{TicketID: ticket.ID, LeaseID: "lease-safe"}
+
+	_, err := RunTicket(context.Background(), RunTicketRequest{
+		RepoRoot: repoRoot,
+		RunID:    "../escaped",
+		Ticket:   ticket,
+		Plan:     plan,
+		Claim:    claim,
+		Adapter:  runtimefake.New(nil, nil),
+	})
+	if err == nil {
+		t.Fatal("expected unsafe run id to be rejected")
+	}
+	if !strings.Contains(err.Error(), "invalid run id") {
+		t.Fatalf("expected invalid run id error, got: %v", err)
+	}
+	if _, statErr := os.Stat(filepath.Join(repoRoot, ".verk", "escaped")); !os.IsNotExist(statErr) {
+		t.Fatalf("unsafe run id created escaped artifact path: %v", statErr)
+	}
+}
+
+func TestRunTicket_RejectsUnsafeTicketIDBeforeArtifactPathBuild(t *testing.T) {
+	repoRoot := t.TempDir()
+	ticket := testTicket("../escaped")
+	plan := state.PlanArtifact{TicketID: ticket.ID}
+	claim := state.ClaimArtifact{TicketID: ticket.ID, LeaseID: "lease-safe"}
+
+	_, err := RunTicket(context.Background(), RunTicketRequest{
+		RepoRoot: repoRoot,
+		RunID:    "run-safe",
+		Ticket:   ticket,
+		Plan:     plan,
+		Claim:    claim,
+		Adapter:  runtimefake.New(nil, nil),
+	})
+	if err == nil {
+		t.Fatal("expected unsafe ticket id to be rejected")
+	}
+	if !strings.Contains(err.Error(), "invalid ticket id") {
+		t.Fatalf("expected invalid ticket id error, got: %v", err)
+	}
+	if _, statErr := os.Stat(filepath.Join(repoRoot, ".verk", "runs", "run-safe", "escaped")); !os.IsNotExist(statErr) {
+		t.Fatalf("unsafe ticket id created escaped artifact path: %v", statErr)
+	}
+}
+
 func TestRunTicket_UsesExplicitWorktreePathForWorkersAndArtifactsStayOnRepoRoot(t *testing.T) {
 	repoRoot := t.TempDir()
 	worktreePath := filepath.Join(repoRoot, "worktree")
@@ -230,8 +283,6 @@ func TestRunTicket_UsesExplicitWorktreePathForWorkersAndArtifactsStayOnRepoRoot(
 func TestRunTicket_ReviewDiffIncludesWorktreeOnlyFile(t *testing.T) {
 	repoRoot := t.TempDir()
 	mustRunGit(t, repoRoot, "init")
-	mustRunGit(t, repoRoot, "config", "user.email", "test@example.com")
-	mustRunGit(t, repoRoot, "config", "user.name", "Test User")
 	if err := os.WriteFile(filepath.Join(repoRoot, "base.txt"), []byte("base\n"), 0o644); err != nil {
 		t.Fatalf("seed repo: %v", err)
 	}
@@ -244,8 +295,9 @@ func TestRunTicket_ReviewDiffIncludesWorktreeOnlyFile(t *testing.T) {
 	}
 	baseCommit := strings.TrimSpace(headOut)
 
-	worktreePath := filepath.Join(repoRoot, "worktree-review")
+	worktreePath := filepath.Join(t.TempDir(), "worktree-review")
 	mustRunGit(t, repoRoot, "worktree", "add", worktreePath, "HEAD")
+	t.Cleanup(func() { _ = exec.Command("git", "-C", repoRoot, "worktree", "remove", "--force", worktreePath).Run() })
 	if err := os.WriteFile(filepath.Join(worktreePath, "ticket-only.txt"), []byte("worktree file\n"), 0o644); err != nil {
 		t.Fatalf("write worktree-only file: %v", err)
 	}
@@ -835,8 +887,6 @@ func TestRunTicket_ScopeViolationBlocksTicket(t *testing.T) {
 
 	// Initialize a real git repo so collectChangedFiles can detect changes.
 	mustRunGit(t, repoRoot, "init")
-	mustRunGit(t, repoRoot, "config", "user.email", "test@example.com")
-	mustRunGit(t, repoRoot, "config", "user.name", "Test User")
 	if err := os.WriteFile(filepath.Join(repoRoot, "tracked.txt"), []byte("base\n"), 0o644); err != nil {
 		t.Fatalf("seed repo: %v", err)
 	}
@@ -861,7 +911,7 @@ func TestRunTicket_ScopeViolationBlocksTicket(t *testing.T) {
 	mustRunGit(t, repoRoot, "commit", "-m", "out-of-scope change")
 
 	cfg := policy.DefaultConfig()
-	ticket := tkmd.Ticket{
+	ticket := epos.Ticket{
 		ID:         "ver-scope-viol",
 		Title:      "Ticket ver-scope-viol",
 		OwnedPaths: []string{"internal/engine"},
@@ -913,8 +963,6 @@ func TestRunTicket_ScopeCheckBlocksWhenOwnedPathsEmpty(t *testing.T) {
 
 	// Initialize a real git repo with a file change outside any scope.
 	mustRunGit(t, repoRoot, "init")
-	mustRunGit(t, repoRoot, "config", "user.email", "test@example.com")
-	mustRunGit(t, repoRoot, "config", "user.name", "Test User")
 	if err := os.WriteFile(filepath.Join(repoRoot, "tracked.txt"), []byte("base\n"), 0o644); err != nil {
 		t.Fatalf("seed repo: %v", err)
 	}
@@ -1059,10 +1107,10 @@ func TestRunTicket_ScopeMissingThenReopensToProceed(t *testing.T) {
 	})
 	writeTicketRunFixture(t, repoRoot, runID, blockedResult.Snapshot)
 	writePlanFixture(t, repoRoot, runID, firstPlan)
-	writeTicketMarkdownFixture(t, repoRoot, tkmd.Ticket{
+	writeTicketMarkdownFixture(t, repoRoot, epos.Ticket{
 		ID:                 ticketID,
 		Title:              ticket.Title,
-		Status:             tkmd.StatusBlocked,
+		Status:             epos.StatusBlocked,
 		OwnedPaths:         nil,
 		UnknownFrontmatter: map[string]any{"type": "task"},
 	})
@@ -1077,15 +1125,15 @@ func TestRunTicket_ScopeMissingThenReopensToProceed(t *testing.T) {
 		t.Fatalf("ReopenTicket returned error: %v", err)
 	}
 
-	reopenedTicket, err := tkmd.LoadTicket(ticketMarkdownPath(repoRoot, ticketID))
+	reopenedTicket, err := epos.LoadTicket(ticketMarkdownPath(repoRoot, ticketID))
 	if err != nil {
 		t.Fatalf("load reopened ticket: %v", err)
 	}
-	if reopenedTicket.Status != tkmd.StatusOpen {
-		t.Fatalf("expected ticket status to become open after reopen, got %q", reopenedTicket.Status)
+	if reopenedTicket.Status != epos.StatusReady {
+		t.Fatalf("expected ticket status to become ready after reopen, got %q", reopenedTicket.Status)
 	}
 	reopenedTicket.OwnedPaths = []string{"internal/engine"}
-	if err := tkmd.SaveTicket(filepath.Join(repoRoot, ".tickets", ticketID+".md"), reopenedTicket); err != nil {
+	if err := epos.SaveTicket(filepath.Join(repoRoot, ".tickets", ticketID+".md"), reopenedTicket); err != nil {
 		t.Fatalf("save reopened ticket: %v", err)
 	}
 
@@ -1262,8 +1310,8 @@ func TestRunTicket_ConcernsRoundTripToArtifact(t *testing.T) {
 	}
 }
 
-func testTicket(id string) tkmd.Ticket {
-	return tkmd.Ticket{
+func testTicket(id string) epos.Ticket {
+	return epos.Ticket{
 		ID:    id,
 		Title: "Ticket " + id,
 		UnknownFrontmatter: map[string]any{
@@ -1272,7 +1320,7 @@ func testTicket(id string) tkmd.Ticket {
 	}
 }
 
-func testPlanAndClaim(t *testing.T, repoRoot string, ticket tkmd.Ticket, cfg policy.Config, runID, leaseID string, verificationCommands []string) (state.PlanArtifact, state.ClaimArtifact) {
+func testPlanAndClaim(t *testing.T, repoRoot string, ticket epos.Ticket, cfg policy.Config, runID, leaseID string, verificationCommands []string) (state.PlanArtifact, state.ClaimArtifact) {
 	t.Helper()
 
 	plan, err := BuildPlanArtifact(ticket, cfg)
@@ -1281,7 +1329,7 @@ func testPlanAndClaim(t *testing.T, repoRoot string, ticket tkmd.Ticket, cfg pol
 	}
 	plan.ValidationCommands = append([]string(nil), verificationCommands...)
 
-	claim, err := tkmd.AcquireClaim(repoRoot, runID, ticket.ID, leaseID, 10*time.Minute, time.Now().UTC())
+	claim, err := epos.AcquireClaim(repoRoot, runID, ticket.ID, leaseID, 10*time.Minute, time.Now().UTC())
 	if err != nil {
 		t.Fatalf("AcquireClaim: %v", err)
 	}
@@ -1290,8 +1338,20 @@ func testPlanAndClaim(t *testing.T, repoRoot string, ticket tkmd.Ticket, cfg pol
 
 func seedClaimSnapshots(t *testing.T, repoRoot, runID, ticketID string, claim state.ClaimArtifact) string {
 	t.Helper()
-	if err := state.SaveJSONAtomic(liveClaimPath(repoRoot, ticketID), claim); err != nil {
-		t.Fatalf("seed live claim: %v", err)
+	if err := eposruntime.WriteRuntimeState(repoRoot, &eposticket.RuntimeState{
+		TicketID: ticketID,
+		Status:   eposticket.StatusClaimed,
+		Claim: &eposticket.Claim{
+			ClaimedBy:    claim.OwnerRunID,
+			ClaimBackend: runID,
+			ClaimedAt:    claim.LeasedAt,
+		},
+		Lease: &eposticket.Lease{
+			LeaseID:   claim.LeaseID,
+			ExpiresAt: claim.ExpiresAt,
+		},
+	}); err != nil {
+		t.Fatalf("seed live runtime state: %v", err)
 	}
 	durableClaimPath := filepath.Join(repoRoot, ".verk", "runs", runID, "claims", "claim-"+ticketID+".json")
 	if err := state.SaveJSONAtomic(durableClaimPath, claim); err != nil {
@@ -1486,8 +1546,6 @@ func TestCollectDiff_ReturnsErrorOnInvalidRepo(t *testing.T) {
 func TestCollectDiff_ReturnsErrorOnInvalidBaseCommit(t *testing.T) {
 	repoRoot := t.TempDir()
 	mustRunGit(t, repoRoot, "init")
-	mustRunGit(t, repoRoot, "config", "user.email", "test@example.com")
-	mustRunGit(t, repoRoot, "config", "user.name", "Test User")
 	if err := os.WriteFile(filepath.Join(repoRoot, "file.txt"), []byte("hello\n"), 0o644); err != nil {
 		t.Fatalf("write file: %v", err)
 	}
@@ -1510,8 +1568,6 @@ func TestCollectChangedFiles_ReturnsErrorOnInvalidRepo(t *testing.T) {
 func TestCollectChangedFiles_ReturnsErrorOnInvalidBaseCommit(t *testing.T) {
 	repoRoot := t.TempDir()
 	mustRunGit(t, repoRoot, "init")
-	mustRunGit(t, repoRoot, "config", "user.email", "test@example.com")
-	mustRunGit(t, repoRoot, "config", "user.name", "Test User")
 	if err := os.WriteFile(filepath.Join(repoRoot, "file.txt"), []byte("hello\n"), 0o644); err != nil {
 		t.Fatalf("write file: %v", err)
 	}
@@ -1640,9 +1696,12 @@ func TestRunTicket_NeedsContextBlocksWorkflow(t *testing.T) {
 	// permanently locked out.  needs_more_context normalization routes through
 	// WorkerStatusNeedsContext → TicketPhaseBlocked, and the blocked terminal
 	// path must release the live claim just like startup failures do.
-	livePath := filepath.Join(repoRoot, ".tickets", ".claims", ticket.ID+".json")
-	if _, err := os.Stat(livePath); err == nil {
-		t.Fatalf("expected live claim to be released after needs_context block, but file still exists: %s", livePath)
+	live, err := epos.LoadLiveClaim(repoRoot, ticket.ID)
+	if err != nil {
+		t.Fatalf("LoadLiveClaim after needs_context block: %v", err)
+	}
+	if live != nil {
+		t.Fatalf("expected live claim to be released after needs_context block, got %#v", live)
 	}
 	durablePath := filepath.Join(repoRoot, ".verk", "runs", "run-needs-ctx", "claims", "claim-"+ticket.ID+".json")
 	var durable state.ClaimArtifact
@@ -1660,10 +1719,12 @@ func TestRunTicket_NeedsContextBlocksWorkflow(t *testing.T) {
 func TestRunTicket_ReleasesClaimOnStartupFailure(t *testing.T) {
 	assertClaimReleased := func(t *testing.T, repoRoot, runID, ticketID string) {
 		t.Helper()
-		// Live claim file should have been removed by release.
-		livePath := filepath.Join(repoRoot, ".tickets", ".claims", ticketID+".json")
-		if _, err := os.Stat(livePath); err == nil {
-			t.Fatalf("expected live claim file to be removed, but it still exists: %s", livePath)
+		live, err := epos.LoadLiveClaim(repoRoot, ticketID)
+		if err != nil {
+			t.Fatalf("LoadLiveClaim after release: %v", err)
+		}
+		if live != nil {
+			t.Fatalf("expected no active live claim after release, got %#v", live)
 		}
 		// Durable claim should be in released state.
 		durablePath := filepath.Join(repoRoot, ".verk", "runs", runID, "claims", "claim-"+ticketID+".json")
@@ -1780,11 +1841,53 @@ func TestRunTicket_ReleasesClaimOnStartupFailure(t *testing.T) {
 		assertClaimReleased(t, repoRoot, "run-retry", ticket.ID)
 
 		// Verify we can re-acquire the claim after the transient failure.
-		_, err = tkmd.AcquireClaim(repoRoot, "run-retry-2", ticket.ID, "lease-retry-2", 10*time.Minute, time.Now().UTC())
+		_, err = epos.AcquireClaim(repoRoot, "run-retry-2", ticket.ID, "lease-retry-2", 10*time.Minute, time.Now().UTC())
 		if err != nil {
 			t.Fatalf("expected claim re-acquisition after transient failure, got error: %v", err)
 		}
 	})
+}
+
+func TestCurrentClaimRemainingTTL_ReadsEposRuntimeState(t *testing.T) {
+	repoRoot := t.TempDir()
+	now := time.Now().UTC()
+	liveExpires := now.Add(2 * time.Minute)
+	staleRequestExpires := now.Add(30 * time.Minute)
+	if err := eposruntime.WriteRuntimeState(repoRoot, &eposticket.RuntimeState{
+		TicketID: "ticket-ttl",
+		Status:   eposticket.StatusClaimed,
+		Claim: &eposticket.Claim{
+			ClaimedBy:    "run-ttl",
+			ClaimBackend: "run-ttl",
+			ClaimedAt:    now.Add(-time.Minute),
+		},
+		Lease: &eposticket.Lease{
+			LeaseID:   "fence-ttl",
+			ExpiresAt: liveExpires,
+		},
+	}); err != nil {
+		t.Fatalf("WriteRuntimeState: %v", err)
+	}
+
+	st := ticketRunState{
+		repoRoot: repoRoot,
+		req: RunTicketRequest{
+			RunID:  "run-ttl",
+			Ticket: epos.Ticket{ID: "ticket-ttl"},
+			Claim: state.ClaimArtifact{
+				LeaseID:   "fence-ttl",
+				ExpiresAt: staleRequestExpires,
+			},
+		},
+	}
+
+	remaining, ok := st.currentClaimRemainingTTL()
+	if !ok {
+		t.Fatal("expected remaining TTL from live epos RuntimeState")
+	}
+	if remaining <= 0 || remaining > 3*time.Minute {
+		t.Fatalf("expected remaining TTL from live epos RuntimeState, got %s", remaining)
+	}
 }
 
 // TestRunTicket_RenewsResumedClaimBeforeExpiry verifies that a resumed claim
@@ -1804,11 +1907,22 @@ func TestRunTicket_RenewsResumedClaimBeforeExpiry(t *testing.T) {
 	claim.LeasedAt = time.Now().UTC().Add(-(originalTTL - 500*time.Millisecond))
 	claim.ExpiresAt = time.Now().UTC().Add(500 * time.Millisecond)
 
-	// Update the live and durable claim snapshots to reflect the simulated
-	// resumed state so RenewClaim checks and updates the same near-expiry lease.
-	liveClaimPath := filepath.Join(repoRoot, ".tickets", ".claims", ticket.ID+".json")
-	if err := state.SaveJSONAtomic(liveClaimPath, claim); err != nil {
-		t.Fatalf("seed live claim: %v", err)
+	// Update live epos RuntimeState and durable claim snapshots to reflect the
+	// simulated resumed state so RenewClaim checks and updates the same lease.
+	if err := eposruntime.WriteRuntimeState(repoRoot, &eposticket.RuntimeState{
+		TicketID: ticket.ID,
+		Status:   eposticket.StatusClaimed,
+		Claim: &eposticket.Claim{
+			ClaimedBy:    "run-resumed-renew",
+			ClaimBackend: "run-resumed-renew",
+			ClaimedAt:    claim.LeasedAt,
+		},
+		Lease: &eposticket.Lease{
+			LeaseID:   claim.LeaseID,
+			ExpiresAt: claim.ExpiresAt,
+		},
+	}); err != nil {
+		t.Fatalf("seed live runtime state: %v", err)
 	}
 	durableClaimPath := filepath.Join(repoRoot, ".verk", "runs", "run-resumed-renew", "claims", "claim-"+ticket.ID+".json")
 	if err := state.SaveJSONAtomic(durableClaimPath, claim); err != nil {
@@ -1872,7 +1986,7 @@ func TestTicketRunState_snapshotPreservesCreatedAt(t *testing.T) {
 	st := &ticketRunState{
 		req: RunTicketRequest{
 			RunID:  "run-snapshot-test",
-			Ticket: tkmd.Ticket{ID: "ver-snapshot-test"},
+			Ticket: epos.Ticket{ID: "ver-snapshot-test"},
 		},
 	}
 
@@ -1904,7 +2018,7 @@ func TestTicketRunState_snapshotOutcome(t *testing.T) {
 			st := &ticketRunState{
 				req: RunTicketRequest{
 					RunID:  "run-snapshot-outcome",
-					Ticket: tkmd.Ticket{ID: "ver-snapshot-outcome"},
+					Ticket: epos.Ticket{ID: "ver-snapshot-outcome"},
 				},
 				currentPhase: tc.phase,
 			}
@@ -1944,7 +2058,7 @@ func TestTicketRunState_snapshotPreservesRestoredCreatedAt(t *testing.T) {
 	st := &ticketRunState{
 		req: RunTicketRequest{
 			RunID:  runID,
-			Ticket: tkmd.Ticket{ID: ticketID},
+			Ticket: epos.Ticket{ID: ticketID},
 		},
 	}
 	st.createdAt = loaded.CreatedAt

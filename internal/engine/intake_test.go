@@ -2,14 +2,14 @@ package engine
 
 import (
 	"testing"
-	"verk/internal/adapters/ticketstore/tkmd"
+	"verk/internal/adapters/ticketstore/epos"
 	"verk/internal/policy"
 	"verk/internal/state"
 )
 
 func TestBuildPlanArtifact_PersistsEffectiveReviewThreshold(t *testing.T) {
 	cfg := policy.DefaultConfig()
-	ticket := tkmd.Ticket{
+	ticket := epos.Ticket{
 		ID:                 "ver-123",
 		Title:              "Implement intake",
 		AcceptanceCriteria: []string{"Criterion one"},
@@ -44,7 +44,7 @@ func TestBuildPlanArtifact_PersistsEffectiveReviewThreshold(t *testing.T) {
 
 func TestBuildPlanArtifact_RejectsMissingOwnedPathsForEpic(t *testing.T) {
 	cfg := policy.DefaultConfig()
-	ticket := tkmd.Ticket{
+	ticket := epos.Ticket{
 		ID:    "ver-epic",
 		Title: "Epic ticket",
 		UnknownFrontmatter: map[string]any{
@@ -63,7 +63,7 @@ func TestBuildPlanArtifact_RejectsMissingOwnedPathsForEpic(t *testing.T) {
 // pair the run was planned against.
 func TestBuildPlanArtifact_SnapshotsEffectiveRoleProfiles(t *testing.T) {
 	cfg := policy.DefaultConfig()
-	ticket := tkmd.Ticket{
+	ticket := epos.Ticket{
 		ID:                 "ver-role",
 		Title:              "role profile snapshot",
 		OwnedPaths:         []string{"internal/engine"},
@@ -95,7 +95,7 @@ func TestBuildPlanArtifact_SnapshotsEffectiveRoleProfiles(t *testing.T) {
 // regardless of what a ticket author set.
 func TestBuildPlanArtifact_IgnoresTicketModelFrontmatter(t *testing.T) {
 	cfg := policy.DefaultConfig()
-	ticket := tkmd.Ticket{
+	ticket := epos.Ticket{
 		ID:                 "ver-model-ignored",
 		Title:              "ticket model is ignored",
 		OwnedPaths:         []string{"internal/engine"},
@@ -123,7 +123,7 @@ func TestBuildPlanArtifact_IgnoresTicketModelFrontmatter(t *testing.T) {
 // snapshot, while model and reasoning remain driven by the role profile.
 func TestBuildPlanArtifact_RuntimePreferenceOverridesSnapshotRuntime(t *testing.T) {
 	cfg := policy.DefaultConfig()
-	ticket := tkmd.Ticket{
+	ticket := epos.Ticket{
 		ID:                 "ver-rt-pref",
 		Title:              "runtime preference override",
 		OwnedPaths:         []string{"internal/engine"},

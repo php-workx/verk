@@ -19,12 +19,15 @@ import (
 // provide the same semantics as the Unix flock implementation: non-blocking,
 // exclusive, automatically released when the process exits.
 func AcquireRunLock(repoRoot, runID string) (*RunLock, error) {
-	dir := filepath.Join(repoRoot, ".verk", "runs", runID)
+	lockPath, err := runLockPath(repoRoot, runID)
+	if err != nil {
+		return nil, err
+	}
+	dir := filepath.Dir(lockPath)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, fmt.Errorf("create run dir: %w", err)
 	}
 
-	lockPath := filepath.Join(dir, "run.lock")
 	file, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o644)
 	if err != nil {
 		return nil, fmt.Errorf("open run lock: %w", err)
@@ -53,7 +56,10 @@ func AcquireRunLock(repoRoot, runID string) (*RunLock, error) {
 // IsRunLockHeld checks if the run lock is currently held by another process.
 // Returns true if the lock is held, false if it's free or doesn't exist.
 func IsRunLockHeld(repoRoot, runID string) bool {
-	lockPath := filepath.Join(repoRoot, ".verk", "runs", runID, "run.lock")
+	lockPath, err := runLockPath(repoRoot, runID)
+	if err != nil {
+		return false
+	}
 	file, err := os.OpenFile(lockPath, os.O_RDWR, 0o644)
 	if err != nil {
 		return false // lock file doesn't exist = not held

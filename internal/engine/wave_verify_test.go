@@ -62,6 +62,40 @@ func qualityCmd(cmd string) policy.QualityCommand {
 	return policy.QualityCommand{Path: ".", Run: []string{cmd}}
 }
 
+func TestIntegrationManagerForPendingTransactionRejectsMissingAcceptedRefs(t *testing.T) {
+	repoRoot := t.TempDir()
+	baseCommit := initEpicRepo(t, repoRoot)
+	tx := pendingWaveIntegrationTransaction{
+		WaveID:       "wave-missing-refs",
+		BaseCommit:   baseCommit,
+		WorktreePath: filepath.Join(t.TempDir(), "missing-integration"),
+	}
+
+	_, err := integrationManagerForPendingTransaction(RunEpicRequest{
+		RepoRoot:     repoRoot,
+		RunID:        "run-missing-refs",
+		WorktreeRoot: t.TempDir(),
+	}, tx, true)
+	if err == nil {
+		t.Fatal("expected missing accepted_refs to fail closed")
+	}
+	if !strings.Contains(err.Error(), "missing accepted_refs") {
+		t.Fatalf("expected missing accepted_refs error, got %v", err)
+	}
+}
+
+func TestPathSetIncludesAllowsAdditionalFinalFiles(t *testing.T) {
+	if !pathSetIncludes([]string{"docs/a.md", "docs/b.md"}, []string{"docs/a.md"}) {
+		t.Fatal("expected superset final file list to include original transaction files")
+	}
+	if pathSetIncludes([]string{"docs/b.md"}, []string{"docs/a.md"}) {
+		t.Fatal("expected missing original transaction file to be rejected")
+	}
+	if pathSetIncludes([]string{"docs/a.md"}, nil) {
+		t.Fatal("expected empty transaction file list to be rejected")
+	}
+}
+
 func TestRunWaveVerificationLoop_NoQualityCommands(t *testing.T) {
 	repoRoot, wavePath, wave := makeWaveVerifyFixture(t)
 	adapter := runtimefake.New(nil, nil)

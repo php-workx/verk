@@ -36,7 +36,7 @@ Build `verk` as a new standalone Go repo with:
   - review severity thresholds
   - closure rules
   - conflict and concurrency policy
-- `internal/adapters/ticketstore/tkmd`
+- `internal/adapters/ticketstore/epos`
   - direct `tk`-compatible markdown+frontmatter store
   - dependency graph queries
   - claim/lease support

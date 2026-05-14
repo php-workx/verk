@@ -5,14 +5,14 @@ import (
 	"fmt"
 	"strings"
 	"time"
-	"verk/internal/adapters/ticketstore/tkmd"
+	"verk/internal/adapters/ticketstore/epos"
 	"verk/internal/policy"
 	"verk/internal/state"
 )
 
 const artifactSchemaVersion = 1
 
-func BuildPlanArtifact(t tkmd.Ticket, cfg policy.Config) (state.PlanArtifact, error) {
+func BuildPlanArtifact(t epos.Ticket, cfg policy.Config) (state.PlanArtifact, error) {
 	if isEpicTicket(t) && len(t.OwnedPaths) == 0 {
 		return state.PlanArtifact{}, fmt.Errorf("epic %q requires owned_paths", t.ID)
 	}
@@ -86,7 +86,7 @@ func parseTicketThreshold(raw string, fallback state.Severity) (state.Severity, 
 	return threshold, nil
 }
 
-func ticketRunID(t tkmd.Ticket) string {
+func ticketRunID(t epos.Ticket) string {
 	if t.UnknownFrontmatter == nil {
 		return ""
 	}
@@ -112,7 +112,7 @@ func buildPlanCriteria(criteria []string) []state.PlanCriterion {
 	return out
 }
 
-func ticketDeclaredChecks(t tkmd.Ticket) []string {
+func ticketDeclaredChecks(t epos.Ticket) []string {
 	if t.UnknownFrontmatter == nil {
 		return nil
 	}
@@ -158,7 +158,7 @@ func asStringSlice(value any) []string {
 	}
 }
 
-func isEpicTicket(t tkmd.Ticket) bool {
+func isEpicTicket(t epos.Ticket) bool {
 	if t.UnknownFrontmatter == nil {
 		return false
 	}

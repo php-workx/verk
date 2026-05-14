@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 	"verk/internal/adapters/runtime"
-	"verk/internal/adapters/ticketstore/tkmd"
+	"verk/internal/adapters/ticketstore/epos"
 	"verk/internal/engine"
 	"verk/internal/policy"
 	"verk/internal/state"
@@ -19,7 +19,7 @@ func TestResumeBlocksOnLiveDurableClaimDivergence(t *testing.T) {
 	repoRoot := t.TempDir()
 	_ = initRepo(t, repoRoot)
 	runID := "run-divergence"
-	ticket := taskTicket("ticket-1", tkmd.StatusInProgress, []string{"internal/app"})
+	ticket := taskTicket("ticket-1", epos.StatusInProgress, []string{"internal/app"})
 	saveTicket(t, repoRoot, ticket)
 	plan, _ := engine.BuildPlanArtifact(ticket, policy.DefaultConfig())
 	plan.RunID = runID

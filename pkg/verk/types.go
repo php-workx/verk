@@ -5,7 +5,7 @@ package verk
 
 import (
 	"verk/internal/adapters/runtime"
-	"verk/internal/adapters/ticketstore/tkmd"
+	"verk/internal/adapters/ticketstore/epos"
 	"verk/internal/engine"
 	"verk/internal/policy"
 	"verk/internal/state"
@@ -62,7 +62,7 @@ type RuntimeCheck = engine.RuntimeCheck
 // ──────────────────────────────────────────────
 
 // Ticket is a parsed ticket from the ticket store.
-type Ticket = tkmd.Ticket
+type Ticket = epos.Ticket
 
 // Adapter is the runtime adapter interface (Codex, Claude, etc.).
 type Adapter = runtime.Adapter
