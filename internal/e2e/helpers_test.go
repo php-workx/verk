@@ -16,8 +16,6 @@ import (
 func initRepo(t *testing.T, root string) string {
 	t.Helper()
 	runGit(t, root, "init")
-	runGit(t, root, "config", "user.email", "test@example.com")
-	runGit(t, root, "config", "user.name", "Test User")
 	if err := os.WriteFile(filepath.Join(root, "tracked.txt"), []byte("base\n"), 0o644); err != nil {
 		t.Fatalf("seed repo: %v", err)
 	}
@@ -65,7 +63,7 @@ func testGitEnv() []string {
 			continue
 		}
 		switch key {
-		case "GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_PREFIX", "GIT_SUPER_PREFIX", "GIT_OPTIONAL_LOCKS", "GIT_CONFIG", "GIT_CONFIG_COUNT", "GIT_CONFIG_GLOBAL", "GIT_CONFIG_NOSYSTEM", "GIT_CONFIG_PARAMETERS", "GIT_TEMPLATE_DIR":
+		case "GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_PREFIX", "GIT_SUPER_PREFIX", "GIT_OPTIONAL_LOCKS", "GIT_CONFIG", "GIT_CONFIG_COUNT", "GIT_CONFIG_GLOBAL", "GIT_CONFIG_NOSYSTEM", "GIT_CONFIG_PARAMETERS", "GIT_TEMPLATE_DIR", "GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL":
 			continue
 		default:
 			out = append(out, entry)
@@ -75,6 +73,10 @@ func testGitEnv() []string {
 		"GIT_OPTIONAL_LOCKS=0",
 		"GIT_CONFIG_GLOBAL="+os.DevNull,
 		"GIT_CONFIG_NOSYSTEM=1",
+		"GIT_AUTHOR_NAME=Test User",
+		"GIT_AUTHOR_EMAIL=test@example.com",
+		"GIT_COMMITTER_NAME=Test User",
+		"GIT_COMMITTER_EMAIL=test@example.com",
 		"GIT_CONFIG_COUNT=1",
 		"GIT_CONFIG_KEY_0=core.hooksPath",
 		"GIT_CONFIG_VALUE_0="+os.DevNull,

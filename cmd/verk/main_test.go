@@ -274,8 +274,6 @@ func TestRunCLIFromDir_LargeOutput_NoDeadlock(t *testing.T) {
 func writeCLIRepo(t *testing.T, repoRoot string) {
 	t.Helper()
 	runGit(t, repoRoot, "init")
-	runGit(t, repoRoot, "config", "user.email", "test@example.com")
-	runGit(t, repoRoot, "config", "user.name", "Test User")
 	if err := os.MkdirAll(filepath.Join(repoRoot, ".tickets", ".claims"), 0o755); err != nil {
 		t.Fatalf("mkdir .tickets: %v", err)
 	}
@@ -339,6 +337,10 @@ func testGitEnv() []string {
 		"GIT_OPTIONAL_LOCKS=0",
 		"GIT_CONFIG_GLOBAL="+os.DevNull,
 		"GIT_CONFIG_NOSYSTEM=1",
+		"GIT_AUTHOR_NAME=Test User",
+		"GIT_AUTHOR_EMAIL=test@example.com",
+		"GIT_COMMITTER_NAME=Test User",
+		"GIT_COMMITTER_EMAIL=test@example.com",
 		"GIT_CONFIG_COUNT=1",
 		"GIT_CONFIG_KEY_0=core.hooksPath",
 		"GIT_CONFIG_VALUE_0="+os.DevNull,
@@ -352,7 +354,11 @@ func isGitLocalEnv(key string) bool {
 	}
 	switch key {
 	case "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+		"GIT_AUTHOR_EMAIL",
+		"GIT_AUTHOR_NAME",
 		"GIT_COMMON_DIR",
+		"GIT_COMMITTER_EMAIL",
+		"GIT_COMMITTER_NAME",
 		"GIT_CONFIG",
 		"GIT_CONFIG_COUNT",
 		"GIT_CONFIG_GLOBAL",
@@ -497,8 +503,6 @@ func TestRunTicket_GitMetadataFailure_ReleasesClaim(t *testing.T) {
 	repoRoot := t.TempDir()
 	// Create a git repo with NO commits — HeadCommit will fail.
 	runGit(t, repoRoot, "init")
-	runGit(t, repoRoot, "config", "user.email", "test@example.com")
-	runGit(t, repoRoot, "config", "user.name", "Test User")
 	if err := os.MkdirAll(filepath.Join(repoRoot, ".tickets", ".claims"), 0o755); err != nil {
 		t.Fatalf("mkdir .tickets: %v", err)
 	}
