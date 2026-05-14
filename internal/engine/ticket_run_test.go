@@ -3450,3 +3450,118 @@ func TestRunTicket_RepairReviewDiffOnlyIncludesRepairDelta(t *testing.T) {
 		t.Errorf("expected repair review ChangedFiles=[docs/repair-notes.md], got %v", repairChangedFiles)
 	}
 }
+
+// TestRunTicket_ReviewerDoesNotReceiveUnrelatedDirtyWorktree is the primary
+// user-facing regression guard for the "dirty worktree pollutes reviewer" bug.
+//
+// Before RunTicket the repo contains:
+//   - a tracked dirty file at unrelated/tracked.txt (modified but not committed)
+//   - an untracked file at unrelated/untracked.txt
+//
+// The worker creates owned/worker.md (and nothing else).
+//
+// The review request must contain only owned/worker.md and must not mention
+// any path under unrelated/.
+func TestRunTicket_ReviewerDoesNotReceiveUnrelatedDirtyWorktree(t *testing.T) {
+	repoRoot := t.TempDir()
+	baseCommit := initEpicRepo(t, repoRoot)
+	stubToolSignals(t, ToolSignals{}) // no derived checks
+
+	// Write a tracked dirty file under unrelated/ before RunTicket.
+	if err := os.MkdirAll(filepath.Join(repoRoot, "unrelated"), 0o755); err != nil {
+		t.Fatalf("mkdir unrelated: %v", err)
+	}
+	trackedDirty := filepath.Join(repoRoot, "unrelated", "tracked.txt")
+	mustRunGit(t, repoRoot, "add", "unrelated")
+	if err := os.WriteFile(trackedDirty, []byte("pre-existing tracked content\n"), 0o644); err != nil {
+		t.Fatalf("write unrelated/tracked.txt: %v", err)
+	}
+	// Stage it so it is a tracked dirty file (added but not committed).
+	mustRunGit(t, repoRoot, "add", "unrelated/tracked.txt")
+
+	// Write an untracked file under unrelated/ before RunTicket.
+	untrackedDirty := filepath.Join(repoRoot, "unrelated", "untracked.txt")
+	if err := os.WriteFile(untrackedDirty, []byte("pre-existing untracked content\n"), 0o644); err != nil {
+		t.Fatalf("write unrelated/untracked.txt: %v", err)
+	}
+
+	cfg := policy.DefaultConfig()
+	ticket := testTicket("ver-unrelated-dirty")
+	plan, claim := testPlanAndClaim(t, repoRoot, ticket, cfg, "run-unrelated-dirty", "lease-unrelated-dirty", []string{`true`})
+
+	started, finished := testRunTimes()
+
+	workerFile := filepath.Join(repoRoot, "owned", "worker.md")
+
+	base := runtimefake.New(
+		[]runtime.WorkerResult{{
+			Status:             runtime.WorkerStatusDone,
+			RetryClass:         runtime.RetryClassTerminal,
+			LeaseID:            claim.LeaseID,
+			StartedAt:          started,
+			FinishedAt:         finished,
+			ResultArtifactPath: filepath.Join(repoRoot, "worker.json"),
+		}},
+		[]runtime.ReviewResult{{
+			Status:             runtime.WorkerStatusDone,
+			RetryClass:         runtime.RetryClassTerminal,
+			LeaseID:            claim.LeaseID,
+			StartedAt:          finished.Add(time.Second),
+			FinishedAt:         finished.Add(2 * time.Second),
+			ReviewStatus:       runtime.ReviewStatusPassed,
+			Summary:            "clean",
+			ResultArtifactPath: filepath.Join(repoRoot, "review.json"),
+		}},
+	)
+	adapter := &mutatingRuntimeAdapter{
+		Adapter: base,
+		onWorker: func() {
+			if err := os.MkdirAll(filepath.Dir(workerFile), 0o755); err != nil {
+				t.Errorf("mkdir owned: %v", err)
+				return
+			}
+			if err := os.WriteFile(workerFile, []byte("# worker output\n"), 0o644); err != nil {
+				t.Errorf("write owned/worker.md: %v", err)
+			}
+		},
+	}
+
+	_, err := RunTicket(context.Background(), RunTicketRequest{
+		RepoRoot:   repoRoot,
+		RunID:      "run-unrelated-dirty",
+		BaseCommit: baseCommit,
+		Ticket:     ticket,
+		Plan:       plan,
+		Claim:      claim,
+		Adapter:    adapter,
+		Config:     cfg,
+	})
+	if err != nil {
+		t.Fatalf("RunTicket error: %v", err)
+	}
+	if len(adapter.ReviewRequests()) != 1 {
+		t.Fatalf("expected 1 review request, got %d", len(adapter.ReviewRequests()))
+	}
+	reviewReq := adapter.ReviewRequests()[0]
+
+	// The worker-created file must appear in the diff.
+	if !strings.Contains(reviewReq.Diff, "owned/worker.md") {
+		t.Errorf("expected owned/worker.md in review diff; diff:\n%s", reviewReq.Diff)
+	}
+
+	// Unrelated dirty files must NOT appear in the diff or ChangedFiles.
+	if strings.Contains(reviewReq.Diff, "unrelated/") {
+		t.Errorf("unrelated/ paths must not appear in review diff; diff:\n%s", reviewReq.Diff)
+	}
+	for _, f := range reviewReq.ChangedFiles {
+		if strings.HasPrefix(f, "unrelated/") {
+			t.Errorf("unrelated path %q must not appear in ReviewRequest.ChangedFiles", f)
+		}
+	}
+
+	// The review prompt must not mention unrelated paths either.
+	prompt := runtime.BuildReviewPrompt(reviewReq)
+	if strings.Contains(prompt, "unrelated/") {
+		t.Errorf("unrelated/ paths must not appear in review prompt; prompt:\n%s", prompt)
+	}
+}
