@@ -298,21 +298,17 @@ func TestRunTicket_ReviewDiffIncludesWorktreeOnlyFile(t *testing.T) {
 	worktreePath := filepath.Join(t.TempDir(), "worktree-review")
 	mustRunGit(t, repoRoot, "worktree", "add", worktreePath, "HEAD")
 	t.Cleanup(func() { _ = exec.Command("git", "-C", repoRoot, "worktree", "remove", "--force", worktreePath).Run() })
-	if err := os.WriteFile(filepath.Join(worktreePath, "ticket-only.txt"), []byte("worktree file\n"), 0o644); err != nil {
-		t.Fatalf("write worktree-only file: %v", err)
-	}
-	mustRunGit(t, worktreePath, "add", "ticket-only.txt")
-	mustRunGit(t, worktreePath, "commit", "-m", "ticket-only change")
 
 	cfg := policy.DefaultConfig()
 	cfg.Runtime.WorkerTimeoutMinutes = 7
 	cfg.Runtime.ReviewerTimeoutMinutes = 9
 	cfg.Runtime.AuthEnvVars = []string{"VERK_API_KEY"}
+	stubToolSignals(t, ToolSignals{}) // no derived checks
 	ticket := testTicket("ver-wi20-worktree")
 	plan, claim := testPlanAndClaim(t, repoRoot, ticket, cfg, "run-wi20-review-diff", "lease-wi20-review-diff", []string{`true`})
 
 	started, finished := testRunTimes()
-	adapter := runtimefake.New(
+	base := runtimefake.New(
 		[]runtime.WorkerResult{
 			{
 				Status:             runtime.WorkerStatusDone,
@@ -336,6 +332,19 @@ func TestRunTicket_ReviewDiffIncludesWorktreeOnlyFile(t *testing.T) {
 			},
 		},
 	)
+	// The worker commits ticket-only.txt during its execution; this is
+	// what the review diff should capture (a worker-attributed change).
+	adapter := &mutatingRuntimeAdapter{
+		Adapter: base,
+		onWorker: func() {
+			if err := os.WriteFile(filepath.Join(worktreePath, "ticket-only.txt"), []byte("worktree file\n"), 0o644); err != nil {
+				t.Errorf("write worktree-only file: %v", err)
+				return
+			}
+			mustRunGit(t, worktreePath, "add", "ticket-only.txt")
+			mustRunGit(t, worktreePath, "commit", "-m", "ticket-only change")
+		},
+	}
 
 	_, err = RunTicket(context.Background(), RunTicketRequest{
 		RepoRoot:     repoRoot,
@@ -1537,9 +1546,12 @@ func testRunTimes() (time.Time, time.Time) {
 }
 
 func TestCollectDiff_ReturnsErrorOnInvalidRepo(t *testing.T) {
-	_, err := collectDiff("/nonexistent/path/that/does/not/exist", "abc123")
+	diff, err := collectDiff("/nonexistent/path/that/does/not/exist", "abc123")
 	if err == nil {
 		t.Fatal("expected error from collectDiff with invalid repo path")
+	}
+	if diff != "" {
+		t.Fatalf("expected empty diff on error, got %q", diff)
 	}
 }
 
@@ -1552,9 +1564,12 @@ func TestCollectDiff_ReturnsErrorOnInvalidBaseCommit(t *testing.T) {
 	mustRunGit(t, repoRoot, "add", "file.txt")
 	mustRunGit(t, repoRoot, "commit", "-m", "initial")
 
-	_, err := collectDiff(repoRoot, "nonexistent-commit-hash")
+	diff, err := collectDiff(repoRoot, "nonexistent-commit-hash")
 	if err == nil {
 		t.Fatal("expected error from collectDiff with invalid base commit")
+	}
+	if diff != "" {
+		t.Fatalf("expected empty diff on error, got %q", diff)
 	}
 }
 
@@ -2977,5 +2992,307 @@ func TestBuildImplementPhaseInstructions_RetryWithoutVerificationCyclesUnchanged
 	want := renderImplementInstructions(plan, state.TicketPhaseImplement, 2)
 	if got != want {
 		t.Fatalf("expected retry with only review cycles to return base instructions unchanged")
+	}
+}
+
+// mutatingRuntimeAdapter wraps runtimefake.Adapter and calls an optional hook
+// during RunWorker so tests can mutate files while the worker is "running".
+type mutatingRuntimeAdapter struct {
+	*runtimefake.Adapter
+	onWorker func()
+}
+
+func (a *mutatingRuntimeAdapter) RunWorker(ctx context.Context, req runtime.WorkerRequest) (runtime.WorkerResult, error) {
+	if a.onWorker != nil {
+		a.onWorker()
+	}
+	return a.Adapter.RunWorker(ctx, req)
+}
+
+// TestRunTicket_ReviewDiffExcludesPreExistingDirtyFiles verifies that dirty
+// files present before RunTicket are not included in the review diff unless
+// the worker further modifies them.
+func TestRunTicket_ReviewDiffExcludesPreExistingDirtyFiles(t *testing.T) {
+	repoRoot := t.TempDir()
+	baseCommit := initEpicRepo(t, repoRoot)
+	stubToolSignals(t, ToolSignals{}) // no derived checks — keeps verify deterministic
+
+	// Create a tracked dirty file pre-existing before RunTicket.
+	trackedDirty := filepath.Join(repoRoot, "tracked.txt")
+	if err := os.WriteFile(trackedDirty, []byte("dirty-before-run\n"), 0o644); err != nil {
+		t.Fatalf("write tracked dirty: %v", err)
+	}
+
+	// Create an untracked dirty file pre-existing before RunTicket.
+	untrackedDirty := filepath.Join(repoRoot, "untracked-dirty.txt")
+	if err := os.WriteFile(untrackedDirty, []byte("untracked dirty\n"), 0o644); err != nil {
+		t.Fatalf("write untracked dirty: %v", err)
+	}
+
+	cfg := policy.DefaultConfig()
+	ticket := testTicket("ver-review-delta-preexist")
+	plan, claim := testPlanAndClaim(t, repoRoot, ticket, cfg, "run-review-delta-preexist", "lease-review-delta-preexist", []string{`true`})
+
+	started, finished := testRunTimes()
+
+	// The worker creates a new file — this is the only thing it should write.
+	// Use a .md file so Go test derivation (addGoChecks) doesn't trigger.
+	workerFile := filepath.Join(repoRoot, "src", "worker-output.md")
+
+	base := runtimefake.New(
+		[]runtime.WorkerResult{{
+			Status:             runtime.WorkerStatusDone,
+			RetryClass:         runtime.RetryClassTerminal,
+			LeaseID:            claim.LeaseID,
+			StartedAt:          started,
+			FinishedAt:         finished,
+			ResultArtifactPath: filepath.Join(repoRoot, "worker.json"),
+		}},
+		[]runtime.ReviewResult{{
+			Status:             runtime.WorkerStatusDone,
+			RetryClass:         runtime.RetryClassTerminal,
+			LeaseID:            claim.LeaseID,
+			StartedAt:          finished.Add(time.Second),
+			FinishedAt:         finished.Add(2 * time.Second),
+			ReviewStatus:       runtime.ReviewStatusPassed,
+			Summary:            "clean",
+			ResultArtifactPath: filepath.Join(repoRoot, "review.json"),
+		}},
+	)
+	adapter := &mutatingRuntimeAdapter{
+		Adapter: base,
+		onWorker: func() {
+			if err := os.MkdirAll(filepath.Dir(workerFile), 0o755); err != nil {
+				t.Errorf("mkdir worker output dir: %v", err)
+				return
+			}
+			if err := os.WriteFile(workerFile, []byte("# worker output\n"), 0o644); err != nil {
+				t.Errorf("write worker file: %v", err)
+			}
+		},
+	}
+
+	_, err := RunTicket(context.Background(), RunTicketRequest{
+		RepoRoot:   repoRoot,
+		RunID:      "run-review-delta-preexist",
+		BaseCommit: baseCommit,
+		Ticket:     ticket,
+		Plan:       plan,
+		Claim:      claim,
+		Adapter:    adapter,
+		Config:     cfg,
+	})
+	if err != nil {
+		t.Fatalf("RunTicket error: %v", err)
+	}
+	if len(adapter.ReviewRequests()) != 1 {
+		t.Fatalf("expected 1 review request, got %d", len(adapter.ReviewRequests()))
+	}
+	reviewReq := adapter.ReviewRequests()[0]
+
+	// Worker file content must appear in the diff.
+	if !strings.Contains(reviewReq.Diff, "worker-output.md") {
+		t.Errorf("expected worker file in review diff; diff:\n%s", reviewReq.Diff)
+	}
+	if !strings.Contains(reviewReq.Diff, "# worker output") {
+		t.Errorf("expected worker file content in review diff; diff:\n%s", reviewReq.Diff)
+	}
+
+	// Pre-existing dirty tracked file must NOT appear in diff.
+	if strings.Contains(reviewReq.Diff, "dirty-before-run") {
+		t.Errorf("pre-existing tracked dirty content must not appear in review diff; diff:\n%s", reviewReq.Diff)
+	}
+
+	// ChangedFiles must contain only the worker file.
+	if len(reviewReq.ChangedFiles) != 1 || reviewReq.ChangedFiles[0] != "src/worker-output.md" {
+		t.Errorf("expected ChangedFiles=[src/worker-output.md], got %v", reviewReq.ChangedFiles)
+	}
+}
+
+// TestRunTicket_ReviewDiffIncludesUntrackedWorkerFile verifies that an
+// untracked file created by the worker appears in the review diff with the
+// expected git diff markers.
+func TestRunTicket_ReviewDiffIncludesUntrackedWorkerFile(t *testing.T) {
+	repoRoot := t.TempDir()
+	baseCommit := initEpicRepo(t, repoRoot)
+	stubToolSignals(t, ToolSignals{}) // no derived checks
+
+	cfg := policy.DefaultConfig()
+	ticket := testTicket("ver-review-delta-untracked")
+	plan, claim := testPlanAndClaim(t, repoRoot, ticket, cfg, "run-review-delta-untracked", "lease-review-delta-untracked", []string{`true`})
+
+	started, finished := testRunTimes()
+
+	newWorkerFile := filepath.Join(repoRoot, "docs", "new-worker-file.md")
+
+	base := runtimefake.New(
+		[]runtime.WorkerResult{{
+			Status:             runtime.WorkerStatusDone,
+			RetryClass:         runtime.RetryClassTerminal,
+			LeaseID:            claim.LeaseID,
+			StartedAt:          started,
+			FinishedAt:         finished,
+			ResultArtifactPath: filepath.Join(repoRoot, "worker.json"),
+		}},
+		[]runtime.ReviewResult{{
+			Status:             runtime.WorkerStatusDone,
+			RetryClass:         runtime.RetryClassTerminal,
+			LeaseID:            claim.LeaseID,
+			StartedAt:          finished.Add(time.Second),
+			FinishedAt:         finished.Add(2 * time.Second),
+			ReviewStatus:       runtime.ReviewStatusPassed,
+			Summary:            "clean",
+			ResultArtifactPath: filepath.Join(repoRoot, "review.json"),
+		}},
+	)
+	adapter := &mutatingRuntimeAdapter{
+		Adapter: base,
+		onWorker: func() {
+			if err := os.MkdirAll(filepath.Dir(newWorkerFile), 0o755); err != nil {
+				t.Errorf("mkdir docs: %v", err)
+				return
+			}
+			if err := os.WriteFile(newWorkerFile, []byte("# New worker doc\n"), 0o644); err != nil {
+				t.Errorf("write new worker file: %v", err)
+			}
+			mustRunGit(t, repoRoot, "add", "docs/new-worker-file.md")
+		},
+	}
+
+	_, err := RunTicket(context.Background(), RunTicketRequest{
+		RepoRoot:   repoRoot,
+		RunID:      "run-review-delta-untracked",
+		BaseCommit: baseCommit,
+		Ticket:     ticket,
+		Plan:       plan,
+		Claim:      claim,
+		Adapter:    adapter,
+		Config:     cfg,
+	})
+	if err != nil {
+		t.Fatalf("RunTicket error: %v", err)
+	}
+	if len(adapter.ReviewRequests()) != 1 {
+		t.Fatalf("expected 1 review request, got %d", len(adapter.ReviewRequests()))
+	}
+	reviewReq := adapter.ReviewRequests()[0]
+
+	if !strings.Contains(reviewReq.Diff, "new file mode") {
+		t.Errorf("expected 'new file mode' in review diff for untracked file; diff:\n%s", reviewReq.Diff)
+	}
+	if !strings.Contains(reviewReq.Diff, "+++ b/docs/new-worker-file.md") {
+		t.Errorf("expected '+++ b/docs/new-worker-file.md' in review diff; diff:\n%s", reviewReq.Diff)
+	}
+	if !strings.Contains(reviewReq.Diff, "# New worker doc") {
+		t.Errorf("expected worker file content in review diff; diff:\n%s", reviewReq.Diff)
+	}
+}
+
+// TestRunTicket_ReviewChangedFilesMatchesWorkerDelta verifies that the
+// ReviewRequest.ChangedFiles field contains only worker-produced files,
+// excludes engine-owned paths (.verk/, .tickets/), and is sorted.
+func TestRunTicket_ReviewChangedFilesMatchesWorkerDelta(t *testing.T) {
+	repoRoot := t.TempDir()
+	baseCommit := initEpicRepo(t, repoRoot)
+	stubToolSignals(t, ToolSignals{}) // no derived checks
+
+	cfg := policy.DefaultConfig()
+	ticket := testTicket("ver-review-delta-changedfiles")
+	plan, claim := testPlanAndClaim(t, repoRoot, ticket, cfg, "run-review-delta-cf", "lease-review-delta-cf", []string{`true`})
+
+	started, finished := testRunTimes()
+
+	base := runtimefake.New(
+		[]runtime.WorkerResult{{
+			Status:             runtime.WorkerStatusDone,
+			RetryClass:         runtime.RetryClassTerminal,
+			LeaseID:            claim.LeaseID,
+			StartedAt:          started,
+			FinishedAt:         finished,
+			ResultArtifactPath: filepath.Join(repoRoot, "worker.json"),
+		}},
+		[]runtime.ReviewResult{{
+			Status:             runtime.WorkerStatusDone,
+			RetryClass:         runtime.RetryClassTerminal,
+			LeaseID:            claim.LeaseID,
+			StartedAt:          finished.Add(time.Second),
+			FinishedAt:         finished.Add(2 * time.Second),
+			ReviewStatus:       runtime.ReviewStatusPassed,
+			Summary:            "clean",
+			ResultArtifactPath: filepath.Join(repoRoot, "review.json"),
+		}},
+	)
+	adapter := &mutatingRuntimeAdapter{
+		Adapter: base,
+		onWorker: func() {
+			// Worker creates two user files. Use .md to avoid Go test derivation.
+			for _, entry := range []struct{ dir, name, content string }{
+				{"docs", "alpha.md", "# alpha\n"},
+				{"docs", "beta.md", "# beta\n"},
+			} {
+				dir := filepath.Join(repoRoot, entry.dir)
+				if err := os.MkdirAll(dir, 0o755); err != nil {
+					t.Errorf("mkdir %s: %v", dir, err)
+					return
+				}
+				if err := os.WriteFile(filepath.Join(dir, entry.name), []byte(entry.content), 0o644); err != nil {
+					t.Errorf("write %s/%s: %v", entry.dir, entry.name, err)
+				}
+			}
+		},
+	}
+
+	_, err := RunTicket(context.Background(), RunTicketRequest{
+		RepoRoot:   repoRoot,
+		RunID:      "run-review-delta-cf",
+		BaseCommit: baseCommit,
+		Ticket:     ticket,
+		Plan:       plan,
+		Claim:      claim,
+		Adapter:    adapter,
+		Config:     cfg,
+	})
+	if err != nil {
+		t.Fatalf("RunTicket error: %v", err)
+	}
+	if len(adapter.ReviewRequests()) != 1 {
+		t.Fatalf("expected 1 review request, got %d", len(adapter.ReviewRequests()))
+	}
+	reviewReq := adapter.ReviewRequests()[0]
+
+	// Engine-owned paths must not appear.
+	for _, f := range reviewReq.ChangedFiles {
+		if strings.HasPrefix(f, ".verk/") || strings.HasPrefix(f, ".tickets/") {
+			t.Errorf("engine-owned path %q must not appear in ReviewRequest.ChangedFiles", f)
+		}
+	}
+
+	// Worker files must be present and sorted.
+	want := []string{"docs/alpha.md", "docs/beta.md"}
+	if len(reviewReq.ChangedFiles) < len(want) {
+		t.Fatalf("expected at least %d ChangedFiles, got %v", len(want), reviewReq.ChangedFiles)
+	}
+	foundAlpha, foundBeta := false, false
+	for _, f := range reviewReq.ChangedFiles {
+		if f == "docs/alpha.md" {
+			foundAlpha = true
+		}
+		if f == "docs/beta.md" {
+			foundBeta = true
+		}
+	}
+	if !foundAlpha {
+		t.Errorf("expected docs/alpha.md in ChangedFiles, got %v", reviewReq.ChangedFiles)
+	}
+	if !foundBeta {
+		t.Errorf("expected docs/beta.md in ChangedFiles, got %v", reviewReq.ChangedFiles)
+	}
+
+	// Files must be sorted.
+	for i := 1; i < len(reviewReq.ChangedFiles); i++ {
+		if reviewReq.ChangedFiles[i-1] > reviewReq.ChangedFiles[i] {
+			t.Errorf("ChangedFiles not sorted: %v", reviewReq.ChangedFiles)
+			break
+		}
 	}
 }

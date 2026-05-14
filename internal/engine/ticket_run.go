@@ -85,6 +85,19 @@ type ticketRunState struct {
 	implementationAttempts int
 	verificationAttempts   int
 	reviewAttempts         int
+	reviewBaseline         *reviewBaseline // captured before each worker attempt; nil on resumed runs
+}
+
+// currentReviewBaseline returns the review baseline for delta computation.
+// If no baseline was captured (e.g. a run resumed directly into review from
+// older artifacts), it returns a conservative compatibility baseline that
+// treats no files as pre-existing dirty. This preserves current behavior for
+// old runs rather than crashing.
+func (st *ticketRunState) currentReviewBaseline() reviewBaseline {
+	if st.reviewBaseline == nil {
+		return reviewBaseline{BaseCommit: st.req.BaseCommit}
+	}
+	return *st.reviewBaseline
 }
 
 type ticketRunPaths struct {
@@ -230,6 +243,11 @@ func RunTicket(ctx context.Context, req RunTicketRequest) (result RunTicketResul
 
 		switch st.currentPhase {
 		case state.TicketPhaseImplement:
+			reviewBaseline, err := captureReviewBaseline(st.worktreePath, req.BaseCommit)
+			if err != nil {
+				return RunTicketResult{}, fmt.Errorf("capture review baseline: %w", err)
+			}
+			st.reviewBaseline = &reviewBaseline
 			workerProfile := workerProfileForPlan(req.Plan, cfg)
 			workerReq := runtime.WorkerRequest{
 				RunID:           req.RunID,
@@ -294,9 +312,9 @@ func RunTicket(ctx context.Context, req RunTicketRequest) (result RunTicketResul
 			}
 
 		case state.TicketPhaseReview:
-			diffForReview, err := collectDiff(st.worktreePath, req.BaseCommit)
+			delta, err := collectReviewDelta(st.worktreePath, req.BaseCommit, st.currentReviewBaseline())
 			if err != nil {
-				return RunTicketResult{}, fmt.Errorf("collect diff for review: %w", err)
+				return RunTicketResult{}, fmt.Errorf("collect review delta: %w", err)
 			}
 			reviewerProfile := reviewerProfileForPlan(req.Plan, cfg)
 			reviewReq := runtime.ReviewRequest{
@@ -310,8 +328,9 @@ func RunTicket(ctx context.Context, req RunTicketRequest) (result RunTicketResul
 				WorktreePath:             st.worktreePath,
 				InputArtifactPath:        st.paths.verificationPath,
 				Instructions:             renderReviewInstructions(req.Plan, st.reviewAttempts+1),
-				Diff:                     diffForReview,
-				Standards:                runtime.BuildReviewStandards(runtime.DetectLanguages(diffForReview)),
+				Diff:                     delta.Diff,
+				ChangedFiles:             delta.ChangedFiles,
+				Standards:                runtime.BuildReviewStandards(runtime.DetectLanguages(delta.Diff)),
 				EffectiveReviewThreshold: req.Plan.EffectiveReviewThreshold,
 				ExecutionConfig:          executionConfigFromPolicy(cfg),
 				OnProgress:               func(detail string) { st.progressDetail(detail) },
@@ -403,6 +422,11 @@ func RunTicket(ctx context.Context, req RunTicketRequest) (result RunTicketResul
 			continue
 
 		case state.TicketPhaseRepair:
+			repairBaseline, err := captureReviewBaseline(st.worktreePath, req.BaseCommit)
+			if err != nil {
+				return RunTicketResult{}, fmt.Errorf("capture review baseline: %w", err)
+			}
+			st.reviewBaseline = &repairBaseline
 			workerProfile := workerProfileForPlan(req.Plan, cfg)
 			workerReq := runtime.WorkerRequest{
 				RunID:           req.RunID,
