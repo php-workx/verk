@@ -545,6 +545,33 @@ func TestListReadyChildren_LiveClaimFilteringUsesActiveClaimSet(t *testing.T) {
 	}
 }
 
+func TestListReadyChildren_LiveClaimWithoutLeaseAllowsReady(t *testing.T) {
+	dir := t.TempDir()
+
+	writeEposTicketFile(t, dir, "epic-live-no-lease", map[string]string{"type": "epic"}, nil)
+	writeEposTicketFileWithStatus(t, dir, "live-no-lease", "open", map[string]string{"parent": "epic-live-no-lease"}, nil)
+	if err := eposruntime.WriteRuntimeState(dir, &eposticket.RuntimeState{
+		TicketID: "live-no-lease",
+		Claim: &eposticket.Claim{
+			ClaimedBy:    "run-other",
+			ClaimBackend: "run-other",
+			ClaimedAt:    time.Now().UTC(),
+		},
+	}); err != nil {
+		t.Fatalf("WriteRuntimeState: %v", err)
+	}
+
+	children, err := ListReadyChildren(dir, "epic-live-no-lease", "run-current")
+	if err != nil {
+		t.Fatalf("ListReadyChildren: %v", err)
+	}
+	got := strings.Join(ticketIDs(children), ",")
+	want := "live-no-lease"
+	if got != want {
+		t.Fatalf("ready children = %s, want %s", got, want)
+	}
+}
+
 func TestListReadyChildren_CurrentRunSeesOwnClaim(t *testing.T) {
 	dir := t.TempDir()
 	now := time.Now().UTC()
@@ -560,7 +587,7 @@ func TestListReadyChildren_CurrentRunSeesOwnClaim(t *testing.T) {
 		ExpiresAt:  now.Add(time.Hour),
 		State:      "active",
 	})
-	if err := eposruntime.Claim(dir, "live-own", "run-current", "backend-current", time.Hour, eposruntime.WithLeaseID("lease-live-own")); err != nil {
+	if err := eposruntime.Claim(dir, "live-own", "run-current", "run-current", time.Hour, eposruntime.WithLeaseID("lease-live-own")); err != nil {
 		t.Fatalf("eposruntime.Claim: %v", err)
 	}
 

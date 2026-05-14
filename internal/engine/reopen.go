@@ -23,13 +23,13 @@ func ReopenTicket(ctx context.Context, req ReopenRequest) error {
 	if req.RunID == "" {
 		return fmt.Errorf("reopen requires run id")
 	}
-	if err := validateArtifactIdentifier(req.RunID, "run id"); err != nil {
+	if err := ValidateArtifactIdentifier(req.RunID, "run id"); err != nil {
 		return err
 	}
 	if req.TicketID == "" {
 		return fmt.Errorf("reopen requires ticket id")
 	}
-	if err := validateArtifactIdentifier(req.TicketID, "ticket id"); err != nil {
+	if err := ValidateArtifactIdentifier(req.TicketID, "ticket id"); err != nil {
 		return err
 	}
 	if req.ToPhase == "" {

@@ -13,6 +13,7 @@ import (
 
 	eposticket "github.com/php-workx/epos/ticket"
 	eposmarkdown "github.com/php-workx/epos/ticket/markdown"
+	eposruntime "github.com/php-workx/epos/ticket/runtime"
 	eposstore "github.com/php-workx/epos/ticket/store"
 	"gopkg.in/yaml.v3"
 )
@@ -193,14 +194,12 @@ func claimedTickets(rootDir, currentRunID string) (map[string]bool, error) {
 	}
 	out := map[string]bool{}
 	for ticketID := range liveClaims {
-		if currentRunID != "" {
-			claim, err := LoadLiveClaim(repoRoot, ticketID)
-			if err != nil {
-				return nil, err
-			}
-			if claim != nil && claim.OwnerRunID == currentRunID {
-				continue
-			}
+		allowed, err := eposruntime.ClaimAllowsReady(repoRoot, ticketID, currentRunID)
+		if err != nil {
+			return nil, err
+		}
+		if allowed {
+			continue
 		}
 		out[ticketID] = true
 	}

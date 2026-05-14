@@ -16,6 +16,18 @@ func LoadLiveClaim(rootDir, ticketID string) (*state.ClaimArtifact, error) {
 	return RuntimeStateToClaimArtifact(runtimeState), nil
 }
 
+func LoadBlockingLiveClaim(rootDir, ticketID, currentRunID string) (*state.ClaimArtifact, error) {
+	repoRoot := resolveRepoRoot(rootDir)
+	allowed, err := eposruntime.ClaimAllowsReady(repoRoot, ticketID, currentRunID)
+	if err != nil {
+		return nil, err
+	}
+	if allowed {
+		return nil, nil //nolint:nilnil // allowed: no blocking claim to report
+	}
+	return LoadLiveClaim(repoRoot, ticketID)
+}
+
 func RuntimeStateToClaimArtifact(runtimeState *eposticket.RuntimeState) *state.ClaimArtifact {
 	if runtimeState == nil || runtimeState.Claim == nil || runtimeState.Lease == nil {
 		return nil

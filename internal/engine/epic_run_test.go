@@ -19,6 +19,8 @@ import (
 	"verk/internal/policy"
 	"verk/internal/state"
 
+	eposticket "github.com/php-workx/epos/ticket"
+	eposruntime "github.com/php-workx/epos/ticket/runtime"
 	runtimefake "verk/internal/adapters/runtime/fake"
 )
 
@@ -240,6 +242,114 @@ func TestCollectBlockedTicketsDoesNotOfferRetryForSnapshotlessBlockedTicket(t *t
 	if blocked[0].RetryPhase != "" {
 		t.Fatalf("expected no retry phase without a blocked run snapshot, got %q", blocked[0].RetryPhase)
 	}
+}
+
+func TestCollectBlockedTicketsDescribesLiveClaimForOpenTicket(t *testing.T) {
+	repoRoot := t.TempDir()
+	child := epos.Ticket{
+		ID:     "ticket-claimed",
+		Title:  "Claimed ticket",
+		Status: epos.StatusOpen,
+	}
+	mustSaveTicket(t, repoRoot, child)
+	if _, err := epos.AcquireClaim(repoRoot, "run-owner", child.ID, "lease-owner", 10*time.Minute, time.Now().UTC()); err != nil {
+		t.Fatalf("acquire claim: %v", err)
+	}
+
+	blocked := collectBlockedTickets(repoRoot, "run-reporter", []epos.Ticket{child})
+	if len(blocked) != 1 {
+		t.Fatalf("expected one blocked ticket, got %d", len(blocked))
+	}
+	if blocked[0].Reason != "waiting on lease (held by run-owner)" {
+		t.Fatalf("expected claim-aware reason, got %q", blocked[0].Reason)
+	}
+}
+
+func TestCollectBlockedTicketsClaimReasonHonorsEposEligibility(t *testing.T) {
+	t.Run("same run claim falls back to status", func(t *testing.T) {
+		repoRoot := t.TempDir()
+		child := epos.Ticket{ID: "ticket-same-run", Status: epos.StatusOpen}
+		mustSaveTicket(t, repoRoot, child)
+		if _, err := epos.AcquireClaim(repoRoot, "run-current", child.ID, "lease-current", 10*time.Minute, time.Now().UTC()); err != nil {
+			t.Fatalf("acquire claim: %v", err)
+		}
+
+		blocked := collectBlockedTickets(repoRoot, "run-current", []epos.Ticket{child})
+		if blocked[0].Reason != "status=open" {
+			t.Fatalf("expected status fallback, got %q", blocked[0].Reason)
+		}
+	})
+
+	t.Run("expired lease falls back to status", func(t *testing.T) {
+		repoRoot := t.TempDir()
+		child := epos.Ticket{ID: "ticket-expired", Status: epos.StatusOpen}
+		mustSaveTicket(t, repoRoot, child)
+		writeRuntimeState(t, repoRoot, &eposticket.RuntimeState{
+			TicketID: child.ID,
+			Claim: &eposticket.Claim{
+				ClaimedBy:    "run-owner",
+				ClaimBackend: "run-owner",
+				ClaimedAt:    time.Now().Add(-2 * time.Hour),
+			},
+			Lease: &eposticket.Lease{
+				LeaseID:   "lease-expired",
+				ExpiresAt: time.Now().Add(-time.Hour),
+			},
+		})
+
+		blocked := collectBlockedTickets(repoRoot, "run-current", []epos.Ticket{child})
+		if blocked[0].Reason != "status=open" {
+			t.Fatalf("expected status fallback, got %q", blocked[0].Reason)
+		}
+	})
+
+	t.Run("deps remain the primary reason", func(t *testing.T) {
+		repoRoot := t.TempDir()
+		child := epos.Ticket{ID: "ticket-deps", Status: epos.StatusOpen, Deps: []string{"dep-open"}}
+		mustSaveTicket(t, repoRoot, child)
+		if _, err := epos.AcquireClaim(repoRoot, "run-owner", child.ID, "lease-owner", 10*time.Minute, time.Now().UTC()); err != nil {
+			t.Fatalf("acquire claim: %v", err)
+		}
+
+		blocked := collectBlockedTickets(repoRoot, "run-current", []epos.Ticket{child})
+		if blocked[0].Reason != "waiting on deps: dep-open" {
+			t.Fatalf("expected deps reason, got %q", blocked[0].Reason)
+		}
+	})
+
+	t.Run("unknown status is not masked by claim", func(t *testing.T) {
+		repoRoot := t.TempDir()
+		child := epos.Ticket{ID: "ticket-weird", Status: epos.Status("weird")}
+		if _, err := epos.AcquireClaim(repoRoot, "run-owner", child.ID, "lease-owner", 10*time.Minute, time.Now().UTC()); err != nil {
+			t.Fatalf("acquire claim: %v", err)
+		}
+
+		blocked := collectBlockedTickets(repoRoot, "run-current", []epos.Ticket{child})
+		if blocked[0].Reason != "status=weird" {
+			t.Fatalf("expected status fallback, got %q", blocked[0].Reason)
+		}
+	})
+
+	t.Run("live blocking claim wins over stale snapshot status", func(t *testing.T) {
+		repoRoot := t.TempDir()
+		runID := "run-current"
+		child := epos.Ticket{ID: "ticket-stale-snapshot", Status: epos.StatusOpen}
+		mustSaveTicket(t, repoRoot, child)
+		if _, err := epos.AcquireClaim(repoRoot, "run-owner", child.ID, "lease-owner", 10*time.Minute, time.Now().UTC()); err != nil {
+			t.Fatalf("acquire claim: %v", err)
+		}
+		writeTicketRunFixture(t, repoRoot, runID, TicketRunSnapshot{
+			ArtifactMeta: state.ArtifactMeta{SchemaVersion: artifactSchemaVersion, RunID: runID},
+			TicketID:     child.ID,
+			CurrentPhase: state.TicketPhaseImplement,
+			BlockReason:  "status=open",
+		})
+
+		blocked := collectBlockedTickets(repoRoot, runID, []epos.Ticket{child})
+		if blocked[0].Reason != "waiting on lease (held by run-owner)" {
+			t.Fatalf("expected claim-aware reason, got %q", blocked[0].Reason)
+		}
+	})
 }
 
 func TestCollectBlockedTicketsOffersRetryForBlockedSnapshot(t *testing.T) {
@@ -1676,8 +1786,6 @@ func initEpicRepo(t *testing.T, root string) string {
 	t.Helper()
 
 	mustRunGit(t, root, "init")
-	mustRunGit(t, root, "config", "user.email", "test@example.com")
-	mustRunGit(t, root, "config", "user.name", "Test User")
 
 	if err := os.WriteFile(filepath.Join(root, "tracked.txt"), []byte("base\n"), 0o644); err != nil {
 		t.Fatalf("seed repo: %v", err)
@@ -1697,6 +1805,14 @@ func mustSaveTicket(t *testing.T, repoRoot string, ticket epos.Ticket) {
 
 	if err := epos.SaveTicket(filepath.Join(repoRoot, ".tickets", ticket.ID+".md"), ticket); err != nil {
 		t.Fatalf("SaveTicket(%s): %v", ticket.ID, err)
+	}
+}
+
+func writeRuntimeState(t *testing.T, repoRoot string, runtimeState *eposticket.RuntimeState) {
+	t.Helper()
+
+	if err := eposruntime.WriteRuntimeState(repoRoot, runtimeState); err != nil {
+		t.Fatalf("WriteRuntimeState(%s): %v", runtimeState.TicketID, err)
 	}
 }
 

@@ -283,8 +283,6 @@ func TestRunTicket_UsesExplicitWorktreePathForWorkersAndArtifactsStayOnRepoRoot(
 func TestRunTicket_ReviewDiffIncludesWorktreeOnlyFile(t *testing.T) {
 	repoRoot := t.TempDir()
 	mustRunGit(t, repoRoot, "init")
-	mustRunGit(t, repoRoot, "config", "user.email", "test@example.com")
-	mustRunGit(t, repoRoot, "config", "user.name", "Test User")
 	if err := os.WriteFile(filepath.Join(repoRoot, "base.txt"), []byte("base\n"), 0o644); err != nil {
 		t.Fatalf("seed repo: %v", err)
 	}
@@ -889,8 +887,6 @@ func TestRunTicket_ScopeViolationBlocksTicket(t *testing.T) {
 
 	// Initialize a real git repo so collectChangedFiles can detect changes.
 	mustRunGit(t, repoRoot, "init")
-	mustRunGit(t, repoRoot, "config", "user.email", "test@example.com")
-	mustRunGit(t, repoRoot, "config", "user.name", "Test User")
 	if err := os.WriteFile(filepath.Join(repoRoot, "tracked.txt"), []byte("base\n"), 0o644); err != nil {
 		t.Fatalf("seed repo: %v", err)
 	}
@@ -967,8 +963,6 @@ func TestRunTicket_ScopeCheckBlocksWhenOwnedPathsEmpty(t *testing.T) {
 
 	// Initialize a real git repo with a file change outside any scope.
 	mustRunGit(t, repoRoot, "init")
-	mustRunGit(t, repoRoot, "config", "user.email", "test@example.com")
-	mustRunGit(t, repoRoot, "config", "user.name", "Test User")
 	if err := os.WriteFile(filepath.Join(repoRoot, "tracked.txt"), []byte("base\n"), 0o644); err != nil {
 		t.Fatalf("seed repo: %v", err)
 	}
@@ -1135,8 +1129,8 @@ func TestRunTicket_ScopeMissingThenReopensToProceed(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load reopened ticket: %v", err)
 	}
-	if reopenedTicket.Status != epos.StatusOpen {
-		t.Fatalf("expected ticket status to become open after reopen, got %q", reopenedTicket.Status)
+	if reopenedTicket.Status != epos.StatusReady {
+		t.Fatalf("expected ticket status to become ready after reopen, got %q", reopenedTicket.Status)
 	}
 	reopenedTicket.OwnedPaths = []string{"internal/engine"}
 	if err := epos.SaveTicket(filepath.Join(repoRoot, ".tickets", ticketID+".md"), reopenedTicket); err != nil {
@@ -1552,8 +1546,6 @@ func TestCollectDiff_ReturnsErrorOnInvalidRepo(t *testing.T) {
 func TestCollectDiff_ReturnsErrorOnInvalidBaseCommit(t *testing.T) {
 	repoRoot := t.TempDir()
 	mustRunGit(t, repoRoot, "init")
-	mustRunGit(t, repoRoot, "config", "user.email", "test@example.com")
-	mustRunGit(t, repoRoot, "config", "user.name", "Test User")
 	if err := os.WriteFile(filepath.Join(repoRoot, "file.txt"), []byte("hello\n"), 0o644); err != nil {
 		t.Fatalf("write file: %v", err)
 	}
@@ -1576,8 +1568,6 @@ func TestCollectChangedFiles_ReturnsErrorOnInvalidRepo(t *testing.T) {
 func TestCollectChangedFiles_ReturnsErrorOnInvalidBaseCommit(t *testing.T) {
 	repoRoot := t.TempDir()
 	mustRunGit(t, repoRoot, "init")
-	mustRunGit(t, repoRoot, "config", "user.email", "test@example.com")
-	mustRunGit(t, repoRoot, "config", "user.name", "Test User")
 	if err := os.WriteFile(filepath.Join(repoRoot, "file.txt"), []byte("hello\n"), 0o644); err != nil {
 		t.Fatalf("write file: %v", err)
 	}

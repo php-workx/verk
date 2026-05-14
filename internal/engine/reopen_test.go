@@ -86,8 +86,8 @@ func TestReopenTicket_BlockedToImplement(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load ticket markdown: %v", err)
 	}
-	if ticket.Status != epos.StatusOpen {
-		t.Fatalf("expected ticket markdown status open, got %q", ticket.Status)
+	if ticket.Status != epos.StatusReady {
+		t.Fatalf("expected ticket markdown status ready, got %q", ticket.Status)
 	}
 }
 
@@ -245,13 +245,13 @@ func TestReopenTicket_UpdatesTicketStoreAfterCommit(t *testing.T) {
 		t.Fatalf("ReopenTicket returned error: %v", err)
 	}
 
-	// After successful reopen, the ticket markdown should be updated to open.
+	// After successful reopen, the ticket markdown should be updated to ready.
 	ticket, err := epos.LoadTicket(ticketMarkdownPath(repoRoot, ticketID))
 	if err != nil {
 		t.Fatalf("load ticket markdown: %v", err)
 	}
-	if ticket.Status != epos.StatusOpen {
-		t.Fatalf("expected ticket status open after reopen, got %q", ticket.Status)
+	if ticket.Status != epos.StatusReady {
+		t.Fatalf("expected ticket status ready after reopen, got %q", ticket.Status)
 	}
 }
 

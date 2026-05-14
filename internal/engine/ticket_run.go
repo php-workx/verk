@@ -1557,19 +1557,19 @@ func validateRunTicketRequest(req RunTicketRequest) error {
 	if req.RunID == "" {
 		return fmt.Errorf("run ticket requires run id")
 	}
-	if err := validateArtifactIdentifier(req.RunID, "run id"); err != nil {
+	if err := ValidateArtifactIdentifier(req.RunID, "run id"); err != nil {
 		return err
 	}
 	if req.Ticket.ID == "" {
 		return fmt.Errorf("run ticket requires ticket metadata")
 	}
-	if err := validateArtifactIdentifier(req.Ticket.ID, "ticket id"); err != nil {
+	if err := ValidateArtifactIdentifier(req.Ticket.ID, "ticket id"); err != nil {
 		return err
 	}
 	if req.Plan.TicketID == "" {
 		return fmt.Errorf("run ticket requires plan artifact")
 	}
-	if err := validateArtifactIdentifier(req.Plan.TicketID, "plan ticket id"); err != nil {
+	if err := ValidateArtifactIdentifier(req.Plan.TicketID, "plan ticket id"); err != nil {
 		return err
 	}
 	if req.Plan.TicketID != req.Ticket.ID {
@@ -1578,7 +1578,7 @@ func validateRunTicketRequest(req RunTicketRequest) error {
 	if req.Claim.TicketID == "" {
 		return fmt.Errorf("run ticket requires claim artifact")
 	}
-	if err := validateArtifactIdentifier(req.Claim.TicketID, "claim ticket id"); err != nil {
+	if err := ValidateArtifactIdentifier(req.Claim.TicketID, "claim ticket id"); err != nil {
 		return err
 	}
 	if req.Claim.TicketID != req.Ticket.ID {

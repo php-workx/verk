@@ -42,7 +42,7 @@ func ResumeRun(ctx context.Context, req ResumeRequest) (ResumeReport, error) { /
 	if req.RunID == "" {
 		return ResumeReport{}, fmt.Errorf("resume requires run id")
 	}
-	if err := validateArtifactIdentifier(req.RunID, "run id"); err != nil {
+	if err := ValidateArtifactIdentifier(req.RunID, "run id"); err != nil {
 		return ResumeReport{}, err
 	}
 	if req.RepoRoot == "" {

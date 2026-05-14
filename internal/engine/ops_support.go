@@ -44,7 +44,7 @@ func loadRunArtifacts(repoRoot, runID string) (runArtifacts, error) {
 	if runID == "" {
 		return runArtifacts{}, fmt.Errorf("run id is required")
 	}
-	if err := validateArtifactIdentifier(runID, "run id"); err != nil {
+	if err := ValidateArtifactIdentifier(runID, "run id"); err != nil {
 		return runArtifacts{}, err
 	}
 
@@ -53,7 +53,7 @@ func loadRunArtifacts(repoRoot, runID string) (runArtifacts, error) {
 		return runArtifacts{}, err
 	}
 	if run.RootTicketID != "" {
-		if err := validateArtifactIdentifier(run.RootTicketID, "root ticket id"); err != nil {
+		if err := ValidateArtifactIdentifier(run.RootTicketID, "root ticket id"); err != nil {
 			return runArtifacts{}, err
 		}
 	}
@@ -69,7 +69,7 @@ func loadRunArtifacts(repoRoot, runID string) (runArtifacts, error) {
 	tickets := make(map[string]TicketRunSnapshot, len(ticketIDs))
 	plans := make(map[string]state.PlanArtifact, len(ticketIDs))
 	for _, ticketID := range ticketIDs {
-		if err := validateArtifactIdentifier(ticketID, "ticket id"); err != nil {
+		if err := ValidateArtifactIdentifier(ticketID, "ticket id"); err != nil {
 			return runArtifacts{}, err
 		}
 		var snapshot TicketRunSnapshot
@@ -95,7 +95,7 @@ func loadRunArtifacts(repoRoot, runID string) (runArtifacts, error) {
 	}
 	waves := make(map[string]state.WaveArtifact, len(waveIDs))
 	for _, waveID := range waveIDs {
-		if err := validateArtifactIdentifier(waveID, "wave id"); err != nil {
+		if err := ValidateArtifactIdentifier(waveID, "wave id"); err != nil {
 			return runArtifacts{}, err
 		}
 		var wave state.WaveArtifact
@@ -130,7 +130,7 @@ func discoverRunTicketIDs(repoRoot, runID string) ([]string, error) {
 	ids := make([]string, 0, len(entries))
 	for _, entry := range entries {
 		if entry.IsDir() {
-			if err := validateArtifactIdentifier(entry.Name(), "ticket id"); err != nil {
+			if err := ValidateArtifactIdentifier(entry.Name(), "ticket id"); err != nil {
 				return nil, err
 			}
 			ids = append(ids, entry.Name())
@@ -148,7 +148,7 @@ func discoverWaveIDs(repoRoot, runID string) ([]string, error) {
 	ids := make([]string, 0, len(paths))
 	for _, path := range paths {
 		id := trimJSONExt(filepath.Base(path))
-		if err := validateArtifactIdentifier(id, "wave id"); err != nil {
+		if err := ValidateArtifactIdentifier(id, "wave id"); err != nil {
 			return nil, err
 		}
 		ids = append(ids, id)
@@ -229,10 +229,10 @@ func loadOptionalClaim(path string) (*state.ClaimArtifact, error) {
 }
 
 func loadTicketSnapshot(repoRoot, runID, ticketID string, target *TicketRunSnapshot) error {
-	if err := validateArtifactIdentifier(runID, "run id"); err != nil {
+	if err := ValidateArtifactIdentifier(runID, "run id"); err != nil {
 		return err
 	}
-	if err := validateArtifactIdentifier(ticketID, "ticket id"); err != nil {
+	if err := ValidateArtifactIdentifier(ticketID, "ticket id"); err != nil {
 		return err
 	}
 	if err := state.LoadJSON(ticketSnapshotPath(repoRoot, runID, ticketID), target); err == nil {
@@ -480,6 +480,6 @@ func setTicketReady(repoRoot, ticketID string) error {
 	if err != nil {
 		return err
 	}
-	ticket.Status = epos.StatusOpen
+	ticket.Status = epos.StatusReady
 	return epos.SaveTicket(ticketMarkdownPath(repoRoot, ticketID), ticket)
 }

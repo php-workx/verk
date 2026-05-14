@@ -118,7 +118,8 @@ func collectBlockedTickets(repoRoot, runID string, children []epos.Ticket) []Blo
 		if child.Status == epos.StatusClosed {
 			continue
 		}
-		reason := describeNotReady(child)
+		reason := describeNotReady(repoRoot, runID, child)
+		claimReason := isClaimWaitReason(reason)
 		phase := state.TicketPhaseIntake
 		if runID != "" {
 			var snap TicketRunSnapshot
@@ -126,7 +127,7 @@ func collectBlockedTickets(repoRoot, runID string, children []epos.Ticket) []Blo
 				if snap.CurrentPhase != "" {
 					phase = snap.CurrentPhase
 				}
-				if trimmed := ticketStatusReason(snap); trimmed != "" {
+				if trimmed := ticketStatusReason(snap); trimmed != "" && !claimReason {
 					reason = trimmed
 				}
 			}
@@ -291,7 +292,7 @@ func RunEpic(ctx context.Context, req RunEpicRequest) (RunEpicResult, error) { /
 				})
 			} else {
 				for _, child := range currentChildren {
-					reason := describeNotReady(child)
+					reason := describeNotReady(req.RepoRoot, req.RunID, child)
 					SendProgress(ctx, req.Progress, ProgressEvent{
 						Type:     EventTicketDetail,
 						TicketID: child.ID,
@@ -315,7 +316,7 @@ func RunEpic(ctx context.Context, req RunEpicRequest) (RunEpicResult, error) { /
 				return result, err
 			}
 			if status != state.EpicRunStatusCompleted {
-				emitBlockedEpicSummary(ctx, req.Progress, currentChildren)
+				emitBlockedEpicSummary(ctx, req.Progress, req.RepoRoot, req.RunID, currentChildren)
 				return result, &BlockedRunError{
 					RunID:          req.RunID,
 					Status:         status,
@@ -855,13 +856,13 @@ func validateRunEpicRequest(req RunEpicRequest) error {
 	if req.RunID == "" {
 		return fmt.Errorf("run epic requires run id")
 	}
-	if err := validateArtifactIdentifier(req.RunID, "run id"); err != nil {
+	if err := ValidateArtifactIdentifier(req.RunID, "run id"); err != nil {
 		return err
 	}
 	if req.RootTicketID == "" {
 		return fmt.Errorf("run epic requires root ticket id")
 	}
-	if err := validateArtifactIdentifier(req.RootTicketID, "root ticket id"); err != nil {
+	if err := ValidateArtifactIdentifier(req.RootTicketID, "root ticket id"); err != nil {
 		return err
 	}
 	if req.Adapter == nil && req.AdapterFactory == nil {
@@ -916,7 +917,7 @@ func epicCompletionStatus(children []epos.Ticket) state.EpicRunStatus {
 }
 
 func updateTicketStoreStatus(repoRoot, ticketID string, status epos.Status) error {
-	if err := validateArtifactIdentifier(ticketID, "ticket id"); err != nil {
+	if err := ValidateArtifactIdentifier(ticketID, "ticket id"); err != nil {
 		return err
 	}
 	path := filepath.Join(repoRoot, ".tickets", ticketID+".md")
@@ -1629,7 +1630,7 @@ func subtractFiles(changed, baseline []string) []string {
 	return out
 }
 
-func describeNotReady(ticket epos.Ticket) string {
+func describeNotReady(repoRoot, runID string, ticket epos.Ticket) string {
 	switch ticket.Status {
 	case epos.StatusClosed:
 		return "closed"
@@ -1638,7 +1639,7 @@ func describeNotReady(ticket epos.Ticket) string {
 	case epos.StatusInProgress:
 		return "in_progress"
 	}
-	// Status is open/ready — must be deps not resolved
+	// Status is open/ready — absent a live claim, it must be waiting on deps.
 	if len(ticket.Deps) > 0 {
 		unresolved := make([]string, 0, len(ticket.Deps))
 		unresolved = append(unresolved, ticket.Deps...)
@@ -1647,7 +1648,30 @@ func describeNotReady(ticket epos.Ticket) string {
 		}
 		return fmt.Sprintf("waiting on %d deps", len(unresolved))
 	}
+	if ticket.Status == epos.StatusOpen || ticket.Status == epos.StatusReady {
+		if reason := describeClaimWait(repoRoot, runID, ticket); reason != "" {
+			return reason
+		}
+	}
 	return fmt.Sprintf("status=%s", string(ticket.Status))
+}
+
+func describeClaimWait(repoRoot, runID string, ticket epos.Ticket) string {
+	if repoRoot == "" || ticket.ID == "" {
+		return ""
+	}
+	claim, err := epos.LoadBlockingLiveClaim(repoRoot, ticket.ID, runID)
+	if err != nil || claim == nil {
+		return ""
+	}
+	if claim.OwnerRunID != "" {
+		return fmt.Sprintf("waiting on lease (held by %s)", claim.OwnerRunID)
+	}
+	return "held by claim"
+}
+
+func isClaimWaitReason(reason string) bool {
+	return reason == "held by claim" || strings.HasPrefix(reason, "waiting on lease ")
 }
 
 func countClosedTickets(outcomes []waveTicketOutcome) int {
@@ -1754,7 +1778,7 @@ func waveBlockedTicketEvents(blockedIDs []string, ticketPhases []state.TicketPha
 // EventTicketDetail lines still describe each child individually; this
 // additional one-line summary makes the terminating state visible at a glance
 // even when those per-ticket lines have scrolled off the activity log.
-func emitBlockedEpicSummary(ctx context.Context, ch chan<- ProgressEvent, children []epos.Ticket) {
+func emitBlockedEpicSummary(ctx context.Context, ch chan<- ProgressEvent, repoRoot, runID string, children []epos.Ticket) {
 	if ch == nil {
 		return
 	}
@@ -1763,7 +1787,7 @@ func emitBlockedEpicSummary(ctx context.Context, ch chan<- ProgressEvent, childr
 		if child.Status == epos.StatusClosed {
 			continue
 		}
-		parts = append(parts, fmt.Sprintf("%s (%s)", child.ID, describeNotReady(child)))
+		parts = append(parts, fmt.Sprintf("%s (%s)", child.ID, describeNotReady(repoRoot, runID, child)))
 	}
 	if len(parts) == 0 {
 		return

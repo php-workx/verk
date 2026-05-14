@@ -41,15 +41,11 @@ func ValidateArtifactIdentifier(id, label string) error {
 	return nil
 }
 
-func validateArtifactIdentifier(id, label string) error {
-	return ValidateArtifactIdentifier(id, label)
-}
-
 func runLockPath(repoRoot, runID string) (string, error) {
 	if repoRoot == "" {
 		return "", fmt.Errorf("repo root is required")
 	}
-	if err := validateArtifactIdentifier(runID, "run id"); err != nil {
+	if err := ValidateArtifactIdentifier(runID, "run id"); err != nil {
 		return "", err
 	}
 	return filepath.Join(repoRoot, ".verk", "runs", runID, "run.lock"), nil
