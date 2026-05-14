@@ -475,6 +475,9 @@ func writeNewFileDiffWithLimits(buf *bytes.Buffer, relPath, mode string, content
 	if hasNoTrailingNewline {
 		lineCount++
 	}
+	if lineCount > syntheticDiffLineLimit {
+		lineCount = syntheticDiffLineLimit
+	}
 
 	fmt.Fprintf(buf, "@@ -0,0 +1,%d @@\n", lineCount)
 	lines := bytes.SplitAfter(content, []byte("\n"))

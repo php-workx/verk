@@ -472,3 +472,42 @@ func TestDiffAgainstFiles_NoTrailingNewlineMarker(t *testing.T) {
 		t.Fatalf("expected no-newline marker in diff:\n%s", diff)
 	}
 }
+
+func TestDiffAgainstFiles_BinaryFileGetsMarker(t *testing.T) {
+	repo, root, baseCommit := newTestRepo(t)
+	// Write a file with NUL byte to trigger binary detection
+	binaryContent := []byte("start\x00end")
+	if err := os.WriteFile(filepath.Join(root, "bin.dat"), binaryContent, 0o644); err != nil {
+		t.Fatalf("write binary file: %v", err)
+	}
+
+	diff, err := repo.DiffAgainstFiles(baseCommit, []string{"bin.dat"})
+	if err != nil {
+		t.Fatalf("DiffAgainstFiles: %v", err)
+	}
+	if !strings.Contains(diff, "Binary files") {
+		t.Fatalf("expected binary marker in diff:\n%s", diff)
+	}
+	// Should not contain the raw binary content
+	if strings.Contains(diff, "\x00") {
+		t.Fatalf("raw NUL byte should not appear in diff:\n%s", diff)
+	}
+}
+
+func TestDiffAgainstFiles_EmptyListReturnsEmpty(t *testing.T) {
+	repo, _, baseCommit := newTestRepo(t)
+	diff, err := repo.DiffAgainstFiles(baseCommit, nil)
+	if err != nil {
+		t.Fatalf("DiffAgainstFiles with nil files: %v", err)
+	}
+	if diff != "" {
+		t.Fatalf("expected empty diff for nil file list, got: %s", diff)
+	}
+	diff, err = repo.DiffAgainstFiles(baseCommit, []string{})
+	if err != nil {
+		t.Fatalf("DiffAgainstFiles with empty files: %v", err)
+	}
+	if diff != "" {
+		t.Fatalf("expected empty diff for empty file list, got: %s", diff)
+	}
+}
