@@ -459,3 +459,16 @@ func TestDiffAgainstFiles_RejectsRepoEscape(t *testing.T) {
 		t.Fatal("expected repo escape path to be rejected")
 	}
 }
+
+func TestDiffAgainstFiles_NoTrailingNewlineMarker(t *testing.T) {
+	repo, root, baseCommit := newTestRepo(t)
+	mustWriteFile(t, filepath.Join(root, "noeol.txt"), "no newline at end") // no trailing \n
+
+	diff, err := repo.DiffAgainstFiles(baseCommit, []string{"noeol.txt"})
+	if err != nil {
+		t.Fatalf("DiffAgainstFiles: %v", err)
+	}
+	if !strings.Contains(diff, "\\ No newline at end of file") {
+		t.Fatalf("expected no-newline marker in diff:\n%s", diff)
+	}
+}

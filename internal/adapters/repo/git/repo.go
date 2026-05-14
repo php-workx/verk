@@ -284,8 +284,9 @@ func writeNewFileDiff(buf *bytes.Buffer, relPath, mode string, content []byte) {
 		fmt.Fprintf(buf, "Binary files /dev/null and b/%s differ\n", relPath)
 		return
 	}
+	hasNoTrailingNewline := !bytes.HasSuffix(content, []byte("\n"))
 	lineCount := bytes.Count(content, []byte("\n"))
-	if !bytes.HasSuffix(content, []byte("\n")) {
+	if hasNoTrailingNewline {
 		lineCount++
 	}
 	fmt.Fprintf(buf, "@@ -0,0 +1,%d @@\n", lineCount)
@@ -299,6 +300,9 @@ func writeNewFileDiff(buf *bytes.Buffer, relPath, mode string, content []byte) {
 		if !bytes.HasSuffix(line, []byte("\n")) {
 			buf.WriteByte('\n')
 		}
+	}
+	if hasNoTrailingNewline {
+		fmt.Fprintf(buf, "\\ No newline at end of file\n")
 	}
 }
 
@@ -458,6 +462,8 @@ func writeNewFileDiffWithLimits(buf *bytes.Buffer, relPath, mode string, content
 		return
 	}
 
+	originalNoTrailingNewline := !bytes.HasSuffix(content, []byte("\n"))
+
 	truncated := false
 	if len(content) > syntheticDiffSizeLimit {
 		content = content[:syntheticDiffSizeLimit]
@@ -490,6 +496,8 @@ func writeNewFileDiffWithLimits(buf *bytes.Buffer, relPath, mode string, content
 	}
 	if truncated {
 		fmt.Fprintf(buf, "\\ [diff truncated: file too large]\n")
+	} else if originalNoTrailingNewline {
+		fmt.Fprintf(buf, "\\ No newline at end of file\n")
 	}
 }
 
