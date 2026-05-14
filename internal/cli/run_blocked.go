@@ -12,6 +12,7 @@ import (
 	"verk/internal/adapters/runtime"
 	"verk/internal/engine"
 	"verk/internal/policy"
+	"verk/internal/state"
 
 	term "github.com/charmbracelet/x/term"
 )
@@ -43,9 +44,17 @@ var blockedRunInteractorFor = func() blockedRunInteractor {
 	return blockedRunInteractor{in: os.Stdin, out: os.Stdout}
 }
 
+// noReasonRecorded is the fallback string used when a blocked ticket has no
+// recorded stop reason. It is a named constant to satisfy the goconst linter.
+const noReasonRecorded = "blocked (no reason recorded)"
+
 // printBlockedRunGuidance writes a stable, testable representation of a blocked
-// epic run to w: one line per blocked ticket with its reason, followed by a
-// concrete retry command for each ticket and a final `verk run` resume line.
+// epic run to w. Tickets are grouped into three distinct sections based on
+// their outcome:
+//   - "Retryable tickets": failed_retryable outcome — safe to reopen automatically.
+//   - "Tickets needing decision": needs_decision outcome — operator must choose
+//     between implement, repair, or blocking the ticket explicitly.
+//   - "Blocked tickets": all other non-closed, non-retryable tickets.
 //
 // The output contract is covered by CLI tests and the ticket's acceptance
 // criteria — avoid changing it without updating both.
@@ -61,24 +70,68 @@ func printBlockedRunGuidance(w io.Writer, blocked *engine.BlockedRunError) {
 		}
 		return
 	}
-	_, _ = fmt.Fprintln(w, "Blocked tickets:")
+
+	// Partition tickets into three buckets by outcome.
+	var retryable, needsDecision, hardBlocked []engine.BlockedTicket
 	for _, t := range blocked.BlockedTickets {
-		reason := strings.TrimSpace(t.Reason)
-		if reason == "" {
-			reason = "blocked (no reason recorded)"
+		switch {
+		case t.RetryPhase != "" && t.Outcome != state.TicketOutcomeNeedsDecision:
+			retryable = append(retryable, t)
+		case t.Outcome == state.TicketOutcomeNeedsDecision:
+			needsDecision = append(needsDecision, t)
+		default:
+			hardBlocked = append(hardBlocked, t)
 		}
-		_, _ = fmt.Fprintf(w, "  %s: %s\n", t.ID, reason)
 	}
-	_, _ = fmt.Fprintln(w)
-	retryable := retryableBlockedTickets(blocked)
-	if len(retryable) == 0 {
+
+	// Section: retryable tickets.
+	if len(retryable) > 0 {
+		_, _ = fmt.Fprintln(w, "Retryable tickets:")
+		for _, t := range retryable {
+			reason := strings.TrimSpace(t.Reason)
+			if reason == "" {
+				reason = noReasonRecorded
+			}
+			_, _ = fmt.Fprintf(w, "  %s: %s\n", t.ID, reason)
+			_, _ = fmt.Fprintf(w, "  To retry:  verk reopen %s %s --to %s\n", blocked.RunID, t.ID, t.RetryPhase)
+		}
+		_, _ = fmt.Fprintln(w)
+	}
+
+	// Section: needs-decision tickets.
+	if len(needsDecision) > 0 {
+		_, _ = fmt.Fprintln(w, "Tickets needing decision:")
+		for _, t := range needsDecision {
+			reason := strings.TrimSpace(t.Reason)
+			if reason == "" {
+				reason = noReasonRecorded
+			}
+			_, _ = fmt.Fprintf(w, "  %s: %s\n", t.ID, reason)
+			_, _ = fmt.Fprintf(w, "  To retry:  verk reopen %s %s --to implement\n", blocked.RunID, t.ID)
+			_, _ = fmt.Fprintf(w, "  To retry:  verk reopen %s %s --to repair\n", blocked.RunID, t.ID)
+			_, _ = fmt.Fprintf(w, "  To block:  verk block %s --reason \"...\"\n", t.ID)
+		}
+		_, _ = fmt.Fprintln(w)
+	}
+
+	// Section: hard-blocked tickets (no retry possible).
+	if len(hardBlocked) > 0 {
+		_, _ = fmt.Fprintln(w, "Blocked tickets:")
+		for _, t := range hardBlocked {
+			reason := strings.TrimSpace(t.Reason)
+			if reason == "" {
+				reason = noReasonRecorded
+			}
+			_, _ = fmt.Fprintf(w, "  %s: %s\n", t.ID, reason)
+		}
+		_, _ = fmt.Fprintln(w)
+	}
+
+	// If nothing is retryable at all, emit a hint.
+	if len(retryable) == 0 && len(needsDecision) == 0 {
 		_, _ = fmt.Fprintln(w, "Retry: no tickets can be reopened automatically")
 		_, _ = fmt.Fprintln(w, "  resolve blockers or dependencies, then run verk run")
 		return
-	}
-	_, _ = fmt.Fprintln(w, "Retry:")
-	for _, t := range retryable {
-		_, _ = fmt.Fprintf(w, "  verk reopen %s %s --to %s\n", blocked.RunID, t.ID, t.RetryPhase)
 	}
 	_, _ = fmt.Fprintln(w, "  verk run")
 }
@@ -90,6 +143,9 @@ func retryableBlockedTickets(blocked *engine.BlockedRunError) []engine.BlockedTi
 	out := make([]engine.BlockedTicket, 0, len(blocked.BlockedTickets))
 	for _, ticket := range blocked.BlockedTickets {
 		if ticket.RetryPhase == "" {
+			continue
+		}
+		if ticket.Outcome == state.TicketOutcomeNeedsDecision {
 			continue
 		}
 		out = append(out, ticket)

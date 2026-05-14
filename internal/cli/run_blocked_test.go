@@ -48,13 +48,14 @@ func TestPrintBlockedRunGuidance_IncludesTicketIDsReasonsAndRetryCommands(t *tes
 	printBlockedRunGuidance(&buf, fakeBlocked())
 	out := buf.String()
 
+	// fakeBlocked() tickets have RetryPhase set and no Outcome — they land in
+	// the "Retryable tickets" section, not the generic "Blocked tickets" section.
 	wants := []string{
-		"Blocked tickets:",
+		"Retryable tickets:",
 		"ver-uqs5",
 		"needs context: reviewer asked for missing fixture details",
 		"ver-abcd",
 		"repair limit exceeded",
-		"Retry:",
 		"verk reopen run-ver-vmgr-123-ver-epic ver-uqs5 --to implement",
 		"verk reopen run-ver-vmgr-123-ver-epic ver-abcd --to implement",
 		"verk run",
@@ -63,6 +64,10 @@ func TestPrintBlockedRunGuidance_IncludesTicketIDsReasonsAndRetryCommands(t *tes
 		if !strings.Contains(out, want) {
 			t.Errorf("expected guidance to contain %q, got:\n%s", want, out)
 		}
+	}
+	// Must NOT use the old catch-all "Blocked tickets:" label for retryable tickets.
+	if strings.Contains(out, "Blocked tickets:") {
+		t.Errorf("retryable tickets must not appear under 'Blocked tickets:', got:\n%s", out)
 	}
 }
 
@@ -114,6 +119,150 @@ func TestPrintBlockedRunGuidance_SkipsNonRetryableDependencyWaiters(t *testing.T
 	}
 	if !strings.Contains(out, "verk reopen run-x mm-e7e1 --to implement") {
 		t.Fatalf("expected retry command for blocked ticket, got:\n%s", out)
+	}
+}
+
+// TestPrintBlockedRunGuidance_NeedsDecision verifies that a ticket with
+// Outcome=needs_decision is rendered in a dedicated "Tickets needing decision"
+// section with all three operator actions: implement, repair, and block.
+func TestPrintBlockedRunGuidance_NeedsDecision(t *testing.T) {
+	var buf bytes.Buffer
+	printBlockedRunGuidance(&buf, &engine.BlockedRunError{
+		RunID:  "run-ver-vmgr-123-ver-epic",
+		Status: state.EpicRunStatusBlocked,
+		BlockedTickets: []engine.BlockedTicket{
+			{
+				ID:      "ver-nd01",
+				Status:  epos.StatusBlocked,
+				Phase:   state.TicketPhaseBlocked,
+				Outcome: state.TicketOutcomeNeedsDecision,
+				Reason:  "reviewer requires human clarification",
+			},
+		},
+	})
+	out := buf.String()
+
+	wants := []string{
+		"Tickets needing decision:",
+		"ver-nd01",
+		"reviewer requires human clarification",
+		"verk reopen run-ver-vmgr-123-ver-epic ver-nd01 --to implement",
+		"verk reopen run-ver-vmgr-123-ver-epic ver-nd01 --to repair",
+		`verk block ver-nd01 --reason "..."`,
+		"verk run",
+	}
+	for _, want := range wants {
+		if !strings.Contains(out, want) {
+			t.Errorf("expected guidance to contain %q, got:\n%s", want, out)
+		}
+	}
+	// Must NOT appear under the generic "Blocked tickets:" catch-all.
+	if strings.Contains(out, "Blocked tickets:") {
+		t.Errorf("needs_decision ticket must not appear under 'Blocked tickets:', got:\n%s", out)
+	}
+	// Must NOT appear under "Retryable tickets:" (it needs operator input).
+	if strings.Contains(out, "Retryable tickets:") {
+		t.Errorf("needs_decision ticket must not appear under 'Retryable tickets:', got:\n%s", out)
+	}
+}
+
+// TestPrintBlockedRunGuidance_FailedRetryable verifies that a ticket with
+// Outcome=failed_retryable is rendered in the "Retryable tickets" section
+// with only its retry command (no decision commands).
+func TestPrintBlockedRunGuidance_FailedRetryable(t *testing.T) {
+	var buf bytes.Buffer
+	printBlockedRunGuidance(&buf, &engine.BlockedRunError{
+		RunID:  "run-ver-vmgr-123-ver-epic",
+		Status: state.EpicRunStatusBlocked,
+		BlockedTickets: []engine.BlockedTicket{
+			{
+				ID:         "ver-fr01",
+				Status:     epos.StatusBlocked,
+				Phase:      state.TicketPhaseBlocked,
+				Outcome:    state.TicketOutcomeFailedRetryable,
+				RetryPhase: state.TicketPhaseImplement,
+				Reason:     "test run timed out",
+			},
+		},
+	})
+	out := buf.String()
+
+	wants := []string{
+		"Retryable tickets:",
+		"ver-fr01",
+		"test run timed out",
+		"verk reopen run-ver-vmgr-123-ver-epic ver-fr01 --to implement",
+		"verk run",
+	}
+	for _, want := range wants {
+		if !strings.Contains(out, want) {
+			t.Errorf("expected guidance to contain %q, got:\n%s", want, out)
+		}
+	}
+	// Must NOT show the decision commands — this ticket is safe to retry automatically.
+	if strings.Contains(out, "--to repair") {
+		t.Errorf("failed_retryable ticket must not show --to repair decision, got:\n%s", out)
+	}
+	if strings.Contains(out, "verk block") {
+		t.Errorf("failed_retryable ticket must not show verk block command, got:\n%s", out)
+	}
+	// Must NOT appear under "Tickets needing decision".
+	if strings.Contains(out, "Tickets needing decision:") {
+		t.Errorf("failed_retryable must not appear under 'Tickets needing decision:', got:\n%s", out)
+	}
+}
+
+// TestPrintBlockedRunGuidance_MixedOutcomes verifies that when a run has tickets
+// with different outcomes, each ticket lands in the correct section.
+func TestPrintBlockedRunGuidance_MixedOutcomes(t *testing.T) {
+	var buf bytes.Buffer
+	printBlockedRunGuidance(&buf, &engine.BlockedRunError{
+		RunID:  "run-mix",
+		Status: state.EpicRunStatusBlocked,
+		BlockedTickets: []engine.BlockedTicket{
+			{
+				ID:         "ver-retryable",
+				Status:     epos.StatusBlocked,
+				Phase:      state.TicketPhaseBlocked,
+				Outcome:    state.TicketOutcomeFailedRetryable,
+				RetryPhase: state.TicketPhaseImplement,
+				Reason:     "transient test failure",
+			},
+			{
+				ID:      "ver-decision",
+				Status:  epos.StatusBlocked,
+				Phase:   state.TicketPhaseBlocked,
+				Outcome: state.TicketOutcomeNeedsDecision,
+				Reason:  "ambiguous spec",
+			},
+			{
+				ID:     "ver-hard",
+				Status: epos.StatusBlocked,
+				Phase:  state.TicketPhaseBlocked,
+				Reason: "waiting on external dependency",
+			},
+		},
+	})
+	out := buf.String()
+
+	// All three sections must appear.
+	for _, section := range []string{"Retryable tickets:", "Tickets needing decision:", "Blocked tickets:"} {
+		if !strings.Contains(out, section) {
+			t.Errorf("expected section %q in output, got:\n%s", section, out)
+		}
+	}
+	// Each ticket in its correct section and with correct commands.
+	if !strings.Contains(out, "verk reopen run-mix ver-retryable --to implement") {
+		t.Errorf("expected retry command for ver-retryable, got:\n%s", out)
+	}
+	if !strings.Contains(out, "verk reopen run-mix ver-decision --to implement") {
+		t.Errorf("expected implement decision command for ver-decision, got:\n%s", out)
+	}
+	if !strings.Contains(out, "verk reopen run-mix ver-decision --to repair") {
+		t.Errorf("expected repair decision command for ver-decision, got:\n%s", out)
+	}
+	if strings.Contains(out, "verk reopen run-mix ver-hard") {
+		t.Errorf("hard-blocked ticket ver-hard must not have a reopen command, got:\n%s", out)
 	}
 }
 
@@ -301,7 +450,8 @@ func TestHandleBlockedEpicRun_NonTTYExitsWithoutPrompt(t *testing.T) {
 		t.Fatal("expected retried=false in non-TTY mode")
 	}
 	// Guidance must be printed to errw so operators see why the run stopped.
-	if !strings.Contains(errw.String(), "Blocked tickets:") {
+	// fakeBlocked() uses retryable tickets, so the section is "Retryable tickets:".
+	if !strings.Contains(errw.String(), "Retryable tickets:") {
 		t.Fatalf("expected guidance in errw, got:\n%s", errw.String())
 	}
 }
