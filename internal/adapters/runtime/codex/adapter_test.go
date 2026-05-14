@@ -187,6 +187,7 @@ func TestRunReviewer_NormalizesFindingsAndDerivesStatus(t *testing.T) {
 		LeaseID:                  "lease-2",
 		RunID:                    "run-2",
 		TicketID:                 "ticket-2",
+		ChangedFiles:             []string{"src/app.go"},
 		EffectiveReviewThreshold: runtime.SeverityP2,
 		ExecutionConfig: runtime.ExecutionConfig{
 			ReviewerTimeoutMinutes: 9,
@@ -195,6 +196,18 @@ func TestRunReviewer_NormalizesFindingsAndDerivesStatus(t *testing.T) {
 	})
 	if err != nil {
 		t.Fatalf("RunReviewer returned error: %v", err)
+	}
+
+	if result.ResultArtifactPath == "" {
+		t.Fatalf("expected result artifact path to be set")
+	}
+	artifactBytes, err := os.ReadFile(result.ResultArtifactPath)
+	if err != nil {
+		t.Fatalf("read review result artifact: %v", err)
+	}
+	artifactStr := string(artifactBytes)
+	if !strings.Contains(artifactStr, `"changed_files"`) || !strings.Contains(artifactStr, `"src/app.go"`) {
+		t.Fatalf("expected changed_files in review artifact:\n%s", artifactBytes)
 	}
 
 	if result.Status != runtime.WorkerStatusDoneWithConcerns {
