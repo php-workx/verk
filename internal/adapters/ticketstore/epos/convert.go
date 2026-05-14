@@ -112,10 +112,22 @@ func toEpos(t Ticket) *eposticket.Ticket { //nolint:cyclop // table-style bridge
 		}
 		out.Present[key] = true
 	}
+	reconcileExtendedStatus(out)
 	if len(out.Extra) == 0 {
 		out.Extra = nil
 	}
 	return out
+}
+
+func reconcileExtendedStatus(out *eposticket.Ticket) {
+	if out == nil || out.Status == "" || out.ExtendedStatus == "" {
+		return
+	}
+	if normalizeStatus(eposticket.Status(out.ExtendedStatus)) == Status(out.Status) {
+		return
+	}
+	out.ExtendedStatus = ""
+	delete(out.Present, "extended_status")
 }
 
 func fromEpos(t *eposticket.Ticket) Ticket {

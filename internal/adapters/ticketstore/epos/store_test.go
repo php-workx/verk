@@ -223,6 +223,80 @@ func TestSaveTicket_ConstructedTicketWritesStatus(t *testing.T) {
 	}
 }
 
+func TestSaveTicket_DropsIncompatibleExtendedStatusAfterStatusChange(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "ticket.md")
+	data := `---
+id: ticket-1
+status: pending
+extended_status: pending
+---
+# Ticket 1
+`
+	if err := os.WriteFile(path, []byte(data), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ticket, err := LoadTicket(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ticket.Status = StatusClosed
+	if err := SaveTicket(path, ticket); err != nil {
+		t.Fatal(err)
+	}
+	roundTripped, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	parsed, err := eposmarkdown.UnmarshalTicket(roundTripped)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if parsed.Status != eposticket.StatusClosed {
+		t.Fatalf("Status = %q, want %q", parsed.Status, eposticket.StatusClosed)
+	}
+	if parsed.ExtendedStatus != "" || parsed.Present["extended_status"] {
+		t.Fatalf("incompatible extended_status was preserved: %#v", parsed)
+	}
+}
+
+func TestSaveTicket_PreservesCompatibleExtendedStatus(t *testing.T) {
+	tests := []struct {
+		name           string
+		status         Status
+		extendedStatus string
+	}{
+		{name: "done stays closed", status: StatusClosed, extendedStatus: string(eposticket.StatusDone)},
+		{name: "failed stays closed", status: StatusClosed, extendedStatus: string(eposticket.StatusFailed)},
+		{name: "under review stays in progress", status: StatusInProgress, extendedStatus: string(eposticket.StatusUnderReview)},
+		{name: "held stays blocked", status: StatusBlocked, extendedStatus: string(eposticket.StatusHeld)},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "ticket.md")
+			if err := SaveTicket(path, Ticket{
+				ID:                 "ticket-1",
+				Status:             tt.status,
+				Body:               "# Ticket 1\n",
+				UnknownFrontmatter: map[string]any{"extended_status": tt.extendedStatus},
+				present:            map[string]bool{"id": true, "status": true, "extended_status": true},
+			}); err != nil {
+				t.Fatal(err)
+			}
+			data, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			parsed, err := eposmarkdown.UnmarshalTicket(data)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if parsed.ExtendedStatus != tt.extendedStatus || !parsed.Present["extended_status"] {
+				t.Fatalf("compatible extended_status was not preserved: %#v", parsed)
+			}
+		})
+	}
+}
+
 func TestRejectsGlobOwnedPaths(t *testing.T) {
 	err := SaveTicket(filepath.Join(t.TempDir(), "ticket.md"), Ticket{
 		ID:         "ticket-1",
