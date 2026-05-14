@@ -302,6 +302,212 @@ func writeNewFileDiff(buf *bytes.Buffer, relPath, mode string, content []byte) {
 	}
 }
 
+// syntheticDiffSizeLimit is the maximum number of bytes read from an untracked
+// file before the output is truncated.
+const syntheticDiffSizeLimit = 256 * 1024
+
+// syntheticDiffLineLimit is the maximum number of lines emitted for an untracked
+// file before the output is truncated.
+const syntheticDiffLineLimit = 4000
+
+// DiffAgainstFiles returns a unified diff of the given files against baseCommit.
+// Tracked changes are produced by git diff; untracked selected files get a
+// synthetic new-file diff so callers see their content regardless of staging
+// status.
+func (r *Repo) DiffAgainstFiles(baseCommit string, files []string) (string, error) {
+	if r == nil {
+		return "", fmt.Errorf("nil repo")
+	}
+	baseCommit = strings.TrimSpace(baseCommit)
+	if baseCommit == "" {
+		return "", fmt.Errorf("base commit is required")
+	}
+	if err := r.verifyCommit(baseCommit); err != nil {
+		return "", err
+	}
+
+	normalized, err := r.normalizeDiffPaths(files)
+	if err != nil {
+		return "", err
+	}
+	if len(normalized) == 0 {
+		return "", nil
+	}
+
+	args := append([]string{"diff", baseCommit, "--"}, normalized...)
+	trackedDiff, err := gitOutput(r.root, args...)
+	if err != nil {
+		return "", err
+	}
+
+	untrackedDiff, err := r.syntheticUntrackedDiff(normalized)
+	if err != nil {
+		return "", err
+	}
+
+	return joinDiffParts(trackedDiff, untrackedDiff), nil
+}
+
+// normalizeDiffPaths normalizes and deduplicates file paths for use in
+// DiffAgainstFiles. It filters empty paths, rejects NUL-containing paths, and
+// rejects paths that escape the repo root.
+func (r *Repo) normalizeDiffPaths(files []string) ([]string, error) {
+	seen := make(map[string]struct{}, len(files))
+	out := make([]string, 0, len(files))
+	for _, f := range files {
+		if f == "" {
+			continue
+		}
+		if strings.Contains(f, "\x00") {
+			return nil, fmt.Errorf("diff path contains NUL: %q", f)
+		}
+		normalized := normalizeComparablePath(f)
+		if normalized == ".." || strings.HasPrefix(normalized, "../") {
+			return nil, fmt.Errorf("diff path escapes repo root: %s", f)
+		}
+		if _, already := seen[normalized]; already {
+			continue
+		}
+		seen[normalized] = struct{}{}
+		out = append(out, normalized)
+	}
+	sort.Strings(out)
+	return out, nil
+}
+
+// syntheticUntrackedDiff builds new-file diffs for any paths in the given list
+// that are untracked in the working tree. Tracked files are silently skipped
+// (their diff comes from git diff). Binary files get a placeholder marker.
+// Large files are truncated at syntheticDiffSizeLimit / syntheticDiffLineLimit.
+func (r *Repo) syntheticUntrackedDiff(paths []string) (string, error) {
+	// Collect the set of untracked files known to git so we can skip tracked ones.
+	untrackedRaw, err := gitBytes(r.root, "ls-files", "--others", "--exclude-standard", "-z")
+	if err != nil {
+		return "", err
+	}
+	untrackedSet := make(map[string]struct{})
+	for _, raw := range splitNullList(untrackedRaw) {
+		n, normErr := normalizeRepoRelativePath(raw)
+		if normErr != nil {
+			continue
+		}
+		untrackedSet[n] = struct{}{}
+	}
+
+	var buf bytes.Buffer
+	for _, p := range paths {
+		if _, ok := untrackedSet[p]; !ok {
+			continue
+		}
+		fullPath := filepath.Join(r.root, filepath.FromSlash(p))
+		info, err := os.Lstat(fullPath)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				continue
+			}
+			return "", fmt.Errorf("stat untracked file %q: %w", p, err)
+		}
+
+		mode := "100644"
+		var content []byte
+		if info.Mode()&os.ModeSymlink != 0 {
+			mode = "120000"
+			target, readErr := os.Readlink(fullPath)
+			if readErr != nil {
+				if errors.Is(readErr, os.ErrNotExist) {
+					continue
+				}
+				return "", fmt.Errorf("read untracked symlink %q: %w", p, readErr)
+			}
+			content = []byte(target)
+		} else {
+			if info.Mode()&0o111 != 0 {
+				mode = "100755"
+			}
+			read, readErr := os.ReadFile(fullPath)
+			if readErr != nil {
+				if errors.Is(readErr, os.ErrNotExist) {
+					continue
+				}
+				return "", fmt.Errorf("read untracked file %q: %w", p, readErr)
+			}
+			content = read
+		}
+
+		if buf.Len() > 0 && !bytes.HasSuffix(buf.Bytes(), []byte("\n")) {
+			buf.WriteByte('\n')
+		}
+		writeNewFileDiffWithLimits(&buf, p, mode, content)
+	}
+	return buf.String(), nil
+}
+
+// writeNewFileDiffWithLimits is like writeNewFileDiff but applies size and line
+// limits to the content, and emits a truncation marker when exceeded.
+func writeNewFileDiffWithLimits(buf *bytes.Buffer, relPath, mode string, content []byte) {
+	fmt.Fprintf(buf, "diff --git a/%s b/%s\n", relPath, relPath)
+	fmt.Fprintf(buf, "new file mode %s\n", mode)
+	fmt.Fprintf(buf, "index 0000000..0000000\n")
+	fmt.Fprintf(buf, "--- /dev/null\n")
+	fmt.Fprintf(buf, "+++ b/%s\n", relPath)
+	if len(content) == 0 {
+		return
+	}
+	if mode != "120000" && bytes.IndexByte(content, 0) >= 0 {
+		fmt.Fprintf(buf, "Binary files /dev/null and b/%s differ\n", relPath)
+		return
+	}
+
+	truncated := false
+	if len(content) > syntheticDiffSizeLimit {
+		content = content[:syntheticDiffSizeLimit]
+		truncated = true
+	}
+
+	lineCount := bytes.Count(content, []byte("\n"))
+	hasNoTrailingNewline := !bytes.HasSuffix(content, []byte("\n"))
+	if hasNoTrailingNewline {
+		lineCount++
+	}
+
+	fmt.Fprintf(buf, "@@ -0,0 +1,%d @@\n", lineCount)
+	lines := bytes.SplitAfter(content, []byte("\n"))
+	emitted := 0
+	for _, line := range lines {
+		if len(line) == 0 {
+			continue
+		}
+		if emitted >= syntheticDiffLineLimit {
+			truncated = true
+			break
+		}
+		buf.WriteByte('+')
+		buf.Write(line)
+		if !bytes.HasSuffix(line, []byte("\n")) {
+			buf.WriteByte('\n')
+		}
+		emitted++
+	}
+	if truncated {
+		fmt.Fprintf(buf, "\\ [diff truncated: file too large]\n")
+	}
+}
+
+// joinDiffParts joins two diff strings, ensuring exactly one newline between
+// them when both are non-empty.
+func joinDiffParts(a, b string) string {
+	if b == "" {
+		return a
+	}
+	if a == "" {
+		return b
+	}
+	if strings.HasSuffix(a, "\n") {
+		return a + b
+	}
+	return a + "\n" + b
+}
+
 func (r *Repo) NormalizeOwnedPath(candidate string) (string, error) {
 	if r == nil {
 		return "", fmt.Errorf("nil repo")

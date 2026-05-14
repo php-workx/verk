@@ -403,3 +403,59 @@ func countWorktreeMetadataDirs(t *testing.T, repoRoot string) int {
 	}
 	return count
 }
+
+func mustWriteFile(t *testing.T, path, content string) {
+	t.Helper()
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatalf("write file %q: %v", path, err)
+	}
+}
+
+func TestDiffAgainstFiles_ExcludesUnselectedTrackedFiles(t *testing.T) {
+	repo, root, baseCommit := newTestRepo(t)
+
+	mustWriteFile(t, filepath.Join(root, "other.txt"), "other\n")
+	runGit(t, root, "add", "other.txt")
+	runGit(t, root, "commit", "-m", "add other")
+	mustWriteFile(t, filepath.Join(root, "tracked.txt"), "selected update\n")
+	mustWriteFile(t, filepath.Join(root, "other.txt"), "unrelated update\n")
+
+	diff, err := repo.DiffAgainstFiles(baseCommit, []string{"tracked.txt"})
+	if err != nil {
+		t.Fatalf("DiffAgainstFiles: %v", err)
+	}
+	if !strings.Contains(diff, "tracked.txt") {
+		t.Fatalf("expected selected file in diff:\n%s", diff)
+	}
+	if strings.Contains(diff, "other.txt") {
+		t.Fatalf("did not expect unselected file in diff:\n%s", diff)
+	}
+}
+
+func TestDiffAgainstFiles_IncludesUntrackedFileContent(t *testing.T) {
+	repo, root, baseCommit := newTestRepo(t)
+	mustWriteFile(t, filepath.Join(root, "new.txt"), "first\nsecond\n")
+
+	diff, err := repo.DiffAgainstFiles(baseCommit, []string{"new.txt"})
+	if err != nil {
+		t.Fatalf("DiffAgainstFiles: %v", err)
+	}
+	for _, want := range []string{
+		"diff --git a/new.txt b/new.txt",
+		"new file mode",
+		"+++ b/new.txt",
+		"+first",
+		"+second",
+	} {
+		if !strings.Contains(diff, want) {
+			t.Fatalf("expected %q in diff:\n%s", want, diff)
+		}
+	}
+}
+
+func TestDiffAgainstFiles_RejectsRepoEscape(t *testing.T) {
+	repo, _, baseCommit := newTestRepo(t)
+	if _, err := repo.DiffAgainstFiles(baseCommit, []string{"../escape.txt"}); err == nil {
+		t.Fatal("expected repo escape path to be rejected")
+	}
+}
