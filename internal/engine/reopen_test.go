@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 	"verk/internal/adapters/ticketstore/epos"
@@ -87,6 +88,38 @@ func TestReopenTicket_BlockedToImplement(t *testing.T) {
 	}
 	if ticket.Status != epos.StatusOpen {
 		t.Fatalf("expected ticket markdown status open, got %q", ticket.Status)
+	}
+}
+
+func TestReopenTicket_RejectsUnsafeIdentifiersBeforeArtifactWrite(t *testing.T) {
+	repoRoot := t.TempDir()
+	tests := []struct {
+		name     string
+		runID    string
+		ticketID string
+		want     string
+	}{
+		{name: "run id", runID: "../escaped", ticketID: "ticket-safe", want: "invalid run id"},
+		{name: "ticket id", runID: "run-safe", ticketID: "../escaped", want: "invalid ticket id"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := ReopenTicket(context.Background(), ReopenRequest{
+				RepoRoot: repoRoot,
+				RunID:    tt.runID,
+				TicketID: tt.ticketID,
+				ToPhase:  state.TicketPhaseImplement,
+			})
+			if err == nil {
+				t.Fatal("expected unsafe identifier to be rejected")
+			}
+			if !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("expected %q error, got: %v", tt.want, err)
+			}
+			if _, statErr := os.Stat(filepath.Join(repoRoot, ".verk", "escaped")); !os.IsNotExist(statErr) {
+				t.Fatalf("unsafe identifier touched escaped artifact path: %v", statErr)
+			}
+		})
 	}
 }
 

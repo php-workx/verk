@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -19,6 +20,59 @@ func TestAcquireRunLock_Success(t *testing.T) {
 	lockPath := filepath.Join(dir, ".verk", "runs", "run-test-1", "run.lock")
 	if lock.path != lockPath {
 		t.Fatalf("expected lock path %q, got %q", lockPath, lock.path)
+	}
+}
+
+func TestAcquireRunLock_RejectsUnsafeRunIDWithoutCreatingEscapedPath(t *testing.T) {
+	dir := t.TempDir()
+	unsafeRunID := "../escaped"
+
+	lock, err := AcquireRunLock(dir, unsafeRunID)
+	if err == nil {
+		_ = lock.Release()
+		t.Fatal("expected unsafe run id to be rejected")
+	}
+	if !strings.Contains(err.Error(), "invalid run id") {
+		t.Fatalf("expected invalid run id error, got: %v", err)
+	}
+	if _, statErr := os.Stat(filepath.Join(dir, ".verk", "escaped", "run.lock")); !os.IsNotExist(statErr) {
+		t.Fatalf("unsafe run id created escaped lock path: %v", statErr)
+	}
+}
+
+func TestValidateArtifactIdentifier_RejectsUnsafeIDs(t *testing.T) {
+	tests := []string{
+		"",
+		".",
+		"..",
+		"../escaped",
+		"escaped/child",
+		`escaped\child`,
+		"ticket..suffix",
+		"/absolute",
+	}
+	for _, id := range tests {
+		t.Run(id, func(t *testing.T) {
+			if err := ValidateArtifactIdentifier(id, "test id"); err == nil {
+				t.Fatalf("expected %q to be rejected", id)
+			}
+		})
+	}
+}
+
+func TestValidateArtifactIdentifier_AcceptsSafeIDs(t *testing.T) {
+	tests := []string{
+		"run-ticket-1-123",
+		"ticket_1",
+		"wave-1",
+		"ABC_123",
+	}
+	for _, id := range tests {
+		t.Run(id, func(t *testing.T) {
+			if err := ValidateArtifactIdentifier(id, "test id"); err != nil {
+				t.Fatalf("expected %q to be accepted: %v", id, err)
+			}
+		})
 	}
 }
 

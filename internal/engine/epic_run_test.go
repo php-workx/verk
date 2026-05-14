@@ -335,6 +335,25 @@ func TestRunEpicSchedulesOpenAndReadyTickets(t *testing.T) {
 	}
 }
 
+func TestRunEpic_RejectsUnsafeRootTicketIDWithSafeRunID(t *testing.T) {
+	repoRoot := t.TempDir()
+	_, err := RunEpic(context.Background(), RunEpicRequest{
+		RepoRoot:     repoRoot,
+		RunID:        "run-safe",
+		RootTicketID: "../escaped",
+		Adapter:      runtimefake.New(nil, nil),
+	})
+	if err == nil {
+		t.Fatal("expected unsafe root ticket id to be rejected")
+	}
+	if !strings.Contains(err.Error(), "invalid root ticket id") {
+		t.Fatalf("expected invalid root ticket id error, got: %v", err)
+	}
+	if _, statErr := os.Stat(filepath.Join(repoRoot, ".verk", "runs", "run-safe")); !os.IsNotExist(statErr) {
+		t.Fatalf("unsafe root ticket id created run artifacts: %v", statErr)
+	}
+}
+
 func TestRunEpicScopeViolationBlocksWave(t *testing.T) {
 	repoRoot := t.TempDir()
 	baseCommit := initEpicRepo(t, repoRoot)

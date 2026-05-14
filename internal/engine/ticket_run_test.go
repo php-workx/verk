@@ -141,6 +141,56 @@ func TestRunTicket_HappyPath(t *testing.T) {
 	}
 }
 
+func TestRunTicket_RejectsUnsafeRunIDBeforeArtifactPathBuild(t *testing.T) {
+	repoRoot := t.TempDir()
+	ticket := testTicket("ticket-safe")
+	plan := state.PlanArtifact{TicketID: ticket.ID}
+	claim := state.ClaimArtifact{TicketID: ticket.ID, LeaseID: "lease-safe"}
+
+	_, err := RunTicket(context.Background(), RunTicketRequest{
+		RepoRoot: repoRoot,
+		RunID:    "../escaped",
+		Ticket:   ticket,
+		Plan:     plan,
+		Claim:    claim,
+		Adapter:  runtimefake.New(nil, nil),
+	})
+	if err == nil {
+		t.Fatal("expected unsafe run id to be rejected")
+	}
+	if !strings.Contains(err.Error(), "invalid run id") {
+		t.Fatalf("expected invalid run id error, got: %v", err)
+	}
+	if _, statErr := os.Stat(filepath.Join(repoRoot, ".verk", "escaped")); !os.IsNotExist(statErr) {
+		t.Fatalf("unsafe run id created escaped artifact path: %v", statErr)
+	}
+}
+
+func TestRunTicket_RejectsUnsafeTicketIDBeforeArtifactPathBuild(t *testing.T) {
+	repoRoot := t.TempDir()
+	ticket := testTicket("../escaped")
+	plan := state.PlanArtifact{TicketID: ticket.ID}
+	claim := state.ClaimArtifact{TicketID: ticket.ID, LeaseID: "lease-safe"}
+
+	_, err := RunTicket(context.Background(), RunTicketRequest{
+		RepoRoot: repoRoot,
+		RunID:    "run-safe",
+		Ticket:   ticket,
+		Plan:     plan,
+		Claim:    claim,
+		Adapter:  runtimefake.New(nil, nil),
+	})
+	if err == nil {
+		t.Fatal("expected unsafe ticket id to be rejected")
+	}
+	if !strings.Contains(err.Error(), "invalid ticket id") {
+		t.Fatalf("expected invalid ticket id error, got: %v", err)
+	}
+	if _, statErr := os.Stat(filepath.Join(repoRoot, ".verk", "runs", "run-safe", "escaped")); !os.IsNotExist(statErr) {
+		t.Fatalf("unsafe ticket id created escaped artifact path: %v", statErr)
+	}
+}
+
 func TestRunTicket_UsesExplicitWorktreePathForWorkersAndArtifactsStayOnRepoRoot(t *testing.T) {
 	repoRoot := t.TempDir()
 	worktreePath := filepath.Join(repoRoot, "worktree")

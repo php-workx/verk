@@ -124,6 +124,63 @@ func TestReopen_ValidatesTargetPhase(t *testing.T) {
 	}
 }
 
+func TestRunEpic_RejectsUnsafeTicketIDBeforeRunLockPathEscape(t *testing.T) {
+	repoRoot := t.TempDir()
+	writeCLIRepo(t, repoRoot)
+
+	stdout, stderr, code := runCLIFromDir(t, repoRoot, "run", "epic", "../escaped")
+	if code == 0 {
+		t.Fatal("expected non-zero exit for unsafe epic ticket id")
+	}
+	if strings.Contains(stdout, "run_id=") {
+		t.Fatalf("unsafe ticket id printed bogus run id: %s", stdout)
+	}
+	if !strings.Contains(stderr, "invalid ticket id") {
+		t.Fatalf("expected invalid ticket id error, got: %s", stderr)
+	}
+	if _, statErr := os.Stat(filepath.Join(repoRoot, ".verk", "escaped", "run.lock")); !os.IsNotExist(statErr) {
+		t.Fatalf("unsafe ticket id created escaped lock path: %v", statErr)
+	}
+}
+
+func TestRunTicket_RejectsUnsafeTicketIDBeforeTicketRead(t *testing.T) {
+	repoRoot := t.TempDir()
+	writeCLIRepo(t, repoRoot)
+	if err := os.WriteFile(filepath.Join(repoRoot, "escaped.md"), []byte("---\nid: escaped\nstatus: open\n---\n"), 0o644); err != nil {
+		t.Fatalf("write escaped ticket bait: %v", err)
+	}
+
+	stdout, stderr, code := runCLIFromDir(t, repoRoot, "run", "ticket", "../escaped")
+	if code == 0 {
+		t.Fatal("expected non-zero exit for unsafe ticket id")
+	}
+	if strings.Contains(stdout, "run_id=") {
+		t.Fatalf("unsafe ticket id printed bogus run id: %s", stdout)
+	}
+	if !strings.Contains(stderr, "invalid ticket id") {
+		t.Fatalf("expected invalid ticket id error, got: %s", stderr)
+	}
+	if _, statErr := os.Stat(filepath.Join(repoRoot, ".verk", "escaped")); !os.IsNotExist(statErr) {
+		t.Fatalf("unsafe ticket id created escaped artifact path: %v", statErr)
+	}
+}
+
+func TestStatus_RejectsUnsafeRunIDBeforeArtifactRead(t *testing.T) {
+	repoRoot := t.TempDir()
+	writeCLIRepo(t, repoRoot)
+
+	_, stderr, code := runCLIFromDir(t, repoRoot, "status", "../escaped")
+	if code == 0 {
+		t.Fatal("expected non-zero exit for unsafe run id")
+	}
+	if !strings.Contains(stderr, "invalid run id") {
+		t.Fatalf("expected invalid run id error, got: %s", stderr)
+	}
+	if _, statErr := os.Stat(filepath.Join(repoRoot, ".verk", "escaped")); !os.IsNotExist(statErr) {
+		t.Fatalf("unsafe run id read escaped artifact path: %v", statErr)
+	}
+}
+
 // runCLIFromDir runs the CLI with the given args from the specified directory,
 // capturing stdout and stderr. Returns stdout, stderr, and exit code.
 func runCLIFromDir(t *testing.T, dir string, args ...string) (string, string, int) {

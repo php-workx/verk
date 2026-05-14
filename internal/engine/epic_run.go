@@ -855,8 +855,14 @@ func validateRunEpicRequest(req RunEpicRequest) error {
 	if req.RunID == "" {
 		return fmt.Errorf("run epic requires run id")
 	}
+	if err := validateArtifactIdentifier(req.RunID, "run id"); err != nil {
+		return err
+	}
 	if req.RootTicketID == "" {
 		return fmt.Errorf("run epic requires root ticket id")
+	}
+	if err := validateArtifactIdentifier(req.RootTicketID, "root ticket id"); err != nil {
+		return err
 	}
 	if req.Adapter == nil && req.AdapterFactory == nil {
 		return fmt.Errorf("run epic requires runtime adapter")
@@ -910,6 +916,9 @@ func epicCompletionStatus(children []epos.Ticket) state.EpicRunStatus {
 }
 
 func updateTicketStoreStatus(repoRoot, ticketID string, status epos.Status) error {
+	if err := validateArtifactIdentifier(ticketID, "ticket id"); err != nil {
+		return err
+	}
 	path := filepath.Join(repoRoot, ".tickets", ticketID+".md")
 	return updateTicketStatus(path, status)
 }

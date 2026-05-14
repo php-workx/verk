@@ -230,6 +230,56 @@ func TestDoRunEpic_DoesNotAdvanceCurrentOnEngineFailure(t *testing.T) {
 	}
 }
 
+func TestDoRunEpic_RejectsUnsafeTicketIDBeforeRunLockPathEscape(t *testing.T) {
+	dir := t.TempDir()
+	initCLITestRepo(t, dir)
+	if err := os.MkdirAll(filepath.Join(dir, ".tickets"), 0o755); err != nil {
+		t.Fatalf("mkdir .tickets: %v", err)
+	}
+
+	t.Chdir(dir)
+
+	var stdout, stderr bytes.Buffer
+	_, err := doRunEpic(&stdout, &stderr, "../escaped")
+	if err == nil {
+		t.Fatal("expected unsafe ticket id to be rejected")
+	}
+	if strings.Contains(stdout.String(), "run_id=") {
+		t.Fatalf("unsafe ticket id printed bogus run id: %s", stdout.String())
+	}
+	if !strings.Contains(err.Error(), "invalid ticket id") {
+		t.Fatalf("expected invalid ticket id error, got: %v", err)
+	}
+	if _, statErr := os.Stat(filepath.Join(dir, ".verk", "escaped", "run.lock")); !os.IsNotExist(statErr) {
+		t.Fatalf("unsafe ticket id created escaped lock path: %v", statErr)
+	}
+}
+
+func TestDoAutoResume_RejectsUnsafeCurrentRunBeforeArtifactRead(t *testing.T) {
+	dir := t.TempDir()
+	initCLITestRepo(t, dir)
+	if err := os.MkdirAll(filepath.Join(dir, ".verk"), 0o755); err != nil {
+		t.Fatalf("mkdir .verk: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, ".verk", "current"), []byte("../escaped\n"), 0o644); err != nil {
+		t.Fatalf("write current: %v", err)
+	}
+
+	t.Chdir(dir)
+
+	var stdout, stderr bytes.Buffer
+	err := doAutoResume(&stdout, &stderr)
+	if err == nil {
+		t.Fatal("expected unsafe current run id to be rejected")
+	}
+	if !strings.Contains(stdout.String(), "invalid current run") {
+		t.Fatalf("expected invalid current run message, got stdout=%s stderr=%s err=%v", stdout.String(), stderr.String(), err)
+	}
+	if _, statErr := os.Stat(filepath.Join(dir, ".verk", "escaped")); !os.IsNotExist(statErr) {
+		t.Fatalf("unsafe current run id read escaped artifact path: %v", statErr)
+	}
+}
+
 func TestDoRunEpic_CurrentPointerSetForPersistedBlockedRun(t *testing.T) {
 	dir := t.TempDir()
 	initCLITestRepo(t, dir)

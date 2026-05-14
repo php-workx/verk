@@ -164,6 +164,9 @@ func initRunCmd(root *cobra.Command) {
 }
 
 func doRunTicket(w, errw io.Writer, ticketID string) (runID string, err error) {
+	if err := engine.ValidateArtifactIdentifier(ticketID, "ticket id"); err != nil {
+		return "", err
+	}
 	emitRunID := true
 	defer func() {
 		if emitRunID && runID != "" {
@@ -331,6 +334,9 @@ func doRunTicket(w, errw io.Writer, ticketID string) (runID string, err error) {
 }
 
 func doRunEpic(w, errw io.Writer, ticketID string) (string, error) {
+	if err := engine.ValidateArtifactIdentifier(ticketID, "ticket id"); err != nil {
+		return "", err
+	}
 	// Cancel engine execution on SIGINT (Ctrl-C) or SIGTERM so that worker
 	// processes and MCP helpers are terminated and claims are released before
 	// the process exits.
@@ -452,6 +458,11 @@ func doAutoResume(w, errw io.Writer) error {
 	}
 	if runID == "" {
 		msg := fmt.Errorf("no active run — start one with: verk run ticket <id>")
+		_, _ = fmt.Fprintf(w, "Error: %s\n", msg)
+		return withExitCode(msg, 1)
+	}
+	if err := engine.ValidateArtifactIdentifier(runID, "run id"); err != nil {
+		msg := fmt.Errorf("invalid current run: %w", err)
 		_, _ = fmt.Fprintf(w, "Error: %s\n", msg)
 		return withExitCode(msg, 1)
 	}
