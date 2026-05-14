@@ -557,3 +557,14 @@ func TestBuildReviewPrompt_IncludesFilesUnderReview(t *testing.T) {
 		}
 	}
 }
+
+func TestBuildReviewPrompt_NoFilesUnderReviewWhenEmpty(t *testing.T) {
+	prompt := BuildReviewPrompt(ReviewRequest{
+		TicketID:                 "VER-001",
+		LeaseID:                  "lease-1",
+		EffectiveReviewThreshold: "P2",
+	})
+	if strings.Contains(prompt, "### Files Under Review") {
+		t.Fatal("expected no Files Under Review section when ChangedFiles is empty")
+	}
+}
