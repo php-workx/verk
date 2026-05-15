@@ -408,3 +408,184 @@ var integrationMarker = regexp.MustCompile(`(?i)\bintegration\b|\btraceability\b
 func hasIntegrationMarker(t epos.Ticket) bool {
 	return integrationMarker.MatchString(t.Title) || integrationMarker.MatchString(t.Body)
 }
+
+// --- Safe Auto-Repair -------------------------------------------------------
+
+// TicketQualityRepairPlan describes a planned set of safe ticket repairs for a
+// quality artifact. Tickets maps ticket id -> repaired ticket struct; callers
+// can save those back to the ticket store. Repairs lists the repair records to
+// attach to the artifact.
+type TicketQualityRepairPlan struct {
+	Tickets map[string]epos.Ticket
+	Repairs []state.TicketQualityRepair
+}
+
+// BuildTicketQualityRepairPlan computes which safe repairs would resolve the
+// findings in the artifact. It is pure: it does not write tickets or
+// filesystem. Filesystem writes happen in the CLI/run integration layer.
+//
+// Safe repairs:
+//   - epic gets union of child OwnedPaths only if all children have non-empty
+//     OwnedPaths (otherwise the inferred union could be misleading)
+//   - planner-required findings get an advisory ticket_quality_notes
+//     frontmatter entry so future runs see the open finding
+//
+// Unsafe repairs (NOT applied):
+//   - inventing acceptance criteria, public CLI scenarios, or test expectations
+//   - splitting compound criteria
+//   - rewriting docs body
+func BuildTicketQualityRepairPlan(input TicketQualityInput, artifact state.TicketQualityArtifact) TicketQualityRepairPlan {
+	plan := TicketQualityRepairPlan{Tickets: map[string]epos.Ticket{}}
+
+	if isEpic(input.RootTicket) {
+		if repaired, repair, ok := repairEpicOwnedPaths(input, artifact); ok {
+			plan.Tickets[repaired.ID] = repaired
+			plan.Repairs = append(plan.Repairs, repair)
+		}
+	}
+
+	for _, f := range artifact.Findings {
+		if !f.RequiresPlanner {
+			continue
+		}
+		repaired, repair, ok := repairAddPlannerNote(input, f)
+		if !ok {
+			continue
+		}
+		if existing, present := plan.Tickets[repaired.ID]; present {
+			repaired = mergeNotes(existing, repaired)
+		}
+		plan.Tickets[repaired.ID] = repaired
+		plan.Repairs = append(plan.Repairs, repair)
+	}
+
+	return plan
+}
+
+// repairEpicOwnedPaths returns a repaired epic ticket with OwnedPaths set to
+// the sorted, deduplicated union of all child OwnedPaths. Only applied when
+// the epic itself has no OwnedPaths AND every child has non-empty OwnedPaths.
+func repairEpicOwnedPaths(input TicketQualityInput, artifact state.TicketQualityArtifact) (epos.Ticket, state.TicketQualityRepair, bool) {
+	root := input.RootTicket
+	if len(root.OwnedPaths) > 0 {
+		return epos.Ticket{}, state.TicketQualityRepair{}, false
+	}
+	children := childrenOf(input, root.ID)
+	if len(children) == 0 {
+		return epos.Ticket{}, state.TicketQualityRepair{}, false
+	}
+	union := map[string]bool{}
+	for _, c := range children {
+		if len(c.OwnedPaths) == 0 {
+			return epos.Ticket{}, state.TicketQualityRepair{}, false
+		}
+		for _, p := range c.OwnedPaths {
+			union[p] = true
+		}
+	}
+	paths := make([]string, 0, len(union))
+	for p := range union {
+		paths = append(paths, p)
+	}
+	sort.Strings(paths)
+	repaired := root
+	repaired.OwnedPaths = paths
+
+	findingID := ""
+	for _, f := range artifact.Findings {
+		if f.TicketID == root.ID && f.Code == string(state.QualityCodeMissingOwnedPaths) {
+			findingID = f.ID
+			break
+		}
+	}
+	return repaired, state.TicketQualityRepair{
+		FindingID: findingID,
+		TicketID:  root.ID,
+		Kind:      "epic_owned_paths_union",
+		Summary:   "set epic owned_paths to union of child owned_paths",
+		Applied:   true,
+	}, true
+}
+
+// repairAddPlannerNote attaches a ticket_quality_notes frontmatter entry that
+// records a planner-required finding. This is informational only; it does not
+// change any acceptance criteria, body text, or other semantic content.
+func repairAddPlannerNote(input TicketQualityInput, f state.TicketQualityFinding) (epos.Ticket, state.TicketQualityRepair, bool) {
+	t, ok := findTicket(input, f.TicketID)
+	if !ok {
+		return epos.Ticket{}, state.TicketQualityRepair{}, false
+	}
+	if t.UnknownFrontmatter == nil {
+		t.UnknownFrontmatter = map[string]any{}
+	}
+	notes, _ := t.UnknownFrontmatter["ticket_quality_notes"].([]any)
+	note := map[string]any{
+		"code":    f.Code,
+		"finding": f.ID,
+		"title":   f.Title,
+	}
+	for _, n := range notes {
+		if existing, ok := n.(map[string]any); ok {
+			if existing["finding"] == f.ID {
+				return epos.Ticket{}, state.TicketQualityRepair{}, false
+			}
+		}
+	}
+	notes = append(notes, note)
+	t.UnknownFrontmatter["ticket_quality_notes"] = notes
+	return t, state.TicketQualityRepair{
+		FindingID: f.ID,
+		TicketID:  f.TicketID,
+		Kind:      "ticket_quality_note",
+		Summary:   "record planner-required finding in ticket_quality_notes",
+		Applied:   true,
+	}, true
+}
+
+func childrenOf(input TicketQualityInput, rootID string) []epos.Ticket {
+	var out []epos.Ticket
+	for _, t := range input.Tickets {
+		if t.ID == rootID {
+			continue
+		}
+		out = append(out, t)
+	}
+	return out
+}
+
+func findTicket(input TicketQualityInput, id string) (epos.Ticket, bool) {
+	if input.RootTicket.ID == id {
+		return input.RootTicket, true
+	}
+	for _, t := range input.Tickets {
+		if t.ID == id {
+			return t, true
+		}
+	}
+	return epos.Ticket{}, false
+}
+
+func mergeNotes(a, b epos.Ticket) epos.Ticket {
+	if a.UnknownFrontmatter == nil {
+		a.UnknownFrontmatter = map[string]any{}
+	}
+	aNotes, _ := a.UnknownFrontmatter["ticket_quality_notes"].([]any)
+	bNotes, _ := b.UnknownFrontmatter["ticket_quality_notes"].([]any)
+	merged := append([]any{}, aNotes...)
+	for _, bn := range bNotes {
+		dup := false
+		bm, _ := bn.(map[string]any)
+		for _, an := range merged {
+			am, _ := an.(map[string]any)
+			if am != nil && bm != nil && am["finding"] == bm["finding"] {
+				dup = true
+				break
+			}
+		}
+		if !dup {
+			merged = append(merged, bn)
+		}
+	}
+	a.UnknownFrontmatter["ticket_quality_notes"] = merged
+	return a
+}

@@ -249,3 +249,90 @@ func TestTicketQuality_FindingIDStable(t *testing.T) {
 		t.Fatalf("finding id should be prefixed with code: %q", a.Findings[0].ID)
 	}
 }
+
+func TestTicketQualityRepair_EpicGetsUnionOwnedPaths(t *testing.T) {
+	root := mkQualityEpic("ver-epic", "Epic root")
+	root.OwnedPaths = nil
+	c1 := mkQualityTicket("ver-c1", "Child 1")
+	c1.OwnedPaths = []string{"internal/a", "internal/b"}
+	c1.AcceptanceCriteria = []string{"verk a --do exits 0"}
+	c2 := mkQualityTicket("ver-c2", "Child 2")
+	c2.OwnedPaths = []string{"internal/b", "docs/x.md"}
+	c2.AcceptanceCriteria = []string{"verk b --do exits 0"}
+	c3 := mkQualityTicket("ver-c3", "Integration")
+	c3.OwnedPaths = []string{"internal/e2e"}
+	c3.AcceptanceCriteria = []string{"e2e verk integration --check exits 0"}
+	in := TicketQualityInput{RootTicket: root, Tickets: []epos.Ticket{root, c1, c2, c3}, Config: policy.DefaultConfig()}
+	art := EvaluateTicketQuality(in)
+	plan := BuildTicketQualityRepairPlan(in, art)
+	repaired, ok := plan.Tickets[root.ID]
+	if !ok {
+		t.Fatalf("expected repaired epic ticket: %+v", plan)
+	}
+	wantPaths := []string{"docs/x.md", "internal/a", "internal/b", "internal/e2e"}
+	if len(repaired.OwnedPaths) != len(wantPaths) {
+		t.Fatalf("expected owned paths %v, got %v", wantPaths, repaired.OwnedPaths)
+	}
+	for i, p := range wantPaths {
+		if repaired.OwnedPaths[i] != p {
+			t.Fatalf("expected path[%d]=%q got %q", i, p, repaired.OwnedPaths[i])
+		}
+	}
+}
+
+func TestTicketQualityRepair_EpicNoRepairWhenChildMissingPaths(t *testing.T) {
+	root := mkQualityEpic("ver-epic2", "Epic root")
+	c1 := mkQualityTicket("ver-c1", "Child 1")
+	c1.OwnedPaths = []string{"internal/a"}
+	c1.AcceptanceCriteria = []string{"verk a --do exits 0"}
+	c2 := mkQualityTicket("ver-c2", "Child 2")
+	c2.AcceptanceCriteria = []string{"verk b --do exits 0"}
+	in := TicketQualityInput{RootTicket: root, Tickets: []epos.Ticket{root, c1, c2}, Config: policy.DefaultConfig()}
+	art := EvaluateTicketQuality(in)
+	plan := BuildTicketQualityRepairPlan(in, art)
+	if _, ok := plan.Tickets[root.ID]; ok {
+		t.Fatalf("expected no epic repair when child lacks owned paths: %+v", plan)
+	}
+}
+
+func TestTicketQualityRepair_PublicContractScenarioNotAutoRewritten(t *testing.T) {
+	tk := mkQualityTicket("ver-pcs", "Add subcommand")
+	tk.OwnedPaths = []string{"cmd/verk"}
+	tk.AcceptanceCriteria = []string{"the cleanup subcommand works"}
+	in := TicketQualityInput{RootTicket: tk, Tickets: []epos.Ticket{tk}, Config: policy.DefaultConfig()}
+	art := EvaluateTicketQuality(in)
+	plan := BuildTicketQualityRepairPlan(in, art)
+	if _, ok := plan.Tickets[tk.ID]; ok {
+		t.Fatalf("did not expect auto-repair for public contract scenario gap: %+v", plan)
+	}
+}
+
+func TestTicketQualityRepair_AmbiguousCriterionNotRewritten(t *testing.T) {
+	tk := mkQualityTicket("ver-ambig", "Implement widget")
+	tk.OwnedPaths = []string{"internal/widget"}
+	tk.AcceptanceCriteria = []string{"feature works properly"}
+	in := TicketQualityInput{RootTicket: tk, Tickets: []epos.Ticket{tk}, Config: policy.DefaultConfig()}
+	art := EvaluateTicketQuality(in)
+	plan := BuildTicketQualityRepairPlan(in, art)
+	if _, ok := plan.Tickets[tk.ID]; ok {
+		t.Fatalf("did not expect ambiguous criterion auto-rewrite: %+v", plan)
+	}
+}
+
+func TestTicketQualityRepair_PlannerNoteRecorded(t *testing.T) {
+	tk := mkQualityTicket("ver-docs", "Document cleanup")
+	tk.OwnedPaths = []string{"docs/cleanup.md"}
+	tk.Body = "The cleanup subcommand does not support recursive mode."
+	tk.AcceptanceCriteria = []string{"docs explain the --force flag"}
+	in := TicketQualityInput{RootTicket: tk, Tickets: []epos.Ticket{tk}, Config: policy.DefaultConfig()}
+	art := EvaluateTicketQuality(in)
+	plan := BuildTicketQualityRepairPlan(in, art)
+	repaired, ok := plan.Tickets[tk.ID]
+	if !ok {
+		t.Fatalf("expected planner-note repair: %+v", plan)
+	}
+	notes, _ := repaired.UnknownFrontmatter["ticket_quality_notes"].([]any)
+	if len(notes) == 0 {
+		t.Fatalf("expected at least one ticket_quality_notes entry: %+v", repaired.UnknownFrontmatter)
+	}
+}
