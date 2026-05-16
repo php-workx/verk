@@ -5,6 +5,14 @@ import (
 	"verk/internal/state"
 )
 
+// SamplingMetadata documents how the suite samples its underlying corpus.
+type SamplingMetadata struct {
+	Method        string `json:"method,omitempty"` // e.g. "hand-picked", "stratified"
+	SourceVersion string `json:"source_version,omitempty"`
+	TotalCorpus   int    `json:"total_corpus,omitempty"`
+	Sampled       int    `json:"sampled,omitempty"`
+}
+
 // SuiteMeta describes a benchmark suite.
 type SuiteMeta struct {
 	Name         string            `json:"name"`
@@ -13,6 +21,7 @@ type SuiteMeta struct {
 	TaskCount    int               `json:"task_count"`
 	SamplingMode string            `json:"sampling_mode,omitempty"` // smoke|regression|holdout|public
 	Labels       map[string]string `json:"labels,omitempty"`
+	Sampling     SamplingMetadata  `json:"sampling,omitempty"`
 }
 
 // BenchmarkMode controls which dimension the matrix varies.

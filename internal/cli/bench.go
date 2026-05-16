@@ -2,6 +2,8 @@ package cli
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"verk/internal/bench"
 	"verk/internal/bench/providers/verknative"
@@ -93,16 +95,132 @@ func runBenchList(cmd *cobra.Command) error {
 }
 
 func runBenchRun(cmd *cobra.Command, suite, matrixPath, outDir string, allowDirty bool) error {
-	return cmdError(cmd, fmt.Errorf("bench run: orchestration not yet implemented (see plan task 6)"), 2)
-}
-
-func runBenchReport(cmd *cobra.Command, runID, _ string) error {
-	return cmdError(cmd, fmt.Errorf("bench report: not yet implemented (see plan task 7)"), 2)
-}
-
-func runBenchCompare(cmd *cobra.Command, baseline, candidate, _ string) error {
-	if !strings.HasPrefix(baseline, "run-") || !strings.HasPrefix(candidate, "run-") {
-		return cmdError(cmd, fmt.Errorf("bench compare: expected run ids prefixed with 'run-'"), 2)
+	repoRoot, err := resolveRepoRoot()
+	if err != nil {
+		return cmdError(cmd, fmt.Errorf("resolve repo root: %w", err), 1)
 	}
-	return cmdError(cmd, fmt.Errorf("bench compare: not yet implemented (see plan task 7)"), 2)
+	r := benchRegistryFactory()
+	providerName, suiteName, err := parseProviderSuite(suite)
+	if err != nil {
+		return cmdError(cmd, err, 1)
+	}
+	provider, ok := r.Get(providerName)
+	if !ok {
+		return cmdError(cmd, fmt.Errorf("unknown provider %q", providerName), 1)
+	}
+	matrix := defaultMatrixFor(provider)
+	if matrixPath != "" {
+		data, err := os.ReadFile(matrixPath)
+		if err != nil {
+			return cmdError(cmd, err, 1)
+		}
+		matrix, err = bench.ParseMatrix(data)
+		if err != nil {
+			return cmdError(cmd, err, 1)
+		}
+	}
+	result, err := bench.Run(cmd.Context(), bench.RunOptions{
+		RepoRoot:   repoRoot,
+		OutDir:     outDir,
+		SuiteName:  suiteName,
+		Provider:   provider,
+		Matrix:     matrix,
+		AllowDirty: allowDirty,
+	})
+	if err != nil {
+		return cmdError(cmd, err, 1)
+	}
+	fmt.Fprintf(cmd.OutOrStdout(), "bench run complete: %s (results=%d)\n", result.RunID, len(result.Results))
+	return nil
+}
+
+// parseProviderSuite handles "provider/suite" or just "suite" (default provider verk-native).
+func parseProviderSuite(s string) (provider, suite string, err error) {
+	if s == "" {
+		return "", "", fmt.Errorf("suite name must not be empty")
+	}
+	if provider, suite, ok := strings.Cut(s, "/"); ok {
+		if provider == "" {
+			return "", "", fmt.Errorf("provider name must not be empty in %q", s)
+		}
+		if suite == "" {
+			return "", "", fmt.Errorf("suite name must not be empty in %q", s)
+		}
+		return provider, suite, nil
+	}
+	return "verk-native", s, nil
+}
+
+// defaultMatrixFor builds a minimal full-verk matrix for the given provider.
+// When the provider does not support full-verk, it falls back to worker-only.
+func defaultMatrixFor(provider bench.Provider) bench.Matrix {
+	mode := bench.ModeFullVerk
+	caps := provider.Capabilities()
+	supportsFullVerk := false
+	for _, m := range caps.SupportedModes {
+		if m == bench.ModeFullVerk {
+			supportsFullVerk = true
+			break
+		}
+	}
+	if !supportsFullVerk {
+		mode = bench.ModeWorkerOnly
+	}
+
+	profile := bench.MatrixProfile{
+		ID:     "default",
+		Worker: bench.ModelRef{Runtime: "claude", Model: "claude-sonnet-4-5"},
+	}
+	if mode == bench.ModeFullVerk {
+		profile.Reviewer = bench.ModelRef{Runtime: "claude", Model: "claude-sonnet-4-5"}
+	}
+
+	design := "fixed-reviewer"
+	if mode == bench.ModeWorkerOnly {
+		design = "fixed-reviewer"
+	}
+
+	return bench.Matrix{
+		Mode:             mode,
+		ComparisonDesign: design,
+		Profiles:         []bench.MatrixProfile{profile},
+	}
+}
+
+func runBenchReport(cmd *cobra.Command, runID, format string) error {
+	repoRoot, _ := resolveRepoRoot()
+	outDir := filepath.Join(repoRoot, ".verk", "bench", "runs", runID)
+	rr, err := bench.LoadRunResult(outDir)
+	if err != nil {
+		return cmdError(cmd, err, 1)
+	}
+	r := bench.BuildReport(rr)
+	switch format {
+	case "json":
+		return bench.RenderJSON(cmd.OutOrStdout(), r)
+	default:
+		return bench.RenderMarkdown(cmd.OutOrStdout(), r)
+	}
+}
+
+func runBenchCompare(cmd *cobra.Command, baseline, candidate, format string) error {
+	repoRoot, _ := resolveRepoRoot()
+	base, err := bench.LoadRunResult(filepath.Join(repoRoot, ".verk", "bench", "runs", baseline))
+	if err != nil {
+		return cmdError(cmd, err, 1)
+	}
+	cand, err := bench.LoadRunResult(filepath.Join(repoRoot, ".verk", "bench", "runs", candidate))
+	if err != nil {
+		return cmdError(cmd, err, 1)
+	}
+	cmp := bench.Compare(base, cand)
+	if cmp.Refusal != "" {
+		return cmdError(cmd, fmt.Errorf("non-comparable: %s", cmp.Refusal), 2)
+	}
+	switch format {
+	case "json":
+		return bench.RenderComparisonJSON(cmd.OutOrStdout(), cmp)
+	default:
+		return bench.RenderComparisonMarkdown(cmd.OutOrStdout(), cmp)
+	}
 }
