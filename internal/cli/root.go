@@ -50,6 +50,7 @@ func newRootCmd() *cobra.Command {
 	initDoctorCmd(root)
 	initInitCmd(root)
 	initInspectCmd(root)
+	initLearnCmd(root)
 
 	return root
 }
