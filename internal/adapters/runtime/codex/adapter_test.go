@@ -8,13 +8,41 @@ import (
 	"testing"
 	"time"
 	"verk/internal/adapters/runtime"
+	"verk/internal/adapters/runtime/llmclibridge"
 )
 
+type fakeBridge struct {
+	runFunc          func(context.Context, llmclibridge.Request) (llmclibridge.Result, error)
+	availabilityFunc func(context.Context, string, string) error
+	requests         []llmclibridge.Request
+}
+
+func (b *fakeBridge) Run(ctx context.Context, req llmclibridge.Request) (llmclibridge.Result, error) {
+	b.requests = append(b.requests, req)
+	if b.runFunc != nil {
+		return b.runFunc(ctx, req)
+	}
+	return llmclibridge.Result{}, nil
+}
+
+func (b *fakeBridge) CheckAvailability(ctx context.Context, runtimeName, command string) error {
+	if b.availabilityFunc != nil {
+		return b.availabilityFunc(ctx, runtimeName, command)
+	}
+	return nil
+}
+
+func installFakeBridge(t *testing.T, bridge *fakeBridge) {
+	t.Helper()
+
+	oldNewBridge := newBridge
+	newBridge = func() bridgeClient { return bridge }
+	t.Cleanup(func() { newBridge = oldNewBridge })
+}
+
 func TestRunWorker_NormalizesAndCapturesArtifacts(t *testing.T) {
-	oldRunCommand := runCommand
 	oldNow := now
 	defer func() {
-		runCommand = oldRunCommand
 		now = oldNow
 	}()
 
@@ -27,32 +55,33 @@ func TestRunWorker_NormalizesAndCapturesArtifacts(t *testing.T) {
 		times = times[1:]
 		return value
 	}
-	runCommand = func(ctx context.Context, binary string, args []string, stdin []byte, env []string, workDir string, timeout time.Duration) (commandResult, error) {
-		if workDir != "" {
-			t.Fatalf("expected Codex process workdir to remain unset, got %q", workDir)
-		}
-
+	bridge := &fakeBridge{}
+	installFakeBridge(t, bridge)
+	bridge.runFunc = func(ctx context.Context, req llmclibridge.Request) (llmclibridge.Result, error) {
 		t.Helper()
-		if binary != "codex-test" {
-			t.Fatalf("expected binary codex-test, got %q", binary)
+		if req.Command != "codex-test" {
+			t.Fatalf("expected command codex-test, got %q", req.Command)
 		}
-		if !hasArg(args, "exec") {
-			t.Fatalf("expected exec subcommand in args: %v", args)
+		if req.RuntimeName != runtimeName {
+			t.Fatalf("expected runtime codex, got %q", req.RuntimeName)
 		}
-		if !hasArg(args, "--json") {
-			t.Fatalf("expected --json flag in args: %v", args)
+		if req.SystemPrompt != runtime.WorkerSystemPrompt() {
+			t.Fatalf("expected worker system prompt")
 		}
-		if !hasArg(args, "--full-auto") {
-			t.Fatalf("expected --full-auto flag in args: %v", args)
+		if !strings.Contains(req.UserPrompt, "ticket-1") {
+			t.Fatalf("expected prompt to contain ticket id, got user prompt: %s", req.UserPrompt)
 		}
-
-		lastArg := args[len(args)-1]
-		if !strings.Contains(lastArg, "ticket-1") {
-			t.Fatalf("expected prompt to contain ticket id, got last arg: %s", lastArg)
+		if req.Model != "gpt-5-mini" {
+			t.Fatalf("expected model gpt-5-mini, got %q", req.Model)
 		}
-
-		if timeout != 7*time.Minute {
-			t.Fatalf("expected worker timeout 7m, got %s", timeout)
+		if req.Reasoning != "medium" {
+			t.Fatalf("expected reasoning medium, got %q", req.Reasoning)
+		}
+		if req.WorktreePath != "/tmp/worktree" {
+			t.Fatalf("expected worktree path /tmp/worktree, got %q", req.WorktreePath)
+		}
+		if req.Timeout != 7*time.Minute {
+			t.Fatalf("expected worker timeout 7m, got %s", req.Timeout)
 		}
 
 		// Codex streams JSONL events and may include the structured result as
@@ -65,10 +94,10 @@ func TestRunWorker_NormalizesAndCapturesArtifacts(t *testing.T) {
 			`{"type":"turn.completed","usage":{"input_tokens":1200,"cached_input_tokens":900,"output_tokens":80}}`,
 		}, "\n")
 
-		return commandResult{
-			stdout:   []byte(outputJSON),
-			stderr:   []byte("worker log"),
-			exitCode: 0,
+		return llmclibridge.Result{
+			Stdout:   []byte(outputJSON),
+			Stderr:   []byte("worker log"),
+			ExitCode: 0,
 		}, nil
 	}
 
@@ -79,6 +108,8 @@ func TestRunWorker_NormalizesAndCapturesArtifacts(t *testing.T) {
 		TicketID:     "ticket-1",
 		Attempt:      2,
 		WorktreePath: "/tmp/worktree",
+		Model:        "gpt-5-mini",
+		Reasoning:    "medium",
 		ExecutionConfig: runtime.ExecutionConfig{
 			WorkerTimeoutMinutes: 7,
 			AuthEnvVars:          []string{"VERK_API_KEY"},
@@ -136,10 +167,8 @@ func TestRunWorker_NormalizesAndCapturesArtifacts(t *testing.T) {
 }
 
 func TestRunReviewer_NormalizesFindingsAndDerivesStatus(t *testing.T) {
-	oldRunCommand := runCommand
 	oldNow := now
 	defer func() {
-		runCommand = oldRunCommand
 		now = oldNow
 	}()
 
@@ -152,21 +181,21 @@ func TestRunReviewer_NormalizesFindingsAndDerivesStatus(t *testing.T) {
 		times = times[1:]
 		return value
 	}
-	runCommand = func(ctx context.Context, binary string, args []string, stdin []byte, env []string, workDir string, timeout time.Duration) (commandResult, error) {
-		if workDir != "" {
-			t.Fatalf("expected Codex process workdir to remain unset, got %q", workDir)
-		}
-
+	bridge := &fakeBridge{}
+	installFakeBridge(t, bridge)
+	bridge.runFunc = func(ctx context.Context, req llmclibridge.Request) (llmclibridge.Result, error) {
 		t.Helper()
-		if binary != "codex-test" {
-			t.Fatalf("expected binary codex-test, got %q", binary)
+		if req.Command != "codex-test" {
+			t.Fatalf("expected command codex-test, got %q", req.Command)
 		}
-		if !hasArg(args, "exec") {
-			t.Fatalf("expected exec subcommand in args: %v", args)
+		if req.SystemPrompt != runtime.ReviewerSystemPrompt() {
+			t.Fatalf("expected reviewer system prompt")
 		}
-
-		if timeout != 9*time.Minute {
-			t.Fatalf("expected reviewer timeout 9m, got %s", timeout)
+		if !strings.Contains(req.UserPrompt, "ticket-2") {
+			t.Fatalf("expected prompt to contain ticket id, got user prompt: %s", req.UserPrompt)
+		}
+		if req.Timeout != 9*time.Minute {
+			t.Fatalf("expected reviewer timeout 9m, got %s", req.Timeout)
 		}
 
 		outputJSON := strings.Join([]string{
@@ -176,9 +205,9 @@ func TestRunReviewer_NormalizesFindingsAndDerivesStatus(t *testing.T) {
 			`{"type":"turn.completed","usage":{"input_tokens":2200,"cached_input_tokens":1100,"output_tokens":140}}`,
 		}, "\n")
 
-		return commandResult{
-			stdout: []byte(outputJSON),
-			stderr: []byte("review log"),
+		return llmclibridge.Result{
+			Stdout: []byte(outputJSON),
+			Stderr: []byte("review log"),
 		}, nil
 	}
 
@@ -243,10 +272,8 @@ func TestRunReviewer_NormalizesFindingsAndDerivesStatus(t *testing.T) {
 }
 
 func TestRunReviewer_UsesCodexCdFlagForWorktreePath(t *testing.T) {
-	oldRunCommand := runCommand
 	oldNow := now
 	defer func() {
-		runCommand = oldRunCommand
 		now = oldNow
 	}()
 
@@ -254,18 +281,16 @@ func TestRunReviewer_UsesCodexCdFlagForWorktreePath(t *testing.T) {
 		return time.Date(2026, 4, 2, 13, 0, 0, 0, time.UTC)
 	}
 
-	runCommand = func(ctx context.Context, binary string, args []string, stdin []byte, env []string, workDir string, timeout time.Duration) (commandResult, error) {
+	bridge := &fakeBridge{}
+	installFakeBridge(t, bridge)
+	bridge.runFunc = func(ctx context.Context, req llmclibridge.Request) (llmclibridge.Result, error) {
 		t.Helper()
-		if workDir != "" {
-			t.Fatalf("expected Codex process workdir to remain unset, got %q", workDir)
-		}
-		assertArgValue(t, args, "-C", "/tmp/review-worktree")
-		if hasArg(args, "--cwd") {
-			t.Fatalf("expected Codex -C/--cd flag, not unsupported --cwd: %v", args)
+		if req.WorktreePath != "/tmp/review-worktree" {
+			t.Fatalf("expected worktree path /tmp/review-worktree, got %q", req.WorktreePath)
 		}
 
 		outputJSON := `{"review_status":"passed","summary":"clean implementation","findings":[]}`
-		return commandResult{stdout: []byte(outputJSON)}, nil
+		return llmclibridge.Result{Text: outputJSON}, nil
 	}
 
 	adapter := NewWithCommand("codex-test")
@@ -284,10 +309,8 @@ func TestRunReviewer_UsesCodexCdFlagForWorktreePath(t *testing.T) {
 }
 
 func TestRunReviewer_PassedReview(t *testing.T) {
-	oldRunCommand := runCommand
 	oldNow := now
 	defer func() {
-		runCommand = oldRunCommand
 		now = oldNow
 	}()
 
@@ -295,15 +318,11 @@ func TestRunReviewer_PassedReview(t *testing.T) {
 		return time.Date(2026, 4, 2, 14, 0, 0, 0, time.UTC)
 	}
 
-	runCommand = func(ctx context.Context, binary string, args []string, stdin []byte, env []string, workDir string, timeout time.Duration) (commandResult, error) {
-		if workDir != "" {
-			t.Fatalf("expected Codex process workdir to remain unset, got %q", workDir)
-		}
-
+	bridge := &fakeBridge{}
+	installFakeBridge(t, bridge)
+	bridge.runFunc = func(ctx context.Context, req llmclibridge.Request) (llmclibridge.Result, error) {
 		outputJSON := `{"review_status":"passed","summary":"clean implementation","findings":[]}`
-		return commandResult{
-			stdout: []byte(outputJSON),
-		}, nil
+		return llmclibridge.Result{Text: outputJSON}, nil
 	}
 
 	adapter := NewWithCommand("codex-test")
@@ -323,24 +342,19 @@ func TestRunReviewer_PassedReview(t *testing.T) {
 }
 
 func TestCheckAvailability_UsesVersionProbe(t *testing.T) {
-	oldRunCommand := runCommand
-	defer func() { runCommand = oldRunCommand }()
-
 	probed := false
-	runCommand = func(ctx context.Context, binary string, args []string, stdin []byte, env []string, workDir string, timeout time.Duration) (commandResult, error) {
-		if workDir != "" {
-			t.Fatalf("expected Codex process workdir to remain unset, got %q", workDir)
-		}
-
-		probed = true
-		if binary != "codex-test" {
-			t.Fatalf("expected binary codex-test, got %q", binary)
-		}
-		if len(args) != 1 || args[0] != "--version" {
-			t.Fatalf("expected version probe, got %v", args)
-		}
-		return commandResult{stdout: []byte("codex 1.0.0")}, nil
-	}
+	installFakeBridge(t, &fakeBridge{
+		availabilityFunc: func(ctx context.Context, gotRuntime, command string) error {
+			probed = true
+			if gotRuntime != runtimeName {
+				t.Fatalf("expected runtime codex, got %q", gotRuntime)
+			}
+			if command != "codex-test" {
+				t.Fatalf("expected command codex-test, got %q", command)
+			}
+			return nil
+		},
+	})
 
 	if err := NewWithCommand("codex-test").CheckAvailability(context.Background()); err != nil {
 		t.Fatalf("expected availability probe to pass, got %v", err)
@@ -351,10 +365,8 @@ func TestCheckAvailability_UsesVersionProbe(t *testing.T) {
 }
 
 func TestRunWorker_NeedsContextStatus(t *testing.T) {
-	oldRunCommand := runCommand
 	oldNow := now
 	defer func() {
-		runCommand = oldRunCommand
 		now = oldNow
 	}()
 
@@ -362,17 +374,15 @@ func TestRunWorker_NeedsContextStatus(t *testing.T) {
 		return time.Date(2026, 4, 2, 12, 0, 0, 0, time.UTC)
 	}
 
-	runCommand = func(ctx context.Context, binary string, args []string, stdin []byte, env []string, workDir string, timeout time.Duration) (commandResult, error) {
-		if workDir != "" {
-			t.Fatalf("expected Codex process workdir to remain unset, got %q", workDir)
-		}
-
-		resultJSON := `{"status":"needs_context","completion_code":"missing_spec","block_reason":"acceptance criteria unclear"}`
-		return commandResult{
-			stdout:   []byte(resultJSON),
-			exitCode: 0,
-		}, nil
-	}
+	installFakeBridge(t, &fakeBridge{
+		runFunc: func(ctx context.Context, req llmclibridge.Request) (llmclibridge.Result, error) {
+			resultJSON := `{"status":"needs_context","completion_code":"missing_spec","block_reason":"acceptance criteria unclear"}`
+			return llmclibridge.Result{
+				Text:     resultJSON,
+				ExitCode: 0,
+			}, nil
+		},
+	})
 
 	adapter := NewWithCommand("codex-test")
 	result, err := adapter.RunWorker(context.Background(), runtime.WorkerRequest{
@@ -391,10 +401,8 @@ func TestRunWorker_NeedsContextStatus(t *testing.T) {
 }
 
 func TestRunWorker_NeedsMoreContextHyphenated(t *testing.T) {
-	oldRunCommand := runCommand
 	oldNow := now
 	defer func() {
-		runCommand = oldRunCommand
 		now = oldNow
 	}()
 
@@ -403,17 +411,15 @@ func TestRunWorker_NeedsMoreContextHyphenated(t *testing.T) {
 	}
 
 	// Simulate a runtime returning the hyphenated form "needs-more-context"
-	runCommand = func(ctx context.Context, binary string, args []string, stdin []byte, env []string, workDir string, timeout time.Duration) (commandResult, error) {
-		if workDir != "" {
-			t.Fatalf("expected Codex process workdir to remain unset, got %q", workDir)
-		}
-
-		resultJSON := `{"status":"needs-more-context","completion_code":"missing_spec","block_reason":"need operator input"}`
-		return commandResult{
-			stdout:   []byte(resultJSON),
-			exitCode: 0,
-		}, nil
-	}
+	installFakeBridge(t, &fakeBridge{
+		runFunc: func(ctx context.Context, req llmclibridge.Request) (llmclibridge.Result, error) {
+			resultJSON := `{"status":"needs-more-context","completion_code":"missing_spec","block_reason":"need operator input"}`
+			return llmclibridge.Result{
+				Text:     resultJSON,
+				ExitCode: 0,
+			}, nil
+		},
+	})
 
 	adapter := NewWithCommand("codex-test")
 	result, err := adapter.RunWorker(context.Background(), runtime.WorkerRequest{
@@ -432,10 +438,8 @@ func TestRunWorker_NeedsMoreContextHyphenated(t *testing.T) {
 }
 
 func TestRunWorker_UsageLimitIsRetryableAndPreservesMessage(t *testing.T) {
-	oldRunCommand := runCommand
 	oldNow := now
 	defer func() {
-		runCommand = oldRunCommand
 		now = oldNow
 	}()
 
@@ -443,22 +447,20 @@ func TestRunWorker_UsageLimitIsRetryableAndPreservesMessage(t *testing.T) {
 		return time.Date(2026, 4, 23, 16, 2, 1, 0, time.UTC)
 	}
 
-	runCommand = func(ctx context.Context, binary string, args []string, stdin []byte, env []string, workDir string, timeout time.Duration) (commandResult, error) {
-		if workDir != "" {
-			t.Fatalf("expected Codex process workdir to remain unset, got %q", workDir)
-		}
-
-		outputJSON := strings.Join([]string{
-			`{"type":"thread.started","thread_id":"thread-1"}`,
-			`{"type":"turn.started"}`,
-			`{"type":"error","message":"You've hit your usage limit for GPT-5.3-Codex-Spark. Switch to another model now, or try again at Apr 27th, 2026 4:32 PM."}`,
-			`{"type":"turn.failed","error":{"message":"You've hit your usage limit for GPT-5.3-Codex-Spark. Switch to another model now, or try again at Apr 27th, 2026 4:32 PM."}}`,
-		}, "\n")
-		return commandResult{
-			stdout:   []byte(outputJSON),
-			exitCode: 1,
-		}, nil
-	}
+	installFakeBridge(t, &fakeBridge{
+		runFunc: func(ctx context.Context, req llmclibridge.Request) (llmclibridge.Result, error) {
+			outputJSON := strings.Join([]string{
+				`{"type":"thread.started","thread_id":"thread-1"}`,
+				`{"type":"turn.started"}`,
+				`{"type":"error","message":"You've hit your usage limit for GPT-5.3-Codex-Spark. Switch to another model now, or try again at Apr 27th, 2026 4:32 PM."}`,
+				`{"type":"turn.failed","error":{"message":"You've hit your usage limit for GPT-5.3-Codex-Spark. Switch to another model now, or try again at Apr 27th, 2026 4:32 PM."}}`,
+			}, "\n")
+			return llmclibridge.Result{
+				Stdout:   []byte(outputJSON),
+				ExitCode: 1,
+			}, nil
+		},
+	})
 
 	adapter := NewWithCommand("codex-test")
 	result, err := adapter.RunWorker(context.Background(), runtime.WorkerRequest{
@@ -484,10 +486,8 @@ func TestRunWorker_UsageLimitIsRetryableAndPreservesMessage(t *testing.T) {
 }
 
 func TestRunWorker_FallbackWhenNoJSON(t *testing.T) {
-	oldRunCommand := runCommand
 	oldNow := now
 	defer func() {
-		runCommand = oldRunCommand
 		now = oldNow
 	}()
 
@@ -495,16 +495,14 @@ func TestRunWorker_FallbackWhenNoJSON(t *testing.T) {
 		return time.Date(2026, 4, 2, 12, 0, 0, 0, time.UTC)
 	}
 
-	runCommand = func(ctx context.Context, binary string, args []string, stdin []byte, env []string, workDir string, timeout time.Duration) (commandResult, error) {
-		if workDir != "" {
-			t.Fatalf("expected Codex process workdir to remain unset, got %q", workDir)
-		}
-
-		return commandResult{
-			stdout:   []byte("I made all the changes. Everything looks good."),
-			exitCode: 0,
-		}, nil
-	}
+	installFakeBridge(t, &fakeBridge{
+		runFunc: func(ctx context.Context, req llmclibridge.Request) (llmclibridge.Result, error) {
+			return llmclibridge.Result{
+				Text:     "I made all the changes. Everything looks good.",
+				ExitCode: 0,
+			}, nil
+		},
+	})
 
 	adapter := NewWithCommand("codex-test")
 	result, err := adapter.RunWorker(context.Background(), runtime.WorkerRequest{
@@ -520,10 +518,8 @@ func TestRunWorker_FallbackWhenNoJSON(t *testing.T) {
 }
 
 func TestRunWorker_SentinelFallback(t *testing.T) {
-	oldRunCommand := runCommand
 	oldNow := now
 	defer func() {
-		runCommand = oldRunCommand
 		now = oldNow
 	}()
 
@@ -531,18 +527,16 @@ func TestRunWorker_SentinelFallback(t *testing.T) {
 		return time.Date(2026, 4, 2, 12, 0, 0, 0, time.UTC)
 	}
 
-	runCommand = func(ctx context.Context, binary string, args []string, stdin []byte, env []string, workDir string, timeout time.Duration) (commandResult, error) {
-		if workDir != "" {
-			t.Fatalf("expected Codex process workdir to remain unset, got %q", workDir)
-		}
-
-		// AI mixed prose with a sentinel-prefixed JSON line
-		output := "Done with changes.\nVERK_RESULT:{\"status\":\"done\",\"completion_code\":\"ok\"}"
-		return commandResult{
-			stdout:   []byte(output),
-			exitCode: 0,
-		}, nil
-	}
+	installFakeBridge(t, &fakeBridge{
+		runFunc: func(ctx context.Context, req llmclibridge.Request) (llmclibridge.Result, error) {
+			// AI mixed prose with a sentinel-prefixed JSON line
+			output := "Done with changes.\nVERK_RESULT:{\"status\":\"done\",\"completion_code\":\"ok\"}"
+			return llmclibridge.Result{
+				Text:     output,
+				ExitCode: 0,
+			}, nil
+		},
+	})
 
 	adapter := NewWithCommand("codex-test")
 	result, err := adapter.RunWorker(context.Background(), runtime.WorkerRequest{
@@ -560,98 +554,30 @@ func TestRunWorker_SentinelFallback(t *testing.T) {
 	}
 }
 
-func hasArg(args []string, value string) bool {
-	for _, arg := range args {
-		if arg == value {
-			return true
-		}
-	}
-	return false
-}
+func TestCommandResultFromBridgePreservesRawStdoutAndParsesBridgeText(t *testing.T) {
+	rawStdout := strings.Join([]string{
+		`{"type":"item.completed","item":{"type":"command_execution"}}`,
+		`{"type":"turn.completed","usage":{"input_tokens":12,"output_tokens":3}}`,
+	}, "\n")
+	result := commandResultFromBridge(llmclibridge.Result{
+		Stdout: []byte(rawStdout),
+		Text:   `{"status":"done","completion_code":"ok"}`,
+	})
 
-// assertArgValue asserts that args contains `flag` followed by `want`.
-func assertArgValue(t *testing.T, args []string, flag, want string) {
-	t.Helper()
-	for i := 0; i+1 < len(args); i++ {
-		if args[i] == flag {
-			if args[i+1] != want {
-				t.Fatalf("expected %s %q, got %q (full args: %v)", flag, want, args[i+1], args)
-			}
-			return
-		}
+	if string(result.stdout) != rawStdout {
+		t.Fatalf("expected raw stdout to be preserved, got %q", string(result.stdout))
 	}
-	t.Fatalf("expected flag %s in args: %v", flag, args)
-}
-
-// TestBuildWorkerArgs_IncludesModelAndReasoning covers ver-laq2 test case 7:
-// Codex supports both `--model` and `-c model_reasoning_effort=<level>`, and
-// the adapter must translate role profile fields into these flags so the
-// run is reproducible without relying on CLI defaults.
-func TestBuildWorkerArgs_IncludesModelAndReasoning(t *testing.T) {
-	req := runtime.WorkerRequest{
-		LeaseID:   "lease-1",
-		Model:     "gpt-5-mini",
-		Reasoning: "medium",
+	if string(result.artifactStdout()) != rawStdout {
+		t.Fatalf("expected artifact stdout to prefer raw stdout, got %q", string(result.artifactStdout()))
 	}
-	args := buildWorkerArgs(req, "prompt-body")
-	assertArgValue(t, args, "--model", "gpt-5-mini")
-	assertArgValue(t, args, "-c", "model_reasoning_effort=medium")
-	// The prompt is always the final positional argument.
-	if last := args[len(args)-1]; last != "prompt-body" {
-		t.Fatalf("expected prompt as final arg, got %q", last)
+	if got := result.parseText(); got != `{"status":"done","completion_code":"ok"}` {
+		t.Fatalf("expected bridge text for parsing, got %q", got)
 	}
-}
-
-func TestBuildWorkerArgs_UsesCodexCdFlagForWorktree(t *testing.T) {
-	req := runtime.WorkerRequest{
-		LeaseID:      "lease-1",
-		WorktreePath: "/tmp/worktree",
+	usage, activity := extractCodexTelemetry(result.stdout)
+	if usage == nil || usage.InputTokens != 12 || usage.OutputTokens != 3 || usage.TotalTokens != 15 {
+		t.Fatalf("expected telemetry from raw stdout, got %#v", usage)
 	}
-	args := buildWorkerArgs(req, "prompt-body")
-	assertArgValue(t, args, "-C", "/tmp/worktree")
-	if hasArg(args, "--cwd") {
-		t.Fatalf("expected Codex -C/--cd flag, not unsupported --cwd: %v", args)
-	}
-}
-
-// TestBuildWorkerArgs_OmitsModelAndReasoningWhenEmpty verifies that an empty
-// role profile leaves both `--model` and `-c model_reasoning_effort=...` off
-// the command line so Codex's own defaults apply. Passing empty flags would
-// cause the CLI to reject the invocation.
-func TestBuildWorkerArgs_OmitsModelAndReasoningWhenEmpty(t *testing.T) {
-	args := buildWorkerArgs(runtime.WorkerRequest{LeaseID: "lease-1"}, "prompt-body")
-	if hasArg(args, "--model") {
-		t.Fatalf("expected no --model flag when Model is unset, got %v", args)
-	}
-	for i := 0; i+1 < len(args); i++ {
-		if args[i] == "-c" && strings.HasPrefix(args[i+1], "model_reasoning_effort=") {
-			t.Fatalf("expected no reasoning override when Reasoning is unset, got %v", args)
-		}
-	}
-}
-
-// TestBuildReviewArgs_IncludesModelAndReasoning is the reviewer counterpart
-// for Codex role profile translation.
-func TestBuildReviewArgs_IncludesModelAndReasoning(t *testing.T) {
-	req := runtime.ReviewRequest{
-		LeaseID:                  "lease-1",
-		Model:                    "gpt-5",
-		Reasoning:                "high",
-		EffectiveReviewThreshold: runtime.SeverityP2,
-	}
-	args := buildReviewArgs(req, "prompt-body")
-	assertArgValue(t, args, "--model", "gpt-5")
-	assertArgValue(t, args, "-c", "model_reasoning_effort=high")
-}
-
-func TestBuildReviewArgs_UsesCodexCdFlagForWorktree(t *testing.T) {
-	req := runtime.ReviewRequest{
-		LeaseID:      "lease-1",
-		WorktreePath: "/tmp/review-worktree",
-	}
-	args := buildReviewArgs(req, "prompt-body")
-	assertArgValue(t, args, "-C", "/tmp/review-worktree")
-	if hasArg(args, "--cwd") {
-		t.Fatalf("expected Codex -C/--cd flag, not unsupported --cwd: %v", args)
+	if activity == nil || activity.EventCount != 2 || activity.CommandCount != 1 {
+		t.Fatalf("expected activity from raw stdout, got %#v", activity)
 	}
 }

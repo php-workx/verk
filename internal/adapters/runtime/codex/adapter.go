@@ -7,13 +7,12 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"os"
-	"os/exec"
 	"strings"
 	"time"
 	"verk/internal/adapters/runtime"
+	"verk/internal/adapters/runtime/llmclibridge"
 	"verk/internal/state"
 )
 
@@ -23,21 +22,25 @@ const (
 )
 
 var (
-	runCommand = defaultRunCommand
-	now        = time.Now
+	newBridge = func() bridgeClient { return llmclibridge.New() }
+	now       = time.Now
 )
 
-// The subprocess inherits the full parent environment so that the Codex CLI
-// can access auth credentials and system config.
+type bridgeClient interface {
+	Run(context.Context, llmclibridge.Request) (llmclibridge.Result, error)
+	CheckAvailability(context.Context, string, string) error
+}
 
 type Adapter struct {
 	Command string
+	bridge  bridgeClient
 }
 
 type commandResult struct {
-	stdout   []byte
-	stderr   []byte
-	exitCode int
+	stdout     []byte
+	stderr     []byte
+	resultText string
+	exitCode   int
 }
 
 type workerArtifact struct {
@@ -71,7 +74,7 @@ type intentArtifact struct {
 }
 
 func New() *Adapter {
-	return &Adapter{Command: defaultBinary}
+	return &Adapter{Command: defaultBinary, bridge: newBridge()}
 }
 
 func NewWithCommand(command string) *Adapter {
@@ -79,24 +82,15 @@ func NewWithCommand(command string) *Adapter {
 	if command == "" {
 		command = defaultBinary
 	}
-	return &Adapter{Command: command}
+	return &Adapter{Command: command, bridge: newBridge()}
 }
 
 func (a *Adapter) CheckAvailability(ctx context.Context) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-
-	env, err := runtimeCommandEnv(runtime.ExecutionConfig{}, "")
-	if err != nil {
-		return fmt.Errorf("build %s availability environment: %w", runtimeName, err)
-	}
-	result, err := runCommand(ctx, a.binary(), []string{"--version"}, nil, env, "", 0)
-	if err != nil {
+	if err := a.runtimeBridge().CheckAvailability(ctx, runtimeName, a.binary()); err != nil {
 		return fmt.Errorf("%s availability check failed: %w", runtimeName, err)
-	}
-	if result.exitCode != 0 {
-		return fmt.Errorf("%s unavailable: exit code %d: %s", runtimeName, result.exitCode, strings.TrimSpace(string(result.stderr)))
 	}
 	return nil
 }
@@ -110,18 +104,13 @@ func (a *Adapter) RunWorker(ctx context.Context, req runtime.WorkerRequest) (run
 	startedAt := now().UTC()
 
 	prompt := runtime.BuildWorkerPrompt(req)
-	args := buildWorkerArgs(req, prompt)
-	env, err := runtimeCommandEnv(req.ExecutionConfig, req.WorktreePath)
-	if err != nil {
-		return runtime.WorkerResult{}, err
-	}
-	execResult, err := runCommand(ctx, a.binary(), args, nil, env, "", runtimeCommandTimeout(req.ExecutionConfig.WorkerTimeoutMinutes))
+	execResult, err := a.runCodexRequest(ctx, runtime.WorkerSystemPrompt(), prompt, req.Model, req.Reasoning, req.WorktreePath, runtimeCommandTimeout(req.ExecutionConfig.WorkerTimeoutMinutes), req.OnProgress)
 	finishedAt := now().UTC()
 	if err != nil {
 		return runtime.WorkerResult{}, fmt.Errorf("run %s worker: %w", runtimeName, err)
 	}
 
-	resultText, _ := runtime.ExtractCLIResultText(execResult.stdout)
+	resultText := execResult.parseText()
 	resultBlock, blockFound := runtime.ParseResultBlock(resultText)
 
 	result := runtime.WorkerResult{
@@ -136,7 +125,7 @@ func (a *Adapter) RunWorker(ctx context.Context, req runtime.WorkerRequest) (run
 	}
 	result.TokenUsage, result.ActivityStats = extractCodexTelemetry(execResult.stdout)
 
-	result.StdoutPath, err = writeBytesArtifact(runtimeName+"-worker-stdout", execResult.stdout)
+	result.StdoutPath, err = writeBytesArtifact(runtimeName+"-worker-stdout", execResult.artifactStdout())
 	if err != nil {
 		return runtime.WorkerResult{}, err
 	}
@@ -152,7 +141,7 @@ func (a *Adapter) RunWorker(ctx context.Context, req runtime.WorkerRequest) (run
 	artifact := workerArtifact{
 		Runtime:            runtimeName,
 		Request:            req,
-		CLIOutput:          safeRawJSON(execResult.stdout),
+		CLIOutput:          safeRawJSON(execResult.artifactStdout()),
 		ResultBlock:        blockPtr,
 		Normalized:         result,
 		CapturedStdoutPath: result.StdoutPath,
@@ -182,18 +171,13 @@ func (a *Adapter) RunReviewer(ctx context.Context, req runtime.ReviewRequest) (r
 	startedAt := now().UTC()
 
 	prompt := runtime.BuildReviewPrompt(req)
-	args := buildReviewArgs(req, prompt)
-	env, err := runtimeCommandEnv(req.ExecutionConfig, req.WorktreePath)
-	if err != nil {
-		return runtime.ReviewResult{}, err
-	}
-	execResult, err := runCommand(ctx, a.binary(), args, nil, env, "", runtimeCommandTimeout(req.ExecutionConfig.ReviewerTimeoutMinutes))
+	execResult, err := a.runCodexRequest(ctx, runtime.ReviewerSystemPrompt(), prompt, req.Model, req.Reasoning, req.WorktreePath, runtimeCommandTimeout(req.ExecutionConfig.ReviewerTimeoutMinutes), req.OnProgress)
 	finishedAt := now().UTC()
 	if err != nil {
 		return runtime.ReviewResult{}, fmt.Errorf("run %s reviewer: %w", runtimeName, err)
 	}
 
-	resultText, _ := runtime.ExtractCLIResultText(execResult.stdout)
+	resultText := execResult.parseText()
 	reviewBlock, blockFound := runtime.ParseReviewBlock(resultText)
 
 	findings, err := normalizeBlockFindings(reviewBlock, blockFound)
@@ -218,7 +202,7 @@ func (a *Adapter) RunReviewer(ctx context.Context, req runtime.ReviewRequest) (r
 		return runtime.ReviewResult{}, err
 	}
 
-	normalized.StdoutPath, err = writeBytesArtifact(runtimeName+"-review-stdout", execResult.stdout)
+	normalized.StdoutPath, err = writeBytesArtifact(runtimeName+"-review-stdout", execResult.artifactStdout())
 	if err != nil {
 		return runtime.ReviewResult{}, err
 	}
@@ -234,7 +218,7 @@ func (a *Adapter) RunReviewer(ctx context.Context, req runtime.ReviewRequest) (r
 	artifact := reviewArtifact{
 		Runtime:            runtimeName,
 		Request:            req,
-		CLIOutput:          safeRawJSON(execResult.stdout),
+		CLIOutput:          safeRawJSON(execResult.artifactStdout()),
 		ReviewBlock:        blockPtr,
 		Normalized:         normalized,
 		CapturedStdoutPath: normalized.StdoutPath,
@@ -262,17 +246,12 @@ func (a *Adapter) RunIntent(ctx context.Context, req runtime.IntentRequest) (run
 
 	req.Runtime = ensureRuntime(req.Runtime, runtimeName)
 	prompt := runtime.BuildIntentPrompt(req)
-	args := buildIntentArgs(req, prompt)
-	env, err := runtimeCommandEnv(runtime.ExecutionConfig{}, req.WorktreePath)
-	if err != nil {
-		return runtime.IntentResult{}, err
-	}
-	execResult, err := runCommand(ctx, a.binary(), args, nil, env, "", 0)
+	execResult, err := a.runCodexRequest(ctx, runtime.IntentSystemPrompt(), prompt, req.Model, req.Reasoning, req.WorktreePath, 0, nil)
 	if err != nil {
 		return runtime.IntentResult{}, fmt.Errorf("run %s intent: %w", runtimeName, err)
 	}
 
-	resultText, _ := runtime.ExtractCLIResultText(execResult.stdout)
+	resultText := execResult.parseText()
 	intentBlock, blockFound := runtime.ParseIntentBlock(resultText)
 	if !blockFound {
 		return runtime.IntentResult{}, fmt.Errorf("run %s intent: missing intent result block", runtimeName)
@@ -285,7 +264,7 @@ func (a *Adapter) RunIntent(ctx context.Context, req runtime.IntentRequest) (run
 		RawResponse:     resultText,
 	}
 
-	stdoutPath, err := writeBytesArtifact(runtimeName+"-intent-stdout", execResult.stdout)
+	stdoutPath, err := writeBytesArtifact(runtimeName+"-intent-stdout", execResult.artifactStdout())
 	if err != nil {
 		return runtime.IntentResult{}, err
 	}
@@ -297,7 +276,7 @@ func (a *Adapter) RunIntent(ctx context.Context, req runtime.IntentRequest) (run
 	artifact := intentArtifact{
 		Runtime:            runtimeName,
 		Request:            req,
-		CLIOutput:          safeRawJSON(execResult.stdout),
+		CLIOutput:          safeRawJSON(execResult.artifactStdout()),
 		IntentBlock:        blockPtr,
 		Normalized:         result,
 		CapturedStdoutPath: stdoutPath,
@@ -370,6 +349,55 @@ func (a *Adapter) binary() string {
 	return a.Command
 }
 
+func (a *Adapter) runtimeBridge() bridgeClient {
+	if a.bridge != nil {
+		return a.bridge
+	}
+	return newBridge()
+}
+
+func (a *Adapter) runCodexRequest(ctx context.Context, systemPrompt, userPrompt, model, reasoning, worktreePath string, timeout time.Duration, onProgress func(string)) (commandResult, error) {
+	result, err := a.runtimeBridge().Run(ctx, llmclibridge.Request{
+		RuntimeName:  runtimeName,
+		Command:      a.binary(),
+		SystemPrompt: systemPrompt,
+		UserPrompt:   userPrompt,
+		Model:        model,
+		Reasoning:    reasoning,
+		WorktreePath: worktreePath,
+		Timeout:      timeout,
+		OnProgress:   onProgress,
+	})
+	if err != nil {
+		return commandResult{}, err
+	}
+	return commandResultFromBridge(result), nil
+}
+
+func commandResultFromBridge(result llmclibridge.Result) commandResult {
+	return commandResult{
+		stdout:     result.Stdout,
+		stderr:     result.Stderr,
+		resultText: result.Text,
+		exitCode:   result.ExitCode,
+	}
+}
+
+func (r commandResult) parseText() string {
+	if strings.TrimSpace(r.resultText) != "" {
+		return r.resultText
+	}
+	resultText, _ := runtime.ExtractCLIResultText(r.stdout)
+	return resultText
+}
+
+func (r commandResult) artifactStdout() []byte {
+	if len(r.stdout) > 0 {
+		return r.stdout
+	}
+	return []byte(r.resultText)
+}
+
 func validateWorkerRequest(req runtime.WorkerRequest) error {
 	if strings.TrimSpace(req.LeaseID) == "" {
 		return fmt.Errorf("worker request missing lease_id")
@@ -392,87 +420,6 @@ func validateIntentRequest(req runtime.IntentRequest) error {
 		return fmt.Errorf("intent request missing lease_id")
 	}
 	return nil
-}
-
-// buildWorkerArgs constructs CLI args for `codex exec`.
-// Codex takes the prompt as a positional argument and writes output to stdout.
-//
-// Role profile mapping: Codex CLI supports `--model <name>` for model
-// selection and `-c model_reasoning_effort=<level>` for reasoning effort.
-// Both are appended only when the role profile set them, so configs that
-// omit either field fall back to Codex's built-in defaults.
-func buildWorkerArgs(req runtime.WorkerRequest, prompt string) []string {
-	args := []string{
-		"exec",
-		"--json",
-		"--full-auto",
-	}
-	args = appendModelArgs(args, req.Model)
-	args = appendReasoningArgs(args, req.Reasoning)
-	if req.WorktreePath != "" {
-		// ver-wi10: keep process cwd unset because Codex uses `-C/--cd` for worktree/config resolution.
-		args = append(args, "-C", req.WorktreePath)
-	}
-	args = append(args, prompt)
-	return args
-}
-
-// buildReviewArgs constructs CLI args for `codex exec` in review mode.
-func buildReviewArgs(req runtime.ReviewRequest, prompt string) []string {
-	args := make([]string, 0, 8)
-	args = append(args,
-		"exec",
-		"--json",
-		"--full-auto",
-	)
-	args = appendModelArgs(args, req.Model)
-	args = appendReasoningArgs(args, req.Reasoning)
-	if req.WorktreePath != "" {
-		// Verifier parity with ver-wi10: keep process cwd unset and route all
-		// filesystem access through Codex's `-C/--cd` flag.
-		args = append(args, "-C", req.WorktreePath)
-	}
-	args = append(args, prompt)
-	return args
-}
-
-func buildIntentArgs(req runtime.IntentRequest, prompt string) []string {
-	args := []string{
-		"exec",
-		"--json",
-		"--full-auto",
-	}
-	args = appendModelArgs(args, req.Model)
-	args = appendReasoningArgs(args, req.Reasoning)
-	if req.WorktreePath != "" {
-		args = append(args, "-C", req.WorktreePath)
-	}
-	args = append(args, prompt)
-	return args
-}
-
-// appendModelArgs adds `--model <name>` to a Codex args list when the role
-// profile selected a model. Trimmed empty values are skipped so a missing
-// profile does not override Codex's own default.
-func appendModelArgs(args []string, model string) []string {
-	model = strings.TrimSpace(model)
-	if model == "" {
-		return args
-	}
-	return append(args, "--model", model)
-}
-
-// appendReasoningArgs adds `-c model_reasoning_effort=<level>` to a Codex
-// args list when the role profile selected a reasoning level. The value is
-// quoted via a key=value tuple as Codex expects; unsupported levels are
-// rejected by the Codex CLI itself, surfacing as a non-zero exit that the
-// worker/review pipeline classifies via standard stderr handling.
-func appendReasoningArgs(args []string, reasoning string) []string {
-	reasoning = strings.TrimSpace(reasoning)
-	if reasoning == "" {
-		return args
-	}
-	return append(args, "-c", "model_reasoning_effort="+reasoning)
 }
 
 // --- Status derivation from verk protocol blocks ---
@@ -844,53 +791,6 @@ func ensureRuntime(value, fallback string) string {
 	return strings.TrimSpace(value)
 }
 
-func defaultRunCommand(ctx context.Context, binary string, args []string, stdin []byte, env []string, _workDir string, timeout time.Duration) (commandResult, error) {
-	if timeout > 0 {
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, timeout)
-		defer cancel()
-	}
-	binary, err := runtime.ValidatedExecutable(binary)
-	if err != nil {
-		return commandResult{}, err
-	}
-	// Runtime executable is validated above, and exec.Command does not invoke a
-	// shell; arguments are passed as argv entries.
-	// nosemgrep: go.lang.security.audit.dangerous-exec-command.dangerous-exec-command
-	cmd := exec.CommandContext(ctx, binary, args...)
-	if len(stdin) > 0 {
-		cmd.Stdin = bytes.NewReader(stdin)
-	}
-	cmd.Env = env
-	// Put the subprocess in its own process group so that MCP helper processes
-	// spawned by the worker are also killed when the context is cancelled.
-	setupProcessGroup(cmd)
-
-	var stdout bytes.Buffer
-	var stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-
-	err = cmd.Run()
-	result := commandResult{
-		stdout: stdout.Bytes(),
-		stderr: stderr.Bytes(),
-	}
-	if err == nil {
-		return result, nil
-	}
-	if ctx.Err() != nil {
-		return result, ctx.Err()
-	}
-
-	var exitErr *exec.ExitError
-	if errors.As(err, &exitErr) {
-		result.exitCode = exitErr.ExitCode()
-		return result, nil
-	}
-	return result, err
-}
-
 func writeBytesArtifact(prefix string, data []byte) (string, error) {
 	file, err := os.CreateTemp("", prefix+"-*.log")
 	if err != nil {
@@ -941,11 +841,6 @@ func encodeJSON(file *os.File, payload any) error {
 	encoder := json.NewEncoder(file)
 	encoder.SetIndent("", "  ")
 	return encoder.Encode(payload)
-}
-
-func runtimeCommandEnv(_ runtime.ExecutionConfig, worktreePath string) ([]string, error) {
-	cleanEnv := runtime.StripEnvKeys(os.Environ(), runtime.GitIsolationKeys()...)
-	return runtime.BuildIsolatedProcessEnv(cleanEnv, worktreePath)
 }
 
 func runtimeCommandTimeout(minutes int) time.Duration {
