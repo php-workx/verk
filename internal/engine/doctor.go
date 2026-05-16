@@ -12,6 +12,7 @@ import (
 	"verk/internal/adapters/runtime/claude"
 	"verk/internal/adapters/runtime/codex"
 	"verk/internal/policy"
+	"verk/internal/state"
 )
 
 type DoctorCheck struct {
@@ -80,6 +81,19 @@ func RunDoctor(repoRoot string) (DoctorReport, int, error) {
 		blocking = true
 	}
 	report.Checks = append(report.Checks, claimStatus)
+
+	// Run one-shot review-findings v1→v2 migration. The migration is idempotent
+	// and uses a lock file to prevent concurrent execution. Doctor is the
+	// canonical trigger because it already receives repoRoot and is invoked by
+	// operators during health checks; hooking it into engine startup would
+	// require threading repoRoot through every entry point for minimal gain.
+	migrateStatus := DoctorCheck{Name: "migrate_review_findings_v2", Status: "passed", Details: "review-findings schema up to date"}
+	if err := state.MigrateReviewFindingsToV2(root); err != nil {
+		migrateStatus.Status = "warning"
+		migrateStatus.Details = err.Error()
+		warnings = true
+	}
+	report.Checks = append(report.Checks, migrateStatus)
 
 	artifactStatus := DoctorCheck{Name: "artifacts", Status: "passed", Details: filepath.Join(root, ".verk", "runs")}
 	if paths, err := collectJSONArtifacts(filepath.Join(root, ".verk", "runs")); err == nil {

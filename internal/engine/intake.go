@@ -11,7 +11,7 @@ import (
 	"verk/internal/state"
 )
 
-const artifactSchemaVersion = 1
+const artifactSchemaVersion = 2
 
 func BuildPlanArtifact(t epos.Ticket, cfg policy.Config) (state.PlanArtifact, error) {
 	if isEpicTicket(t) && len(t.OwnedPaths) == 0 {

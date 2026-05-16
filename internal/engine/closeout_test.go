@@ -724,7 +724,7 @@ func validResolvedFinding(id string) state.ReviewFinding {
 func TestValidateReviewFinding_ResolvedWithoutEvidenceBlocks(t *testing.T) {
 	f := validResolvedFinding("f-res-1")
 	f.ResolutionEvidence = nil
-	if err := validateReviewFinding(f, state.SeverityP2); err == nil || !strings.Contains(err.Error(), "missing resolution_evidence") {
+	if err := validateReviewFinding(f, state.SeverityP2, nil); err == nil || !strings.Contains(err.Error(), "missing resolution_evidence") {
 		t.Fatalf("expected missing resolution_evidence error, got: %v", err)
 	}
 }
@@ -732,7 +732,7 @@ func TestValidateReviewFinding_ResolvedWithoutEvidenceBlocks(t *testing.T) {
 func TestValidateReviewFinding_ResolvedWithEmptyDiffRangesBlocks(t *testing.T) {
 	f := validResolvedFinding("f-res-2")
 	f.ResolutionEvidence.DiffRanges = nil
-	if err := validateReviewFinding(f, state.SeverityP2); err == nil || !strings.Contains(err.Error(), "no diff_ranges") {
+	if err := validateReviewFinding(f, state.SeverityP2, nil); err == nil || !strings.Contains(err.Error(), "no diff_ranges") {
 		t.Fatalf("expected no diff_ranges error, got: %v", err)
 	}
 }
@@ -740,7 +740,7 @@ func TestValidateReviewFinding_ResolvedWithEmptyDiffRangesBlocks(t *testing.T) {
 func TestValidateReviewFinding_ResolvedWithEmptyTestReferencesBlocks(t *testing.T) {
 	f := validResolvedFinding("f-res-3")
 	f.ResolutionEvidence.TestReferences = nil
-	if err := validateReviewFinding(f, state.SeverityP2); err == nil || !strings.Contains(err.Error(), "no test_references") {
+	if err := validateReviewFinding(f, state.SeverityP2, nil); err == nil || !strings.Contains(err.Error(), "no test_references") {
 		t.Fatalf("expected no test_references error, got: %v", err)
 	}
 }
@@ -751,14 +751,14 @@ func TestValidateReviewFinding_ResolvedWithMalformedTestReferenceBlocks(t *testi
 	f.ResolutionEvidence.TestReferences = []state.TestReference{
 		{Kind: "test_function", Package: "engine"},
 	}
-	if err := validateReviewFinding(f, state.SeverityP2); err == nil || !strings.Contains(err.Error(), "missing name") {
+	if err := validateReviewFinding(f, state.SeverityP2, nil); err == nil || !strings.Contains(err.Error(), "missing name") {
 		t.Fatalf("expected missing name error, got: %v", err)
 	}
 }
 
 func TestValidateReviewFinding_ResolvedWithValidEvidencePasses(t *testing.T) {
 	f := validResolvedFinding("f-res-5")
-	if err := validateReviewFinding(f, state.SeverityP2); err != nil {
+	if err := validateReviewFinding(f, state.SeverityP2, nil); err != nil {
 		t.Fatalf("expected valid resolved finding to pass, got: %v", err)
 	}
 }
@@ -767,7 +767,7 @@ func TestValidateReviewFinding_LegacyEvidenceGrandfathered(t *testing.T) {
 	f := validResolvedFinding("f-res-6")
 	// Legacy flag bypasses all evidence checks.
 	f.ResolutionEvidence = &state.ResolutionEvidence{Legacy: true}
-	if err := validateReviewFinding(f, state.SeverityP2); err != nil {
+	if err := validateReviewFinding(f, state.SeverityP2, nil); err != nil {
 		t.Fatalf("expected legacy evidence to be grandfathered, got: %v", err)
 	}
 }
@@ -775,8 +775,50 @@ func TestValidateReviewFinding_LegacyEvidenceGrandfathered(t *testing.T) {
 func TestValidateReviewFinding_ResolvedWithoutRepairCycleIDBlocks(t *testing.T) {
 	f := validResolvedFinding("f-res-7")
 	f.ResolutionEvidence.RepairCycleID = ""
-	if err := validateReviewFinding(f, state.SeverityP2); err == nil || !strings.Contains(err.Error(), "missing repair_cycle_id") {
+	if err := validateReviewFinding(f, state.SeverityP2, nil); err == nil || !strings.Contains(err.Error(), "missing repair_cycle_id") {
 		t.Fatalf("expected missing repair_cycle_id error, got: %v", err)
+	}
+}
+
+func TestValidateResolutionEvidence_DiffOutsideOwnedPathsFails(t *testing.T) {
+	f := validResolvedFinding("f-scope-1")
+	// DiffRange.File is outside owned_paths → scope violation error.
+	f.ResolutionEvidence.DiffRanges = []state.DiffRange{
+		{File: "internal/other/module.go", StartLine: 1, EndLine: 10},
+	}
+	ownedPaths := []string{"internal/engine"}
+	err := validateReviewFinding(f, state.SeverityP2, ownedPaths)
+	if err == nil {
+		t.Fatal("expected scope violation error, got nil")
+	}
+	if !strings.Contains(err.Error(), "scope violation") {
+		t.Fatalf("expected 'scope violation' in error, got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "internal/other/module.go") {
+		t.Fatalf("expected out-of-scope file name in error, got: %v", err)
+	}
+}
+
+func TestValidateResolutionEvidence_DiffWithinOwnedPathsPasses(t *testing.T) {
+	f := validResolvedFinding("f-scope-2")
+	// DiffRange.File is within owned_paths → passes.
+	f.ResolutionEvidence.DiffRanges = []state.DiffRange{
+		{File: "internal/engine/closeout.go", StartLine: 1, EndLine: 50},
+	}
+	ownedPaths := []string{"internal/engine"}
+	if err := validateReviewFinding(f, state.SeverityP2, ownedPaths); err != nil {
+		t.Fatalf("expected in-scope diff to pass, got: %v", err)
+	}
+}
+
+func TestValidateResolutionEvidence_EmptyOwnedPathsSkipsBoundsCheck(t *testing.T) {
+	f := validResolvedFinding("f-scope-3")
+	// When owned_paths is empty, bounds check is skipped (no scope declared).
+	f.ResolutionEvidence.DiffRanges = []state.DiffRange{
+		{File: "anywhere/else.go", StartLine: 1, EndLine: 10},
+	}
+	if err := validateReviewFinding(f, state.SeverityP2, nil); err != nil {
+		t.Fatalf("expected empty owned_paths to skip bounds check, got: %v", err)
 	}
 }
 

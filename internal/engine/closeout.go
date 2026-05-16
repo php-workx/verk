@@ -423,7 +423,7 @@ func validateArtifactIntegrity(req closeoutRequest, currentRunID string) error {
 			return fmt.Errorf("review artifact run %q does not match current run %q", req.review.RunID, currentRunID)
 		}
 		for _, finding := range req.review.Findings {
-			if err := validateReviewFinding(finding, req.plan.EffectiveReviewThreshold); err != nil {
+			if err := validateReviewFinding(finding, req.plan.EffectiveReviewThreshold, req.plan.OwnedPaths); err != nil {
 				return err
 			}
 		}
@@ -648,7 +648,7 @@ func requiredValidationCoveragePassed(coverage state.ValidationCoverageArtifact)
 // Non-blocking findings may omit file/line (speculative/informational findings are
 // allowed without precise location), but a non-empty file that is whitespace-only
 // is always rejected as a programming error.
-func validateReviewFinding(f state.ReviewFinding, threshold state.Severity) error {
+func validateReviewFinding(f state.ReviewFinding, threshold state.Severity, ownedPaths []string) error {
 	if f.ID == "" {
 		return fmt.Errorf("review finding missing id")
 	}
@@ -677,7 +677,7 @@ func validateReviewFinding(f state.ReviewFinding, threshold state.Severity) erro
 	case "open":
 		return nil
 	case "resolved":
-		return validateResolutionEvidence(f)
+		return validateResolutionEvidence(f, ownedPaths)
 	case "waived":
 		if strings.TrimSpace(f.WaivedBy) == "" {
 			return fmt.Errorf("waived review finding %q missing waived_by", f.ID)
@@ -701,13 +701,15 @@ func validateReviewFinding(f state.ReviewFinding, threshold state.Severity) erro
 // Gate rules:
 //  1. ResolutionEvidence must be non-nil (or Legacy == true).
 //  2. DiffRanges must be non-empty.
-//  3. TestReferences must be non-empty; each must pass ValidateTestReference.
-//  4. RepairCycleID must be non-empty.
+//  3. Every DiffRange.File must lie within the ticket's owned_paths (scope
+//     violation — distinct from generic closeout failure; spec SR-4 rule 4).
+//  4. TestReferences must be non-empty; each must pass ValidateTestReference.
+//  5. RepairCycleID must be non-empty.
 //
 // TODO(P4-stretch): Validate that each TestReference actually exists in
 // the worktree by walking the AST. Deferred — requires build-time symbol
 // resolution which is out of scope for the foundational gate MVP.
-func validateResolutionEvidence(f state.ReviewFinding) error {
+func validateResolutionEvidence(f state.ReviewFinding, ownedPaths []string) error {
 	ev := f.ResolutionEvidence
 	if ev == nil {
 		return fmt.Errorf("resolved review finding %q missing resolution_evidence", f.ID)
@@ -717,6 +719,16 @@ func validateResolutionEvidence(f state.ReviewFinding) error {
 	}
 	if len(ev.DiffRanges) == 0 {
 		return fmt.Errorf("resolved review finding %q resolution_evidence has no diff_ranges", f.ID)
+	}
+	// Owned-paths bounds check: every DiffRange.File must be within scope.
+	// A diff outside scope is a scope violation — separate from generic
+	// closeout failure — so callers can distinguish the two error kinds.
+	if len(ownedPaths) > 0 {
+		for _, dr := range ev.DiffRanges {
+			if !fileInOwned(dr.File, ownedPaths) {
+				return fmt.Errorf("scope violation: resolved review finding %q resolution_evidence diff_range file %q is outside owned_paths", f.ID, dr.File)
+			}
+		}
 	}
 	if len(ev.TestReferences) == 0 {
 		return fmt.Errorf("resolved review finding %q resolution_evidence has no test_references", f.ID)
