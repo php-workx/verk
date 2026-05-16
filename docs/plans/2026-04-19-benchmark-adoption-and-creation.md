@@ -1,7 +1,8 @@
 # Benchmark Adoption and Creation Specification
 
-> **Status: Active / Planned.** Parent epic `ver-g9p2` and benchmark
-> implementation children remain open.
+> **Status: Backburner / Planned.** Parent epic `ver-g9p2` and benchmark
+> implementation children remain open, but this track is intentionally
+> deprioritized while runtime/tool stability work is addressed.
 
 > **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans
 > to implement this plan task-by-task.

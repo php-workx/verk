@@ -10,6 +10,8 @@ or ticket first, then update this file.
 - Implemented: feature track has landed; document is retained as the durable
   design/reference.
 - Planned: design exists, but no active implementation was found.
+- Backburner: design and tickets remain tracked, but the work is intentionally
+  deprioritized behind higher-risk tool reliability work.
 - Blocked: design exists, but another plan or capability must land first.
 - Reference: baseline or support spec that other plans build on.
 - Gap: repeatedly identified need, but no dedicated plan was found.
@@ -31,7 +33,8 @@ or ticket first, then update this file.
 | Per-worker review diffs | Implemented / Reference | [2026-04-20-per-worker-review-diffs.md](2026-04-20-per-worker-review-diffs.md) | no dedicated epic found in this index pass | Reviewers inspect the current worker attempt's delta instead of the whole dirty worktree. |
 | Recursive sub-epic execution | Implemented / No standalone plan | no dedicated plan found | `ver-vmgr` and children | Closed remediation track for recursive sub-epic review findings; a future standalone plan is only needed for new recursive execution scope. |
 | High-severity review findings | Implemented / No standalone plan | no dedicated plan found | `ver-wgxh` and children | Closed remediation track for claim safety, lease handling, runtime status normalization, verification environment behavior, and epic acceptance propagation. |
-| Benchmarking | Active / Planned | [2026-04-19-benchmark-adoption-and-creation.md](2026-04-19-benchmark-adoption-and-creation.md) | `ver-g9p2` and children | Public/private benchmark strategy, reproducibility, verifier integrity, flake taxonomy, cost accounting, and suite governance. |
+| Benchmarking | Backburner / Planned | [2026-04-19-benchmark-adoption-and-creation.md](2026-04-19-benchmark-adoption-and-creation.md) | `ver-g9p2` and children | Public/private benchmark strategy, reproducibility, verifier integrity, flake taxonomy, cost accounting, and suite governance. Keep the tickets open, but do not treat them as the active priority while runtime/tool reliability is being stabilized. |
+| Fabrikk llmcli runtime adapter integration | Planned / High priority | [2026-05-16-llmcli-runtime-adapter-integration.md](2026-05-16-llmcli-runtime-adapter-integration.md) | `fi-8ken` and children | Migrate Claude and Codex runtime execution through Fabrikk `llmcli`/`llmclient` while preserving Verk runtime names, artifacts, worktree isolation, intent support, and retry classification. |
 | Verk as skill | Planned | [2026-04-19-verk-as-skill-cross-agent.md](2026-04-19-verk-as-skill-cross-agent.md) | no active epic found in this index pass | Claude Code skill-mode foundation for verk primitives and artifact-compatible execution. |
 | Skill host portability | Blocked | [2026-04-19-verk-skill-host-portability.md](2026-04-19-verk-skill-host-portability.md) | no active epic found in this index pass | Extend skill-mode support beyond Claude Code after the v1 skill surface is available. |
 | Ticket quality pre-run gate | Implemented | [2026-04-21-ticket-quality-gate.md](2026-04-21-ticket-quality-gate.md) | no active epic found in this index pass | Deterministic ticket lint, planner-role review, traceability checks, and safe auto-repair for underspecified tickets. User-facing reference: [../ticket-quality-gate.md](../ticket-quality-gate.md). |
@@ -47,18 +50,23 @@ new escaped defect changes the risk profile.
 
 ### Current Priority Order
 
-1. Close the benchmark implementation track from
-   [2026-04-19-benchmark-adoption-and-creation.md](2026-04-19-benchmark-adoption-and-creation.md),
-   especially reproducibility, manifest/profile freezing, verifier integrity,
-   flake accounting, cache/workspace isolation, and cost provenance.
-2. Finish the remaining active pieces of
+1. Stabilize the coding-agent runtime path with
+   [2026-05-16-llmcli-runtime-adapter-integration.md](2026-05-16-llmcli-runtime-adapter-integration.md),
+   starting with shared `llmcli` bridge coverage for Claude, Codex, and intent
+   calls.
+2. Finish the remaining active tool-reliability pieces of
    [2026-04-19-impl-verify-improvements.md](2026-04-19-impl-verify-improvements.md),
    especially intent echo policy wiring/resume behavior and any compiled-constraint
    promotion work not covered by the implemented profile and review-gate pieces.
 3. Implement the Claude Code foundation in
    [2026-04-19-verk-as-skill-cross-agent.md](2026-04-19-verk-as-skill-cross-agent.md),
-   starting with the localhost HTTP daemon.
-4. Keep [2026-04-19-verk-skill-host-portability.md](2026-04-19-verk-skill-host-portability.md)
+   starting with the localhost HTTP daemon, after runtime execution is stable.
+4. Keep the benchmark implementation track from
+   [2026-04-19-benchmark-adoption-and-creation.md](2026-04-19-benchmark-adoption-and-creation.md)
+   on the backburner. Do not forget it; keep `ver-g9p2` and children as the
+   parked source of truth for reproducibility, verifier integrity, flake
+   accounting, cache/workspace isolation, and cost provenance.
+5. Keep [2026-04-19-verk-skill-host-portability.md](2026-04-19-verk-skill-host-portability.md)
    blocked until the v1 skill surface is real enough to audit against other
    host capabilities.
 
@@ -66,12 +74,15 @@ new escaped defect changes the risk profile.
 
 Safe parallel tracks:
 
-- Independent benchmark provider/reporting subtasks that do not share writer
-  files.
-- Intent echo adapter/prompt work, provided engine phase wiring is serialized
-  with active `ticket_run.go` changes.
-- Daemon state-file/startup-lock/auth work for the skill-mode plan, before
-  touching shared engine orchestration.
+- `llmclibridge` package implementation and runtime diagnostic documentation,
+  provided adapter rewrites are serialized per package.
+- Claude and Codex adapter rewrites can proceed separately only after the bridge
+  interface is stable; shared runtime types and prompt files should remain
+  serialized.
+- Intent echo policy wiring/resume work, provided engine phase wiring is
+  serialized with active `ticket_run.go` changes.
+- Daemon state-file/startup-lock/auth work for the skill-mode plan, after
+  runtime execution stability is no longer the active bottleneck.
 - Documentation and report rendering updates for implemented tracks.
 
 Coordinate carefully or serialize when work touches shared execution files:
@@ -80,11 +91,13 @@ Coordinate carefully or serialize when work touches shared execution files:
 - `internal/engine/epic_run.go`
 - `internal/state/types.go`
 - `internal/adapters/runtime/prompt.go`
+- `internal/adapters/runtime/types.go`
 - `internal/policy/config.go`
 - `internal/cli/run.go`
 
 Benchmarking, verk-as-skill, and skill host portability are useful tracks, but
-they should not outrank core run correctness and quality gates.
+they should not outrank core run correctness, runtime adapter stability, and
+quality gates.
 
 ## Review Materials
 
