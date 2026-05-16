@@ -1,5 +1,9 @@
 # Validation Coverage Artifacts
 
+> **Status: Reference / Implemented.** The schema is implemented in
+> `internal/state/validation_coverage.go` and consumed by ticket, wave, and
+> closeout artifacts.
+
 ## Purpose
 
 `verk run` must answer durable questions after any run:
@@ -16,7 +20,7 @@ information across ticket, wave, and epic scopes.
 
 This document is the durable schema reference for:
 
-- [`ver-rcgh`](../docs/plans/2026-04-19-verk-run-repair-oriented-gates.md) —
+- [`ver-rcgh`](2026-04-19-verk-run-repair-oriented-gates.md) —
   introduces these artifacts.
 - `ver-y29o` / `ver-1qru` / `ver-ssp3` / `ver-bks9` — consume them.
 - `ver-mbvz` / `ver-aw4j` — render them.

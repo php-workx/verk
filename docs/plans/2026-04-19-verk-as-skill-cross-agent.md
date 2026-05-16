@@ -83,6 +83,10 @@ The plan's self-review retains an open finding about residual fabrication risk (
 
 Long-lived daemon per workspace, reachable via HTTP on localhost with bearer auth. Session-bound so multiple concurrent invocations can't step on each other.
 
+Resolved transport decision: v1 uses HTTP on a localhost-bound random port.
+Unix sockets, stdio, and remote/shared daemon transports are deferred out of
+this plan.
+
 ### State file
 
 `.verk/daemon.json`, atomic write (tmp + rename), mode `0600`:

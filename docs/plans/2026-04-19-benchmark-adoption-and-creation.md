@@ -1,5 +1,8 @@
 # Benchmark Adoption and Creation Specification
 
+> **Status: Active / Planned.** Parent epic `ver-g9p2` and benchmark
+> implementation children remain open.
+
 > **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans
 > to implement this plan task-by-task.
 
@@ -245,10 +248,25 @@ without reopening the whole design.
 by default. That exercises the same intake, artifact, ticket, review, repair,
 resume, and closeout paths as production `verk run`.
 
+The first implementation materializes one synthetic ticket per benchmark task.
+It must not create a suite-level or task-level epic solely to satisfy the
+benchmark runner. Each benchmark task ticket is the execution unit, and the
+runner invokes the normal direct-ticket lifecycle for that unit. Benchmark
+tasks that intentionally exercise epic or wave behavior must declare that shape
+explicitly in the task fixture rather than inheriting it from the benchmark
+harness.
+
 In-memory tasks are allowed only for unit tests of provider parsing, matrix
 expansion, scoring, and report rendering. They should not be the default
 execution path for benchmark runs because they would bypass important `verk`
 integration behavior.
+
+Synthetic benchmark tickets skip the ticket quality pre-run gate. The task
+manifest and provider contract are the source of ticket quality for benchmark
+fixtures; running the planner gate against generated benchmark tickets would
+measure planner-review behavior instead of the benchmark task. `verk-native`
+tasks that need to test the quality gate should model that as an explicit
+fixture and assertion.
 
 ### Benchmark Modes
 
@@ -366,6 +384,11 @@ Required fields:
 - timeout
 - allowed network policy
 - allowed files or workspace scope
+
+The synthetic ticket's `owned_paths` are copied from the task spec's declared
+allowed paths. Providers must fail task preparation when a task omits allowed
+paths for a mutable repository workspace. The benchmark runner should not infer
+owned paths from observed diffs, verifier commands, or repository layout.
 
 ### Agent Profile
 

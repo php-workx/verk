@@ -3,7 +3,7 @@
 ## Metadata
 
 - Date: 2026-04-21
-- Status: planned
+- Status: implemented / reference
 - Scope: Role-based worker profiles — taxonomy, detection, frontmatter field, pre-run validation, rationalization injection, and prompt placement.
 - Out of scope: Reviewer role specialisation (separate concern); compiled-constraint promotion (P7 in impl-verify-improvements); wave/epic-level profiles.
 - Related: [Rationalizations.md](Rationalizations.md) (rationalization catalog), [impl-verify-improvements](2026-04-19-impl-verify-improvements.md) P3 (anti-rationalization injection), [ticket-quality-gate](2026-04-21-ticket-quality-gate.md) (pre-run validation home).
