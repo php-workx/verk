@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -195,6 +196,9 @@ func doRunTicket(w, errw io.Writer, ticketID string) (runID string, err error) {
 	if err != nil {
 		return "", err
 	}
+	if _, err := engine.ResolveTicketProfile(filepath.Join(repoRoot, ".tickets"), &ticket); err != nil {
+		return "", err
+	}
 	runID = newRunID(ticketID)
 	plan, err := engine.BuildPlanArtifact(ticket, cfg)
 	if err != nil {
@@ -313,6 +317,11 @@ func doRunTicket(w, errw io.Writer, ticketID string) (runID string, err error) {
 		ticket.Status = epos.StatusBlocked
 		run.Status = state.EpicRunStatusBlocked
 		run.CurrentPhase = state.TicketPhaseBlocked
+		// Surface the quality-gate block details before the generic status line
+		// so the operator sees which findings blocked dispatch.
+		if strings.Contains(result.Snapshot.BlockReason, ticketQualityGateMarker) {
+			printTicketQualityBlock(w, repoRoot, runID)
+		}
 	}
 	run.UpdatedAt = time.Now().UTC()
 	if err := finalizeRun(

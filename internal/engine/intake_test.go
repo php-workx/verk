@@ -1,6 +1,9 @@
 package engine
 
 import (
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 	"verk/internal/adapters/ticketstore/epos"
 	"verk/internal/policy"
@@ -146,5 +149,100 @@ func TestBuildPlanArtifact_RuntimePreferenceOverridesSnapshotRuntime(t *testing.
 	}
 	if artifact.ReviewerProfile.Model != "opus" || artifact.ReviewerProfile.Reasoning != "xhigh" {
 		t.Fatalf("expected reviewer model/reasoning to stay policy-owned, got %+v", artifact.ReviewerProfile)
+	}
+}
+
+// writeMinimalTicketFile writes a minimal valid ticket markdown file to dir/<id>.md
+// and returns the path. The ticket has no profile field by default.
+func writeMinimalTicketFile(t *testing.T, dir, id, extraFrontmatter string) string {
+	t.Helper()
+	path := filepath.Join(dir, id+".md")
+	content := "---\nid: " + id + "\nstatus: open\nowned_paths:\n  - internal/foo.go\n" + extraFrontmatter + "---\n# " + id + "\n\nbody text\n"
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatalf("write ticket file: %v", err)
+	}
+	return path
+}
+
+func TestResolveTicketProfile_DetectsAndWritesBackWhenEmpty(t *testing.T) {
+	dir := t.TempDir()
+	ticketID := "ver-detect"
+	writeMinimalTicketFile(t, dir, ticketID, "")
+
+	ticket, err := epos.LoadTicket(filepath.Join(dir, ticketID+".md"))
+	if err != nil {
+		t.Fatalf("load ticket: %v", err)
+	}
+	if ticket.Profile != "" {
+		t.Fatalf("expected empty profile before detection, got %q", ticket.Profile)
+	}
+
+	profile, err := ResolveTicketProfile(dir, &ticket)
+	if err != nil {
+		t.Fatalf("ResolveTicketProfile returned error: %v", err)
+	}
+	if profile == "" {
+		t.Fatal("expected non-empty detected profile")
+	}
+	// ticket struct must be updated in-place
+	if ticket.Profile != profile {
+		t.Fatalf("ticket.Profile = %q, want %q", ticket.Profile, profile)
+	}
+
+	// file on disk must now contain the profile
+	saved, err := epos.LoadTicket(filepath.Join(dir, ticketID+".md"))
+	if err != nil {
+		t.Fatalf("reload ticket: %v", err)
+	}
+	if saved.Profile != profile {
+		t.Fatalf("saved profile = %q, want %q", saved.Profile, profile)
+	}
+}
+
+func TestResolveTicketProfile_ValidatesExplicitProfile(t *testing.T) {
+	dir := t.TempDir()
+	ticketID := "ver-explicit"
+	writeMinimalTicketFile(t, dir, ticketID, "profile: contract-engineer\n")
+
+	ticket, err := epos.LoadTicket(filepath.Join(dir, ticketID+".md"))
+	if err != nil {
+		t.Fatalf("load ticket: %v", err)
+	}
+
+	profile, err := ResolveTicketProfile(dir, &ticket)
+	if err != nil {
+		t.Fatalf("ResolveTicketProfile returned error: %v", err)
+	}
+	if profile != epos.ProfileContract {
+		t.Fatalf("expected %q, got %q", epos.ProfileContract, profile)
+	}
+
+	// file must NOT have been rewritten — stat mtime check is fragile on fast
+	// systems, so reload and verify profile is unchanged instead
+	saved, err := epos.LoadTicket(filepath.Join(dir, ticketID+".md"))
+	if err != nil {
+		t.Fatalf("reload ticket: %v", err)
+	}
+	if saved.Profile != epos.ProfileContract {
+		t.Fatalf("saved profile = %q, want %q", epos.ProfileContract, saved.Profile)
+	}
+}
+
+func TestResolveTicketProfile_RejectsUnknownProfile(t *testing.T) {
+	dir := t.TempDir()
+	ticketID := "ver-bad-profile"
+	writeMinimalTicketFile(t, dir, ticketID, "profile: wizard\n")
+
+	ticket, err := epos.LoadTicket(filepath.Join(dir, ticketID+".md"))
+	if err != nil {
+		t.Fatalf("load ticket: %v", err)
+	}
+
+	_, err = ResolveTicketProfile(dir, &ticket)
+	if err == nil {
+		t.Fatal("expected error for unknown profile, got nil")
+	}
+	if !strings.Contains(err.Error(), "unknown_profile") {
+		t.Fatalf("error %q does not contain 'unknown_profile'", err.Error())
 	}
 }

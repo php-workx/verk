@@ -3,6 +3,7 @@ package engine
 import (
 	"crypto/sha256"
 	"fmt"
+	"path/filepath"
 	"strings"
 	"time"
 	"verk/internal/adapters/ticketstore/epos"
@@ -46,6 +47,7 @@ func BuildPlanArtifact(t epos.Ticket, cfg policy.Config) (state.PlanArtifact, er
 		OwnedPaths:               append([]string(nil), t.OwnedPaths...),
 		ReviewThreshold:          plannedThreshold,
 		EffectiveReviewThreshold: effective,
+		AgentProfile:             t.Profile,
 		// RuntimePreference is ticket-level routing only — it can swap the
 		// runtime identifier (e.g. force codex for a ticket) but MUST NOT
 		// influence model or reasoning selection. Ticket frontmatter `model`
@@ -173,4 +175,24 @@ func validateSeverity(severity state.Severity) error {
 	default:
 		return fmt.Errorf("severity must be one of P0, P1, P2, P3, or P4")
 	}
+}
+
+// ResolveTicketProfile ensures the ticket has a valid agent profile. If the
+// profile is empty, it is detected from ticket content and written back to the
+// ticket file. If the profile is already set, it is validated and an error is
+// returned for unknown values. Returns the resolved profile name.
+func ResolveTicketProfile(ticketsDir string, t *epos.Ticket) (string, error) {
+	if t.Profile != "" {
+		if err := epos.ValidateProfile(t.Profile); err != nil {
+			return "", fmt.Errorf("unknown_profile: %w", err)
+		}
+		return t.Profile, nil
+	}
+	detected := epos.DetectProfile(*t)
+	t.Profile = detected
+	path := filepath.Join(ticketsDir, t.ID+".md")
+	if err := epos.SaveTicket(path, *t); err != nil {
+		return "", fmt.Errorf("write back profile: %w", err)
+	}
+	return detected, nil
 }

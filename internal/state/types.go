@@ -130,6 +130,10 @@ type PlanArtifact struct {
 	ReviewThreshold          Severity        `json:"review_threshold"`
 	EffectiveReviewThreshold Severity        `json:"effective_review_threshold"`
 	RuntimePreference        string          `json:"runtime_preference"`
+	// AgentProfile is the resolved agent role profile (e.g. "backend-engineer")
+	// for this ticket. Set during intake: detected automatically when the
+	// ticket's profile field is empty, or validated and copied when explicit.
+	AgentProfile string `json:"agent_profile,omitempty"`
 	// WorkerProfile and ReviewerProfile snapshot the effective role profiles
 	// (runtime/model/reasoning) as of intake. They are informational only:
 	// retry and resume always re-resolve profiles from the current config,

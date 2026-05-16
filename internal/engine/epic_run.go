@@ -1577,6 +1577,13 @@ func executeEpicTicket(ctx context.Context, req RunEpicRequest, cfg policy.Confi
 		})
 	}
 
+	ticketsDir := filepath.Join(req.RepoRoot, ".tickets")
+	if _, profileErr := ResolveTicketProfile(ticketsDir, &ticket); profileErr != nil {
+		outcome.err = profileErr
+		outcome.phase = snapshotPhaseOrImplement(req.RepoRoot, req.RunID, ticketID)
+		return outcome
+	}
+
 	plan, err := BuildPlanArtifact(ticket, cfg)
 	if err != nil {
 		outcome.err = err
