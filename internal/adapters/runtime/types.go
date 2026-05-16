@@ -53,20 +53,23 @@ const (
 )
 
 type WorkerRequest struct {
-	RunID             string              `json:"run_id,omitempty"`
-	TicketID          string              `json:"ticket_id,omitempty"`
-	WaveID            string              `json:"wave_id,omitempty"`
-	LeaseID           string              `json:"lease_id"`
-	Attempt           int                 `json:"attempt,omitempty"`
-	Runtime           string              `json:"runtime,omitempty"`
-	Model             string              `json:"model,omitempty"`
-	Reasoning         string              `json:"reasoning,omitempty"`
-	FallbackReason    string              `json:"fallback_reason,omitempty"`
-	WorktreePath      string              `json:"worktree_path,omitempty"`
-	InputArtifactPath string              `json:"input_artifact_path,omitempty"`
-	Instructions      string              `json:"instructions,omitempty"`
-	ExecutionConfig   ExecutionConfig     `json:"execution_config,omitempty"`
-	OnProgress        func(detail string) `json:"-"` // called with tool-use summaries during execution
+	RunID             string `json:"run_id,omitempty"`
+	TicketID          string `json:"ticket_id,omitempty"`
+	WaveID            string `json:"wave_id,omitempty"`
+	LeaseID           string `json:"lease_id"`
+	Attempt           int    `json:"attempt,omitempty"`
+	Runtime           string `json:"runtime,omitempty"`
+	Model             string `json:"model,omitempty"`
+	Reasoning         string `json:"reasoning,omitempty"`
+	FallbackReason    string `json:"fallback_reason,omitempty"`
+	WorktreePath      string `json:"worktree_path,omitempty"`
+	InputArtifactPath string `json:"input_artifact_path,omitempty"`
+	Instructions      string `json:"instructions,omitempty"`
+	// Profile is the agent role profile for this ticket (e.g. "security-engineer").
+	// Empty string means no profile framing is injected into the prompt.
+	Profile         string              `json:"profile,omitempty"`
+	ExecutionConfig ExecutionConfig     `json:"execution_config,omitempty"`
+	OnProgress      func(detail string) `json:"-"` // called with tool-use summaries during execution
 }
 
 type ReviewRequest struct {

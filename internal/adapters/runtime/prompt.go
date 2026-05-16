@@ -104,6 +104,8 @@ If no issues are found, set review_status to "passed" and findings to an empty a
 }
 
 // BuildWorkerPrompt constructs the user prompt for an implementation worker.
+// If req.Profile is set, the profile's rationalization framing is injected
+// after the ticket content and before the standards block.
 func BuildWorkerPrompt(req WorkerRequest) string {
 	var b strings.Builder
 
@@ -128,6 +130,12 @@ func BuildWorkerPrompt(req WorkerRequest) string {
 
 	if req.InputArtifactPath != "" {
 		fmt.Fprintf(&b, "\nPrior artifact: %s\n", req.InputArtifactPath)
+	}
+
+	if profileBlock := BuildProfilePrompt(req.Profile); profileBlock != "" {
+		b.WriteString("\n### Role Profile\n\n")
+		b.WriteString(profileBlock)
+		b.WriteString("\n")
 	}
 
 	return b.String()

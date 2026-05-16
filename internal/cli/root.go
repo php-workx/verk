@@ -51,6 +51,7 @@ func newRootCmd() *cobra.Command {
 	initInitCmd(root)
 	initInspectCmd(root)
 	initLearnCmd(root)
+	initBenchCmd(root)
 
 	return root
 }

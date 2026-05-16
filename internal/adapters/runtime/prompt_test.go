@@ -712,3 +712,77 @@ func TestBuildPlannerReviewPrompt_OmitsPromotedRulesSectionWhenEmpty(t *testing.
 		t.Errorf("expected 'Lessons From Prior' section to be absent when PromotedRules is empty:\n%s", prompt)
 	}
 }
+
+// Profile prompt tests.
+
+func TestBuildProfilePrompt_SecurityContainsCredentialKeyword(t *testing.T) {
+	profile := BuildProfilePrompt("security-engineer")
+	if !strings.Contains(strings.ToLower(profile), "credential") {
+		t.Fatalf("expected 'credential' in security-engineer profile:\n%s", profile)
+	}
+}
+
+func TestBuildProfilePrompt_ContractContainsExitCode(t *testing.T) {
+	profile := BuildProfilePrompt("contract-engineer")
+	if !strings.Contains(strings.ToLower(profile), "exit code") {
+		t.Fatalf("expected 'exit code' in contract-engineer profile:\n%s", profile)
+	}
+}
+
+func TestBuildProfilePrompt_UnknownReturnsEmpty(t *testing.T) {
+	profile := BuildProfilePrompt("unknown-role")
+	if profile != "" {
+		t.Fatalf("expected empty string for unknown profile, got %q", profile)
+	}
+}
+
+func TestBuildWorkerPrompt_ProfileBlockAppearsAfterTicketContentBeforeStandards(t *testing.T) {
+	req := WorkerRequest{
+		TicketID:     "VER-100",
+		LeaseID:      "lease-100",
+		Instructions: "Add cleanup subcommand",
+		Profile:      "contract-engineer",
+	}
+	prompt := BuildWorkerPrompt(req)
+
+	ticketIdx := strings.Index(prompt, "Add cleanup subcommand")
+	profileIdx := strings.Index(prompt, "contract-engineer")
+	roleProfileIdx := strings.Index(prompt, "### Role Profile")
+
+	if ticketIdx < 0 {
+		t.Fatal("expected ticket content 'Add cleanup subcommand' in prompt")
+	}
+	if profileIdx < 0 {
+		t.Fatal("expected 'contract-engineer' in prompt")
+	}
+	if roleProfileIdx < 0 {
+		t.Fatal("expected '### Role Profile' section in prompt")
+	}
+	if ticketIdx > profileIdx {
+		t.Fatalf("expected ticket content (pos %d) to appear before profile block (pos %d)", ticketIdx, profileIdx)
+	}
+}
+
+func TestBuildWorkerPrompt_EmptyProfileSkipsBlock(t *testing.T) {
+	req := WorkerRequest{
+		TicketID:     "VER-101",
+		LeaseID:      "lease-101",
+		Instructions: "Some task",
+		Profile:      "",
+	}
+	prompt := BuildWorkerPrompt(req)
+
+	// None of the profile-specific markers should appear.
+	for _, marker := range []string{
+		"security-engineer",
+		"contract-engineer",
+		"frontend-engineer",
+		"backend-engineer",
+		"### Role Profile",
+		"Rationalizations to resist",
+	} {
+		if strings.Contains(prompt, marker) {
+			t.Errorf("expected no profile content in prompt with empty profile, but found %q", marker)
+		}
+	}
+}

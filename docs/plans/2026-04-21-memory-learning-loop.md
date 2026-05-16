@@ -1,5 +1,7 @@
 # Memory Learning Loop Implementation Plan
 
+> **Status: Implemented.** See [docs/memory-learning-loop.md](../memory-learning-loop.md).
+
 > **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
 
 **Goal:** Capture escaped defects from failed or blocked verk runs and turn them into reviewable, reusable ticket-quality knowledge.

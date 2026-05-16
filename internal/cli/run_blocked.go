@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"verk/internal/adapters/runtime"
@@ -16,6 +17,49 @@ import (
 
 	term "github.com/charmbracelet/x/term"
 )
+
+// ticketQualityGateMarker is the prefix embedded in block reasons and
+// BlockedRunError.Cause strings when a ticket quality gate blocks a run.
+// It is a named constant so callers can do a cheap strings.Contains check
+// without importing the engine package's internals.
+const ticketQualityGateMarker = "ticket quality gate blocked"
+
+// printTicketQualityBlock reads the ticket-quality.json artifact for runID and
+// writes the structured block summary to w. The output format follows the spec:
+//
+//	Ticket quality gate blocked before worker dispatch
+//	  <ticket-id> <severity> <finding-code>
+//	  …
+//	Artifact: .verk/runs/<run-id>/ticket-quality.json
+//	Retry: verk inspect epic <root-ticket-id> --fix
+//
+// If the artifact cannot be read (e.g. it is missing because the gate ran
+// on a single ticket without a run-id), a one-line fallback is printed instead.
+// The function always writes at least one line — callers should not guard it
+// with an "if artifact exists" check.
+func printTicketQualityBlock(w io.Writer, repoRoot, runID string) {
+	artifactPath := filepath.Join(repoRoot, ".verk", "runs", runID, "ticket-quality.json")
+	relPath := filepath.Join(".verk", "runs", runID, "ticket-quality.json")
+
+	var qa state.TicketQualityArtifact
+	if err := state.LoadJSON(artifactPath, &qa); err != nil {
+		_, _ = fmt.Fprintln(w, "Ticket quality gate blocked before worker dispatch")
+		_, _ = fmt.Fprintf(w, "  (artifact not available: %v)\n", err)
+		return
+	}
+
+	_, _ = fmt.Fprintln(w, "Ticket quality gate blocked before worker dispatch")
+	for _, f := range qa.Findings {
+		if f.Disposition == "pass" {
+			continue
+		}
+		_, _ = fmt.Fprintf(w, "  %s %s %s\n", f.TicketID, f.Severity, f.Code)
+	}
+	_, _ = fmt.Fprintf(w, "Artifact: %s\n", relPath)
+	if qa.RootTicketID != "" {
+		_, _ = fmt.Fprintf(w, "Retry: verk inspect epic %s --fix\n", qa.RootTicketID)
+	}
+}
 
 // blockedRunInteractor is the subset of os.File capabilities needed to
 // interactively prompt the operator after a blocked epic run. It is factored
@@ -522,6 +566,14 @@ func handleBlockedEpicRun(
 	cfg contextCfgForResume,
 	blocked *engine.BlockedRunError,
 ) (retried bool, err error) {
+	// Quality-gate blocks have a Cause containing the gate marker and no
+	// individual BlockedTickets. Render the structured quality-gate summary
+	// to stdout (not errw) so operators can pipe it; the generic guidance
+	// path handles all other block variants.
+	if blocked.Cause != nil && strings.Contains(blocked.Cause.Error(), ticketQualityGateMarker) {
+		printTicketQualityBlock(w, repoRoot, blocked.RunID)
+		return false, nil
+	}
 	printBlockedRunGuidance(errw, blocked)
 
 	interactor := blockedRunInteractorFor()
