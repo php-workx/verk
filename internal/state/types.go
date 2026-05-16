@@ -1,6 +1,9 @@
 package state
 
-import "time"
+import (
+	"fmt"
+	"time"
+)
 
 type (
 	TicketPhase   string
@@ -226,18 +229,71 @@ type VerificationArtifact struct {
 	ValidationCoverage *ValidationCoverageArtifact `json:"validation_coverage,omitempty"`
 }
 
+// ResolutionEvidence documents how a review finding was resolved by a
+// repair worker. Required when a finding's disposition is "resolved".
+type ResolutionEvidence struct {
+	DiffRanges     []DiffRange     `json:"diff_ranges"`
+	TestReferences []TestReference `json:"test_references"`
+	RepairCycleID  string          `json:"repair_cycle_id"`
+	ResolvedAt     time.Time       `json:"resolved_at"`
+	Legacy         bool            `json:"legacy,omitempty"` // migration marker only
+}
+
+// DiffRange identifies a contiguous changed region in a file.
+type DiffRange struct {
+	File      string `json:"file"`
+	StartLine int    `json:"start_line"`
+	EndLine   int    `json:"end_line"`
+}
+
+// TestReference is a normalized pointer to a test or assertion. Free-form
+// strings are rejected by the closeout gate to prevent reviewers from
+// accepting unverifiable claims.
+type TestReference struct {
+	Kind    string `json:"kind"`              // "test_function" | "file_line"
+	Package string `json:"package,omitempty"` // for test_function
+	Name    string `json:"name,omitempty"`    // for test_function
+	File    string `json:"file,omitempty"`    // for file_line
+	Line    int    `json:"line,omitempty"`    // for file_line
+}
+
+// ValidateTestReference returns nil for a well-formed reference, error otherwise.
+func ValidateTestReference(r TestReference) error {
+	switch r.Kind {
+	case "test_function":
+		if r.Package == "" {
+			return fmt.Errorf("test_function reference missing package")
+		}
+		if r.Name == "" {
+			return fmt.Errorf("test_function reference missing name")
+		}
+		return nil
+	case "file_line":
+		if r.File == "" {
+			return fmt.Errorf("file_line reference missing file")
+		}
+		if r.Line <= 0 {
+			return fmt.Errorf("file_line reference missing line")
+		}
+		return nil
+	default:
+		return fmt.Errorf("unknown test reference kind %q; must be one of: test_function, file_line", r.Kind)
+	}
+}
+
 type ReviewFinding struct {
-	ID              string    `json:"id"`
-	Severity        Severity  `json:"severity"`
-	Title           string    `json:"title"`
-	Body            string    `json:"body"`
-	File            string    `json:"file,omitempty"`
-	Line            int       `json:"line,omitempty"`
-	Disposition     string    `json:"disposition"`
-	WaivedBy        string    `json:"waived_by,omitempty"`
-	WaivedAt        time.Time `json:"waived_at,omitempty"`
-	WaiverReason    string    `json:"waiver_reason,omitempty"`
-	WaiverExpiresAt time.Time `json:"waiver_expires_at,omitempty"`
+	ID                 string              `json:"id"`
+	Severity           Severity            `json:"severity"`
+	Title              string              `json:"title"`
+	Body               string              `json:"body"`
+	File               string              `json:"file,omitempty"`
+	Line               int                 `json:"line,omitempty"`
+	Disposition        string              `json:"disposition"`
+	WaivedBy           string              `json:"waived_by,omitempty"`
+	WaivedAt           time.Time           `json:"waived_at,omitempty"`
+	WaiverReason       string              `json:"waiver_reason,omitempty"`
+	WaiverExpiresAt    time.Time           `json:"waiver_expires_at,omitempty"`
+	ResolutionEvidence *ResolutionEvidence `json:"resolution_evidence,omitempty"`
 }
 
 type ReviewFindingsArtifact struct {
@@ -401,4 +457,16 @@ type ClaimArtifact struct {
 	ReleaseReason         string    `json:"release_reason,omitempty"`
 	State                 string    `json:"state"`
 	LastSeenLiveClaimPath string    `json:"last_seen_live_claim_path,omitempty"`
+}
+
+// FreezeArtifact records the owned_paths edit guard that was active for
+// a run at orchestration start. Persisted at
+// .verk/runs/<run-id>/tickets/<ticket-id>/freeze.json.
+type FreezeArtifact struct {
+	ArtifactMeta
+	RunID        string    `json:"run_id"`
+	TicketID     string    `json:"ticket_id"`
+	AllowedPaths []string  `json:"allowed_paths"`
+	Active       bool      `json:"active"`
+	StartedAt    time.Time `json:"started_at"`
 }

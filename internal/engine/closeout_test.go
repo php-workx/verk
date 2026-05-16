@@ -668,6 +668,16 @@ func baseCloseoutRequest() closeoutRequest {
 				File:        "internal/engine/closeout.go",
 				Line:        10,
 				Disposition: "resolved",
+				ResolutionEvidence: &state.ResolutionEvidence{
+					DiffRanges: []state.DiffRange{
+						{File: "internal/engine/closeout.go", StartLine: 1, EndLine: 50},
+					},
+					TestReferences: []state.TestReference{
+						{Kind: "test_function", Package: "engine", Name: "TestBaseCloseout"},
+					},
+					RepairCycleID: "cycle-1",
+					ResolvedAt:    now,
+				},
 			},
 		},
 		BlockingFindings:         []string{},
@@ -681,6 +691,92 @@ func baseCloseoutRequest() closeoutRequest {
 		verification:      verification,
 		review:            review,
 		requiredArtifacts: []string{"verification.json", "review-findings.json"},
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Resolution evidence gate tests
+// ---------------------------------------------------------------------------
+
+func validResolvedFinding(id string) state.ReviewFinding {
+	now := fixedTime()
+	return state.ReviewFinding{
+		ID:          id,
+		Severity:    state.SeverityP3,
+		Title:       "resolved finding",
+		Body:        "resolved finding body",
+		File:        "internal/engine/closeout.go",
+		Line:        10,
+		Disposition: "resolved",
+		ResolutionEvidence: &state.ResolutionEvidence{
+			DiffRanges: []state.DiffRange{
+				{File: "internal/engine/closeout.go", StartLine: 1, EndLine: 50},
+			},
+			TestReferences: []state.TestReference{
+				{Kind: "test_function", Package: "engine", Name: "TestSomething"},
+			},
+			RepairCycleID: "cycle-1",
+			ResolvedAt:    now,
+		},
+	}
+}
+
+func TestValidateReviewFinding_ResolvedWithoutEvidenceBlocks(t *testing.T) {
+	f := validResolvedFinding("f-res-1")
+	f.ResolutionEvidence = nil
+	if err := validateReviewFinding(f, state.SeverityP2); err == nil || !strings.Contains(err.Error(), "missing resolution_evidence") {
+		t.Fatalf("expected missing resolution_evidence error, got: %v", err)
+	}
+}
+
+func TestValidateReviewFinding_ResolvedWithEmptyDiffRangesBlocks(t *testing.T) {
+	f := validResolvedFinding("f-res-2")
+	f.ResolutionEvidence.DiffRanges = nil
+	if err := validateReviewFinding(f, state.SeverityP2); err == nil || !strings.Contains(err.Error(), "no diff_ranges") {
+		t.Fatalf("expected no diff_ranges error, got: %v", err)
+	}
+}
+
+func TestValidateReviewFinding_ResolvedWithEmptyTestReferencesBlocks(t *testing.T) {
+	f := validResolvedFinding("f-res-3")
+	f.ResolutionEvidence.TestReferences = nil
+	if err := validateReviewFinding(f, state.SeverityP2); err == nil || !strings.Contains(err.Error(), "no test_references") {
+		t.Fatalf("expected no test_references error, got: %v", err)
+	}
+}
+
+func TestValidateReviewFinding_ResolvedWithMalformedTestReferenceBlocks(t *testing.T) {
+	f := validResolvedFinding("f-res-4")
+	// test_function missing Name
+	f.ResolutionEvidence.TestReferences = []state.TestReference{
+		{Kind: "test_function", Package: "engine"},
+	}
+	if err := validateReviewFinding(f, state.SeverityP2); err == nil || !strings.Contains(err.Error(), "missing name") {
+		t.Fatalf("expected missing name error, got: %v", err)
+	}
+}
+
+func TestValidateReviewFinding_ResolvedWithValidEvidencePasses(t *testing.T) {
+	f := validResolvedFinding("f-res-5")
+	if err := validateReviewFinding(f, state.SeverityP2); err != nil {
+		t.Fatalf("expected valid resolved finding to pass, got: %v", err)
+	}
+}
+
+func TestValidateReviewFinding_LegacyEvidenceGrandfathered(t *testing.T) {
+	f := validResolvedFinding("f-res-6")
+	// Legacy flag bypasses all evidence checks.
+	f.ResolutionEvidence = &state.ResolutionEvidence{Legacy: true}
+	if err := validateReviewFinding(f, state.SeverityP2); err != nil {
+		t.Fatalf("expected legacy evidence to be grandfathered, got: %v", err)
+	}
+}
+
+func TestValidateReviewFinding_ResolvedWithoutRepairCycleIDBlocks(t *testing.T) {
+	f := validResolvedFinding("f-res-7")
+	f.ResolutionEvidence.RepairCycleID = ""
+	if err := validateReviewFinding(f, state.SeverityP2); err == nil || !strings.Contains(err.Error(), "missing repair_cycle_id") {
+		t.Fatalf("expected missing repair_cycle_id error, got: %v", err)
 	}
 }
 
