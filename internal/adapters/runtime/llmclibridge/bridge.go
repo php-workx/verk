@@ -4,9 +4,11 @@ package llmclibridge
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -96,6 +98,12 @@ type Result struct {
 	Usage       *llmclient.Usage
 }
 
+type RuntimeDiagnostic struct {
+	Runtime   string
+	Available bool
+	Details   string
+}
+
 func NewBackend(cfg BackendConfig) (llmclient.Backend, error) {
 	if strings.TrimSpace(cfg.BackendName) == "" {
 		return nil, fmt.Errorf("llmcli backend name is empty")
@@ -169,7 +177,7 @@ func (b *Bridge) Run(ctx context.Context, req Request) (Result, error) {
 	opts := requestOptions(req, env, capture.Append)
 	events, err := backend.Stream(ctx, requestContext(req), opts...)
 	if err != nil {
-		return Result{}, err
+		return Result{}, sanitizeRuntimeError(req.RuntimeName, err)
 	}
 
 	result := collectEvents(events, req.OnProgress)
@@ -198,6 +206,43 @@ func (b *Bridge) CheckAvailability(ctx context.Context, runtimeName, command str
 		return fmt.Errorf("%s unavailable: %s", runtimeName, detail)
 	}
 	return nil
+}
+
+func (b *Bridge) DiagnoseRuntime(ctx context.Context, runtimeName, command string) RuntimeDiagnostic {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	runtimeName = strings.TrimSpace(runtimeName)
+	diag := RuntimeDiagnostic{Runtime: runtimeName}
+
+	cfg, err := ResolveBackendConfig(runtimeName, command)
+	if err != nil {
+		diag.Details = resolveDiagnosticDetail(runtimeName, command, err)
+		return diag
+	}
+	diag.Runtime = cfg.RuntimeName
+
+	backend, err := b.newBackend(cfg)
+	if err != nil {
+		diag.Details = sanitizeRuntimeDetail(cfg.RuntimeName, err)
+		return diag
+	}
+	defer func() { _ = backend.Close() }()
+
+	if err := checkRequiredRuntimeOptions(cfg.RuntimeName, backend); err != nil {
+		diag.Details = err.Error()
+		return diag
+	}
+
+	ready := backend.Ready(ctx)
+	if ready.State != llmclient.ReadyOK {
+		diag.Details = readinessDiagnosticDetail(cfg.RuntimeName, ready)
+		return diag
+	}
+
+	diag.Available = true
+	diag.Details = "ready"
+	return diag
 }
 
 func requestContext(req Request) *llmclient.Context {
@@ -243,6 +288,141 @@ func requestOptions(req Request, env []string, capture llmclient.RawCaptureFunc)
 		}
 	}
 	return opts
+}
+
+type capabilitiesBackend interface {
+	Capabilities() llmclient.Capabilities
+}
+
+func checkRequiredRuntimeOptions(runtimeName string, backend llmclient.Backend) error {
+	provider, ok := backend.(capabilitiesBackend)
+	if !ok {
+		return nil
+	}
+
+	caps := provider.Capabilities()
+	unsupported := make([]llmclient.OptionName, 0)
+	for _, name := range requiredRuntimeOptions(runtimeName) {
+		if caps.OptionSupport[name] == llmclient.OptionSupportNone || caps.OptionSupport[name] == "" {
+			unsupported = append(unsupported, name)
+		}
+	}
+	if len(unsupported) == 0 {
+		return nil
+	}
+	return &runtimeUnsupportedOptionError{runtimeName: runtimeName, options: unsupported}
+}
+
+func requiredRuntimeOptions(runtimeName string) []llmclient.OptionName {
+	opts := []llmclient.OptionName{
+		llmclient.OptionWorkingDirectory,
+		llmclient.OptionEnvironment,
+		llmclient.OptionTimeout,
+		llmclient.OptionRawCapture,
+	}
+	if strings.TrimSpace(runtimeName) == RuntimeCodex {
+		opts = append(opts,
+			llmclient.OptionCodexJSONL,
+			llmclient.OptionReasoningEffort,
+		)
+	}
+	return opts
+}
+
+type runtimeUnsupportedOptionError struct {
+	runtimeName string
+	options     []llmclient.OptionName
+}
+
+func (e *runtimeUnsupportedOptionError) Error() string {
+	return fmt.Sprintf("%s runtime does not support required options: %s", e.runtimeName, optionNames(e.options))
+}
+
+func (e *runtimeUnsupportedOptionError) Is(target error) bool {
+	return target == llmclient.ErrUnsupportedOption
+}
+
+func (e *runtimeUnsupportedOptionError) Unwrap() error {
+	return llmclient.ErrUnsupportedOption
+}
+
+func sanitizeRuntimeError(runtimeName string, err error) error {
+	var unsupported *llmclient.UnsupportedOptionError
+	if errors.As(err, &unsupported) {
+		return &runtimeUnsupportedOptionError{
+			runtimeName: strings.TrimSpace(runtimeName),
+			options:     unsupported.Options,
+		}
+	}
+	return err
+}
+
+func sanitizeRuntimeDetail(runtimeName string, err error) string {
+	if err == nil {
+		return ""
+	}
+	return sanitizeRuntimeDetailString(runtimeName, err.Error())
+}
+
+func sanitizeRuntimeDetailString(runtimeName, detail string) string {
+	return strings.ReplaceAll(detail, backendCodexExec, strings.TrimSpace(runtimeName))
+}
+
+func resolveDiagnosticDetail(runtimeName, command string, err error) string {
+	if err == nil {
+		return ""
+	}
+	runtimeName = strings.TrimSpace(runtimeName)
+	if runtimeName == "" {
+		return err.Error()
+	}
+	command = strings.TrimSpace(command)
+	if command == "" {
+		command = runtimeName
+	}
+	var pathErr *exec.Error
+	if errors.As(err, &pathErr) {
+		return fmt.Sprintf("%s binary %q not found in PATH; install %s or configure the runtime command", runtimeName, pathErr.Name, runtimeName)
+	}
+	if os.IsNotExist(err) {
+		return fmt.Sprintf("%s binary %q not found; install %s or configure the runtime command", runtimeName, command, runtimeName)
+	}
+	return sanitizeRuntimeDetail(runtimeName, err)
+}
+
+func readinessDiagnosticDetail(runtimeName string, report llmclient.ReadyReport) string {
+	detail := strings.TrimSpace(report.Detail)
+	switch report.State {
+	case llmclient.ReadyMissingBinary:
+		if detail == "" {
+			return fmt.Sprintf("%s binary missing; install %s or configure the runtime command", runtimeName, runtimeName)
+		}
+		return fmt.Sprintf("%s binary missing: %s; install %s or configure the runtime command", runtimeName, sanitizeRuntimeDetailString(runtimeName, detail), runtimeName)
+	case llmclient.ReadyNotAuthed:
+		if detail == "" {
+			return fmt.Sprintf("%s not authenticated; run the %s CLI login flow", runtimeName, runtimeName)
+		}
+		return fmt.Sprintf("%s not authenticated: %s", runtimeName, sanitizeRuntimeDetailString(runtimeName, detail))
+	case llmclient.ReadyUnknown:
+		if detail == "" {
+			return fmt.Sprintf("%s readiness could not be determined", runtimeName)
+		}
+		return fmt.Sprintf("%s readiness could not be determined: %s", runtimeName, sanitizeRuntimeDetailString(runtimeName, detail))
+	default:
+		if detail == "" {
+			return fmt.Sprintf("%s readiness failed", runtimeName)
+		}
+		return fmt.Sprintf("%s readiness failed: %s", runtimeName, sanitizeRuntimeDetailString(runtimeName, detail))
+	}
+}
+
+func optionNames(options []llmclient.OptionName) string {
+	names := make([]string, 0, len(options))
+	for _, option := range options {
+		names = append(names, string(option))
+	}
+	sort.Strings(names)
+	return strings.Join(names, ", ")
 }
 
 type rawCapture struct {

@@ -337,6 +337,141 @@ func TestCheckAvailabilityReturnsVersionProbeError(t *testing.T) {
 	}
 }
 
+func TestDiagnoseRuntimeReportsMissingBinaryWithUserRuntimeName(t *testing.T) {
+	t.Parallel()
+
+	bridge := New(
+		WithBaseEnv(func() []string { return []string{"PATH=/usr/bin"} }),
+	)
+
+	diag := bridge.DiagnoseRuntime(context.Background(), RuntimeCodex, filepath.Join(t.TempDir(), "missing-codex"))
+	if diag.Available {
+		t.Fatalf("expected missing binary diagnostic to be unavailable")
+	}
+	if diag.Runtime != RuntimeCodex {
+		t.Fatalf("expected runtime %q, got %q", RuntimeCodex, diag.Runtime)
+	}
+	if !strings.Contains(diag.Details, "codex binary") || !strings.Contains(diag.Details, "install codex") {
+		t.Fatalf("expected actionable codex missing-binary detail, got %q", diag.Details)
+	}
+	if strings.Contains(diag.Details, backendCodexExec) {
+		t.Fatalf("diagnostic leaked backend name: %q", diag.Details)
+	}
+}
+
+func TestDiagnoseRuntimeSanitizesReadinessMissingBinaryDetail(t *testing.T) {
+	t.Parallel()
+
+	bridge := New(
+		WithBackendFactory(func(cfg BackendConfig) (llmclient.Backend, error) {
+			return &fakeBackend{
+				name: cfg.BackendName,
+				readyReport: &llmclient.ReadyReport{
+					State:  llmclient.ReadyMissingBinary,
+					Detail: "codex-exec binary not found",
+				},
+				capabilities: codexDiagnosticCapabilities(),
+			}, nil
+		}),
+		WithBaseEnv(func() []string { return []string{"PATH=/usr/bin"} }),
+	)
+
+	diag := bridge.DiagnoseRuntime(context.Background(), RuntimeCodex, writeExecutable(t, t.TempDir(), "codex"))
+	if diag.Available {
+		t.Fatalf("expected readiness missing-binary diagnostic to be unavailable")
+	}
+	if !strings.Contains(diag.Details, "codex binary missing") || !strings.Contains(diag.Details, "install codex") || !strings.Contains(diag.Details, "configure the runtime command") {
+		t.Fatalf("expected actionable codex missing-binary detail, got %q", diag.Details)
+	}
+	if strings.Contains(diag.Details, backendCodexExec) {
+		t.Fatalf("diagnostic leaked backend name: %q", diag.Details)
+	}
+}
+
+func TestDiagnoseRuntimeReportsReadinessFailureWithUserRuntimeName(t *testing.T) {
+	t.Parallel()
+
+	bridge := New(
+		WithBackendFactory(func(cfg BackendConfig) (llmclient.Backend, error) {
+			return &fakeBackend{
+				name: cfg.BackendName,
+				readyReport: &llmclient.ReadyReport{
+					State:  llmclient.ReadyNotAuthed,
+					Detail: "run codex login",
+				},
+				capabilities: codexDiagnosticCapabilities(),
+			}, nil
+		}),
+		WithBaseEnv(func() []string { return []string{"PATH=/usr/bin"} }),
+	)
+
+	diag := bridge.DiagnoseRuntime(context.Background(), RuntimeCodex, writeExecutable(t, t.TempDir(), "codex"))
+	if diag.Available {
+		t.Fatalf("expected not-authed diagnostic to be unavailable")
+	}
+	if !strings.Contains(diag.Details, "codex not authenticated") || !strings.Contains(diag.Details, "run codex login") {
+		t.Fatalf("expected auth detail in diagnostic, got %q", diag.Details)
+	}
+	if strings.Contains(diag.Details, backendCodexExec) {
+		t.Fatalf("diagnostic leaked backend name: %q", diag.Details)
+	}
+}
+
+func TestDiagnoseRuntimeReportsUnsupportedRequiredOptionsWithUserRuntimeName(t *testing.T) {
+	t.Parallel()
+
+	caps := codexDiagnosticCapabilities()
+	delete(caps.OptionSupport, llmclient.OptionCodexJSONL)
+	bridge := New(
+		WithBackendFactory(func(cfg BackendConfig) (llmclient.Backend, error) {
+			return &fakeBackend{name: cfg.BackendName, capabilities: caps}, nil
+		}),
+		WithBaseEnv(func() []string { return []string{"PATH=/usr/bin"} }),
+	)
+
+	diag := bridge.DiagnoseRuntime(context.Background(), RuntimeCodex, writeExecutable(t, t.TempDir(), "codex"))
+	if diag.Available {
+		t.Fatalf("expected unsupported option diagnostic to be unavailable")
+	}
+	if !strings.Contains(diag.Details, "codex runtime does not support required options: codexJSONL") {
+		t.Fatalf("expected unsupported option detail, got %q", diag.Details)
+	}
+	if strings.Contains(diag.Details, backendCodexExec) {
+		t.Fatalf("diagnostic leaked backend name: %q", diag.Details)
+	}
+}
+
+func TestRunSanitizesUnsupportedOptionBackendName(t *testing.T) {
+	t.Parallel()
+
+	bridge := New(
+		WithBackendFactory(func(cfg BackendConfig) (llmclient.Backend, error) {
+			return &fakeBackend{
+				name:      cfg.BackendName,
+				streamErr: llmclient.NewUnsupportedOptionError(backendCodexExec, llmclient.OptionCodexJSONL),
+			}, nil
+		}),
+		WithBaseEnv(func() []string { return []string{"PATH=/usr/bin"} }),
+	)
+
+	_, err := bridge.Run(context.Background(), Request{
+		RuntimeName: RuntimeCodex,
+		Command:     writeExecutable(t, t.TempDir(), "codex"),
+	})
+	if err == nil {
+		t.Fatalf("expected unsupported option error")
+	}
+	if !errors.Is(err, llmclient.ErrUnsupportedOption) {
+		t.Fatalf("expected errors.Is ErrUnsupportedOption, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "codex runtime does not support required options: codexJSONL") {
+		t.Fatalf("expected sanitized codex runtime error, got %v", err)
+	}
+	if strings.Contains(err.Error(), backendCodexExec) {
+		t.Fatalf("error leaked backend name: %v", err)
+	}
+}
+
 type fakeBackend struct {
 	name          string
 	events        []llmclient.Event
@@ -345,6 +480,7 @@ type fakeBackend struct {
 	captureStderr []byte
 	available     *bool
 	readyReport   *llmclient.ReadyReport
+	capabilities  *llmclient.Capabilities
 	input         *llmclient.Context
 	config        llmclient.RequestConfig
 }
@@ -381,6 +517,13 @@ func (b *fakeBackend) Ready(context.Context) llmclient.ReadyReport {
 		return *b.readyReport
 	}
 	return llmclient.ReadyReport{State: llmclient.ReadyOK}
+}
+
+func (b *fakeBackend) Capabilities() llmclient.Capabilities {
+	if b.capabilities != nil {
+		return *b.capabilities
+	}
+	return llmclient.Capabilities{}
 }
 
 func (b *fakeBackend) Close() error { return nil }
@@ -429,4 +572,17 @@ func containsEnv(env []string, pair string) bool {
 		}
 	}
 	return false
+}
+
+func codexDiagnosticCapabilities() *llmclient.Capabilities {
+	return &llmclient.Capabilities{
+		OptionSupport: map[llmclient.OptionName]llmclient.OptionSupport{
+			llmclient.OptionWorkingDirectory: llmclient.OptionSupportFull,
+			llmclient.OptionEnvironment:      llmclient.OptionSupportFull,
+			llmclient.OptionTimeout:          llmclient.OptionSupportFull,
+			llmclient.OptionRawCapture:       llmclient.OptionSupportFull,
+			llmclient.OptionCodexJSONL:       llmclient.OptionSupportFull,
+			llmclient.OptionReasoningEffort:  llmclient.OptionSupportFull,
+		},
+	}
 }

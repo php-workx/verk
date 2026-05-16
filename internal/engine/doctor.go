@@ -9,8 +9,7 @@ import (
 	"sort"
 	"strings"
 	"verk/internal/adapters/repo/git"
-	"verk/internal/adapters/runtime/claude"
-	"verk/internal/adapters/runtime/codex"
+	"verk/internal/adapters/runtime/llmclibridge"
 	"verk/internal/policy"
 	"verk/internal/state"
 )
@@ -31,6 +30,15 @@ type DoctorReport struct {
 	RepoRoot string         `json:"repo_root"`
 	Checks   []DoctorCheck  `json:"checks"`
 	Runtimes []RuntimeCheck `json:"runtimes"`
+}
+
+var diagnoseRuntime = func(ctx context.Context, runtimeName string) RuntimeCheck {
+	diag := llmclibridge.New().DiagnoseRuntime(ctx, runtimeName, "")
+	return RuntimeCheck{
+		Runtime:   diag.Runtime,
+		Available: diag.Available,
+		Details:   diag.Details,
+	}
 }
 
 func RunDoctor(repoRoot string) (DoctorReport, int, error) {
@@ -146,26 +154,25 @@ func RunDoctor(repoRoot string) (DoctorReport, int, error) {
 
 func checkRuntimes(ctx context.Context, cfg policy.Config) []RuntimeCheck {
 	names := configuredRuntimes(cfg)
+	defaultRuntime := normalizeRuntimeName(cfg.Runtime.DefaultRuntime)
 	checks := make([]RuntimeCheck, 0, len(names))
 	for _, name := range names {
 		checks = append(checks, RuntimeCheck{Runtime: name})
 	}
 	for i := range checks {
-		var err error
-		switch checks[i].Runtime {
-		case "codex":
-			err = codex.New().CheckAvailability(ctx)
-		case "claude":
-			err = claude.New().CheckAvailability(ctx)
-		default:
-			err = fmt.Errorf("unsupported runtime %q", checks[i].Runtime)
+		runtimeName := checks[i].Runtime
+		diagnostic := diagnoseRuntime(ctx, runtimeName)
+		if diagnostic.Runtime == "" {
+			diagnostic.Runtime = runtimeName
 		}
-		checks[i].Available = err == nil
-		if err != nil {
-			checks[i].Details = err.Error()
-		} else if cfg.Runtime.DefaultRuntime == checks[i].Runtime {
+		checks[i] = diagnostic
+		if !checks[i].Available {
+			if strings.TrimSpace(checks[i].Details) == "" {
+				checks[i].Details = "unavailable"
+			}
+		} else if defaultRuntime == checks[i].Runtime {
 			checks[i].Details = "available (default runtime)"
-		} else {
+		} else if strings.TrimSpace(checks[i].Details) == "" || checks[i].Details == "ready" {
 			checks[i].Details = "available"
 		}
 	}
@@ -174,9 +181,15 @@ func checkRuntimes(ctx context.Context, cfg policy.Config) []RuntimeCheck {
 
 func configuredRuntimes(cfg policy.Config) []string {
 	seen := map[string]struct{}{}
-	out := make([]string, 0, 2)
-	for _, candidate := range []string{cfg.Runtime.DefaultRuntime} {
-		name := strings.TrimSpace(strings.ToLower(candidate))
+	out := make([]string, 0, 5)
+	for _, candidate := range []string{
+		cfg.Runtime.DefaultRuntime,
+		cfg.Runtime.Worker.Runtime,
+		cfg.Runtime.Reviewer.Runtime,
+		cfg.Runtime.WorkerFallback.Runtime,
+		cfg.Runtime.ReviewerFallback.Runtime,
+	} {
+		name := normalizeRuntimeName(candidate)
 		if name == "" {
 			continue
 		}
@@ -191,6 +204,10 @@ func configuredRuntimes(cfg policy.Config) []string {
 	}
 	sort.Strings(out)
 	return out
+}
+
+func normalizeRuntimeName(name string) string {
+	return strings.TrimSpace(strings.ToLower(name))
 }
 
 func loadJSONMap(path string, target *map[string]any) error {

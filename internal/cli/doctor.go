@@ -8,6 +8,8 @@ import (
 	"github.com/spf13/cobra"
 )
 
+var runDoctor = engine.RunDoctor
+
 func initDoctorCmd(root *cobra.Command) {
 	var doctorJSONFlag bool
 
@@ -20,7 +22,7 @@ func initDoctorCmd(root *cobra.Command) {
 			if err != nil {
 				repoRoot = "."
 			}
-			report, code, err := engine.RunDoctor(repoRoot)
+			report, code, err := runDoctor(repoRoot)
 			if err != nil {
 				return withExitCode(err, 2)
 			}
