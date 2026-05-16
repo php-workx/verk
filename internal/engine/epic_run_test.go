@@ -1490,6 +1490,7 @@ func TestRunEpic_AppliesPostRepairFilesToMain(t *testing.T) {
 
 	root := epicTicket("epic-post-repair-main")
 	child := epicChildTicket("ticket-post-repair-main", root.ID, epos.StatusReady, nil, []string{"primary.txt"})
+	child.AcceptanceCriteria = []string{"primary.txt exists with correct content"}
 	mustSaveTicket(t, repoRoot, root)
 	mustSaveTicket(t, repoRoot, child)
 
@@ -1569,6 +1570,7 @@ func TestRunEpic_PersistsWaveOrdinalBeforeWaveArtifact(t *testing.T) {
 
 	root := epicTicket("epic-wave-cursor-before-artifact")
 	child := epicChildTicket("ticket-wave-cursor-before-artifact", root.ID, epos.StatusReady, nil, []string{"tracked.txt"})
+	child.AcceptanceCriteria = []string{"tracked.txt updated correctly"}
 	mustSaveTicket(t, repoRoot, root)
 	mustSaveTicket(t, repoRoot, child)
 
@@ -1714,6 +1716,7 @@ func TestRunEpic_BlocksWhenFailedTicketDiffPersistenceFails(t *testing.T) {
 
 	root := epicTicket("epic-blocked-diff-persist-fail")
 	child := epicChildTicket("ticket-blocked-diff-persist-fail", root.ID, epos.StatusReady, nil, []string{"tracked.txt"})
+	child.AcceptanceCriteria = []string{"tracked.txt written by worker"}
 	mustSaveTicket(t, repoRoot, root)
 	mustSaveTicket(t, repoRoot, child)
 
@@ -1963,6 +1966,9 @@ func epicChildTicket(id, parent string, status epos.Status, deps, owned []string
 		Status:     status,
 		Deps:       deps,
 		OwnedPaths: append([]string(nil), owned...),
+		// ValidationCommands satisfies the ticket quality gate (missing_acceptance_criteria
+		// requires at least one of: AcceptanceCriteria, TestCases, ValidationCommands).
+		ValidationCommands: []string{"true"},
 		UnknownFrontmatter: map[string]any{
 			"parent": parent,
 			"type":   "task",
@@ -2544,10 +2550,11 @@ func TestRunEpicLinkedSiblingsNotEachOthersChildren(t *testing.T) {
 	// Two siblings that cross-link each other via the tk links field.
 	// Links are stored in UnknownFrontmatter since Ticket has no native Links field.
 	sibA := epos.Ticket{
-		ID:         "sib-linked-a",
-		Title:      "Sibling A",
-		Status:     epos.StatusOpen,
-		OwnedPaths: []string{"internal/app/sib-a"},
+		ID:                 "sib-linked-a",
+		Title:              "Sibling A",
+		Status:             epos.StatusOpen,
+		OwnedPaths:         []string{"internal/app/sib-a"},
+		ValidationCommands: []string{"true"},
 		UnknownFrontmatter: map[string]any{
 			"parent": epic.ID,
 			"type":   "task",
@@ -2557,10 +2564,11 @@ func TestRunEpicLinkedSiblingsNotEachOthersChildren(t *testing.T) {
 	mustSaveTicket(t, repoRoot, sibA)
 
 	sibB := epos.Ticket{
-		ID:         "sib-linked-b",
-		Title:      "Sibling B",
-		Status:     epos.StatusOpen,
-		OwnedPaths: []string{"internal/app/sib-b"},
+		ID:                 "sib-linked-b",
+		Title:              "Sibling B",
+		Status:             epos.StatusOpen,
+		OwnedPaths:         []string{"internal/app/sib-b"},
+		ValidationCommands: []string{"true"},
 		UnknownFrontmatter: map[string]any{
 			"parent": epic.ID,
 			"type":   "task",

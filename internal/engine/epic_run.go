@@ -275,6 +275,35 @@ func RunEpic(ctx context.Context, req RunEpicRequest) (RunEpicResult, error) { /
 		return result, err
 	}
 
+	// --- Ticket quality gate --------------------------------------------------
+	// Run before the first wave is dispatched so workers never receive tickets
+	// that fail the deterministic quality checks.
+	rootTicket, err := loadEpicTicket(req.RepoRoot, req.RootTicketID)
+	if err != nil {
+		return result, fmt.Errorf("load root ticket for quality gate: %w", err)
+	}
+	qualityArtifact, err := RunTicketQualityGate(ctx, req.RepoRoot, req.RunID, cfg, rootTicket, children)
+	if err != nil {
+		return result, fmt.Errorf("ticket quality gate: %w", err)
+	}
+	if qualityArtifact.Blocked {
+		result.Run.Status = state.EpicRunStatusBlocked
+		result.Run.CurrentPhase = state.TicketPhaseBlocked
+		result.Run.UpdatedAt = time.Now().UTC()
+		if saveErr := state.SaveJSONAtomic(runPath, result.Run); saveErr != nil {
+			return result, errors.Join(
+				fmt.Errorf("ticket quality gate blocked: %s", qualityArtifact.BlockReason),
+				fmt.Errorf("persist run state: %w", saveErr),
+			)
+		}
+		return result, &BlockedRunError{
+			RunID:  req.RunID,
+			Status: state.EpicRunStatusBlocked,
+			Cause:  fmt.Errorf("ticket quality gate blocked: %s", qualityArtifact.BlockReason),
+		}
+	}
+	// -------------------------------------------------------------------------
+
 	for {
 		if err := ctx.Err(); err != nil {
 			return result, err

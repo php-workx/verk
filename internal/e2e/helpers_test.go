@@ -97,7 +97,6 @@ func taskTicket(id string, status epos.Status, owned []string) epos.Ticket {
 		Title:              "Ticket " + id,
 		Status:             status,
 		OwnedPaths:         append([]string(nil), owned...),
-		AcceptanceCriteria: []string{"done"},
 		ValidationCommands: []string{"true"},
 		UnknownFrontmatter: map[string]any{"type": "task"},
 	}
