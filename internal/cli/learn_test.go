@@ -159,16 +159,139 @@ func TestLearn_ShowPrintsFullDetail(t *testing.T) {
 	}
 }
 
-func TestLearn_PromoteNotImplementedYet(t *testing.T) {
+func TestLearn_PromoteAppendsToPromotedRules(t *testing.T) {
+	dir := t.TempDir()
+	initCLITestRepo(t, dir)
+
+	memDir := filepath.Join(dir, ".verk", "memory")
+	id := fmt.Sprintf("learn-%d", time.Now().UnixNano())
+	lesson := memory.EscapedDefect{
+		ID:        id,
+		CreatedAt: time.Now().UTC(),
+		Summary:   "reviewer missed nil check in handler",
+		MissedBy:  []string{"reviewer"},
+		Status:    memory.StatusProposed,
+	}
+	if err := memory.AppendLesson(memDir, lesson); err != nil {
+		t.Fatalf("seed lesson: %v", err)
+	}
+
+	stdout, stderr, code := runLearnInDir(t, dir,
+		"learn", "promote", id,
+		"--target", "ticket-quality-rule",
+		"--rule-id", "my-rule",
+	)
+	if code != 0 {
+		t.Fatalf("expected exit 0, got %d\nstdout: %s\nstderr: %s", code, stdout, stderr)
+	}
+	if !strings.Contains(stdout, "my-rule") {
+		t.Fatalf("expected rule ID in stdout, got: %s", stdout)
+	}
+
+	// Verify promoted-rules.jsonl exists and contains a matching entry.
+	data, err := os.ReadFile(filepath.Join(memDir, "promoted-rules.jsonl"))
+	if err != nil {
+		t.Fatalf("read promoted-rules.jsonl: %v", err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+	if len(lines) != 1 {
+		t.Fatalf("expected 1 line in promoted-rules.jsonl, got %d", len(lines))
+	}
+
+	var entry memory.PromotionEntry
+	if err := json.Unmarshal([]byte(lines[0]), &entry); err != nil {
+		t.Fatalf("unmarshal promotion entry: %v", err)
+	}
+	if entry.LessonID != id {
+		t.Errorf("LessonID = %q, want %q", entry.LessonID, id)
+	}
+	if entry.RuleID != "my-rule" {
+		t.Errorf("RuleID = %q, want %q", entry.RuleID, "my-rule")
+	}
+	if entry.Target != "ticket-quality-rule" {
+		t.Errorf("Target = %q, want %q", entry.Target, "ticket-quality-rule")
+	}
+	if entry.Summary != lesson.Summary {
+		t.Errorf("Summary = %q, want %q", entry.Summary, lesson.Summary)
+	}
+}
+
+func TestLearn_PromoteMarksLessonStatusPromoted(t *testing.T) {
+	dir := t.TempDir()
+	initCLITestRepo(t, dir)
+
+	memDir := filepath.Join(dir, ".verk", "memory")
+	id := fmt.Sprintf("learn-%d", time.Now().UnixNano())
+	lesson := memory.EscapedDefect{
+		ID:        id,
+		CreatedAt: time.Now().UTC(),
+		Summary:   "planner skipped acceptance criteria",
+		MissedBy:  []string{"planner_review"},
+		Status:    memory.StatusProposed,
+	}
+	if err := memory.AppendLesson(memDir, lesson); err != nil {
+		t.Fatalf("seed lesson: %v", err)
+	}
+
+	_, stderr, code := runLearnInDir(t, dir,
+		"learn", "promote", id,
+		"--target", "ticket-quality-rule",
+		"--rule-id", "rule-ac-check",
+	)
+	if code != 0 {
+		t.Fatalf("expected exit 0, got %d\nstderr: %s", code, stderr)
+	}
+
+	// Verify via store that status is now promoted.
+	got, found, err := memory.GetLesson(memDir, id)
+	if err != nil {
+		t.Fatalf("GetLesson: %v", err)
+	}
+	if !found {
+		t.Fatal("lesson not found after promote")
+	}
+	if got.Status != memory.StatusPromoted {
+		t.Errorf("Status = %q, want %q", got.Status, memory.StatusPromoted)
+	}
+}
+
+func TestLearn_PromoteRequiresRuleID(t *testing.T) {
+	dir := t.TempDir()
+	initCLITestRepo(t, dir)
+
+	memDir := filepath.Join(dir, ".verk", "memory")
+	id := fmt.Sprintf("learn-%d", time.Now().UnixNano())
+	lesson := memory.EscapedDefect{
+		ID:        id,
+		CreatedAt: time.Now().UTC(),
+		Summary:   "some lesson",
+		MissedBy:  []string{"reviewer"},
+		Status:    memory.StatusProposed,
+	}
+	if err := memory.AppendLesson(memDir, lesson); err != nil {
+		t.Fatalf("seed lesson: %v", err)
+	}
+
+	_, _, code := runLearnInDir(t, dir,
+		"learn", "promote", id,
+		"--target", "ticket-quality-rule",
+		// intentionally omitting --rule-id
+	)
+	if code == 0 {
+		t.Fatal("expected non-zero exit when --rule-id is omitted, got 0")
+	}
+}
+
+func TestLearn_PromoteUnknownLessonFails(t *testing.T) {
 	dir := t.TempDir()
 	initCLITestRepo(t, dir)
 
 	_, _, code := runLearnInDir(t, dir,
-		"learn", "promote", "learn-12345",
-		"--target", ".agents/patterns/test.md",
-		"--rule-id", "rule-001",
+		"learn", "promote", "learn-does-not-exist",
+		"--target", "ticket-quality-rule",
+		"--rule-id", "rule-xyz",
 	)
 	if code == 0 {
-		t.Fatal("expected non-zero exit for promote (not implemented), got 0")
+		t.Fatal("expected non-zero exit for unknown lesson ID, got 0")
 	}
 }

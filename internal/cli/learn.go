@@ -200,16 +200,57 @@ func newLearnPromoteCmd() *cobra.Command {
 
 	cmd := &cobra.Command{
 		Use:          "promote <lesson-id>",
-		Short:        "Promote a lesson to a rule (not implemented)",
+		Short:        "Promote a lesson to a ticket-quality rule",
 		Args:         cobra.ExactArgs(1),
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return cmdError(cmd, fmt.Errorf("not implemented yet"), 1)
+			if ruleID == "" {
+				return cmdError(cmd, fmt.Errorf("--rule-id is required"), 2)
+			}
+
+			repoRoot, err := resolveRepoRoot()
+			if err != nil {
+				return cmdError(cmd, fmt.Errorf("resolve repo root: %w", err), 1)
+			}
+
+			memDir := memoryDir(repoRoot)
+			lessonID := args[0]
+
+			lesson, found, err := memory.GetLesson(memDir, lessonID)
+			if err != nil {
+				return cmdError(cmd, fmt.Errorf("get lesson: %w", err), 1)
+			}
+			if !found {
+				return cmdError(cmd, fmt.Errorf("lesson %q not found", lessonID), 1)
+			}
+
+			// Append a new record for the same ID with StatusPromoted.
+			promoted := lesson
+			promoted.Status = memory.StatusPromoted
+			promoted.CreatedAt = time.Now().UTC()
+			if err := memory.AppendLesson(memDir, promoted); err != nil {
+				return cmdError(cmd, fmt.Errorf("update lesson status: %w", err), 1)
+			}
+
+			// Append promotion entry to promoted-rules.jsonl.
+			entry := memory.PromotionEntry{
+				LessonID:   lessonID,
+				PromotedAt: time.Now().UTC(),
+				Target:     target,
+				RuleID:     ruleID,
+				Summary:    lesson.Summary,
+			}
+			if err := memory.AppendPromotion(memDir, entry); err != nil {
+				return cmdError(cmd, fmt.Errorf("record promotion: %w", err), 1)
+			}
+
+			_, _ = fmt.Fprintln(cmd.OutOrStdout(), ruleID)
+			return nil
 		},
 	}
 
-	cmd.Flags().StringVar(&target, "target", "", "Target file for the rule")
-	cmd.Flags().StringVar(&ruleID, "rule-id", "", "Rule ID to assign")
+	cmd.Flags().StringVar(&target, "target", "", "Target rule category (e.g. ticket-quality-rule)")
+	cmd.Flags().StringVar(&ruleID, "rule-id", "", "Rule ID to assign (required)")
 
 	return cmd
 }

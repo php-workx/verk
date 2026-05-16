@@ -629,6 +629,65 @@ func TestDetectEpicCycleAllowsNewAncestor(t *testing.T) {
 	}
 }
 
+func TestSaveLoadTicket_RoundTripsProfile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "ticket.md")
+	ticket := Ticket{
+		ID:      "ticket-profile",
+		Status:  StatusOpen,
+		Profile: ProfileContract,
+		Body:    "# ticket-profile\n",
+		present: map[string]bool{
+			"id":     true,
+			"status": true,
+		},
+	}
+	if err := SaveTicket(path, ticket); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := LoadTicket(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.Profile != ProfileContract {
+		t.Fatalf("Profile = %q, want %q", loaded.Profile, ProfileContract)
+	}
+}
+
+func TestSaveLoadTicket_NoProfileLoadsEmpty(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "ticket.md")
+	data := "---\nid: ticket-no-profile\nstatus: open\n---\n# ticket-no-profile\n"
+	if err := os.WriteFile(path, []byte(data), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := LoadTicket(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.Profile != "" {
+		t.Fatalf("Profile = %q, want empty string", loaded.Profile)
+	}
+}
+
+func TestValidateProfile_AcceptsKnownValues(t *testing.T) {
+	for _, p := range []string{ProfileSecurity, ProfileContract, ProfileFrontend, ProfileBackend} {
+		if err := ValidateProfile(p); err != nil {
+			t.Errorf("ValidateProfile(%q) = %v, want nil", p, err)
+		}
+	}
+}
+
+func TestValidateProfile_RejectsUnknownValue(t *testing.T) {
+	if err := ValidateProfile("unknown-profile"); err == nil {
+		t.Fatal("expected error for unknown profile, got nil")
+	}
+}
+
+func TestValidateProfile_AcceptsEmpty(t *testing.T) {
+	if err := ValidateProfile(""); err != nil {
+		t.Fatalf("ValidateProfile(\"\") = %v, want nil", err)
+	}
+}
+
 func writeEposTicketFile(t *testing.T, rootDir, id string, fields map[string]string, deps []string) {
 	t.Helper()
 	writeEposTicketFileWithStatus(t, rootDir, id, "open", fields, deps)

@@ -7,6 +7,7 @@ import (
 	"sort"
 	"strings"
 	"verk/internal/adapters/ticketstore/epos"
+	"verk/internal/memory"
 	"verk/internal/policy"
 	"verk/internal/state"
 )
@@ -462,6 +463,32 @@ var integrationMarker = regexp.MustCompile(`(?i)\bintegration\b|\btraceability\b
 
 func hasIntegrationMarker(t epos.Ticket) bool {
 	return integrationMarker.MatchString(t.Title) || integrationMarker.MatchString(t.Body)
+}
+
+// --- Advisory Findings From Promoted Rules ----------------------------------
+
+// AdvisoryFindingsFromPromotedRules converts promoted memory rules into
+// non-blocking advisory findings for the given ticket set. Rules are NEVER
+// upgraded to blocking automatically — they appear as severity P3 (advisory)
+// regardless of the original lesson. Use BuildPlannerReviewPrompt or the
+// engine review pipeline to surface them.
+func AdvisoryFindingsFromPromotedRules(rules []memory.PromotionEntry, tickets []epos.Ticket) []state.TicketQualityFinding {
+	out := make([]state.TicketQualityFinding, 0, len(tickets)*len(rules))
+	for _, r := range rules {
+		for _, t := range tickets {
+			out = append(out, state.TicketQualityFinding{
+				ID:          makeFindingID(t.ID, state.TicketQualityCode("promoted_rule:"+r.RuleID), nil),
+				TicketID:    t.ID,
+				Code:        "promoted_rule:" + r.RuleID,
+				Severity:    state.SeverityP3,
+				Title:       fmt.Sprintf("lesson: %s", r.Summary),
+				Body:        fmt.Sprintf("Promoted memory rule %s applies. Reviewer should verify the lesson is addressed.", r.RuleID),
+				Repairable:  false,
+				Disposition: "advisory",
+			})
+		}
+	}
+	return out
 }
 
 // --- Safe Auto-Repair -------------------------------------------------------
