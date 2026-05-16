@@ -4062,3 +4062,84 @@ func TestRunTicket_PersistsTicketQualityArtifact(t *testing.T) {
 		t.Fatalf("expected scope %q, got %q", "ticket", artifact.Scope)
 	}
 }
+
+// TestRunTicket_WritesFreezeArtifact asserts that RunTicket writes
+// freeze.json under the ticket run directory when owned_paths are set,
+// and that the artifact records the correct ticket id and paths.
+func TestRunTicket_WritesFreezeArtifact(t *testing.T) {
+	repoRoot := t.TempDir()
+	cfg := policy.DefaultConfig()
+	runID := "run-freeze"
+
+	ticket := epos.Ticket{
+		ID:                 "ver-freeze",
+		Title:              "Freeze test ticket",
+		AcceptanceCriteria: []string{"verk test --x exits 0"},
+		OwnedPaths:         []string{"internal/widget", "docs/widget.md"},
+		UnknownFrontmatter: map[string]any{"type": "task"},
+	}
+	plan, claim := testPlanAndClaim(t, repoRoot, ticket, cfg, runID, "lease-freeze", []string{`true`})
+
+	started, finished := testRunTimes()
+	adapter := runtimefake.New(
+		[]runtime.WorkerResult{{
+			Status:             runtime.WorkerStatusDone,
+			RetryClass:         runtime.RetryClassTerminal,
+			LeaseID:            claim.LeaseID,
+			StartedAt:          started,
+			FinishedAt:         finished,
+			ResultArtifactPath: filepath.Join(repoRoot, "worker.json"),
+		}},
+		[]runtime.ReviewResult{{
+			Status:             runtime.WorkerStatusDone,
+			RetryClass:         runtime.RetryClassTerminal,
+			LeaseID:            claim.LeaseID,
+			StartedAt:          finished.Add(time.Second),
+			FinishedAt:         finished.Add(2 * time.Second),
+			ReviewStatus:       runtime.ReviewStatusPassed,
+			Summary:            "ok",
+			ResultArtifactPath: filepath.Join(repoRoot, "review.json"),
+		}},
+	)
+
+	_, err := RunTicket(context.Background(), RunTicketRequest{
+		RepoRoot: repoRoot,
+		RunID:    runID,
+		Ticket:   ticket,
+		Plan:     plan,
+		Claim:    claim,
+		Adapter:  adapter,
+		Config:   cfg,
+	})
+	if err != nil {
+		t.Fatalf("RunTicket returned error: %v", err)
+	}
+
+	freezePath := filepath.Join(repoRoot, ".verk", "runs", runID, "tickets", ticket.ID, "freeze.json")
+	if _, statErr := os.Stat(freezePath); os.IsNotExist(statErr) {
+		t.Fatalf("expected freeze.json at %s, but file does not exist", freezePath)
+	}
+
+	var freeze state.FreezeArtifact
+	if err := state.LoadJSON(freezePath, &freeze); err != nil {
+		t.Fatalf("failed to load freeze.json: %v", err)
+	}
+	if freeze.TicketID != ticket.ID {
+		t.Errorf("freeze.TicketID = %q, want %q", freeze.TicketID, ticket.ID)
+	}
+	if freeze.RunID != runID {
+		t.Errorf("freeze.RunID = %q, want %q", freeze.RunID, runID)
+	}
+	if !freeze.Active {
+		t.Error("expected freeze.Active to be true")
+	}
+	wantPaths := []string{"internal/widget", "docs/widget.md"}
+	if len(freeze.AllowedPaths) != len(wantPaths) {
+		t.Fatalf("freeze.AllowedPaths = %v, want %v", freeze.AllowedPaths, wantPaths)
+	}
+	for i, p := range wantPaths {
+		if freeze.AllowedPaths[i] != p {
+			t.Errorf("freeze.AllowedPaths[%d] = %q, want %q", i, freeze.AllowedPaths[i], p)
+		}
+	}
+}

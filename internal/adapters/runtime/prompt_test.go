@@ -786,3 +786,40 @@ func TestBuildWorkerPrompt_EmptyProfileSkipsBlock(t *testing.T) {
 		}
 	}
 }
+
+func TestBuildWorkerPrompt_IncludesHardEditGuardWhenOwnedPathsSet(t *testing.T) {
+	req := WorkerRequest{
+		TicketID:   "VER-200",
+		LeaseID:    "lease-200",
+		OwnedPaths: []string{"internal/widget", "docs/widget.md"},
+	}
+	prompt := BuildWorkerPrompt(req)
+
+	if !strings.Contains(prompt, "## Hard Edit Guard") {
+		t.Fatal("expected '## Hard Edit Guard' section in prompt")
+	}
+	for _, p := range req.OwnedPaths {
+		if !strings.Contains(prompt, p) {
+			t.Errorf("expected owned path %q to appear in prompt", p)
+		}
+	}
+	if !strings.Contains(prompt, "scope_escape_attempt") {
+		t.Error("expected 'scope_escape_attempt' in hard edit guard section")
+	}
+}
+
+func TestBuildWorkerPrompt_OmitsGuardWhenOwnedPathsEmpty(t *testing.T) {
+	req := WorkerRequest{
+		TicketID:   "VER-201",
+		LeaseID:    "lease-201",
+		OwnedPaths: nil,
+	}
+	prompt := BuildWorkerPrompt(req)
+
+	if strings.Contains(prompt, "## Hard Edit Guard") {
+		t.Error("expected no '## Hard Edit Guard' section when OwnedPaths is empty")
+	}
+	if strings.Contains(prompt, "scope_escape_attempt") {
+		t.Error("expected no 'scope_escape_attempt' when OwnedPaths is empty")
+	}
+}

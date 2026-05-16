@@ -291,6 +291,25 @@ func RunTicket(ctx context.Context, req RunTicketRequest) (result RunTicketResul
 		}
 	}
 
+	// Write freeze.json at run start so artifacts can audit the owned_paths
+	// edit guard that was active when orchestration began.
+	freezeArtifact := state.FreezeArtifact{
+		ArtifactMeta: state.ArtifactMeta{
+			SchemaVersion: artifactSchemaVersion,
+			RunID:         req.RunID,
+			CreatedAt:     stateTime(),
+			UpdatedAt:     stateTime(),
+		},
+		RunID:        req.RunID,
+		TicketID:     req.Ticket.ID,
+		AllowedPaths: req.Plan.OwnedPaths,
+		Active:       true,
+		StartedAt:    stateTime(),
+	}
+	if err := state.SaveJSONAtomic(filepath.Join(st.paths.runDir, "freeze.json"), freezeArtifact); err != nil {
+		return RunTicketResult{}, fmt.Errorf("write freeze artifact: %w", err)
+	}
+
 	if st.currentPhase == state.TicketPhaseIntake {
 		if err := st.transitionTo(state.TicketPhaseImplement); err != nil {
 			return RunTicketResult{}, err
@@ -323,6 +342,7 @@ func RunTicket(ctx context.Context, req RunTicketRequest) (result RunTicketResul
 				Reasoning:       workerProfile.Reasoning,
 				WorktreePath:    st.worktreePath,
 				Instructions:    buildImplementPhaseInstructions(st, st.implementationAttempts+1),
+				OwnedPaths:      req.Plan.OwnedPaths,
 				ExecutionConfig: executionConfigFromPolicy(cfg),
 				OnProgress:      func(detail string) { st.progressDetail(detail) },
 			}
@@ -502,6 +522,7 @@ func RunTicket(ctx context.Context, req RunTicketRequest) (result RunTicketResul
 				Reasoning:       workerProfile.Reasoning,
 				WorktreePath:    st.worktreePath,
 				Instructions:    renderRepairInstructions(st),
+				OwnedPaths:      req.Plan.OwnedPaths,
 				ExecutionConfig: executionConfigFromPolicy(cfg),
 				OnProgress:      func(detail string) { st.progressDetail(detail) },
 			}

@@ -67,7 +67,11 @@ type WorkerRequest struct {
 	Instructions      string `json:"instructions,omitempty"`
 	// Profile is the agent role profile for this ticket (e.g. "security-engineer").
 	// Empty string means no profile framing is injected into the prompt.
-	Profile         string              `json:"profile,omitempty"`
+	Profile string `json:"profile,omitempty"`
+	// OwnedPaths lists the file paths this worker is permitted to edit.
+	// When non-empty, BuildWorkerPrompt renders a Hard Edit Guard section
+	// instructing the worker to stay within this set.
+	OwnedPaths      []string            `json:"owned_paths,omitempty"`
 	ExecutionConfig ExecutionConfig     `json:"execution_config,omitempty"`
 	OnProgress      func(detail string) `json:"-"` // called with tool-use summaries during execution
 }
