@@ -189,6 +189,15 @@ Implementation note:
 - Add backend/fidelity diagnostics to artifacts or status only where useful.
 - Acceptance: doctor and CLI tests cover the stable user-facing names.
 
+Implementation note:
+
+- Doctor runtime checks now use `llmclibridge.DiagnoseRuntime` instead of the
+  legacy Claude/Codex adapter availability checks.
+- Diagnostics keep canonical runtime names in CLI text and JSON output, including
+  unsupported-option paths where Fabrikk internally reports `codex-exec`.
+- Missing binary, missing auth, unsupported option, and readiness failures are
+  reported with install, login, or runtime-command configuration guidance.
+
 ### P2. Document Operational Fallbacks
 
 - Document when to use direct Go package integration versus the `llmcli` stdio
@@ -197,6 +206,41 @@ Implementation note:
   failures or backend readiness failures.
 - Keep persistent backends such as `codex-appserver` out of scope until
   `codex-exec` parity is complete.
+
+Operational guidance:
+
+- Default to direct Go package integration inside Verk. Verk imports Fabrikk's
+  Go packages and calls `llmclient.Backend` implementations through
+  `internal/adapters/runtime/llmclibridge`. This keeps prompt construction,
+  artifact capture, result normalization, ticket retry classification, and
+  worktree isolation in Verk while delegating backend process supervision and
+  event streaming to Fabrikk.
+- Use the `llmcli` stdio binary as the fallback boundary for non-Go consumers or
+  external tools that cannot import Fabrikk packages. That mode should speak the
+  same runtime contract over stdio, but it is not Verk's default because Verk
+  already runs in-process Go code and needs direct access to raw capture,
+  fidelity, usage, and normalized event data.
+- Keep user-facing runtime names as `claude` and `codex` in config, doctor
+  output, artifacts, and ticket status. `codex-exec` is an internal Fabrikk
+  backend name used only inside the bridge mapping.
+- Separate backend readiness failures from Verk prompt or normalization failures
+  by looking at where the failure appears:
+  - `verk doctor` / `doctor --json` unavailable runtime entries mean backend
+    readiness problems: missing CLI binary, missing auth, unsupported required
+    options, or backend readiness failures. Fix installation, login, PATH, or the
+    configured runtime command before debugging prompts.
+  - Worker/reviewer artifacts with raw stdout/stderr plus a parsed Verk result or
+    review block mean the backend ran; failures after that point are Verk
+    prompt, block parsing, normalization, retry classification, or closeout
+    behavior.
+  - Bridge errors that mention unsupported required options are adapter/backend
+    capability mismatches. Do not mask them in prompts; upgrade or fix the
+    Fabrikk backend so required options such as workdir, environment, timeout,
+    raw capture, Codex JSONL, and reasoning effort are honored.
+- Persistent backends, including `codex-appserver`, remain postponed. Do not add
+  them to Verk until `codex-exec` parity is complete, doctor diagnostics are
+  stable, and the persistent backend exposes equivalent workdir, environment,
+  timeout, raw capture, JSONL, usage, and readiness fidelity.
 
 ## Verification
 
