@@ -112,6 +112,13 @@ Event collection rules:
 - Acceptance: `go test ./...` resolves the dependency without a local-only
   assumption.
 
+Implementation note:
+
+- Pinned Fabrikk at `v0.1.0`, which matches the local Fabrikk checkout commit
+  `d766ca3f90755c11305143a233a45eb291bf396b`.
+- Raised Verk's `go` directive to `1.26.3`, matching Fabrikk's module
+  directive and the installed toolchain.
+
 ### P1. Add the llmclibridge Package
 
 - Implement backend selection and Verk-to-Fabrikk runtime mapping.
@@ -120,6 +127,13 @@ Event collection rules:
 - Implement fake-backend tests for event collection, raw capture, required
   options, and error mapping.
 - Acceptance: bridge tests do not spawn real Claude or Codex CLIs.
+
+Implementation note:
+
+- Added `internal/adapters/runtime/llmclibridge` with fake-backend tests for
+  runtime mapping, `exec.LookPath` command resolution, request context/options,
+  raw capture, text de-duplication, text fallbacks, error/cancel exit mapping,
+  and tool-call progress callbacks.
 
 ### P1. Migrate the Claude Adapter
 

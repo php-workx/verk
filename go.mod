@@ -1,6 +1,6 @@
 module verk
 
-go 1.26.2
+go 1.26.3
 
 require (
 	charm.land/bubbles/v2 v2.1.0
@@ -9,6 +9,7 @@ require (
 	github.com/charmbracelet/x/term v0.2.2
 	github.com/gofrs/flock v0.13.0
 	github.com/php-workx/epos v0.3.0
+	github.com/php-workx/fabrikk v0.1.0
 	github.com/spf13/cobra v1.10.2
 	golang.org/x/sys v0.43.0
 	gopkg.in/yaml.v3 v3.0.1
