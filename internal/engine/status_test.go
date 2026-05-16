@@ -234,6 +234,42 @@ func TestDeriveStatus_IncludesFailureSummaries(t *testing.T) {
 	}
 }
 
+func TestStatusTicket_IncludesProfile(t *testing.T) {
+	repoRoot := t.TempDir()
+	runID := "run-profile"
+	ticketID := "ticket-profile"
+
+	writeOpRunFixture(t, repoRoot, runID, state.RunArtifact{
+		ArtifactMeta: state.ArtifactMeta{SchemaVersion: 1, RunID: runID},
+		Mode:         "ticket",
+		RootTicketID: ticketID,
+		Status:       state.EpicRunStatusRunning,
+		CurrentPhase: state.TicketPhaseImplement,
+		TicketIDs:    []string{ticketID},
+	})
+	writePlanFixture(t, repoRoot, runID, state.PlanArtifact{
+		ArtifactMeta: state.ArtifactMeta{SchemaVersion: 1, RunID: runID},
+		TicketID:     ticketID,
+		AgentProfile: "contract-engineer",
+	})
+	writeTicketRunFixture(t, repoRoot, runID, TicketRunSnapshot{
+		ArtifactMeta: state.ArtifactMeta{SchemaVersion: 1, RunID: runID},
+		TicketID:     ticketID,
+		CurrentPhase: state.TicketPhaseImplement,
+	})
+
+	report, err := DeriveStatus(StatusRequest{RepoRoot: repoRoot, RunID: runID})
+	if err != nil {
+		t.Fatalf("DeriveStatus returned error: %v", err)
+	}
+	if len(report.Tickets) != 1 {
+		t.Fatalf("expected one ticket, got %d", len(report.Tickets))
+	}
+	if got := report.Tickets[0].Profile; got != "contract-engineer" {
+		t.Fatalf("expected Profile %q, got %q", "contract-engineer", got)
+	}
+}
+
 func TestTicketStatusReason_UsesFailuresForRuntimeEventStream(t *testing.T) {
 	snapshot := TicketRunSnapshot{
 		CurrentPhase: state.TicketPhaseBlocked,

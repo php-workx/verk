@@ -74,6 +74,9 @@ func initStatusCmd(root *cobra.Command) {
 
 				_, _ = fmt.Fprintf(w, "  %s %s\n", tagFn(r, tag), title)
 
+				if ticket.Profile != "" {
+					_, _ = fmt.Fprintf(w, "  %s %s\n", strings.Repeat(" ", len(tag)), r.dim("Profile: "+ticket.Profile))
+				}
 				if ticket.BlockReason != "" {
 					reason := shortenBlockReason(ticket.BlockReason)
 					_, _ = fmt.Fprintf(w, "  %s %s\n", strings.Repeat(" ", len(tag)), r.dim(reason))
