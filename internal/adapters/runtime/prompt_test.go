@@ -120,6 +120,47 @@ func TestParseResultBlock_MalformedJSON(t *testing.T) {
 	}
 }
 
+func TestParseIntentBlock_ValidatesAllParsePaths(t *testing.T) {
+	tests := []struct {
+		name      string
+		input     string
+		wantFound bool
+	}{
+		{
+			name:      "direct JSON",
+			input:     `{"covered_criteria":["criterion one"],"target_files":["internal/foo.go"],"test_plan":"go test ./..."}`,
+			wantFound: true,
+		},
+		{
+			name:      "sentinel JSON",
+			input:     `VERK_INTENT:{"covered_criteria":["criterion one"],"target_files":["internal/foo.go"],"test_plan":"go test ./..."}`,
+			wantFound: true,
+		},
+		{
+			name:      "last JSON fallback",
+			input:     "Intent follows:\n{\"covered_criteria\":[\"criterion one\"],\"target_files\":[\"internal/foo.go\"],\"test_plan\":\"go test ./...\"}",
+			wantFound: true,
+		},
+		{
+			name:      "empty object rejected",
+			input:     `{}`,
+			wantFound: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			block, found := ParseIntentBlock(tt.input)
+			if found != tt.wantFound {
+				t.Fatalf("found=%v, want %v", found, tt.wantFound)
+			}
+			if found && block.TestPlan != "go test ./..." {
+				t.Fatalf("test_plan=%q, want go test ./...", block.TestPlan)
+			}
+		})
+	}
+}
+
 func TestParseReviewBlock_DirectJSON(t *testing.T) {
 	text := `{
   "review_status": "findings",
@@ -366,6 +407,31 @@ func TestBuildWorkerPrompt_AsksWorkerToInspectExistingImplementation(t *testing.
 	expected := "Before editing, inspect the current working tree to determine whether any required implementation already exists, then continue from the actual state."
 	if !strings.Contains(prompt, expected) {
 		t.Fatalf("expected existing-implementation instruction in prompt:\n%s", prompt)
+	}
+}
+
+func TestBuildIntentPrompt_ForbidsEditsAndIncludesScope(t *testing.T) {
+	prompt := BuildIntentPrompt(IntentRequest{
+		TicketID:     "VER-INTENT",
+		LeaseID:      "lease-intent",
+		Attempt:      2,
+		WorktreePath: "/workspace",
+		Instructions: "Implement the feature",
+		OwnedPaths:   []string{"internal/foo.go"},
+	})
+
+	for _, want := range []string{
+		"Ticket: VER-INTENT",
+		"Intent attempt: 2",
+		"Lease ID: lease-intent",
+		"Working directory: /workspace",
+		"This is an intent echo only. Do not edit files.",
+		"Implement the feature",
+		"- internal/foo.go",
+	} {
+		if !strings.Contains(prompt, want) {
+			t.Fatalf("expected %q in prompt:\n%s", want, prompt)
+		}
 	}
 }
 

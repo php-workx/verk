@@ -1409,6 +1409,13 @@ func (a *sleepyRuntimeAdapter) RunReviewer(ctx context.Context, req runtime.Revi
 	return a.reviewResult, nil
 }
 
+func (a *sleepyRuntimeAdapter) RunIntent(ctx context.Context, req runtime.IntentRequest) (runtime.IntentResult, error) {
+	if err := ctx.Err(); err != nil {
+		return runtime.IntentResult{}, err
+	}
+	return runtime.IntentResult{TargetFiles: req.OwnedPaths, TestPlan: "test"}, nil
+}
+
 func TestRunTicket_ChangedFilesCaptured(t *testing.T) {
 	repoRoot := t.TempDir()
 	baseCommit := initEpicRepo(t, repoRoot)

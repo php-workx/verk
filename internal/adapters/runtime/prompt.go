@@ -10,6 +10,7 @@ import (
 const (
 	ResultSentinel = "VERK_RESULT:"
 	ReviewSentinel = "VERK_REVIEW:"
+	IntentSentinel = "VERK_INTENT:"
 )
 
 // EpicReviewFraming is the canonical wording shown to epic-level reviewers so
@@ -103,6 +104,26 @@ When you are finished, your final message MUST be ONLY a JSON object — no pros
 If no issues are found, set review_status to "passed" and findings to an empty array.`
 }
 
+// IntentSystemPrompt returns the system prompt for a pre-implementation intent
+// echo. This phase is read-only: it confirms understanding before edits begin.
+func IntentSystemPrompt() string {
+	return `You are a verk implementation worker doing a pre-implementation intent echo.
+
+Rules:
+- Do not edit files.
+- Read the ticket instructions and declared owned_paths carefully.
+- State which acceptance criteria you intend to cover, which files you expect to touch, and how you plan to test.
+- If the task is unclear, return the best narrow plan and leave implementation concerns for the next phase.
+
+When you are finished, your final message MUST be ONLY a JSON object — no prose, no markdown, no explanation. The JSON must conform to this schema:
+
+{
+  "covered_criteria": ["short criterion descriptions"],
+  "target_files": ["relative/path.go"],
+  "test_plan": "brief validation plan"
+}`
+}
+
 // BuildWorkerPrompt constructs the user prompt for an implementation worker.
 // If req.Profile is set, the profile's rationalization framing is injected
 // after the ticket content and before the standards block.
@@ -148,6 +169,41 @@ func BuildWorkerPrompt(req WorkerRequest) string {
 		b.WriteString("\n## Hard Edit Guard\n\n")
 		b.WriteString("This worker is scoped to the following owned paths. Any edit outside this set\n")
 		b.WriteString("must stop immediately and return status: blocked with reason scope_escape_attempt.\n\n")
+		for _, p := range req.OwnedPaths {
+			fmt.Fprintf(&b, "- %s\n", p)
+		}
+	}
+
+	return b.String()
+}
+
+// BuildIntentPrompt constructs the user prompt for a pre-implementation intent
+// echo. It mirrors the worker prompt's ticket and scope context, but explicitly
+// forbids edits.
+func BuildIntentPrompt(req IntentRequest) string {
+	var b strings.Builder
+
+	if req.TicketID != "" {
+		fmt.Fprintf(&b, "Ticket: %s\n", req.TicketID)
+	}
+	if req.Attempt > 1 {
+		fmt.Fprintf(&b, "Intent attempt: %d (previous intent was insufficient)\n", req.Attempt)
+	}
+	fmt.Fprintf(&b, "Lease ID: %s\n", req.LeaseID)
+
+	if req.WorktreePath != "" {
+		fmt.Fprintf(&b, "Working directory: %s\n", req.WorktreePath)
+	}
+
+	b.WriteString("This is an intent echo only. Do not edit files.\n")
+
+	if req.Instructions != "" {
+		b.WriteString("\n")
+		b.WriteString(req.Instructions)
+	}
+
+	if len(req.OwnedPaths) > 0 {
+		b.WriteString("\n## Owned Paths\n\n")
 		for _, p := range req.OwnedPaths {
 			fmt.Fprintf(&b, "- %s\n", p)
 		}
@@ -248,6 +304,13 @@ type VerkReviewBlock struct {
 	Findings     []RawFinding `json:"findings"`
 }
 
+// VerkIntentBlock is the JSON structure intent echo workers must return.
+type VerkIntentBlock struct {
+	CoveredCriteria []string `json:"covered_criteria"`
+	TargetFiles     []string `json:"target_files"`
+	TestPlan        string   `json:"test_plan"`
+}
+
 // RawFinding matches the JSON shape expected from reviewers.
 type RawFinding struct {
 	ID              string  `json:"id,omitempty"`
@@ -321,6 +384,35 @@ func ParseReviewBlock(text string) (VerkReviewBlock, bool) {
 	}
 
 	return VerkReviewBlock{}, false
+}
+
+// ParseIntentBlock extracts a VerkIntentBlock from AI output.
+// Same three-strategy approach as ParseResultBlock.
+func ParseIntentBlock(text string) (VerkIntentBlock, bool) {
+	text = strings.TrimSpace(text)
+
+	var block VerkIntentBlock
+	if err := json.Unmarshal([]byte(text), &block); err == nil {
+		return finalizeIntentBlock(block)
+	}
+
+	if b, ok := parseSentinelLine[VerkIntentBlock](text, IntentSentinel); ok {
+		return finalizeIntentBlock(b)
+	}
+
+	if b, ok := parseLastJSON[VerkIntentBlock](stripSentinelLines(text, IntentSentinel)); ok {
+		return finalizeIntentBlock(b)
+	}
+
+	return VerkIntentBlock{}, false
+}
+
+func finalizeIntentBlock(b VerkIntentBlock) (VerkIntentBlock, bool) {
+	if len(b.CoveredCriteria) == 0 && len(b.TargetFiles) == 0 && strings.TrimSpace(b.TestPlan) == "" {
+		return VerkIntentBlock{}, false
+	}
+	b.TestPlan = strings.TrimSpace(b.TestPlan)
+	return b, true
 }
 
 func finalizeReviewBlock(b VerkReviewBlock) (VerkReviewBlock, bool) {

@@ -42,6 +42,7 @@ type reflectingAdapter struct {
 type functionAdapter struct {
 	runWorker   func(context.Context, runtime.WorkerRequest) (runtime.WorkerResult, error)
 	runReviewer func(context.Context, runtime.ReviewRequest) (runtime.ReviewResult, error)
+	runIntent   func(context.Context, runtime.IntentRequest) (runtime.IntentResult, error)
 }
 
 func (a functionAdapter) RunWorker(ctx context.Context, req runtime.WorkerRequest) (runtime.WorkerResult, error) {
@@ -56,6 +57,13 @@ func (a functionAdapter) RunReviewer(ctx context.Context, req runtime.ReviewRequ
 		return runtime.ReviewResult{}, fmt.Errorf("functionAdapter: RunReviewer not configured")
 	}
 	return a.runReviewer(ctx, req)
+}
+
+func (a functionAdapter) RunIntent(ctx context.Context, req runtime.IntentRequest) (runtime.IntentResult, error) {
+	if a.runIntent == nil {
+		return runtime.IntentResult{TargetFiles: req.OwnedPaths, TestPlan: "test"}, nil
+	}
+	return a.runIntent(ctx, req)
 }
 
 func (a *reflectingAdapter) RunWorker(ctx context.Context, req runtime.WorkerRequest) (runtime.WorkerResult, error) {
@@ -88,6 +96,13 @@ func (a *reflectingAdapter) RunReviewer(ctx context.Context, req runtime.ReviewR
 	result.LeaseID = req.LeaseID
 	a.reviewIndex++
 	return result, nil
+}
+
+func (a *reflectingAdapter) RunIntent(ctx context.Context, req runtime.IntentRequest) (runtime.IntentResult, error) {
+	if err := ctx.Err(); err != nil {
+		return runtime.IntentResult{}, err
+	}
+	return runtime.IntentResult{TargetFiles: req.OwnedPaths, TestPlan: "test"}, nil
 }
 
 func (a *reflectingAdapter) WorkerRequests() []runtime.WorkerRequest {
@@ -2048,6 +2063,13 @@ func (a *blockingEpicAdapter) RunReviewer(ctx context.Context, req runtime.Revie
 		Summary:            "clean",
 		ResultArtifactPath: filepath.Join("artifacts", req.TicketID+"-review.json"),
 	}, nil
+}
+
+func (a *blockingEpicAdapter) RunIntent(ctx context.Context, req runtime.IntentRequest) (runtime.IntentResult, error) {
+	if err := ctx.Err(); err != nil {
+		return runtime.IntentResult{}, err
+	}
+	return runtime.IntentResult{TargetFiles: req.OwnedPaths, TestPlan: "test"}, nil
 }
 
 func (a *blockingEpicAdapter) maxConcurrent() int {

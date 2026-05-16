@@ -153,9 +153,39 @@ type ReviewResult struct {
 	Findings           []ReviewFinding             `json:"findings"`
 }
 
+// IntentRequest is the input for a pre-implementation intent echo. The worker
+// is asked to return structured JSON describing which acceptance criteria it
+// plans to address, which files it intends to touch, and how it will test.
+type IntentRequest struct {
+	RunID        string
+	TicketID     string
+	LeaseID      string
+	Attempt      int
+	Runtime      string
+	Model        string
+	Reasoning    string
+	WorktreePath string
+	Instructions string
+	OwnedPaths   []string
+}
+
+// IntentResult is the parsed output of an intent echo call.
+type IntentResult struct {
+	CoveredCriteria []string
+	TargetFiles     []string
+	TestPlan        string
+	RawResponse     string
+}
+
 type Adapter interface {
 	RunWorker(ctx context.Context, req WorkerRequest) (WorkerResult, error)
 	RunReviewer(ctx context.Context, req ReviewRequest) (ReviewResult, error)
+	// RunIntent executes a pre-implementation intent echo against the worker.
+	// The worker returns a structured JSON object describing which acceptance
+	// criteria it plans to address, which files it intends to touch, and how
+	// it will test. The engine validates the result before dispatching the
+	// implementation worker.
+	RunIntent(ctx context.Context, req IntentRequest) (IntentResult, error)
 }
 
 // ValidatedExecutable normalizes a runtime executable name or path before it is

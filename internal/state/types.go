@@ -16,6 +16,7 @@ type (
 
 const (
 	TicketPhaseIntake    TicketPhase = "intake"
+	TicketPhaseIntent    TicketPhase = "intent"
 	TicketPhaseImplement TicketPhase = "implement"
 	TicketPhaseVerify    TicketPhase = "verify"
 	TicketPhaseReview    TicketPhase = "review"
@@ -66,6 +67,7 @@ const (
 const (
 	EscalationNonConvergentVerification = "non_convergent_verification"
 	EscalationNonConvergentReview       = "non_convergent_review"
+	EscalationNonConvergentIntent       = "non_convergent_intent"
 )
 
 type ArtifactMeta struct {
@@ -469,4 +471,19 @@ type FreezeArtifact struct {
 	AllowedPaths []string  `json:"allowed_paths"`
 	Active       bool      `json:"active"`
 	StartedAt    time.Time `json:"started_at"`
+}
+
+// IntentArtifact records the worker's pre-implementation understanding of the
+// ticket. Persisted at
+// .verk/runs/<run-id>/tickets/<ticket-id>/intent-<attempt>.json.
+// The intent phase runs between Intake and Implement when policy.IntentRequired
+// is true. On validation failure the engine retries with corrective context
+// up to MaxIntentAttempts before blocking the ticket.
+type IntentArtifact struct {
+	ArtifactMeta
+	Attempt         int      `json:"attempt"`
+	CoveredCriteria []string `json:"covered_criteria"` // criteria worker plans to address
+	TargetFiles     []string `json:"target_files"`     // files worker plans to touch
+	TestPlan        string   `json:"test_plan"`        // prose summary of test approach
+	RawResponse     string   `json:"raw_response,omitempty"`
 }

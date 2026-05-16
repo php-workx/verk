@@ -60,6 +60,16 @@ type reviewArtifact struct {
 	CapturedStderrPath string                   `json:"captured_stderr_path"`
 }
 
+type intentArtifact struct {
+	Runtime            string                   `json:"runtime"`
+	Request            runtime.IntentRequest    `json:"request"`
+	CLIOutput          json.RawMessage          `json:"cli_output"`
+	IntentBlock        *runtime.VerkIntentBlock `json:"intent_block,omitempty"`
+	Normalized         runtime.IntentResult     `json:"normalized"`
+	CapturedStdoutPath string                   `json:"captured_stdout_path"`
+	CapturedStderrPath string                   `json:"captured_stderr_path"`
+}
+
 func New() *Adapter {
 	return &Adapter{Command: defaultBinary}
 }
@@ -245,6 +255,61 @@ func (a *Adapter) RunReviewer(ctx context.Context, req runtime.ReviewRequest) (r
 	return normalized, nil
 }
 
+func (a *Adapter) RunIntent(ctx context.Context, req runtime.IntentRequest) (runtime.IntentResult, error) {
+	if err := validateIntentRequest(req); err != nil {
+		return runtime.IntentResult{}, err
+	}
+
+	req.Runtime = ensureRuntime(req.Runtime, runtimeName)
+	prompt := runtime.BuildIntentPrompt(req)
+	args := buildIntentArgs(req, prompt)
+	env, err := runtimeCommandEnv(runtime.ExecutionConfig{}, req.WorktreePath)
+	if err != nil {
+		return runtime.IntentResult{}, err
+	}
+	execResult, err := runCommand(ctx, a.binary(), args, nil, env, "", 0)
+	if err != nil {
+		return runtime.IntentResult{}, fmt.Errorf("run %s intent: %w", runtimeName, err)
+	}
+
+	resultText, _ := runtime.ExtractCLIResultText(execResult.stdout)
+	intentBlock, blockFound := runtime.ParseIntentBlock(resultText)
+	if !blockFound {
+		return runtime.IntentResult{}, fmt.Errorf("run %s intent: missing intent result block", runtimeName)
+	}
+
+	result := runtime.IntentResult{
+		CoveredCriteria: intentBlock.CoveredCriteria,
+		TargetFiles:     intentBlock.TargetFiles,
+		TestPlan:        intentBlock.TestPlan,
+		RawResponse:     resultText,
+	}
+
+	stdoutPath, err := writeBytesArtifact(runtimeName+"-intent-stdout", execResult.stdout)
+	if err != nil {
+		return runtime.IntentResult{}, err
+	}
+	stderrPath, err := writeBytesArtifact(runtimeName+"-intent-stderr", execResult.stderr)
+	if err != nil {
+		return runtime.IntentResult{}, err
+	}
+	blockPtr := &intentBlock
+	artifact := intentArtifact{
+		Runtime:            runtimeName,
+		Request:            req,
+		CLIOutput:          safeRawJSON(execResult.stdout),
+		IntentBlock:        blockPtr,
+		Normalized:         result,
+		CapturedStdoutPath: stdoutPath,
+		CapturedStderrPath: stderrPath,
+	}
+	if _, err := writeJSONArtifact(runtimeName+"-intent-result", artifact); err != nil {
+		return runtime.IntentResult{}, err
+	}
+
+	return result, nil
+}
+
 func extractCodexTelemetry(stdout []byte) (*state.RuntimeTokenUsage, *state.RuntimeActivityStats) {
 	scanner := bufio.NewScanner(bytes.NewReader(stdout))
 	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
@@ -322,6 +387,13 @@ func validateReviewRequest(req runtime.ReviewRequest) error {
 	return nil
 }
 
+func validateIntentRequest(req runtime.IntentRequest) error {
+	if strings.TrimSpace(req.LeaseID) == "" {
+		return fmt.Errorf("intent request missing lease_id")
+	}
+	return nil
+}
+
 // buildWorkerArgs constructs CLI args for `codex exec`.
 // Codex takes the prompt as a positional argument and writes output to stdout.
 //
@@ -358,6 +430,21 @@ func buildReviewArgs(req runtime.ReviewRequest, prompt string) []string {
 	if req.WorktreePath != "" {
 		// Verifier parity with ver-wi10: keep process cwd unset and route all
 		// filesystem access through Codex's `-C/--cd` flag.
+		args = append(args, "-C", req.WorktreePath)
+	}
+	args = append(args, prompt)
+	return args
+}
+
+func buildIntentArgs(req runtime.IntentRequest, prompt string) []string {
+	args := []string{
+		"exec",
+		"--json",
+		"--full-auto",
+	}
+	args = appendModelArgs(args, req.Model)
+	args = appendReasoningArgs(args, req.Reasoning)
+	if req.WorktreePath != "" {
 		args = append(args, "-C", req.WorktreePath)
 	}
 	args = append(args, prompt)
