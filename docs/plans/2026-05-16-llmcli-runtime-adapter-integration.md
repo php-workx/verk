@@ -162,6 +162,24 @@ Implementation note:
   it.
 - Acceptance: no behavior covered only by the deleted helpers is lost.
 
+Implementation note:
+
+- Removed the unused Claude-local process-group helper and its obsolete
+  helper-only tests after Claude and Codex adapters were routed through
+  Fabrikk `llmcli` via `llmclibridge`; Verk no longer owns local
+  Claude/Codex subprocess or process-group helpers.
+- Verk bridge and adapter tests retain bridge-level coverage for timeout and
+  cancelled event normalization, raw capture plumbing, and runtime artifact
+  behavior. They do not duplicate subprocess process-tree cancellation tests.
+- Process-tree cancellation fidelity is owned by Fabrikk `llmcli` subprocess
+  supervisor tests for the pinned Fabrikk version, including
+  `llmcli/subprocess_test.go` coverage such as
+  `TestSupervisor_ContextCancelTerminatesProcess`.
+- Removal condition and guardrail: if Verk changes the pinned Fabrikk version
+  or switches backend supervision mode, verify Fabrikk subprocess
+  process-tree cancellation tests still exist and pass, or add a Verk smoke
+  test before relying on the new execution path.
+
 ### P2. Update Doctor and Runtime Diagnostics
 
 - Keep CLI runtime selection and doctor output user-facing as `claude` and

@@ -11,10 +11,10 @@ import (
 	"time"
 )
 
-// TestSetupProcessGroup_CancelTreatsESRCHAsSuccess — see
-// internal/adapters/runtime/claude/process_group_unix_test.go for full
-// rationale. Mirrored here to keep the three process-group helpers
-// behaviourally consistent.
+// TestSetupProcessGroup_CancelTreatsESRCHAsSuccess verifies the verification
+// command helper treats already-exited process groups as successful cleanup.
+// Runtime adapters now rely on Fabrikk llmcli for equivalent subprocess
+// supervision.
 func TestSetupProcessGroup_CancelTreatsESRCHAsSuccess(t *testing.T) {
 	t.Parallel()
 
