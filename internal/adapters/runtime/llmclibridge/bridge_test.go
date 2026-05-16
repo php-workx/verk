@@ -249,7 +249,11 @@ func TestRunProgressFromToolCallEvents(t *testing.T) {
 		name: backendClaude,
 		events: []llmclient.Event{
 			{Type: llmclient.EventToolCallStart, ToolCall: &llmclient.ToolCall{Name: "Read"}},
-			{Type: llmclient.EventToolCallEnd, ToolCall: &llmclient.ToolCall{Name: "Read"}},
+			{Type: llmclient.EventToolCallEnd, ToolCall: &llmclient.ToolCall{Name: "Read", Arguments: map[string]interface{}{"file_path": "/repo/internal/adapters/runtime/claude/adapter.go"}}},
+			{Type: llmclient.EventToolCallStart, ToolCall: &llmclient.ToolCall{Name: "Write"}},
+			{Type: llmclient.EventToolCallEnd, ToolCall: &llmclient.ToolCall{Name: "Write", Arguments: map[string]interface{}{"file_path": "/repo/pkg/generated.go"}}},
+			{Type: llmclient.EventToolCallStart, ToolCall: &llmclient.ToolCall{Name: "Bash"}},
+			{Type: llmclient.EventToolCallEnd, ToolCall: &llmclient.ToolCall{Name: "Bash", Arguments: map[string]interface{}{"command": "go test ./internal/adapters/runtime/claude"}}},
 		},
 	}
 	bridge := New(
@@ -265,7 +269,11 @@ func TestRunProgressFromToolCallEvents(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Run returned error: %v", err)
 	}
-	want := []string{"tool call started: Read", "tool call finished: Read"}
+	want := []string{
+		"reading internal/adapters/runtime/claude/adapter.go",
+		"writing pkg/generated.go",
+		"$ go test ./internal/adapters/runtime/claude",
+	}
 	if !reflect.DeepEqual(progress, want) {
 		t.Fatalf("expected progress %#v, got %#v", want, progress)
 	}
@@ -289,12 +297,54 @@ func TestRunReturnsStreamErrorBeforeExecution(t *testing.T) {
 	}
 }
 
+func TestCheckAvailabilityRunsVersionProbeWithoutBackendReadiness(t *testing.T) {
+	t.Parallel()
+
+	backendCalled := false
+	bridge := New(
+		WithBackendFactory(func(cfg BackendConfig) (llmclient.Backend, error) {
+			backendCalled = true
+			return &fakeBackend{
+				name:        cfg.BackendName,
+				readyReport: &llmclient.ReadyReport{State: llmclient.ReadyNotAuthed, Detail: "not logged in"},
+			}, nil
+		}),
+		WithBaseEnv(func() []string { return []string{"PATH=/usr/bin"} }),
+	)
+
+	if err := bridge.CheckAvailability(context.Background(), RuntimeClaude, writeExecutable(t, t.TempDir(), "claude")); err != nil {
+		t.Fatalf("CheckAvailability returned error: %v", err)
+	}
+	if backendCalled {
+		t.Fatalf("expected CheckAvailability to avoid backend readiness checks")
+	}
+}
+
+func TestCheckAvailabilityReturnsVersionProbeError(t *testing.T) {
+	t.Parallel()
+
+	bridge := New(
+		WithBaseEnv(func() []string { return []string{"PATH=/usr/bin"} }),
+	)
+	exe := writeExecutableContent(t, t.TempDir(), "claude", "#!/bin/sh\necho version failed >&2\nexit 17\n")
+
+	err := bridge.CheckAvailability(context.Background(), RuntimeClaude, exe)
+	if err == nil {
+		t.Fatalf("expected availability error")
+	}
+	if !strings.Contains(err.Error(), "version failed") {
+		t.Fatalf("expected version probe detail in error, got %v", err)
+	}
+}
+
 type fakeBackend struct {
 	name          string
 	events        []llmclient.Event
 	streamErr     error
 	captureStdout []byte
 	captureStderr []byte
+	available     *bool
+	readyReport   *llmclient.ReadyReport
 	input         *llmclient.Context
 	config        llmclient.RequestConfig
 }
@@ -319,9 +369,17 @@ func (b *fakeBackend) Stream(_ context.Context, input *llmclient.Context, opts .
 
 func (b *fakeBackend) Name() string { return b.name }
 
-func (b *fakeBackend) Available() bool { return true }
+func (b *fakeBackend) Available() bool {
+	if b.available != nil {
+		return *b.available
+	}
+	return true
+}
 
 func (b *fakeBackend) Ready(context.Context) llmclient.ReadyReport {
+	if b.readyReport != nil {
+		return *b.readyReport
+	}
 	return llmclient.ReadyReport{State: llmclient.ReadyOK}
 }
 
@@ -343,8 +401,14 @@ func textMessage(text string) *llmclient.AssistantMessage {
 func writeExecutable(t *testing.T, dir, name string) string {
 	t.Helper()
 
+	return writeExecutableContent(t, dir, name, "#!/bin/sh\nexit 0\n")
+}
+
+func writeExecutableContent(t *testing.T, dir, name, content string) string {
+	t.Helper()
+
 	path := filepath.Join(dir, name)
-	if err := os.WriteFile(path, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+	if err := os.WriteFile(path, []byte(content), 0o755); err != nil {
 		t.Fatalf("write executable: %v", err)
 	}
 	return path

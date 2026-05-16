@@ -1,159 +1,104 @@
 package claude
 
 import (
-	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"os"
-	"os/exec"
-	goruntime "runtime"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 	"verk/internal/adapters/runtime"
+	"verk/internal/adapters/runtime/llmclibridge"
 )
 
-// TestMain allows this test binary to act as a subprocess helper.
-// When _CLAUDE_TEST_WRITE_HUGE_LINE=1, it writes a 2MB line to stdout so that
-// bufio.Scanner (1MB max) returns bufio.ErrTooLong — enabling a real scanner
-// error test without external tooling.
-// When _CLAUDE_TEST_STREAM_JSON_OUTPUT=1, it writes minimal stream-json lines and
-// exits normally.
-// When _CLAUDE_TEST_WRITE_HUGE_SLEEP_MS is set, the helper pauses after writing
-// the large line, which allows tests to confirm that the parent kills the child
-// instead of waiting for normal completion.
-func TestMain(m *testing.M) {
-	if marker := os.Getenv("_CLAUDE_TEST_GRANDCHILD_MARKER"); marker != "" {
-		time.Sleep(300 * time.Millisecond)
-		_ = os.WriteFile(marker, []byte("grandchild-survived"), 0o644)
-		os.Exit(0)
-	}
-	if os.Getenv("_CLAUDE_TEST_WRITE_HUGE_LINE") == "1" {
-		if marker := os.Getenv("_CLAUDE_TEST_SPAWN_GRANDCHILD_MARKER"); marker != "" {
-			cmd := exec.Command(os.Args[0], "-test.run=^$")
-			cmd.Env = claudeTestEnvWithout(
-				"_CLAUDE_TEST_WRITE_HUGE_LINE",
-				"_CLAUDE_TEST_WRITE_HUGE_LINE_PREFIX",
-				"_CLAUDE_TEST_WRITE_HUGE_SLEEP_MS",
-				"_CLAUDE_TEST_EXIT_MARKER",
-				"_CLAUDE_TEST_SPAWN_GRANDCHILD_MARKER",
-			)
-			cmd.Env = append(cmd.Env, "_CLAUDE_TEST_GRANDCHILD_MARKER="+marker)
-			_ = cmd.Start()
-			time.Sleep(100 * time.Millisecond)
-		}
-		if os.Getenv("_CLAUDE_TEST_WRITE_HUGE_LINE_PREFIX") == "1" {
-			_, _ = fmt.Fprintln(os.Stdout, `{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Read","input":{"file_path":"/tmp/test.txt"}}]}}`)
-		}
-		_, _ = fmt.Fprintln(os.Stdout, strings.Repeat("x", 2*1024*1024))
-		if delay := os.Getenv("_CLAUDE_TEST_WRITE_HUGE_SLEEP_MS"); delay == "1" {
-			time.Sleep(2 * time.Second)
-		}
-		if marker := os.Getenv("_CLAUDE_TEST_EXIT_MARKER"); marker != "" {
-			_ = os.WriteFile(marker, []byte("normal-exit"), 0o644)
-		}
-		os.Exit(0)
-	}
-	if os.Getenv("_CLAUDE_TEST_STREAM_JSON_OUTPUT") == "1" {
-		_, _ = fmt.Fprintln(os.Stdout, `{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Read","input":{"file_path":"/tmp/test.txt"}}]}}`)
-		_, _ = fmt.Fprintln(os.Stdout, `{"type":"result","is_error":false,"subtype":"success","result":"{\"status\":\"done\"}","duration_ms":5,"num_turns":1}`)
-		_, _ = fmt.Fprintln(os.Stderr, "streaming stderr")
-		os.Exit(0)
-	}
-	os.Exit(m.Run())
+type fakeBridge struct {
+	runFunc          func(context.Context, llmclibridge.Request) (llmclibridge.Result, error)
+	availabilityFunc func(context.Context, string, string) error
+	requests         []llmclibridge.Request
 }
 
-func claudeTestEnvWithout(keys ...string) []string {
-	blocked := make(map[string]struct{}, len(keys))
-	for _, key := range keys {
-		blocked[key] = struct{}{}
+func (b *fakeBridge) Run(ctx context.Context, req llmclibridge.Request) (llmclibridge.Result, error) {
+	b.requests = append(b.requests, req)
+	if b.runFunc != nil {
+		return b.runFunc(ctx, req)
 	}
-	env := os.Environ()
-	filtered := env[:0]
-	for _, value := range env {
-		key, _, ok := strings.Cut(value, "=")
-		if ok {
-			if _, remove := blocked[key]; remove {
-				continue
-			}
-		}
-		filtered = append(filtered, value)
-	}
-	return filtered
+	return llmclibridge.Result{}, nil
 }
 
-// mockCLIOutput builds a JSON response matching `claude -p --output-format json`.
-func mockCLIOutput(resultText string, isError bool) []byte {
-	output := runtime.CLIOutputJSON{
-		Type:       "result",
-		Subtype:    "success",
-		IsError:    isError,
-		NumTurns:   3,
-		Result:     resultText,
-		SessionID:  "test-session",
-		DurationMS: 5000,
+func (b *fakeBridge) CheckAvailability(ctx context.Context, runtimeName, command string) error {
+	if b.availabilityFunc != nil {
+		return b.availabilityFunc(ctx, runtimeName, command)
 	}
-	if isError {
-		output.Subtype = "error"
+	return nil
+}
+
+func installFakeBridge(t *testing.T, bridge *fakeBridge) {
+	t.Helper()
+
+	oldNewBridge := newBridge
+	newBridge = func() bridgeClient { return bridge }
+	t.Cleanup(func() { newBridge = oldNewBridge })
+}
+
+func freezeNow(t *testing.T, values ...time.Time) {
+	t.Helper()
+
+	oldNow := now
+	now = func() time.Time {
+		if len(values) == 0 {
+			t.Fatal("now called more times than expected")
+		}
+		value := values[0]
+		values = values[1:]
+		return value
 	}
-	data, _ := json.Marshal(output)
-	return data
+	t.Cleanup(func() { now = oldNow })
 }
 
 func TestRunWorker_NormalizesAndCapturesArtifacts(t *testing.T) {
-	oldRunCommand := runCommand
-	oldNow := now
-	defer func() {
-		runCommand = oldRunCommand
-		now = oldNow
-	}()
-
-	times := []time.Time{
+	freezeNow(t,
 		time.Date(2026, 4, 2, 12, 0, 0, 0, time.UTC),
 		time.Date(2026, 4, 2, 12, 5, 0, 0, time.UTC),
+	)
+
+	rawStdout := []byte(`{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Read"}]}}` + "\n")
+	resultJSON := `{"status":"done_with_concerns","completion_code":"ok","concerns":["minor style issue in helper"]}`
+	bridge := &fakeBridge{
+		runFunc: func(ctx context.Context, req llmclibridge.Request) (llmclibridge.Result, error) {
+			t.Helper()
+			if req.RuntimeName != runtimeName {
+				t.Fatalf("expected runtime %q, got %q", runtimeName, req.RuntimeName)
+			}
+			if req.Command != "claude-test" {
+				t.Fatalf("expected command claude-test, got %q", req.Command)
+			}
+			if req.Model != "sonnet" {
+				t.Fatalf("expected model sonnet, got %q", req.Model)
+			}
+			if req.Reasoning != "" {
+				t.Fatalf("expected Claude reasoning to be empty, got %q", req.Reasoning)
+			}
+			if req.WorktreePath != "/tmp/worktree" {
+				t.Fatalf("expected worktree path /tmp/worktree, got %q", req.WorktreePath)
+			}
+			if req.Timeout != 7*time.Minute {
+				t.Fatalf("expected worker timeout 7m, got %s", req.Timeout)
+			}
+			if !strings.Contains(req.UserPrompt, "ticket-1") || !strings.Contains(req.UserPrompt, "Attempt: 2") {
+				t.Fatalf("expected worker prompt to include ticket and attempt, got: %s", req.UserPrompt)
+			}
+
+			return llmclibridge.Result{
+				Text:     resultJSON,
+				Stdout:   rawStdout,
+				Stderr:   []byte("worker log"),
+				ExitCode: 0,
+			}, nil
+		},
 	}
-	now = func() time.Time {
-		value := times[0]
-		times = times[1:]
-		return value
-	}
-	runCommand = func(ctx context.Context, binary string, args []string, stdin []byte, env []string, workDir string, timeout time.Duration) (commandResult, error) {
-		t.Helper()
-		if binary != "claude-test" {
-			t.Fatalf("expected binary claude-test, got %q", binary)
-		}
-		if !hasArg(args, "-p") {
-			t.Fatalf("expected -p flag in args: %v", args)
-		}
-		assertArgValue(t, args, "--output-format", "json")
-
-		promptText := string(stdin)
-		if !strings.Contains(promptText, "ticket-1") {
-			t.Fatalf("expected prompt to contain ticket id, got: %s", promptText)
-		}
-		if !strings.Contains(promptText, "Attempt: 2") {
-			t.Fatalf("expected prompt to contain attempt number, got: %s", promptText)
-		}
-		if workDir != "/tmp/worktree" {
-			t.Fatalf("expected workDir /tmp/worktree, got %q", workDir)
-		}
-
-		if timeout != 7*time.Minute {
-			t.Fatalf("expected worker timeout 7m, got %s", timeout)
-		}
-		// env is nil — subprocess inherits full parent environment
-
-		// AI returns JSON-only as instructed
-		resultJSON := `{"status":"done_with_concerns","completion_code":"ok","concerns":["minor style issue in helper"]}`
-
-		return commandResult{
-			stdout:   mockCLIOutput(resultJSON, false),
-			stderr:   []byte("worker log"),
-			exitCode: 0,
-		}, nil
-	}
+	installFakeBridge(t, bridge)
 
 	adapter := NewWithCommand("claude-test")
 	result, err := adapter.RunWorker(context.Background(), runtime.WorkerRequest{
@@ -161,6 +106,7 @@ func TestRunWorker_NormalizesAndCapturesArtifacts(t *testing.T) {
 		RunID:        "run-1",
 		TicketID:     "ticket-1",
 		Attempt:      2,
+		Model:        "sonnet",
 		WorktreePath: "/tmp/worktree",
 		ExecutionConfig: runtime.ExecutionConfig{
 			WorkerTimeoutMinutes: 7,
@@ -187,6 +133,7 @@ func TestRunWorker_NormalizesAndCapturesArtifacts(t *testing.T) {
 		t.Fatalf("expected captured artifact paths, got %#v", result)
 	}
 
+	assertLegacyStdoutArtifact(t, result.StdoutPath, resultJSON, rawStdout)
 	stderrBytes, err := os.ReadFile(result.StderrPath)
 	if err != nil {
 		t.Fatalf("read stderr artifact: %v", err)
@@ -195,64 +142,54 @@ func TestRunWorker_NormalizesAndCapturesArtifacts(t *testing.T) {
 		t.Fatalf("unexpected stderr capture: %s", string(stderrBytes))
 	}
 
-	artifactBytes, err := os.ReadFile(result.ResultArtifactPath)
-	if err != nil {
-		t.Fatalf("read result artifact: %v", err)
+	var artifact workerArtifact
+	readJSONArtifact(t, result.ResultArtifactPath, &artifact)
+	if artifact.Normalized.LeaseID != "lease-1" {
+		t.Fatalf("expected normalized lease id, got %q", artifact.Normalized.LeaseID)
 	}
-	var artifact map[string]any
-	if err := json.Unmarshal(artifactBytes, &artifact); err != nil {
-		t.Fatalf("artifact is not valid JSON: %v", err)
+	if artifact.Normalized.Status != runtime.WorkerStatusDoneWithConcerns {
+		t.Fatalf("unexpected normalized status: %q", artifact.Normalized.Status)
 	}
-	normalized, _ := artifact["normalized"].(map[string]any)
-	if normalized["lease_id"] != "lease-1" {
-		t.Fatalf("expected normalized lease id, got %#v", normalized["lease_id"])
+	var cliOut runtime.CLIOutputJSON
+	if err := json.Unmarshal(artifact.CLIOutput, &cliOut); err != nil {
+		t.Fatalf("artifact cli output is not legacy CLI JSON: %v", err)
 	}
-	if normalized["status"] != string(runtime.WorkerStatusDoneWithConcerns) {
-		t.Fatalf("unexpected normalized status: %#v", normalized["status"])
+	if cliOut.Result == "" || !strings.Contains(cliOut.Result, "done_with_concerns") {
+		t.Fatalf("expected CLI output result to contain bridge text, got %#v", cliOut)
 	}
 }
 
-func TestRunWorker_StreamingCommandUsesWorktreePath(t *testing.T) {
-	oldRunStreamingCommand := runStreamingCommand
-	oldNow := now
-	defer func() {
-		runStreamingCommand = oldRunStreamingCommand
-		now = oldNow
-	}()
+func TestRunWorker_ProgressCallbackFlowsThroughBridge(t *testing.T) {
+	freezeNow(t,
+		time.Date(2026, 4, 2, 11, 0, 0, 0, time.UTC),
+		time.Date(2026, 4, 2, 11, 1, 0, 0, time.UTC),
+	)
 
-	now = func() time.Time {
-		return time.Date(2026, 4, 2, 11, 0, 0, 0, time.UTC)
+	var progress []string
+	bridge := &fakeBridge{
+		runFunc: func(ctx context.Context, req llmclibridge.Request) (llmclibridge.Result, error) {
+			t.Helper()
+			if req.WorktreePath != "/tmp/worktree-streaming" {
+				t.Fatalf("expected worktree path /tmp/worktree-streaming, got %q", req.WorktreePath)
+			}
+			if req.OnProgress == nil {
+				t.Fatalf("expected progress callback")
+			}
+			req.OnProgress("reading internal/adapters/runtime/claude/adapter.go")
+			return llmclibridge.Result{
+				Text:     `{"status":"done","completion_code":"ok"}`,
+				ExitCode: 0,
+			}, nil
+		},
 	}
+	installFakeBridge(t, bridge)
 
-	runStreamingCommand = func(ctx context.Context, binary string, args []string, stdin []byte, env []string, workDir string, timeout time.Duration, onProgress func(string)) (commandResult, error) {
-		t.Helper()
-		if binary != "claude-test" {
-			t.Fatalf("expected binary claude-test, got %q", binary)
-		}
-		if !hasArg(args, "--output-format") {
-			t.Fatalf("expected output-format arg in args: %v", args)
-		}
-		if workDir != "/tmp/worktree-streaming" {
-			t.Fatalf("expected workDir /tmp/worktree-streaming, got %q", workDir)
-		}
-		if onProgress != nil {
-			onProgress("starting")
-		}
-		return commandResult{
-			stdout:   mockCLIOutput(`{"status":"done","completion_code":"ok"}`, false),
-			exitCode: 0,
-		}, nil
-	}
-
-	adapter := NewWithCommand("claude-test")
-	result, err := adapter.RunWorker(context.Background(), runtime.WorkerRequest{
+	result, err := NewWithCommand("claude-test").RunWorker(context.Background(), runtime.WorkerRequest{
 		LeaseID:      "lease-stream-1",
 		TicketID:     "ticket-stream-1",
 		WorktreePath: "/tmp/worktree-streaming",
 		OnProgress: func(detail string) {
-			if strings.TrimSpace(detail) == "" {
-				t.Fatalf("expected non-empty progress detail")
-			}
+			progress = append(progress, detail)
 		},
 	})
 	if err != nil {
@@ -261,77 +198,26 @@ func TestRunWorker_StreamingCommandUsesWorktreePath(t *testing.T) {
 	if result.Status != runtime.WorkerStatusDone {
 		t.Fatalf("expected done, got %q", result.Status)
 	}
-}
-
-func TestRunWorker_StreamingCommandUsesEmptyWorktreePathWhenUnset(t *testing.T) {
-	oldRunStreamingCommand := runStreamingCommand
-	oldNow := now
-	defer func() {
-		runStreamingCommand = oldRunStreamingCommand
-		now = oldNow
-	}()
-
-	now = func() time.Time {
-		return time.Date(2026, 4, 2, 11, 5, 0, 0, time.UTC)
-	}
-
-	runStreamingCommand = func(ctx context.Context, binary string, args []string, stdin []byte, env []string, workDir string, timeout time.Duration, onProgress func(string)) (commandResult, error) {
-		t.Helper()
-		if workDir != "" {
-			t.Fatalf("expected empty workDir when WorktreePath is unset, got %q", workDir)
-		}
-		if onProgress != nil {
-			onProgress("starting")
-		}
-		return commandResult{
-			stdout:   mockCLIOutput(`{"status":"done","completion_code":"ok"}`, false),
-			exitCode: 0,
-		}, nil
-	}
-
-	adapter := NewWithCommand("claude-test")
-	result, err := adapter.RunWorker(context.Background(), runtime.WorkerRequest{
-		LeaseID:  "lease-stream-2",
-		TicketID: "ticket-stream-2",
-		OnProgress: func(detail string) {
-			if strings.TrimSpace(detail) == "" {
-				t.Fatalf("expected non-empty progress detail")
-			}
-		},
-	})
-	if err != nil {
-		t.Fatalf("RunWorker returned error: %v", err)
-	}
-	if result.Status != runtime.WorkerStatusDone {
-		t.Fatalf("expected done, got %q", result.Status)
+	if len(progress) != 1 || progress[0] != "reading internal/adapters/runtime/claude/adapter.go" {
+		t.Fatalf("expected progress from bridge, got %#v", progress)
 	}
 }
 
 func TestRunWorker_BlockedStatus(t *testing.T) {
-	oldRunCommand := runCommand
-	oldNow := now
-	defer func() {
-		runCommand = oldRunCommand
-		now = oldNow
-	}()
+	freezeNow(t, time.Date(2026, 4, 2, 12, 0, 0, 0, time.UTC), time.Date(2026, 4, 2, 12, 0, 1, 0, time.UTC))
+	installFakeBridge(t, &fakeBridge{
+		runFunc: func(ctx context.Context, req llmclibridge.Request) (llmclibridge.Result, error) {
+			if req.WorktreePath != "" {
+				t.Fatalf("expected empty worktree path when unset, got %q", req.WorktreePath)
+			}
+			return llmclibridge.Result{
+				Text:     `{"status":"blocked","completion_code":"missing_dependency","block_reason":"required service unavailable"}`,
+				ExitCode: 0,
+			}, nil
+		},
+	})
 
-	now = func() time.Time {
-		return time.Date(2026, 4, 2, 12, 0, 0, 0, time.UTC)
-	}
-
-	runCommand = func(ctx context.Context, binary string, args []string, stdin []byte, env []string, workDir string, timeout time.Duration) (commandResult, error) {
-		if workDir != "" {
-			t.Fatalf("expected empty workDir when WorktreePath is unset, got %q", workDir)
-		}
-		resultJSON := `{"status":"blocked","completion_code":"missing_dependency","block_reason":"required service unavailable"}`
-		return commandResult{
-			stdout:   mockCLIOutput(resultJSON, false),
-			exitCode: 0,
-		}, nil
-	}
-
-	adapter := NewWithCommand("claude-test")
-	result, err := adapter.RunWorker(context.Background(), runtime.WorkerRequest{
+	result, err := NewWithCommand("claude-test").RunWorker(context.Background(), runtime.WorkerRequest{
 		LeaseID:  "lease-1",
 		TicketID: "ticket-1",
 	})
@@ -347,81 +233,61 @@ func TestRunWorker_BlockedStatus(t *testing.T) {
 }
 
 func TestRunWorker_FallbackWhenNoResultBlock(t *testing.T) {
-	oldRunCommand := runCommand
-	oldNow := now
-	defer func() {
-		runCommand = oldRunCommand
-		now = oldNow
-	}()
+	freezeNow(t, time.Date(2026, 4, 2, 12, 0, 0, 0, time.UTC), time.Date(2026, 4, 2, 12, 0, 1, 0, time.UTC))
+	installFakeBridge(t, &fakeBridge{
+		runFunc: func(context.Context, llmclibridge.Request) (llmclibridge.Result, error) {
+			return llmclibridge.Result{
+				Text:     "I made all the changes. Everything looks good.",
+				ExitCode: 0,
+			}, nil
+		},
+	})
 
-	now = func() time.Time {
-		return time.Date(2026, 4, 2, 12, 0, 0, 0, time.UTC)
-	}
-
-	runCommand = func(ctx context.Context, binary string, args []string, stdin []byte, env []string, workDir string, timeout time.Duration) (commandResult, error) {
-		// AI didn't follow JSON-only instruction — returned prose
-		resultText := "I made all the changes. Everything looks good."
-		return commandResult{
-			stdout:   mockCLIOutput(resultText, false),
-			exitCode: 0,
-		}, nil
-	}
-
-	adapter := NewWithCommand("claude-test")
-	result, err := adapter.RunWorker(context.Background(), runtime.WorkerRequest{
+	result, err := NewWithCommand("claude-test").RunWorker(context.Background(), runtime.WorkerRequest{
 		LeaseID:  "lease-1",
 		TicketID: "ticket-1",
 	})
 	if err != nil {
 		t.Fatalf("RunWorker returned error: %v", err)
 	}
-	// Without parseable JSON, successful CLI exit → done
 	if result.Status != runtime.WorkerStatusDone {
 		t.Fatalf("expected done fallback, got %q", result.Status)
 	}
 }
 
 func TestRunReviewer_NormalizesFindingsAndDerivesStatus(t *testing.T) {
-	oldRunCommand := runCommand
-	oldNow := now
-	defer func() {
-		runCommand = oldRunCommand
-		now = oldNow
-	}()
-
-	times := []time.Time{
+	freezeNow(t,
 		time.Date(2026, 4, 2, 13, 0, 0, 0, time.UTC),
 		time.Date(2026, 4, 2, 13, 3, 0, 0, time.UTC),
+	)
+
+	rawStdout := []byte(`{"type":"stream-json","event":"raw"}` + "\n")
+	resultJSON := `{"review_status":"findings","summary":"needs fixes","findings":[{"severity":"P2","title":"blocking issue","body":"blocking issue","file":"internal/example.go","line":12,"disposition":"open"}]}`
+	bridge := &fakeBridge{
+		runFunc: func(ctx context.Context, req llmclibridge.Request) (llmclibridge.Result, error) {
+			t.Helper()
+			if req.Command != "claude-test" {
+				t.Fatalf("expected command claude-test, got %q", req.Command)
+			}
+			if req.Reasoning != "" {
+				t.Fatalf("expected Claude reasoning to be empty, got %q", req.Reasoning)
+			}
+			if req.Timeout != 9*time.Minute {
+				t.Fatalf("expected reviewer timeout 9m, got %s", req.Timeout)
+			}
+			if !strings.Contains(req.UserPrompt, "src/app.go") {
+				t.Fatalf("expected review prompt to include changed file, got: %s", req.UserPrompt)
+			}
+			return llmclibridge.Result{
+				Text:   resultJSON,
+				Stdout: rawStdout,
+				Stderr: []byte("review log"),
+			}, nil
+		},
 	}
-	now = func() time.Time {
-		value := times[0]
-		times = times[1:]
-		return value
-	}
-	runCommand = func(ctx context.Context, binary string, args []string, stdin []byte, env []string, workDir string, timeout time.Duration) (commandResult, error) {
-		t.Helper()
-		if binary != "claude-test" {
-			t.Fatalf("expected binary claude-test, got %q", binary)
-		}
-		if !hasArg(args, "-p") {
-			t.Fatalf("expected -p flag in args: %v", args)
-		}
-		assertArgValue(t, args, "--output-format", "json")
+	installFakeBridge(t, bridge)
 
-		if timeout != 9*time.Minute {
-			t.Fatalf("expected reviewer timeout 9m, got %s", timeout)
-		}
-
-		resultJSON := `{"review_status":"findings","summary":"needs fixes","findings":[{"severity":"P2","title":"blocking issue","body":"blocking issue","file":"internal/example.go","line":12,"disposition":"open"}]}`
-
-		return commandResult{
-			stdout: mockCLIOutput(resultJSON, false),
-			stderr: []byte("review log"),
-		}, nil
-	}
-
-	adapter := NewWithCommand("claude-test")
-	result, err := adapter.RunReviewer(context.Background(), runtime.ReviewRequest{
+	result, err := NewWithCommand("claude-test").RunReviewer(context.Background(), runtime.ReviewRequest{
 		LeaseID:                  "lease-2",
 		RunID:                    "run-2",
 		TicketID:                 "ticket-2",
@@ -439,6 +305,7 @@ func TestRunReviewer_NormalizesFindingsAndDerivesStatus(t *testing.T) {
 	if result.ResultArtifactPath == "" {
 		t.Fatalf("expected result artifact path to be set")
 	}
+	assertLegacyStdoutArtifact(t, result.StdoutPath, resultJSON, rawStdout)
 	artifactBytes, err := os.ReadFile(result.ResultArtifactPath)
 	if err != nil {
 		t.Fatalf("read review result artifact: %v", err)
@@ -475,26 +342,16 @@ func TestRunReviewer_NormalizesFindingsAndDerivesStatus(t *testing.T) {
 }
 
 func TestRunReviewer_PassedReview(t *testing.T) {
-	oldRunCommand := runCommand
-	oldNow := now
-	defer func() {
-		runCommand = oldRunCommand
-		now = oldNow
-	}()
+	freezeNow(t, time.Date(2026, 4, 2, 14, 0, 0, 0, time.UTC), time.Date(2026, 4, 2, 14, 0, 1, 0, time.UTC))
+	installFakeBridge(t, &fakeBridge{
+		runFunc: func(context.Context, llmclibridge.Request) (llmclibridge.Result, error) {
+			return llmclibridge.Result{
+				Text: `{"review_status":"passed","summary":"clean implementation, all criteria met","findings":[]}`,
+			}, nil
+		},
+	})
 
-	now = func() time.Time {
-		return time.Date(2026, 4, 2, 14, 0, 0, 0, time.UTC)
-	}
-
-	runCommand = func(ctx context.Context, binary string, args []string, stdin []byte, env []string, workDir string, timeout time.Duration) (commandResult, error) {
-		resultJSON := `{"review_status":"passed","summary":"clean implementation, all criteria met","findings":[]}`
-		return commandResult{
-			stdout: mockCLIOutput(resultJSON, false),
-		}, nil
-	}
-
-	adapter := NewWithCommand("claude-test")
-	result, err := adapter.RunReviewer(context.Background(), runtime.ReviewRequest{
+	result, err := NewWithCommand("claude-test").RunReviewer(context.Background(), runtime.ReviewRequest{
 		LeaseID:                  "lease-3",
 		EffectiveReviewThreshold: runtime.SeverityP2,
 	})
@@ -509,24 +366,66 @@ func TestRunReviewer_PassedReview(t *testing.T) {
 	}
 }
 
-func TestCheckAvailability_UsesVersionProbe(t *testing.T) {
-	oldRunCommand := runCommand
-	defer func() { runCommand = oldRunCommand }()
+func TestRunIntent_NormalizesBridgeText(t *testing.T) {
+	rawStdout := []byte(`{"type":"stream-json","event":"raw"}` + "\n")
+	resultJSON := `{"covered_criteria":["criterion 1"],"target_files":["internal/example.go"],"test_plan":"go test ./..."}`
+	beforeArtifacts := intentStdoutArtifactSet(t)
+	installFakeBridge(t, &fakeBridge{
+		runFunc: func(ctx context.Context, req llmclibridge.Request) (llmclibridge.Result, error) {
+			t.Helper()
+			if req.Timeout != 0 {
+				t.Fatalf("expected no intent timeout, got %s", req.Timeout)
+			}
+			if req.OnProgress != nil {
+				t.Fatalf("expected no intent progress callback")
+			}
+			if !strings.Contains(req.UserPrompt, "ticket-intent") {
+				t.Fatalf("expected intent prompt to include ticket id, got: %s", req.UserPrompt)
+			}
+			return llmclibridge.Result{
+				Text:   resultJSON,
+				Stdout: rawStdout,
+			}, nil
+		},
+	})
 
-	probed := false
-	runCommand = func(ctx context.Context, binary string, args []string, stdin []byte, env []string, workDir string, timeout time.Duration) (commandResult, error) {
-		probed = true
-		if binary != "claude-test" {
-			t.Fatalf("expected binary claude-test, got %q", binary)
-		}
-		if workDir != "" {
-			t.Fatalf("expected empty workDir for availability check, got %q", workDir)
-		}
-		if len(args) != 1 || args[0] != "--version" {
-			t.Fatalf("expected version probe, got %v", args)
-		}
-		return commandResult{stdout: []byte("claude 1.0.0")}, nil
+	result, err := NewWithCommand("claude-test").RunIntent(context.Background(), runtime.IntentRequest{
+		LeaseID:  "lease-intent",
+		TicketID: "ticket-intent",
+	})
+	if err != nil {
+		t.Fatalf("RunIntent returned error: %v", err)
 	}
+	if len(result.CoveredCriteria) != 1 || result.CoveredCriteria[0] != "criterion 1" {
+		t.Fatalf("unexpected covered criteria: %#v", result.CoveredCriteria)
+	}
+	if len(result.TargetFiles) != 1 || result.TargetFiles[0] != "internal/example.go" {
+		t.Fatalf("unexpected target files: %#v", result.TargetFiles)
+	}
+	if result.TestPlan != "go test ./..." {
+		t.Fatalf("unexpected test plan: %q", result.TestPlan)
+	}
+	matches := newIntentStdoutArtifacts(t, beforeArtifacts)
+	if len(matches) != 1 {
+		t.Fatalf("expected one new intent stdout artifact, got %d: %v", len(matches), matches)
+	}
+	assertLegacyStdoutArtifact(t, matches[0], resultJSON, rawStdout)
+}
+
+func TestCheckAvailability_UsesBridge(t *testing.T) {
+	probed := false
+	installFakeBridge(t, &fakeBridge{
+		availabilityFunc: func(ctx context.Context, runtimeName, command string) error {
+			probed = true
+			if runtimeName != "claude" {
+				t.Fatalf("expected runtime claude, got %q", runtimeName)
+			}
+			if command != "claude-test" {
+				t.Fatalf("expected command claude-test, got %q", command)
+			}
+			return nil
+		},
+	})
 
 	if err := NewWithCommand("claude-test").CheckAvailability(context.Background()); err != nil {
 		t.Fatalf("expected availability probe to pass, got %v", err)
@@ -536,28 +435,34 @@ func TestCheckAvailability_UsesVersionProbe(t *testing.T) {
 	}
 }
 
+func TestCheckAvailability_WrapsBridgeError(t *testing.T) {
+	installFakeBridge(t, &fakeBridge{
+		availabilityFunc: func(context.Context, string, string) error {
+			return errors.New("not logged in")
+		},
+	})
+
+	err := NewWithCommand("claude-test").CheckAvailability(context.Background())
+	if err == nil {
+		t.Fatalf("expected availability error")
+	}
+	if !strings.Contains(err.Error(), "claude availability check failed") || !strings.Contains(err.Error(), "not logged in") {
+		t.Fatalf("unexpected availability error: %v", err)
+	}
+}
+
 func TestRunWorker_NeedsContextStatus(t *testing.T) {
-	oldRunCommand := runCommand
-	oldNow := now
-	defer func() {
-		runCommand = oldRunCommand
-		now = oldNow
-	}()
+	freezeNow(t, time.Date(2026, 4, 2, 12, 0, 0, 0, time.UTC), time.Date(2026, 4, 2, 12, 0, 1, 0, time.UTC))
+	installFakeBridge(t, &fakeBridge{
+		runFunc: func(context.Context, llmclibridge.Request) (llmclibridge.Result, error) {
+			return llmclibridge.Result{
+				Text:     `{"status":"needs_context","completion_code":"missing_spec","block_reason":"acceptance criteria unclear"}`,
+				ExitCode: 0,
+			}, nil
+		},
+	})
 
-	now = func() time.Time {
-		return time.Date(2026, 4, 2, 12, 0, 0, 0, time.UTC)
-	}
-
-	runCommand = func(ctx context.Context, binary string, args []string, stdin []byte, env []string, workDir string, timeout time.Duration) (commandResult, error) {
-		resultJSON := `{"status":"needs_context","completion_code":"missing_spec","block_reason":"acceptance criteria unclear"}`
-		return commandResult{
-			stdout:   mockCLIOutput(resultJSON, false),
-			exitCode: 0,
-		}, nil
-	}
-
-	adapter := NewWithCommand("claude-test")
-	result, err := adapter.RunWorker(context.Background(), runtime.WorkerRequest{
+	result, err := NewWithCommand("claude-test").RunWorker(context.Background(), runtime.WorkerRequest{
 		LeaseID:  "lease-1",
 		TicketID: "ticket-1",
 	})
@@ -573,28 +478,17 @@ func TestRunWorker_NeedsContextStatus(t *testing.T) {
 }
 
 func TestRunWorker_NeedsMoreContextHyphenated(t *testing.T) {
-	oldRunCommand := runCommand
-	oldNow := now
-	defer func() {
-		runCommand = oldRunCommand
-		now = oldNow
-	}()
+	freezeNow(t, time.Date(2026, 4, 2, 12, 0, 0, 0, time.UTC), time.Date(2026, 4, 2, 12, 0, 1, 0, time.UTC))
+	installFakeBridge(t, &fakeBridge{
+		runFunc: func(context.Context, llmclibridge.Request) (llmclibridge.Result, error) {
+			return llmclibridge.Result{
+				Text:     `{"status":"needs-more-context","completion_code":"missing_spec","block_reason":"need operator input"}`,
+				ExitCode: 0,
+			}, nil
+		},
+	})
 
-	now = func() time.Time {
-		return time.Date(2026, 4, 2, 12, 0, 0, 0, time.UTC)
-	}
-
-	// Simulate a runtime returning the hyphenated form "needs-more-context"
-	runCommand = func(ctx context.Context, binary string, args []string, stdin []byte, env []string, workDir string, timeout time.Duration) (commandResult, error) {
-		resultJSON := `{"status":"needs-more-context","completion_code":"missing_spec","block_reason":"need operator input"}`
-		return commandResult{
-			stdout:   mockCLIOutput(resultJSON, false),
-			exitCode: 0,
-		}, nil
-	}
-
-	adapter := NewWithCommand("claude-test")
-	result, err := adapter.RunWorker(context.Background(), runtime.WorkerRequest{
+	result, err := NewWithCommand("claude-test").RunWorker(context.Background(), runtime.WorkerRequest{
 		LeaseID:  "lease-1",
 		TicketID: "ticket-1",
 	})
@@ -609,221 +503,91 @@ func TestRunWorker_NeedsMoreContextHyphenated(t *testing.T) {
 	}
 }
 
-func hasArg(args []string, value string) bool {
-	for _, arg := range args {
-		if arg == value {
-			return true
-		}
+func TestCommandResultFromBridgeUsesTextForParsingAndArtifacts(t *testing.T) {
+	rawStdout := []byte(`{"type":"assistant","delta":"not legacy cli json"}` + "\n")
+	result := commandResultFromBridge(llmclibridge.Result{
+		Text:     `{"status":"done","completion_code":"ok"}`,
+		Stdout:   rawStdout,
+		Stderr:   []byte("stderr"),
+		ExitCode: 0,
+	})
+
+	resultText, ok := runtime.ExtractCLIResultText(result.stdout)
+	if !ok {
+		t.Fatalf("expected bridge text to be wrapped in legacy CLI JSON")
 	}
-	return false
+	if resultText != `{"status":"done","completion_code":"ok"}` {
+		t.Fatalf("unexpected extracted result text: %q", resultText)
+	}
+	artifactText, artifactOK := runtime.ExtractCLIResultText(result.artifactStdout())
+	if !artifactOK {
+		t.Fatalf("expected artifact stdout to be wrapped in legacy CLI JSON, got %q", result.artifactStdout())
+	}
+	if artifactText != resultText {
+		t.Fatalf("expected artifact stdout result %q, got %q", resultText, artifactText)
+	}
+	if string(result.artifactStdout()) == string(rawStdout) {
+		t.Fatalf("expected artifact stdout to preserve legacy CLI envelope instead of raw bridge stdout")
+	}
 }
 
-func assertArgValue(t *testing.T, args []string, flag, want string) {
+func assertLegacyStdoutArtifact(t *testing.T, path, expectedResult string, rawStdout []byte) {
 	t.Helper()
-	for i := 0; i+1 < len(args); i++ {
-		if args[i] == flag {
-			if args[i+1] != want {
-				t.Fatalf("expected %s %q, got %q", flag, want, args[i+1])
-			}
-			return
+
+	stdoutBytes, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read stdout artifact: %v", err)
+	}
+	resultText, cliOK := runtime.ExtractCLIResultText(stdoutBytes)
+	if !cliOK {
+		t.Fatalf("expected stdout artifact to be parseable legacy CLI JSON, got %q", stdoutBytes)
+	}
+	if resultText != expectedResult {
+		t.Fatalf("expected stdout artifact result %q, got %q", expectedResult, resultText)
+	}
+	if string(stdoutBytes) == string(rawStdout) {
+		t.Fatalf("expected stdout artifact to preserve legacy CLI envelope instead of raw bridge stdout")
+	}
+}
+
+func intentStdoutArtifactSet(t *testing.T) map[string]struct{} {
+	t.Helper()
+
+	matches, err := filepath.Glob(filepath.Join(os.TempDir(), "claude-intent-stdout-*.log"))
+	if err != nil {
+		t.Fatalf("glob intent stdout artifacts: %v", err)
+	}
+	artifacts := make(map[string]struct{}, len(matches))
+	for _, match := range matches {
+		artifacts[match] = struct{}{}
+	}
+	return artifacts
+}
+
+func newIntentStdoutArtifacts(t *testing.T, before map[string]struct{}) []string {
+	t.Helper()
+
+	matches, err := filepath.Glob(filepath.Join(os.TempDir(), "claude-intent-stdout-*.log"))
+	if err != nil {
+		t.Fatalf("glob intent stdout artifacts: %v", err)
+	}
+	var newMatches []string
+	for _, match := range matches {
+		if _, ok := before[match]; !ok {
+			newMatches = append(newMatches, match)
 		}
 	}
-	t.Fatalf("expected flag %s in args: %v", flag, args)
+	return newMatches
 }
 
-// TestBuildWorkerArgs_IncludesModelWhenSet covers ver-laq2 test case 6:
-// when the role profile selects a model, the Claude adapter must translate
-// it into the `--model <name>` CLI flag so the installed CLI runs the
-// configured model rather than its built-in default. Reasoning is
-// intentionally not asserted here — Claude's CLI does not currently expose
-// a reasoning-effort flag, so reasoning stays informational on the attempt
-// artifact (see adapter.go doc for buildWorkerArgs).
-func TestBuildWorkerArgs_IncludesModelWhenSet(t *testing.T) {
-	req := runtime.WorkerRequest{
-		LeaseID: "lease-1",
-		Model:   "sonnet",
-	}
-	args := buildWorkerArgs(req)
-	assertArgValue(t, args, "--model", "sonnet")
-}
+func readJSONArtifact(t *testing.T, path string, target any) {
+	t.Helper()
 
-// TestBuildWorkerArgs_OmitsModelWhenEmpty guarantees that a missing model
-// profile does NOT pass an empty `--model` argument to the CLI (which would
-// fail), and instead falls back to the CLI's own default.
-func TestBuildWorkerArgs_OmitsModelWhenEmpty(t *testing.T) {
-	args := buildWorkerArgs(runtime.WorkerRequest{LeaseID: "lease-1"})
-	if hasArg(args, "--model") {
-		t.Fatalf("expected no --model flag when Model is unset, got %v", args)
-	}
-}
-
-// TestBuildReviewArgs_IncludesModelWhenSet is the reviewer-side counterpart
-// to TestBuildWorkerArgs_IncludesModelWhenSet and locks in the role-based
-// reviewer model routing.
-func TestBuildReviewArgs_IncludesModelWhenSet(t *testing.T) {
-	req := runtime.ReviewRequest{
-		LeaseID:                  "lease-1",
-		Model:                    "opus",
-		EffectiveReviewThreshold: runtime.SeverityP2,
-	}
-	args := buildReviewArgs(req)
-	assertArgValue(t, args, "--model", "opus")
-}
-
-// TestRunStreamingCommand_ScannerError verifies that when the subprocess writes
-// a line exceeding the 1 MB scanner buffer, defaultRunStreamingCommand returns
-// a wrapped bufio.ErrTooLong, kills the subprocess, and does not block in
-// cmd.Wait().  The subprocess is this test binary itself, re-invoked with
-// _CLAUDE_TEST_WRITE_HUGE_LINE=1 (handled by TestMain above).
-func TestRunStreamingCommand_ScannerError(t *testing.T) {
-	marker, err := os.CreateTemp("", "claude-stream-scan-marker-*")
+	data, err := os.ReadFile(path)
 	if err != nil {
-		t.Fatalf("create temp marker: %v", err)
+		t.Fatalf("read JSON artifact %s: %v", path, err)
 	}
-	defer os.Remove(marker.Name())
-
-	// Ensure marker is absent unless the child exits cleanly.
-	_ = marker.Close()
-	_ = os.Remove(marker.Name())
-
-	env := append(os.Environ(),
-		"_CLAUDE_TEST_WRITE_HUGE_LINE=1",
-		"_CLAUDE_TEST_WRITE_HUGE_LINE_PREFIX=1",
-		"_CLAUDE_TEST_WRITE_HUGE_SLEEP_MS=1",
-		"_CLAUDE_TEST_EXIT_MARKER="+marker.Name(),
-	)
-	start := time.Now()
-	result, err := defaultRunStreamingCommand(
-		context.Background(),
-		os.Args[0],
-		[]string{"-test.run=^$"}, // no tests match; TestMain writes the huge line then exits
-		nil,
-		env,
-		"",
-		10*time.Second,
-		nil,
-	)
-	elapsed := time.Since(start)
-	if err == nil {
-		t.Fatal("expected scanner error, got nil")
-	}
-	if !errors.Is(err, bufio.ErrTooLong) {
-		t.Fatalf("expected error wrapping bufio.ErrTooLong, got: %v", err)
-	}
-	if elapsed > 1500*time.Millisecond {
-		t.Fatalf("scan error path should return quickly to avoid deadlock; took %s", elapsed)
-	}
-	if _, statErr := os.Stat(marker.Name()); statErr == nil {
-		t.Fatalf("expected marker to remain absent when process is killed")
-	} else if !errors.Is(statErr, os.ErrNotExist) {
-		t.Fatalf("expected marker to remain absent when process is killed: %v", statErr)
-	}
-	// The oversized token should still preserve already-read output for debugging.
-	if len(result.stdout) == 0 {
-		t.Fatalf("expected partial stdout to be preserved after scan error")
-	}
-	if len(result.stderr) != 0 {
-		t.Fatalf("unexpected stderr from helper process: %q", string(result.stderr))
-	}
-	_ = result.stdout
-	_ = result.stderr
-}
-
-func TestRunStreamingCommand_ScannerErrorKillsProcessGroup(t *testing.T) {
-	if !claudeTestSupportsProcessGroupKill() {
-		t.Skip("process-group cancellation is only supported on Unix platforms")
-	}
-
-	marker, err := os.CreateTemp("", "claude-stream-grandchild-marker-*")
-	if err != nil {
-		t.Fatalf("create temp marker: %v", err)
-	}
-	markerPath := marker.Name()
-	if err := marker.Close(); err != nil {
-		t.Fatalf("close marker: %v", err)
-	}
-	if err := os.Remove(markerPath); err != nil {
-		t.Fatalf("remove marker: %v", err)
-	}
-
-	env := append(os.Environ(),
-		"_CLAUDE_TEST_WRITE_HUGE_LINE=1",
-		"_CLAUDE_TEST_WRITE_HUGE_SLEEP_MS=1",
-		"_CLAUDE_TEST_SPAWN_GRANDCHILD_MARKER="+markerPath,
-	)
-	_, err = defaultRunStreamingCommand(
-		context.Background(),
-		os.Args[0],
-		[]string{"-test.run=^$"},
-		nil,
-		env,
-		"",
-		10*time.Second,
-		nil,
-	)
-	if err == nil {
-		t.Fatal("expected scanner error, got nil")
-	}
-	if !errors.Is(err, bufio.ErrTooLong) {
-		t.Fatalf("expected error wrapping bufio.ErrTooLong, got: %v", err)
-	}
-
-	time.Sleep(800 * time.Millisecond)
-	if _, statErr := os.Stat(markerPath); statErr == nil {
-		t.Fatalf("expected process-group kill to terminate grandchild before marker write")
-	} else if !errors.Is(statErr, os.ErrNotExist) {
-		t.Fatalf("expected marker to remain absent when process group is killed: %v", statErr)
-	}
-}
-
-func claudeTestSupportsProcessGroupKill() bool {
-	switch goruntime.GOOS {
-	case "aix", "android", "darwin", "dragonfly", "freebsd", "hurd", "illumos", "ios", "linux", "netbsd", "openbsd", "solaris":
-		return true
-	default:
-		return false
-	}
-}
-
-func TestRunStreamingCommand_NormalCompletion_SelfBinary(t *testing.T) {
-	var sawProgress bool
-	env := append(os.Environ(), "_CLAUDE_TEST_STREAM_JSON_OUTPUT=1")
-	result, err := defaultRunStreamingCommand(
-		context.Background(),
-		os.Args[0],
-		[]string{"-test.run=^$"}, // no tests match; TestMain writes stream-json and exits
-		nil,
-		env,
-		"",
-		10*time.Second,
-		func(msg string) {
-			sawProgress = true
-			if msg == "" {
-				t.Fatalf("expected non-empty progress message")
-			}
-		},
-	)
-	if err != nil {
-		t.Fatalf("expected normal completion, got error: %v", err)
-	}
-	if result.exitCode != 0 {
-		t.Fatalf("expected exitCode 0, got %d", result.exitCode)
-	}
-	if len(result.stdout) == 0 {
-		t.Fatalf("expected result stdout to be present")
-	}
-	if string(result.stderr) != "streaming stderr\n" {
-		t.Fatalf("unexpected stderr capture: %q", string(result.stderr))
-	}
-	if !sawProgress {
-		t.Fatalf("expected onProgress callback for assistant tool_use event")
-	}
-
-	var cliOut runtime.CLIOutputJSON
-	if err := json.Unmarshal(result.stdout, &cliOut); err != nil {
-		t.Fatalf("result stdout should be cli json: %v", err)
-	}
-	if cliOut.Type != "result" || cliOut.Subtype != "success" || cliOut.Result != `{"status":"done"}` {
-		t.Fatalf("unexpected cli output: %#v", cliOut)
+	if err := json.Unmarshal(data, target); err != nil {
+		t.Fatalf("artifact %s is not valid JSON: %v", path, err)
 	}
 }

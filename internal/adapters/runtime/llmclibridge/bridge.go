@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+
 	verkruntime "verk/internal/adapters/runtime"
 
 	"github.com/php-workx/fabrikk/llmcli"
@@ -178,6 +179,27 @@ func (b *Bridge) Run(ctx context.Context, req Request) (Result, error) {
 	return result, nil
 }
 
+func (b *Bridge) CheckAvailability(ctx context.Context, runtimeName, command string) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	cfg, err := ResolveBackendConfig(runtimeName, command)
+	if err != nil {
+		return err
+	}
+
+	probe := exec.CommandContext(ctx, cfg.Path, "--version")
+	probe.Env = b.baseEnv()
+	if output, err := probe.CombinedOutput(); err != nil {
+		detail := strings.TrimSpace(string(output))
+		if detail == "" {
+			detail = err.Error()
+		}
+		return fmt.Errorf("%s unavailable: %s", runtimeName, detail)
+	}
+	return nil
+}
+
 func requestContext(req Request) *llmclient.Context {
 	return &llmclient.Context{
 		SystemPrompt: req.SystemPrompt,
@@ -272,8 +294,6 @@ func collectEvents(events <-chan llmclient.Event, onProgress func(string)) Resul
 			if !sawDelta {
 				textEnd.WriteString(event.Content)
 			}
-		case llmclient.EventToolCallStart:
-			emitProgress(onProgress, "tool call started", event.ToolCall)
 		case llmclient.EventToolCallEnd:
 			emitProgress(onProgress, "tool call finished", event.ToolCall)
 		case llmclient.EventDone:
@@ -305,12 +325,80 @@ func emitProgress(onProgress func(string), prefix string, call *llmclient.ToolCa
 	if onProgress == nil || call == nil {
 		return
 	}
-	name := strings.TrimSpace(call.Name)
-	if name == "" {
+	summary := summarizeToolCall(call)
+	if summary == "" {
 		onProgress(prefix)
 		return
 	}
-	onProgress(prefix + ": " + name)
+	onProgress(summary)
+}
+
+func summarizeToolCall(call *llmclient.ToolCall) string {
+	if call == nil {
+		return ""
+	}
+	name := strings.TrimSpace(call.Name)
+	if name == "" {
+		return ""
+	}
+	params := call.Arguments
+	switch name {
+	case "Read":
+		if fp, ok := stringArg(params, "file_path"); ok {
+			return fmt.Sprintf("reading %s", shortenPath(fp))
+		}
+	case "Write":
+		if fp, ok := stringArg(params, "file_path"); ok {
+			return fmt.Sprintf("writing %s", shortenPath(fp))
+		}
+	case "Edit":
+		if fp, ok := stringArg(params, "file_path"); ok {
+			return fmt.Sprintf("editing %s", shortenPath(fp))
+		}
+	case "Bash":
+		if cmd, ok := stringArg(params, "command"); ok {
+			if len(cmd) > 50 {
+				cmd = cmd[:47] + "..."
+			}
+			return fmt.Sprintf("$ %s", cmd)
+		}
+	case "Glob":
+		if pattern, ok := stringArg(params, "pattern"); ok {
+			return fmt.Sprintf("searching %s", pattern)
+		}
+	case "Grep":
+		if pattern, ok := stringArg(params, "pattern"); ok {
+			return fmt.Sprintf("grep %s", pattern)
+		}
+	}
+	return name
+}
+
+func stringArg(params map[string]interface{}, key string) (string, bool) {
+	if params == nil {
+		return "", false
+	}
+	value, ok := params[key].(string)
+	if !ok || value == "" {
+		return "", false
+	}
+	return value, true
+}
+
+func shortenPath(path string) string {
+	if idx := strings.Index(path, "/internal/"); idx >= 0 {
+		return path[idx+1:]
+	}
+	if idx := strings.Index(path, "/cmd/"); idx >= 0 {
+		return path[idx+1:]
+	}
+	if idx := strings.Index(path, "/pkg/"); idx >= 0 {
+		return path[idx+1:]
+	}
+	if home, err := os.UserHomeDir(); err == nil && strings.HasPrefix(path, home) {
+		return "~" + path[len(home):]
+	}
+	return path
 }
 
 func messageText(message *llmclient.AssistantMessage) string {
