@@ -3,9 +3,8 @@ package cli
 import (
 	"fmt"
 	"strings"
-
 	"verk/internal/bench"
-	// TODO(task-4): import verk/internal/bench/providers/verknative once Task 4 lands.
+	"verk/internal/bench/providers/verknative"
 
 	"github.com/spf13/cobra"
 )
@@ -75,7 +74,7 @@ var benchRegistryFactory = newDefaultBenchRegistry
 
 func newDefaultBenchRegistry() *bench.Registry {
 	r := bench.NewRegistry()
-	// TODO(task-4): register verknative.New() once verk/internal/bench/providers/verknative lands.
+	_ = r.Register(verknative.New())
 	return r
 }
 
@@ -97,11 +96,11 @@ func runBenchRun(cmd *cobra.Command, suite, matrixPath, outDir string, allowDirt
 	return cmdError(cmd, fmt.Errorf("bench run: orchestration not yet implemented (see plan task 6)"), 2)
 }
 
-func runBenchReport(cmd *cobra.Command, runID, format string) error {
+func runBenchReport(cmd *cobra.Command, runID, _ string) error {
 	return cmdError(cmd, fmt.Errorf("bench report: not yet implemented (see plan task 7)"), 2)
 }
 
-func runBenchCompare(cmd *cobra.Command, baseline, candidate, format string) error {
+func runBenchCompare(cmd *cobra.Command, baseline, candidate, _ string) error {
 	if !strings.HasPrefix(baseline, "run-") || !strings.HasPrefix(candidate, "run-") {
 		return cmdError(cmd, fmt.Errorf("bench compare: expected run ids prefixed with 'run-'"), 2)
 	}

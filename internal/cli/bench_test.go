@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"strings"
 	"testing"
-
 	"verk/internal/bench"
 )
 
