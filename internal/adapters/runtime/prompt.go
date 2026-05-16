@@ -422,6 +422,14 @@ func BuildPlannerReviewPrompt(req PlannerReviewRequest) string {
 		}
 	}
 
+	if len(req.PromotedRules) > 0 {
+		b.WriteString("\n### Lessons From Prior Escaped Defects\n\n")
+		for _, r := range req.PromotedRules {
+			fmt.Fprintf(&b, "- %s: %s\n", r.RuleID, r.Summary)
+		}
+		b.WriteString("\nUse these lessons as context. Do not block solely because a lesson applies; raise a finding only if you see concrete evidence the issue exists.\n")
+	}
+
 	b.WriteString("\n### Your Job\n\n")
 	b.WriteString("This is NOT implementation review. Do not evaluate code.\n")
 	b.WriteString("Look for:\n")

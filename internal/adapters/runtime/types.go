@@ -194,6 +194,14 @@ type RawTicketQualityFinding struct {
 	Evidence []string `json:"evidence,omitempty"`
 }
 
+// PromotedRuleContext is a compact representation of a promoted memory rule
+// for inclusion in planner review prompts. It is intentionally minimal to
+// keep prompt size bounded.
+type PromotedRuleContext struct {
+	RuleID  string `json:"rule_id"`
+	Summary string `json:"summary"`
+}
+
 // PlannerReviewRequest is the input for a planner-role ticket quality
 // review. It is intentionally separate from ReviewRequest so adapters can
 // route planner requests differently if needed.
@@ -203,6 +211,7 @@ type PlannerReviewRequest struct {
 	DeterministicFindings    []RawTicketQualityFinding
 	EffectiveReviewThreshold Severity
 	LeaseID                  string
+	PromotedRules            []PromotedRuleContext `json:"promoted_rules,omitempty"`
 }
 
 // PlannerReviewResult is the parsed output of a planner-role review.

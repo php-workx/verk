@@ -667,3 +667,48 @@ func TestBuildPlannerReviewPrompt_StatesJSONOnly(t *testing.T) {
 		t.Fatalf("expected PlannerSystemPrompt to contain 'JSON only':\n%s", PlannerSystemPrompt)
 	}
 }
+
+func TestBuildPlannerReviewPrompt_IncludesPromotedRules(t *testing.T) {
+	req := PlannerReviewRequest{
+		RootTicketID:             "EPIC-1",
+		EffectiveReviewThreshold: "P2",
+		LeaseID:                  "lease-99",
+		Tickets: []TicketSummary{
+			{ID: "TICK-1", Title: "Do something"},
+		},
+		PromotedRules: []PromotedRuleContext{
+			{RuleID: "rule-abc", Summary: "always validate inputs before processing"},
+		},
+	}
+	prompt := BuildPlannerReviewPrompt(req)
+
+	if !strings.Contains(prompt, "Lessons From Prior Escaped Defects") {
+		t.Errorf("expected 'Lessons From Prior Escaped Defects' section header in prompt:\n%s", prompt)
+	}
+	if !strings.Contains(prompt, "rule-abc") {
+		t.Errorf("expected rule ID 'rule-abc' in prompt:\n%s", prompt)
+	}
+	if !strings.Contains(prompt, "always validate inputs before processing") {
+		t.Errorf("expected rule summary in prompt:\n%s", prompt)
+	}
+	if !strings.Contains(prompt, "Do not block solely because a lesson applies") {
+		t.Errorf("expected advisory instruction in prompt:\n%s", prompt)
+	}
+}
+
+func TestBuildPlannerReviewPrompt_OmitsPromotedRulesSectionWhenEmpty(t *testing.T) {
+	req := PlannerReviewRequest{
+		RootTicketID:             "EPIC-1",
+		EffectiveReviewThreshold: "P2",
+		LeaseID:                  "lease-99",
+		Tickets: []TicketSummary{
+			{ID: "TICK-1", Title: "Do something"},
+		},
+		// PromotedRules intentionally omitted / nil
+	}
+	prompt := BuildPlannerReviewPrompt(req)
+
+	if strings.Contains(prompt, "Lessons From Prior") {
+		t.Errorf("expected 'Lessons From Prior' section to be absent when PromotedRules is empty:\n%s", prompt)
+	}
+}

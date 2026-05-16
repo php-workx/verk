@@ -4,6 +4,7 @@ import (
 	"strings"
 	"testing"
 	"verk/internal/adapters/ticketstore/epos"
+	"verk/internal/memory"
 	"verk/internal/policy"
 	"verk/internal/state"
 )
@@ -426,5 +427,92 @@ func TestTicketQualityRepair_PlannerNoteRecorded(t *testing.T) {
 	notes, _ := repaired.UnknownFrontmatter["ticket_quality_notes"].([]any)
 	if len(notes) == 0 {
 		t.Fatalf("expected at least one ticket_quality_notes entry: %+v", repaired.UnknownFrontmatter)
+	}
+}
+
+func TestAdvisoryFindingsFromPromotedRules_OnePerTicketPerRule(t *testing.T) {
+	rules := []memory.PromotionEntry{
+		{RuleID: "rule-abc", Summary: "always validate inputs"},
+		{RuleID: "rule-xyz", Summary: "check nil before dereference"},
+	}
+	tickets := []epos.Ticket{
+		mkQualityTicket("ver-1", "Implement widget"),
+		mkQualityTicket("ver-2", "Add store layer"),
+	}
+	findings := AdvisoryFindingsFromPromotedRules(rules, tickets)
+
+	// 2 rules * 2 tickets = 4 findings
+	if len(findings) != 4 {
+		t.Fatalf("expected 4 findings, got %d", len(findings))
+	}
+
+	// Each finding should reference a ticket and a rule
+	for _, f := range findings {
+		if f.TicketID == "" {
+			t.Errorf("finding missing TicketID: %+v", f)
+		}
+		if !strings.HasPrefix(f.Code, "promoted_rule:") {
+			t.Errorf("finding code should start with 'promoted_rule:', got %q", f.Code)
+		}
+	}
+
+	// Verify one finding per (rule, ticket) combination
+	seen := map[string]bool{}
+	for _, f := range findings {
+		key := f.TicketID + "|" + f.Code
+		if seen[key] {
+			t.Errorf("duplicate finding for key %q", key)
+		}
+		seen[key] = true
+	}
+}
+
+func TestAdvisoryFindingsFromPromotedRules_NeverBlocking(t *testing.T) {
+	rules := []memory.PromotionEntry{
+		{RuleID: "rule-abc", Summary: "critical: always validate inputs"},
+	}
+	tickets := []epos.Ticket{
+		mkQualityTicket("ver-1", "Implement widget"),
+	}
+	findings := AdvisoryFindingsFromPromotedRules(rules, tickets)
+
+	if len(findings) != 1 {
+		t.Fatalf("expected 1 finding, got %d", len(findings))
+	}
+	f := findings[0]
+	if f.Severity != state.SeverityP3 {
+		t.Errorf("advisory finding must be P3, got %q", f.Severity)
+	}
+	if f.Disposition != "advisory" {
+		t.Errorf("advisory finding must have disposition 'advisory', got %q", f.Disposition)
+	}
+	// Verify it would NOT trigger blocking (P3 < P2 threshold)
+	artifact := EvaluateTicketQuality(TicketQualityInput{
+		RootTicket: tickets[0],
+		Tickets:    tickets,
+	})
+	// Inject findings into artifact to check they don't cause blocking
+	artifactWithAdvisory := artifact
+	artifactWithAdvisory.Findings = append(artifactWithAdvisory.Findings, findings...)
+	// P3 finding should not affect Blocked status (threshold is P2)
+	for _, af := range findings {
+		if severityAtLeast(af.Severity, blockThreshold(policy.Config{})) {
+			t.Errorf("advisory P3 finding must not meet block threshold P2: severity=%q", af.Severity)
+		}
+	}
+}
+
+func TestAdvisoryFindingsFromPromotedRules_EmptyWhenNoRules(t *testing.T) {
+	tickets := []epos.Ticket{
+		mkQualityTicket("ver-1", "Implement widget"),
+	}
+	findings := AdvisoryFindingsFromPromotedRules(nil, tickets)
+	if len(findings) != 0 {
+		t.Fatalf("expected 0 findings with no rules, got %d", len(findings))
+	}
+
+	findings = AdvisoryFindingsFromPromotedRules([]memory.PromotionEntry{}, tickets)
+	if len(findings) != 0 {
+		t.Fatalf("expected 0 findings with empty rules slice, got %d", len(findings))
 	}
 }
