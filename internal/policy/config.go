@@ -124,12 +124,35 @@ type LoggingConfig struct {
 	ArtifactRetention int    `yaml:"artifact_retention" json:"artifact_retention"`
 }
 
+// TicketQualityConfig controls the deterministic ticket quality gate that runs
+// before a worker is dispatched. All fields have safe defaults via DefaultConfig.
+type TicketQualityConfig struct {
+	// Enabled turns the gate on or off. Defaults to true.
+	Enabled bool `yaml:"enabled" json:"enabled"`
+	// PlannerReview enables the planner-review advisory path. Defaults to true.
+	PlannerReview bool `yaml:"planner_review" json:"planner_review"`
+	// AutoFixSafe, when true, allows verk run to apply safe auto-repairs
+	// (e.g. inferring epic owned_paths from children) without --fix. Defaults
+	// to false so operators opt in explicitly.
+	AutoFixSafe bool `yaml:"auto_fix_safe" json:"auto_fix_safe"`
+	// BlockThreshold is the minimum severity that causes the gate to block.
+	// Accepted values: P0, P1, P2, P3, P4. Defaults to P2.
+	BlockThreshold string `yaml:"block_threshold" json:"block_threshold"`
+	// RequirePublicContractScenarios enforces the missing_public_contract_scenario
+	// rule. Defaults to true.
+	RequirePublicContractScenarios bool `yaml:"require_public_contract_scenarios" json:"require_public_contract_scenarios"`
+	// RequireEpicIntegrationTicket enforces the integration_gap rule for epics.
+	// Defaults to true.
+	RequireEpicIntegrationTicket bool `yaml:"require_epic_integration_ticket" json:"require_epic_integration_ticket"`
+}
+
 type Config struct {
-	Scheduler    SchedulerConfig    `yaml:"scheduler" json:"scheduler"`
-	Policy       PolicyConfig       `yaml:"policy" json:"policy"`
-	Runtime      RuntimeConfig      `yaml:"runtime" json:"runtime"`
-	Verification VerificationConfig `yaml:"verification" json:"verification"`
-	Logging      LoggingConfig      `yaml:"logging" json:"logging"`
+	Scheduler     SchedulerConfig     `yaml:"scheduler" json:"scheduler"`
+	Policy        PolicyConfig        `yaml:"policy" json:"policy"`
+	Runtime       RuntimeConfig       `yaml:"runtime" json:"runtime"`
+	Verification  VerificationConfig  `yaml:"verification" json:"verification"`
+	Logging       LoggingConfig       `yaml:"logging" json:"logging"`
+	TicketQuality TicketQualityConfig `yaml:"ticket_quality" json:"ticket_quality"`
 }
 
 func LoadConfig(repoRoot string) (Config, error) {

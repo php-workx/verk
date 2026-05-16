@@ -516,3 +516,285 @@ func TestAdvisoryFindingsFromPromotedRules_EmptyWhenNoRules(t *testing.T) {
 		t.Fatalf("expected 0 findings with empty rules slice, got %d", len(findings))
 	}
 }
+
+// --- Tests for 7 new rules --------------------------------------------------
+
+func TestTicketQuality_CompoundCriterionWarns(t *testing.T) {
+	tk := mkQualityTicket("ver-cc1", "Implement validation")
+	tk.OwnedPaths = []string{"internal/validation"}
+	// Criterion is long (>100 chars) and contains " and " joining two claims.
+	tk.AcceptanceCriteria = []string{
+		"verk validate --input file.json exits 0 and prints \"valid\" on stdout and returns HTTP 200 when called via the REST endpoint",
+	}
+	tk.ValidationCommands = []string{"go test ./internal/validation/..."}
+	in := TicketQualityInput{RootTicket: tk, Tickets: []epos.Ticket{tk}, Config: policy.DefaultConfig()}
+	art := EvaluateTicketQuality(in)
+	if !containsCode(findCodes(art), "compound_acceptance_criterion") {
+		t.Fatalf("expected compound_acceptance_criterion finding: %+v", art.Findings)
+	}
+	// compound is P3 and should not block at P2 threshold.
+	for _, f := range art.Findings {
+		if f.Code == "compound_acceptance_criterion" && f.Severity != state.SeverityP3 {
+			t.Fatalf("compound_acceptance_criterion should be P3, got %q", f.Severity)
+		}
+	}
+}
+
+func TestTicketQuality_NotFlaggedForSimpleCriterion(t *testing.T) {
+	tk := mkQualityTicket("ver-cc2", "Implement widget")
+	tk.OwnedPaths = []string{"internal/widget"}
+	// Short criterion — should not be flagged even if it contains "and".
+	tk.AcceptanceCriteria = []string{"verk widget --enable exits 0 and prints ok"}
+	tk.ValidationCommands = []string{"go test ./internal/widget/..."}
+	in := TicketQualityInput{RootTicket: tk, Tickets: []epos.Ticket{tk}, Config: policy.DefaultConfig()}
+	art := EvaluateTicketQuality(in)
+	if containsCode(findCodes(art), "compound_acceptance_criterion") {
+		t.Fatalf("did not expect compound_acceptance_criterion for short criterion: %+v", art.Findings)
+	}
+}
+
+func TestTicketQuality_MissingValidationCommandsForCodeTicket(t *testing.T) {
+	tk := mkQualityTicket("ver-mvc1", "Implement widget")
+	// Owned path is a plain file with no code extension — should fire the rule.
+	tk.OwnedPaths = []string{"configs/widget.yaml"}
+	tk.AcceptanceCriteria = []string{"verk widget --enable exits 0"}
+	// No ValidationCommands set.
+	in := TicketQualityInput{RootTicket: tk, Tickets: []epos.Ticket{tk}, Config: policy.DefaultConfig()}
+	art := EvaluateTicketQuality(in)
+	if !containsCode(findCodes(art), "missing_validation_commands") {
+		t.Fatalf("expected missing_validation_commands: %+v", art.Findings)
+	}
+}
+
+func TestTicketQuality_MissingValidationCommandsSkippedForDocsTicket(t *testing.T) {
+	tk := mkQualityTicket("ver-mvc2", "Update docs")
+	tk.UnknownFrontmatter = map[string]any{"type": "docs"}
+	tk.OwnedPaths = []string{"docs/widget.md"}
+	tk.AcceptanceCriteria = []string{"docs explain the --enable flag"}
+	in := TicketQualityInput{RootTicket: tk, Tickets: []epos.Ticket{tk}, Config: policy.DefaultConfig()}
+	art := EvaluateTicketQuality(in)
+	if containsCode(findCodes(art), "missing_validation_commands") {
+		t.Fatalf("did not expect missing_validation_commands on docs ticket: %+v", art.Findings)
+	}
+}
+
+func TestTicketQuality_OwnedPathMissingWarns(t *testing.T) {
+	tk := mkQualityTicket("ver-opm1", "Fix internal bug")
+	tk.OwnedPaths = []string{"internal/engine/closeout.go"}
+	tk.AcceptanceCriteria = []string{"verk run exits 0"}
+	tk.ValidationCommands = []string{"go test ./internal/engine/..."}
+	existing := map[string]bool{
+		// closeout.go is NOT in the map — should fire the warning.
+		"internal/engine/ticket_quality.go": true,
+	}
+	in := TicketQualityInput{
+		RootTicket:    tk,
+		Tickets:       []epos.Ticket{tk},
+		Config:        policy.DefaultConfig(),
+		ExistingPaths: existing,
+	}
+	art := EvaluateTicketQuality(in)
+	if !containsCode(findCodes(art), "owned_path_missing") {
+		t.Fatalf("expected owned_path_missing finding: %+v", art.Findings)
+	}
+}
+
+func TestTicketQuality_OwnedPathMissingSkippedWhenNilMap(t *testing.T) {
+	tk := mkQualityTicket("ver-opm2", "Fix internal bug")
+	tk.OwnedPaths = []string{"internal/engine/closeout.go"}
+	tk.AcceptanceCriteria = []string{"verk run exits 0"}
+	tk.ValidationCommands = []string{"go test ./internal/engine/..."}
+	// ExistingPaths is nil — rule should be skipped entirely.
+	in := TicketQualityInput{
+		RootTicket:    tk,
+		Tickets:       []epos.Ticket{tk},
+		Config:        policy.DefaultConfig(),
+		ExistingPaths: nil,
+	}
+	art := EvaluateTicketQuality(in)
+	if containsCode(findCodes(art), "owned_path_missing") {
+		t.Fatalf("did not expect owned_path_missing when ExistingPaths is nil: %+v", art.Findings)
+	}
+}
+
+func TestTicketQuality_DependencyBlockedMismatch(t *testing.T) {
+	dep := mkQualityTicket("ver-dep1", "Dependency ticket")
+	dep.Status = epos.StatusBlocked
+	dep.OwnedPaths = []string{"internal/dep"}
+	dep.AcceptanceCriteria = []string{"dep exits 0"}
+	dep.ValidationCommands = []string{"go test ./internal/dep/..."}
+
+	tk := mkQualityTicket("ver-dk1", "Dependent ticket")
+	tk.OwnedPaths = []string{"internal/widget"}
+	tk.AcceptanceCriteria = []string{"verk widget exits 0"}
+	tk.ValidationCommands = []string{"go test ./internal/widget/..."}
+	tk.Deps = []string{"ver-dep1"}
+
+	in := TicketQualityInput{
+		RootTicket: tk,
+		Tickets:    []epos.Ticket{tk, dep},
+		Config:     policy.DefaultConfig(),
+	}
+	art := EvaluateTicketQuality(in)
+	if !containsCode(findCodes(art), "dependency_blocked_or_closed_mismatch") {
+		t.Fatalf("expected dependency_blocked_or_closed_mismatch when dep is blocked: %+v", art.Findings)
+	}
+}
+
+func TestTicketQuality_DependencyClosedMismatch(t *testing.T) {
+	dep := mkQualityTicket("ver-dep2", "Closed dependency")
+	dep.Status = epos.StatusClosed
+	dep.OwnedPaths = []string{"internal/dep"}
+	dep.AcceptanceCriteria = []string{"dep exits 0"}
+	dep.ValidationCommands = []string{"go test ./internal/dep/..."}
+
+	tk := mkQualityTicket("ver-dk2", "Open ticket with closed dep")
+	tk.OwnedPaths = []string{"internal/widget"}
+	tk.AcceptanceCriteria = []string{"verk widget exits 0"}
+	tk.ValidationCommands = []string{"go test ./internal/widget/..."}
+	tk.Deps = []string{"ver-dep2"}
+
+	in := TicketQualityInput{
+		RootTicket: tk,
+		Tickets:    []epos.Ticket{tk, dep},
+		Config:     policy.DefaultConfig(),
+	}
+	art := EvaluateTicketQuality(in)
+	if !containsCode(findCodes(art), "dependency_blocked_or_closed_mismatch") {
+		t.Fatalf("expected dependency_blocked_or_closed_mismatch when dep is closed and ticket is open: %+v", art.Findings)
+	}
+}
+
+func TestTicketQuality_DependencyReadyNoMismatch(t *testing.T) {
+	dep := mkQualityTicket("ver-dep3", "Ready dep")
+	dep.OwnedPaths = []string{"internal/dep"}
+	dep.AcceptanceCriteria = []string{"dep exits 0"}
+	dep.ValidationCommands = []string{"go test ./internal/dep/..."}
+
+	tk := mkQualityTicket("ver-dk3", "Ticket with ready dep")
+	tk.OwnedPaths = []string{"internal/widget"}
+	tk.AcceptanceCriteria = []string{"verk widget exits 0"}
+	tk.ValidationCommands = []string{"go test ./internal/widget/..."}
+	tk.Deps = []string{"ver-dep3"}
+
+	in := TicketQualityInput{
+		RootTicket: tk,
+		Tickets:    []epos.Ticket{tk, dep},
+		Config:     policy.DefaultConfig(),
+	}
+	art := EvaluateTicketQuality(in)
+	if containsCode(findCodes(art), "dependency_blocked_or_closed_mismatch") {
+		t.Fatalf("did not expect dependency_blocked_or_closed_mismatch when dep is ready: %+v", art.Findings)
+	}
+}
+
+func TestTicketQuality_MissingNegativeCaseWarns(t *testing.T) {
+	tk := mkQualityTicket("ver-mnc1", "Input validation and error handling")
+	tk.OwnedPaths = []string{"internal/validator"}
+	// Criteria describe only success paths — no failure/reject/error mention.
+	tk.AcceptanceCriteria = []string{
+		"verk validate --input good.json exits 0",
+		"verk validate --input well-formed.json prints ok",
+	}
+	tk.ValidationCommands = []string{"go test ./internal/validator/..."}
+	in := TicketQualityInput{RootTicket: tk, Tickets: []epos.Ticket{tk}, Config: policy.DefaultConfig()}
+	art := EvaluateTicketQuality(in)
+	if !containsCode(findCodes(art), "missing_negative_case") {
+		t.Fatalf("expected missing_negative_case finding: %+v", art.Findings)
+	}
+}
+
+func TestTicketQuality_MissingNegativeCaseNotFlaggedWhenCovered(t *testing.T) {
+	tk := mkQualityTicket("ver-mnc2", "Input validation and error handling")
+	tk.OwnedPaths = []string{"internal/validator"}
+	tk.AcceptanceCriteria = []string{
+		"verk validate --input good.json exits 0",
+		"verk validate --input bad.json exits 1 and prints \"invalid input\" to stderr",
+	}
+	tk.ValidationCommands = []string{"go test ./internal/validator/..."}
+	in := TicketQualityInput{RootTicket: tk, Tickets: []epos.Ticket{tk}, Config: policy.DefaultConfig()}
+	art := EvaluateTicketQuality(in)
+	if containsCode(findCodes(art), "missing_negative_case") {
+		t.Fatalf("did not expect missing_negative_case when negative criterion present: %+v", art.Findings)
+	}
+}
+
+func TestTicketQuality_PlanTraceabilityGapWarns(t *testing.T) {
+	tk := mkQualityTicket("ver-ptg1", "Implement per the spec")
+	tk.OwnedPaths = []string{"internal/widget"}
+	tk.AcceptanceCriteria = []string{"verk widget --enable exits 0"}
+	tk.ValidationCommands = []string{"go test ./internal/widget/..."}
+	// Body mentions "plan" but has no docs/plans/ link and no plan_refs.
+	tk.Body = "This ticket implements the widget feature as described in the plan."
+	in := TicketQualityInput{RootTicket: tk, Tickets: []epos.Ticket{tk}, Config: policy.DefaultConfig()}
+	art := EvaluateTicketQuality(in)
+	if !containsCode(findCodes(art), "plan_traceability_gap") {
+		t.Fatalf("expected plan_traceability_gap finding: %+v", art.Findings)
+	}
+}
+
+func TestTicketQuality_PlanTraceabilityGapNotFlaggedWithLink(t *testing.T) {
+	tk := mkQualityTicket("ver-ptg2", "Implement per the spec")
+	tk.OwnedPaths = []string{"internal/widget"}
+	tk.AcceptanceCriteria = []string{"verk widget --enable exits 0"}
+	tk.ValidationCommands = []string{"go test ./internal/widget/..."}
+	tk.Body = "See docs/plans/widget.md for full spec."
+	in := TicketQualityInput{RootTicket: tk, Tickets: []epos.Ticket{tk}, Config: policy.DefaultConfig()}
+	art := EvaluateTicketQuality(in)
+	if containsCode(findCodes(art), "plan_traceability_gap") {
+		t.Fatalf("did not expect plan_traceability_gap when docs/plans/ link present: %+v", art.Findings)
+	}
+}
+
+func TestTicketQuality_ReviewerInstructionGapWarns(t *testing.T) {
+	tk := mkQualityTicket("ver-rig1", "Implement auth token refresh")
+	tk.OwnedPaths = []string{"internal/auth"}
+	tk.AcceptanceCriteria = []string{"verk auth --refresh exits 0"}
+	tk.ValidationCommands = []string{"go test ./internal/auth/..."}
+	// Title contains "auth" — should trigger the rule without reviewer_notes.
+	in := TicketQualityInput{RootTicket: tk, Tickets: []epos.Ticket{tk}, Config: policy.DefaultConfig()}
+	art := EvaluateTicketQuality(in)
+	if !containsCode(findCodes(art), "reviewer_instruction_gap") {
+		t.Fatalf("expected reviewer_instruction_gap for auth ticket: %+v", art.Findings)
+	}
+	// Should be P3 (advisory, non-blocking at P2 threshold).
+	for _, f := range art.Findings {
+		if f.Code == "reviewer_instruction_gap" && f.Severity != state.SeverityP3 {
+			t.Fatalf("reviewer_instruction_gap should be P3, got %q", f.Severity)
+		}
+	}
+}
+
+func TestTicketQuality_ReviewerInstructionGapNotFlaggedWithNotes(t *testing.T) {
+	tk := mkQualityTicket("ver-rig2", "Implement security token refresh")
+	tk.OwnedPaths = []string{"internal/auth"}
+	tk.AcceptanceCriteria = []string{"verk auth --refresh exits 0"}
+	tk.ValidationCommands = []string{"go test ./internal/auth/..."}
+	tk.UnknownFrontmatter = map[string]any{
+		"reviewer_notes": "Check that token expiry is enforced and old tokens are revoked.",
+	}
+	in := TicketQualityInput{RootTicket: tk, Tickets: []epos.Ticket{tk}, Config: policy.DefaultConfig()}
+	art := EvaluateTicketQuality(in)
+	if containsCode(findCodes(art), "reviewer_instruction_gap") {
+		t.Fatalf("did not expect reviewer_instruction_gap when reviewer_notes present: %+v", art.Findings)
+	}
+}
+
+// --- Policy config tests ----------------------------------------------------
+
+func TestBlockThreshold_DefaultsToP2WhenUnset(t *testing.T) {
+	cfg := policy.Config{}
+	got := blockThreshold(cfg)
+	if got != state.SeverityP2 {
+		t.Fatalf("expected P2 when BlockThreshold is empty, got %q", got)
+	}
+}
+
+func TestBlockThreshold_OverriddenByPolicy(t *testing.T) {
+	cfg := policy.Config{}
+	cfg.TicketQuality.BlockThreshold = "P3"
+	got := blockThreshold(cfg)
+	if got != state.SeverityP3 {
+		t.Fatalf("expected P3 from policy override, got %q", got)
+	}
+}

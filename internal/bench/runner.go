@@ -53,6 +53,17 @@ type WorkspacePreparer interface {
 	PrepareWorkspace(task Task, dir string) error
 }
 
+// cellID returns a composite identifier for a matrix cell that encodes both
+// the profile ID and the reviewer model. This ensures workspace paths are
+// unique when the same profile ID is used with different reviewers.
+// When the profile has no reviewer (worker-only mode), the suffix is "none".
+func cellID(p MatrixProfile) string {
+	if p.Reviewer.Model == "" {
+		return p.ID + "__none"
+	}
+	return p.ID + "__" + p.Reviewer.Model
+}
+
 // DefaultExecutor returns an Executor that uses provider scoring if available,
 // otherwise returns an unsolved result with FailureOther.
 func DefaultExecutor(provider Provider) Executor {
@@ -74,13 +85,18 @@ func DefaultExecutor(provider Provider) Executor {
 		if score.Solved {
 			status = TaskStatusSolved
 		}
-		return TaskResult{
+		// Normalise usage confidence so reports show proper labels.
+		result := TaskResult{
 			TaskID:     task.ID,
 			ProfileID:  profile.ID,
 			Status:     status,
 			Score:      score,
 			DurationMS: time.Since(start).Milliseconds(),
 		}
+		for i := range result.Usage {
+			result.Usage[i].Confidence = defaultUsageConfidence(result.Usage[i])
+		}
+		return result
 	}
 }
 
@@ -265,7 +281,7 @@ func Run(ctx context.Context, opts RunOptions) (RunSummary, error) {
 // "blocked" sentinel that should be recorded but not checkpointed), and any
 // hard error that should abort the run.
 func runOnePair(ctx context.Context, opts RunOptions, executor Executor, outDir string, task Task, workerProfile MatrixProfile) (TaskResult, bool, error) {
-	workDir := filepath.Join(outDir, "tasks", task.ID, workerProfile.ID, "work")
+	workDir := filepath.Join(outDir, "tasks", task.ID, cellID(workerProfile), "work")
 	if err := os.MkdirAll(workDir, 0o755); err != nil {
 		return TaskResult{}, false, fmt.Errorf("bench: create work dir for task %q profile %q: %w", task.ID, workerProfile.ID, err)
 	}

@@ -28,19 +28,20 @@ func initBenchCmd(root *cobra.Command) {
 	}
 
 	var matrixPath, outDir string
-	var allowDirty bool
+	var allowDirty, includeHoldout bool
 	runCmd := &cobra.Command{
 		Use:          "run <suite>",
 		Short:        "Run a benchmark suite (stub)",
 		Args:         cobra.ExactArgs(1),
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runBenchRun(cmd, args[0], matrixPath, outDir, allowDirty)
+			return runBenchRun(cmd, args[0], matrixPath, outDir, allowDirty, includeHoldout)
 		},
 	}
 	runCmd.Flags().StringVar(&matrixPath, "matrix", "", "Path to benchmark matrix YAML/JSON")
 	runCmd.Flags().StringVar(&outDir, "out", "", "Output directory (default .verk/bench/runs/<run-id>)")
 	runCmd.Flags().BoolVar(&allowDirty, "allow-dirty", false, "Allow running with a dirty worktree (results marked non-comparable)")
+	runCmd.Flags().BoolVar(&includeHoldout, "include-holdout", false, "Allow running holdout suites (required when suite sampling_mode is holdout)")
 
 	var reportFormat string
 	reportCmd := &cobra.Command{
@@ -52,7 +53,7 @@ func initBenchCmd(root *cobra.Command) {
 			return runBenchReport(cmd, args[0], reportFormat)
 		},
 	}
-	reportCmd.Flags().StringVar(&reportFormat, "format", "markdown", "Output format: markdown|json")
+	reportCmd.Flags().StringVar(&reportFormat, "format", "markdown", "Output format: markdown|json|csv")
 
 	var compareFormat string
 	compareCmd := &cobra.Command{
@@ -94,7 +95,7 @@ func runBenchList(cmd *cobra.Command) error {
 	return nil
 }
 
-func runBenchRun(cmd *cobra.Command, suite, matrixPath, outDir string, allowDirty bool) error {
+func runBenchRun(cmd *cobra.Command, suite, matrixPath, outDir string, allowDirty, includeHoldout bool) error {
 	repoRoot, err := resolveRepoRoot()
 	if err != nil {
 		return cmdError(cmd, fmt.Errorf("resolve repo root: %w", err), 1)
@@ -108,6 +109,14 @@ func runBenchRun(cmd *cobra.Command, suite, matrixPath, outDir string, allowDirt
 	if !ok {
 		return cmdError(cmd, fmt.Errorf("unknown provider %q", providerName), 1)
 	}
+
+	// Holdout guard: refuse to run a holdout suite unless --include-holdout is set.
+	for _, sm := range provider.Suites() {
+		if sm.Name == suiteName && sm.SamplingMode == bench.SamplingModeHoldout && !includeHoldout {
+			return cmdError(cmd, fmt.Errorf("refusing to run holdout suite without --include-holdout"), 2)
+		}
+	}
+
 	matrix := defaultMatrixFor(provider)
 	if matrixPath != "" {
 		data, err := os.ReadFile(matrixPath)
@@ -198,6 +207,8 @@ func runBenchReport(cmd *cobra.Command, runID, format string) error {
 	switch format {
 	case "json":
 		return bench.RenderJSON(cmd.OutOrStdout(), r)
+	case "csv":
+		return bench.RenderCSV(cmd.OutOrStdout(), r)
 	default:
 		return bench.RenderMarkdown(cmd.OutOrStdout(), r)
 	}

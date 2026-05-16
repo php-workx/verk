@@ -64,3 +64,10 @@ never splits compound criteria or rewrites docs body text.
 Lessons captured from past escaped defects can be promoted into
 additional planner-review context. That mechanism is intentionally
 separate; see the memory learning loop plan.
+
+## Planner-Review Adapter
+
+The `policy.ticket_quality.planner_review` flag signals intent to route
+advisory findings through a planner-review adapter. Wiring the adapter
+call into the run pipeline is reserved for a follow-up; the flag is
+read but the adapter is not yet invoked automatically.

@@ -415,3 +415,60 @@ func TestLoadCheckpoint_MissingDir(t *testing.T) {
 		t.Error("expected found=false for empty dir")
 	}
 }
+
+func TestCellID_NoReviewerUsesNoneSuffix(t *testing.T) {
+	p := MatrixProfile{
+		ID:     "worker-a",
+		Worker: ModelRef{Runtime: "claude", Model: "claude-3-5-sonnet"},
+		// Reviewer deliberately left zero-value.
+	}
+	got := cellID(p)
+	if got != "worker-a__none" {
+		t.Errorf("cellID (no reviewer): got %q, want %q", got, "worker-a__none")
+	}
+}
+
+func TestCellID_WithReviewerUsesModel(t *testing.T) {
+	p := MatrixProfile{
+		ID:       "worker-a",
+		Worker:   ModelRef{Runtime: "claude", Model: "claude-3-5-sonnet"},
+		Reviewer: ModelRef{Runtime: "claude", Model: "claude-3-opus"},
+	}
+	got := cellID(p)
+	if got != "worker-a__claude-3-opus" {
+		t.Errorf("cellID (with reviewer): got %q, want %q", got, "worker-a__claude-3-opus")
+	}
+}
+
+func TestRun_WorkspacePathUsesCellID(t *testing.T) {
+	outDir := t.TempDir()
+	repoRoot := makeTempGitRepo(t)
+
+	tasks := []Task{{ID: "task-ws", Suite: "fake-suite"}}
+	provider := &fakeProvider{name: "fake", tasks: tasks}
+
+	var capturedWorkDir string
+	executor := func(ctx context.Context, task Task, profile MatrixProfile, workDir string) TaskResult {
+		capturedWorkDir = workDir
+		return noopExecutor(ctx, task, profile, workDir)
+	}
+
+	matrix := minimalMatrix() // worker-only, profile ID="p1", no reviewer
+	_, err := Run(context.Background(), RunOptions{
+		RepoRoot:  repoRoot,
+		OutDir:    outDir,
+		SuiteName: "fake-suite",
+		Provider:  provider,
+		Matrix:    matrix,
+		Executor:  executor,
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	// Workspace should use cellID format: <profile-id>__none for worker-only.
+	expectedSuffix := filepath.Join("tasks", "task-ws", "p1__none", "work")
+	if !strings.HasSuffix(capturedWorkDir, expectedSuffix) {
+		t.Errorf("workspace path %q does not end with %q", capturedWorkDir, expectedSuffix)
+	}
+}
