@@ -11,6 +11,11 @@ import (
 const (
 	defectsFile    = "escaped-defects.jsonl"
 	promotionsFile = "promoted-rules.jsonl"
+
+	maxSummaryLen         = 4096
+	maxRecommendedRuleLen = 2048
+	maxRuleIDLen          = 256
+	maxPromotionSummary   = 2048
 )
 
 // AppendLesson validates and appends an EscapedDefect record to the JSONL store.
@@ -18,6 +23,12 @@ const (
 func AppendLesson(dir string, lesson EscapedDefect) error {
 	if lesson.Summary == "" {
 		return fmt.Errorf("lesson summary must not be empty")
+	}
+	if len(lesson.Summary) > maxSummaryLen {
+		return fmt.Errorf("lesson summary exceeds %d chars (got %d)", maxSummaryLen, len(lesson.Summary))
+	}
+	if len(lesson.RecommendedRule) > maxRecommendedRuleLen {
+		return fmt.Errorf("lesson recommended_rule exceeds %d chars (got %d)", maxRecommendedRuleLen, len(lesson.RecommendedRule))
 	}
 	if !ValidStatus[lesson.Status] {
 		return fmt.Errorf("unknown lesson status %q", lesson.Status)
@@ -118,6 +129,12 @@ func GetLesson(dir, id string) (EscapedDefect, bool, error) {
 
 // AppendPromotion appends a PromotionEntry record to the promotions JSONL store.
 func AppendPromotion(dir string, entry PromotionEntry) error {
+	if len(entry.RuleID) > maxRuleIDLen {
+		return fmt.Errorf("promotion rule_id exceeds %d chars (got %d)", maxRuleIDLen, len(entry.RuleID))
+	}
+	if len(entry.Summary) > maxPromotionSummary {
+		return fmt.Errorf("promotion summary exceeds %d chars (got %d)", maxPromotionSummary, len(entry.Summary))
+	}
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return fmt.Errorf("create memory dir: %w", err)
 	}

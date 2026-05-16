@@ -48,10 +48,17 @@ func EvaluateTicketQuality(input TicketQualityInput) state.TicketQualityArtifact
 	for _, t := range tickets {
 		findings = append(findings, evalMissingAcceptanceCriteria(t)...)
 		findings = append(findings, evalAmbiguousCriteria(t)...)
+		findings = append(findings, evalCompoundAcceptanceCriterion(t)...)
+		findings = append(findings, evalMissingValidationCommands(t)...)
 		findings = append(findings, evalMissingOwnedPaths(t)...)
+		findings = append(findings, evalOwnedPathMissing(t, input.ExistingPaths)...)
 		findings = append(findings, evalDependencyMissing(t, idSet)...)
+		findings = append(findings, evalDependencyBlockedOrClosed(t, input.Tickets)...)
 		findings = append(findings, evalPublicContractScenario(t)...)
+		findings = append(findings, evalMissingNegativeCase(t)...)
 		findings = append(findings, evalDocsDescopeRisk(t)...)
+		findings = append(findings, evalPlanTraceabilityGap(t)...)
+		findings = append(findings, evalReviewerInstructionGap(t)...)
 	}
 	if isEpic(input.RootTicket) {
 		findings = append(findings, evalIntegrationGap(input.RootTicket, tickets)...)
@@ -201,10 +208,12 @@ func severityAtLeast(sev, threshold state.Severity) bool {
 }
 
 // blockThreshold returns the effective block threshold for ticket quality.
-// Defaults to P2 (blocks P0/P1/P2; warns on P3/P4) until policy config grows
-// a ticket_quality section.
-func blockThreshold(_ policy.Config) state.Severity {
-	return state.SeverityP2
+// Reads from policy.Config.TicketQuality.BlockThreshold; defaults to P2.
+func blockThreshold(cfg policy.Config) state.Severity {
+	if cfg.TicketQuality.BlockThreshold == "" {
+		return state.SeverityP2
+	}
+	return state.Severity(cfg.TicketQuality.BlockThreshold)
 }
 
 // --- Rule implementations --------------------------------------------------
@@ -405,6 +414,285 @@ func evalDocsDescopeRisk(t epos.Ticket) []state.TicketQualityFinding {
 		AutoRepairable:  false,
 		RequiresPlanner: true,
 		Disposition:     "open",
+	}}
+}
+
+// evalCompoundAcceptanceCriterion flags a single criterion that appears to pack
+// two independently verifiable claims into one line. Heuristic: criterion
+// contains " and " (count > 0) AND length > 100 characters.
+func evalCompoundAcceptanceCriterion(t epos.Ticket) []state.TicketQualityFinding {
+	var out []state.TicketQualityFinding
+	for _, c := range t.AcceptanceCriteria {
+		lc := strings.ToLower(c)
+		andCount := strings.Count(lc, " and ")
+		if andCount > 0 && len(c) > 100 {
+			code := state.QualityCodeCompoundAcceptanceCriterion
+			out = append(out, state.TicketQualityFinding{
+				ID:             makeFindingID(t.ID, code, []string{c}),
+				TicketID:       t.ID,
+				Code:           string(code),
+				Severity:       state.SeverityP3,
+				Title:          "acceptance criterion may pack two independently verifiable claims",
+				Body:           "Split the criterion into two separate lines so each is verifiable on its own.",
+				Evidence:       []string{c},
+				Repairable:     false,
+				AutoRepairable: false,
+				Disposition:    "open",
+			})
+		}
+	}
+	return out
+}
+
+// evalMissingValidationCommands flags tickets that have acceptance criteria but
+// no validation_commands and no code-file owned paths that would imply a
+// default lint/test derivation. Skipped for docs and chore tickets.
+func evalMissingValidationCommands(t epos.Ticket) []state.TicketQualityFinding {
+	if isDocsTicket(t) || isChoreTicket(t) {
+		return nil
+	}
+	// Must have acceptance criteria to be expected to have validation commands.
+	if len(t.AcceptanceCriteria) == 0 {
+		return nil
+	}
+	if len(t.ValidationCommands) > 0 {
+		return nil
+	}
+	// If any owned path is a code file or code directory (extensionless path
+	// that could be a Go/Python/Rust/TS package dir), assume lint/test can
+	// be derived. We skip the warning when a path has no file extension (no
+	// dot after the last "/") since that strongly suggests a source directory.
+	codeExtensions := []string{".go", ".ts", ".py", ".rs"}
+	for _, p := range t.OwnedPaths {
+		// Exact code file match.
+		for _, ext := range codeExtensions {
+			if strings.HasSuffix(p, ext) {
+				return nil
+			}
+		}
+		// Extensionless path with a "/" is almost certainly a source directory.
+		if strings.Contains(p, "/") {
+			base := p[strings.LastIndex(p, "/")+1:]
+			if !strings.Contains(base, ".") {
+				return nil
+			}
+		}
+	}
+	code := state.QualityCodeMissingValidationCommands
+	return []state.TicketQualityFinding{{
+		ID:             makeFindingID(t.ID, code, nil),
+		TicketID:       t.ID,
+		Code:           string(code),
+		Severity:       state.SeverityP2,
+		Title:          "ticket has acceptance criteria but no validation commands",
+		Body:           "Add validation_commands (e.g. a test or lint invocation) so the worker can verify the acceptance criteria automatically.",
+		Repairable:     false,
+		AutoRepairable: false,
+		Disposition:    "open",
+	}}
+}
+
+// ownedPathLooksNew returns true when the path pattern suggests it is a
+// newly-introduced file (e.g. lacks any slash-separated component, or the
+// path is entirely a leaf name). The heuristic is kept very conservative to
+// avoid false positives: we only skip the warning when the path contains no
+// "/" at all (i.e. is a top-level plain name with no directory component).
+// Paths under stable directories like "internal/" are always considered
+// potentially existing.
+func ownedPathLooksNew(p string) bool {
+	// A path with no directory separator cannot be a stable internal path.
+	return !strings.Contains(p, "/")
+}
+
+// evalOwnedPathMissing warns when an owned path is given but does not appear
+// in ExistingPaths. Skipped when ExistingPaths is nil (check not configured).
+// Very conservative: only warns when path contains "/" (i.e. is not
+// trivially new) to keep false-positive rate low.
+func evalOwnedPathMissing(t epos.Ticket, existing map[string]bool) []state.TicketQualityFinding {
+	if existing == nil {
+		return nil
+	}
+	var out []state.TicketQualityFinding
+	for _, p := range t.OwnedPaths {
+		if existing[p] {
+			continue
+		}
+		if ownedPathLooksNew(p) {
+			continue
+		}
+		code := state.QualityCodeOwnedPathMissing
+		out = append(out, state.TicketQualityFinding{
+			ID:             makeFindingID(t.ID, code, []string{p}),
+			TicketID:       t.ID,
+			Code:           string(code),
+			Severity:       state.SeverityP2,
+			Title:          fmt.Sprintf("owned path %q does not appear to exist", p),
+			Body:           "Verify the path is correct; if the path will be created by this ticket, add it under a clearly new directory to suppress this warning.",
+			Evidence:       []string{p},
+			Repairable:     false,
+			AutoRepairable: false,
+			Disposition:    "open",
+		})
+	}
+	return out
+}
+
+// evalDependencyBlockedOrClosed flags tickets whose dependencies are in
+// Blocked or Closed status when the relationship is inconsistent. Requires
+// the full ticket slice to be passed so we can look up dep status.
+func evalDependencyBlockedOrClosed(t epos.Ticket, all []epos.Ticket) []state.TicketQualityFinding {
+	if len(t.Deps) == 0 {
+		return nil
+	}
+	// Build a quick lookup from the all-tickets slice.
+	byID := make(map[string]epos.Ticket, len(all))
+	for _, dep := range all {
+		byID[dep.ID] = dep
+	}
+	var out []state.TicketQualityFinding
+	for _, depID := range t.Deps {
+		dep, ok := byID[depID]
+		if !ok {
+			// dependency_missing handles the absent case; skip here.
+			continue
+		}
+		switch dep.Status {
+		case epos.StatusBlocked:
+			code := state.QualityCodeDependencyBlockedOrClosedMismatch
+			out = append(out, state.TicketQualityFinding{
+				ID:             makeFindingID(t.ID, code, []string{depID, "blocked"}),
+				TicketID:       t.ID,
+				Code:           string(code),
+				Severity:       state.SeverityP2,
+				Title:          fmt.Sprintf("dependency %q is currently Blocked", depID),
+				Body:           "Resolve the blocked dependency before this ticket can proceed, or remove the dependency if it no longer applies.",
+				Evidence:       []string{depID},
+				Repairable:     false,
+				AutoRepairable: false,
+				Disposition:    "open",
+			})
+		case epos.StatusClosed:
+			if t.Status != epos.StatusClosed {
+				code := state.QualityCodeDependencyBlockedOrClosedMismatch
+				out = append(out, state.TicketQualityFinding{
+					ID:             makeFindingID(t.ID, code, []string{depID, "closed"}),
+					TicketID:       t.ID,
+					Code:           string(code),
+					Severity:       state.SeverityP2,
+					Title:          fmt.Sprintf("dependency %q is Closed but this ticket is not", depID),
+					Body:           "A closed dependency on an open ticket may indicate the work was already completed separately. Verify whether this dependency is still needed.",
+					Evidence:       []string{depID},
+					Repairable:     false,
+					AutoRepairable: false,
+					Disposition:    "open",
+				})
+			}
+		}
+	}
+	return out
+}
+
+var (
+	negativeCaseTrigger  = regexp.MustCompile(`(?i)\bvalidation\b|\berror\b|\bfails\b|\brejects\b`)
+	negativeCaseEvidence = regexp.MustCompile(`(?i)\berror\b|\bfailure\b|\breject\b|\binvalid\b|\bexception\b|\bnon.zero exit\b|\bexit [1-9]\b`)
+)
+
+// evalMissingNegativeCase flags tickets about validation/error handling that
+// have no acceptance criterion or test case mentioning failure paths.
+func evalMissingNegativeCase(t epos.Ticket) []state.TicketQualityFinding {
+	combined := t.Title + " " + t.Body
+	if !negativeCaseTrigger.MatchString(combined) {
+		return nil
+	}
+	// Check all criteria and test cases for negative-path evidence.
+	all := strings.Join(t.AcceptanceCriteria, "\n") + "\n" + strings.Join(t.TestCases, "\n")
+	if negativeCaseEvidence.MatchString(all) {
+		return nil
+	}
+	code := state.QualityCodeMissingNegativeCase
+	return []state.TicketQualityFinding{{
+		ID:             makeFindingID(t.ID, code, nil),
+		TicketID:       t.ID,
+		Code:           string(code),
+		Severity:       state.SeverityP2,
+		Title:          "ticket mentions validation/errors but has no negative-case acceptance criterion",
+		Body:           "Add at least one acceptance criterion or test case that specifies the expected failure path (error message, non-zero exit, rejection reason).",
+		Repairable:     false,
+		AutoRepairable: false,
+		Disposition:    "open",
+	}}
+}
+
+var planRefTrigger = regexp.MustCompile(`(?i)\bplan\b|\bspec\b|\bRFC\b`)
+
+// evalPlanTraceabilityGap flags tickets that reference a plan/spec/RFC but
+// do not link to a docs/plans/ path and have no plan_refs frontmatter.
+func evalPlanTraceabilityGap(t epos.Ticket) []state.TicketQualityFinding {
+	combined := t.Title + " " + t.Body
+	if !planRefTrigger.MatchString(combined) {
+		return nil
+	}
+	// Check whether the ticket already has a plan link.
+	if strings.Contains(t.Body, "docs/plans/") {
+		return nil
+	}
+	if t.UnknownFrontmatter != nil {
+		if _, ok := t.UnknownFrontmatter["plan_refs"]; ok {
+			return nil
+		}
+	}
+	code := state.QualityCodePlanTraceabilityGap
+	return []state.TicketQualityFinding{{
+		ID:             makeFindingID(t.ID, code, nil),
+		TicketID:       t.ID,
+		Code:           string(code),
+		Severity:       state.SeverityP2,
+		Title:          "ticket references a plan/spec/RFC but provides no docs/plans/ link",
+		Body:           "Add a docs/plans/ link in the ticket body or a plan_refs frontmatter entry so reviewers can trace requirements.",
+		Repairable:     false,
+		AutoRepairable: false,
+		Disposition:    "open",
+	}}
+}
+
+var reviewerGuidanceTrigger = regexp.MustCompile(`(?i)\bsecurity\b|\bmigration\b|\bbreaking\b|\bauth\b|\bpayment\b`)
+
+// evalReviewerInstructionGap flags tickets that involve security, migrations,
+// breaking changes, auth, or payments but provide no reviewer guidance.
+func evalReviewerInstructionGap(t epos.Ticket) []state.TicketQualityFinding {
+	combined := t.Title + " " + t.Body
+	// Also check tags stored in UnknownFrontmatter["tags"].
+	if t.UnknownFrontmatter != nil {
+		if tags, ok := t.UnknownFrontmatter["tags"].([]any); ok {
+			for _, tag := range tags {
+				if s, ok := tag.(string); ok {
+					combined += " " + s
+				}
+			}
+		}
+	}
+	if !reviewerGuidanceTrigger.MatchString(combined) {
+		return nil
+	}
+	// Check for existing reviewer guidance frontmatter.
+	if t.UnknownFrontmatter != nil {
+		for _, key := range []string{"reviewer_notes", "review_focus"} {
+			if _, ok := t.UnknownFrontmatter[key]; ok {
+				return nil
+			}
+		}
+	}
+	code := state.QualityCodeReviewerInstructionGap
+	return []state.TicketQualityFinding{{
+		ID:             makeFindingID(t.ID, code, nil),
+		TicketID:       t.ID,
+		Code:           string(code),
+		Severity:       state.SeverityP3,
+		Title:          "ticket involves security/auth/migration/payment but has no reviewer guidance",
+		Body:           "Add reviewer_notes or review_focus frontmatter to guide reviewers on what to check.",
+		Repairable:     false,
+		AutoRepairable: false,
+		Disposition:    "open",
 	}}
 }
 

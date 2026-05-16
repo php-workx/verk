@@ -34,3 +34,16 @@ Every public surface (CLI flag, HTTP endpoint, RPC method, exported Go symbol)
 is a promise to all current and future callers. Add a new surface only when you
 are prepared to maintain it. When in doubt, keep it unexported until the contract
 is proven stable.
+
+### Source-Driven Development
+
+When implementing against a spec, plan, or external API, verify against the
+authoritative source — not from memory.
+
+| Rationalization | Counter |
+| --- | --- |
+| "I'm confident about this API" | Confidence is not evidence. Training data contains outdated patterns that look correct but break against current versions. Verify. |
+| "Fetching docs wastes tokens" | Hallucinating an API wastes more. The user debugs for an hour, then discovers the function signature changed. One fetch prevents hours of rework. |
+| "I'll verify the API later" | Later means after the contract is declared. A wrong contract surface costs more to fix than a correct one costs to verify upfront. |
+| "The docs won't have what I need" | If the docs don't cover it, that's valuable information — the pattern may not be officially supported. |
+| "I'll just mention it might be outdated" | A disclaimer doesn't help. Either verify and cite, or clearly flag it as unverified. Hedging is the worst option. |

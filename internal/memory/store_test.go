@@ -2,6 +2,8 @@ package memory
 
 import (
 	"fmt"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -175,6 +177,137 @@ func TestAppendPromotion_PersistsEntry(t *testing.T) {
 	}
 	if entries[0].RuleID != entry.RuleID {
 		t.Errorf("RuleID = %q, want %q", entries[0].RuleID, entry.RuleID)
+	}
+}
+
+func TestAppendLesson_RejectsSummaryTooLong(t *testing.T) {
+	dir := t.TempDir()
+	lesson := EscapedDefect{
+		ID:        fmt.Sprintf("learn-%d", time.Now().UnixNano()),
+		CreatedAt: time.Now().UTC(),
+		Summary:   strings.Repeat("x", maxSummaryLen+1),
+		Status:    StatusProposed,
+	}
+	if err := AppendLesson(dir, lesson); err == nil {
+		t.Fatal("expected error for summary > 4096 chars, got nil")
+	}
+}
+
+func TestAppendLesson_RejectsRecommendedRuleTooLong(t *testing.T) {
+	dir := t.TempDir()
+	lesson := EscapedDefect{
+		ID:              fmt.Sprintf("learn-%d", time.Now().UnixNano()),
+		CreatedAt:       time.Now().UTC(),
+		Summary:         "valid summary",
+		RecommendedRule: strings.Repeat("r", maxRecommendedRuleLen+1),
+		Status:          StatusProposed,
+	}
+	if err := AppendLesson(dir, lesson); err == nil {
+		t.Fatal("expected error for recommended_rule > 2048 chars, got nil")
+	}
+}
+
+func TestAppendPromotion_RejectsRuleIDTooLong(t *testing.T) {
+	dir := t.TempDir()
+	entry := PromotionEntry{
+		LessonID:   "learn-123",
+		PromotedAt: time.Now().UTC(),
+		Target:     ".agents/patterns/my-pattern.md",
+		RuleID:     strings.Repeat("r", maxRuleIDLen+1),
+		Summary:    "valid summary",
+	}
+	if err := AppendPromotion(dir, entry); err == nil {
+		t.Fatal("expected error for rule_id > 256 chars, got nil")
+	}
+}
+
+func TestAppendPromotion_RejectsSummaryTooLong(t *testing.T) {
+	dir := t.TempDir()
+	entry := PromotionEntry{
+		LessonID:   "learn-123",
+		PromotedAt: time.Now().UTC(),
+		Target:     ".agents/patterns/my-pattern.md",
+		RuleID:     "rule-001",
+		Summary:    strings.Repeat("s", maxPromotionSummary+1),
+	}
+	if err := AppendPromotion(dir, entry); err == nil {
+		t.Fatal("expected error for promotion summary > 2048 chars, got nil")
+	}
+}
+
+func TestListLessons_MissingFile(t *testing.T) {
+	dir := t.TempDir()
+	// No file written — ListLessons should return nil, nil.
+	lessons, err := ListLessons(dir)
+	if err != nil {
+		t.Fatalf("ListLessons on missing file: %v", err)
+	}
+	if lessons != nil {
+		t.Fatalf("expected nil lessons for missing file, got %v", lessons)
+	}
+}
+
+func TestListLessons_EmptyFile(t *testing.T) {
+	dir := t.TempDir()
+	// Write one lesson then another, simulating an empty file edge-case by
+	// creating the dir but never writing — handled by missing-file test above.
+	// This variant writes a lesson then reads; count must equal 1.
+	lesson := EscapedDefect{
+		ID:        fmt.Sprintf("learn-%d", time.Now().UnixNano()),
+		CreatedAt: time.Now().UTC(),
+		Summary:   "edge case",
+		Status:    StatusProposed,
+	}
+	if err := AppendLesson(dir, lesson); err != nil {
+		t.Fatalf("AppendLesson: %v", err)
+	}
+	lessons, err := ListLessons(dir)
+	if err != nil {
+		t.Fatalf("ListLessons: %v", err)
+	}
+	if len(lessons) != 1 {
+		t.Fatalf("expected 1 lesson, got %d", len(lessons))
+	}
+}
+
+func TestListLessons_ConcurrentAppend(t *testing.T) {
+	dir := t.TempDir()
+	const n = 10
+	var wg sync.WaitGroup
+	now := time.Now().UTC()
+
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			lesson := EscapedDefect{
+				ID:        fmt.Sprintf("learn-%d-%d", now.UnixNano(), i),
+				CreatedAt: now.Add(time.Duration(i) * time.Millisecond),
+				Summary:   fmt.Sprintf("concurrent lesson %d", i),
+				Status:    StatusProposed,
+			}
+			if err := AppendLesson(dir, lesson); err != nil {
+				t.Errorf("AppendLesson goroutine %d: %v", i, err)
+			}
+		}(i)
+	}
+	wg.Wait()
+
+	lessons, err := ListLessons(dir)
+	if err != nil {
+		t.Fatalf("ListLessons after concurrent appends: %v", err)
+	}
+	if len(lessons) != n {
+		t.Fatalf("expected %d lessons after concurrent appends, got %d", n, len(lessons))
+	}
+	// Verify all records are valid (non-empty summary).
+	for idx, l := range lessons {
+		if l.Summary == "" {
+			t.Errorf("lesson %d has empty summary (partial write corruption)", idx)
+		}
+		if l.ID == "" {
+			t.Errorf("lesson %d has empty ID (partial write corruption)", idx)
+		}
 	}
 }
 

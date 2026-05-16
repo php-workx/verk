@@ -2,6 +2,7 @@ package bench
 
 import (
 	"bytes"
+	"encoding/csv"
 	"encoding/json"
 	"strings"
 	"testing"
@@ -195,5 +196,110 @@ func TestRenderJSON_RoundTrips(t *testing.T) {
 	}
 	if len(decoded.PerTask) != len(report.PerTask) {
 		t.Errorf("PerTask length: got %d, want %d", len(decoded.PerTask), len(report.PerTask))
+	}
+}
+
+func TestRenderCSV_HasHeaderAndRows(t *testing.T) {
+	rr := makeTestRunResult()
+	report := BuildReport(rr)
+
+	var buf bytes.Buffer
+	if err := RenderCSV(&buf, report); err != nil {
+		t.Fatalf("RenderCSV failed: %v", err)
+	}
+
+	r := csv.NewReader(&buf)
+	records, err := r.ReadAll()
+	if err != nil {
+		t.Fatalf("csv.ReadAll failed: %v", err)
+	}
+
+	// Header row + 5 task rows
+	if len(records) != 6 {
+		t.Fatalf("expected 6 rows (1 header + 5 tasks), got %d", len(records))
+	}
+
+	header := records[0]
+	expectedCols := []string{"task_id", "profile_id", "status", "failure", "repair_cycles", "review_cycles", "duration_ms", "cost_usd", "cost_confidence"}
+	if len(header) != len(expectedCols) {
+		t.Fatalf("header column count: got %d, want %d", len(header), len(expectedCols))
+	}
+	for i, col := range expectedCols {
+		if header[i] != col {
+			t.Errorf("header[%d]: got %q, want %q", i, header[i], col)
+		}
+	}
+
+	// Verify first data row corresponds to task-1.
+	row1 := records[1]
+	if row1[0] != "task-1" {
+		t.Errorf("row1 task_id: got %q, want %q", row1[0], "task-1")
+	}
+	if row1[2] != "solved" {
+		t.Errorf("row1 status: got %q, want %q", row1[2], "solved")
+	}
+	// task-1 has confidence="exact" and cost=0.01
+	if row1[8] != "exact" {
+		t.Errorf("row1 cost_confidence: got %q, want %q", row1[8], "exact")
+	}
+
+	// task-3 is unsolved with no usage — confidence should be "unavailable"
+	row3 := records[3]
+	if row3[0] != "task-3" {
+		t.Errorf("row3 task_id: got %q, want %q", row3[0], "task-3")
+	}
+	if row3[8] != "unavailable" {
+		t.Errorf("row3 cost_confidence: got %q, want %q", row3[8], "unavailable")
+	}
+}
+
+func TestRenderMarkdown_IncludesFailureCategorySection(t *testing.T) {
+	rr := makeTestRunResult()
+	// Add a task with an explicit failure category.
+	rr.Results = append(rr.Results, TaskResult{
+		TaskID:     "task-6",
+		ProfileID:  "p1",
+		Status:     TaskStatusUnsolved,
+		Failure:    FailureModelLimit,
+		DurationMS: 500,
+	})
+	report := BuildReport(rr)
+
+	var buf bytes.Buffer
+	if err := RenderMarkdown(&buf, report); err != nil {
+		t.Fatalf("RenderMarkdown failed: %v", err)
+	}
+
+	md := buf.String()
+	if !strings.Contains(md, "## Failure Categories") {
+		t.Error("Markdown missing '## Failure Categories' section")
+	}
+	if !strings.Contains(md, string(FailureModelLimit)) {
+		t.Errorf("Markdown missing failure category %q", FailureModelLimit)
+	}
+}
+
+func TestRenderMarkdown_IncludesPerProfileTable(t *testing.T) {
+	rr := makeTestRunResult()
+	report := BuildReport(rr)
+
+	var buf bytes.Buffer
+	if err := RenderMarkdown(&buf, report); err != nil {
+		t.Fatalf("RenderMarkdown failed: %v", err)
+	}
+
+	md := buf.String()
+	if !strings.Contains(md, "## Per-Profile Breakdown") {
+		t.Error("Markdown missing '## Per-Profile Breakdown' section")
+	}
+	if !strings.Contains(md, "Profile") {
+		t.Error("Markdown per-profile table missing 'Profile' column header")
+	}
+	if !strings.Contains(md, "Solve %") {
+		t.Error("Markdown per-profile table missing 'Solve %' column header")
+	}
+	// Profile p1 should appear in the table.
+	if !strings.Contains(md, "p1") {
+		t.Error("Markdown per-profile table missing profile 'p1'")
 	}
 }

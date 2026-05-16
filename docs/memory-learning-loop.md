@@ -100,3 +100,38 @@ same `id` and updated status; readers deduplicate using last-record-wins.
 Whether `.verk/memory/` is committed is a per-project choice. Operators
 who want shared lessons should commit it; operators who want
 machine-local lessons should add it to `.gitignore`.
+
+## Committing Memory
+
+The `.verk/memory/` directory holds append-only JSONL files. The tradeoff:
+
+| Choice | Commit to repo | Add to `.gitignore` |
+|---|---|---|
+| **Shared lessons** | Lessons are visible to all team members and survive machine changes. | — |
+| **Per-machine lessons** | — | Lessons stay local; no risk of leaking sensitive incident context. |
+| **Hybrid** | Commit only `promoted-rules.jsonl` (curated). Ignore `escaped-defects.jsonl` (raw). | — |
+
+### Sample `.gitignore` entries
+
+**Ignore everything in memory (per-machine):**
+```gitignore
+# verk memory — machine-local only
+.verk/memory/
+```
+
+**Commit promoted rules, ignore raw defects:**
+```gitignore
+# verk memory — keep curated rules, ignore raw escaped defects
+.verk/memory/escaped-defects.jsonl
+```
+
+**Commit everything (shared team lessons):**
+```gitignore
+# verk memory — intentionally committed; remove this block to share lessons
+# (nothing to ignore)
+```
+
+> Tip: because both files are append-only JSONL, merge conflicts are
+> rare — each line is a self-contained JSON object. `git` will surface
+> a conflict only if two branches appended records in the exact same
+> byte offset, which is unlikely in practice.

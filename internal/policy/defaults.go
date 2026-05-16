@@ -35,5 +35,13 @@ func DefaultConfig() Config {
 			DefaultTimeoutMinutes: 15,
 			EnvPassthrough:        []string{"PATH", "HOME", "CI"},
 		},
+		TicketQuality: TicketQualityConfig{
+			Enabled:                        true,
+			PlannerReview:                  true,
+			AutoFixSafe:                    false,
+			BlockThreshold:                 "P2",
+			RequirePublicContractScenarios: true,
+			RequireEpicIntegrationTicket:   true,
+		},
 	}
 }

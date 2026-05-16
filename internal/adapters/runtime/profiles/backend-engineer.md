@@ -32,3 +32,16 @@ leave the dangerous edges unverified.
 Keep function scope narrow. A function that modifies state should not also
 perform I/O unless the combination is the explicit contract. Mixing concerns
 makes it impossible to test state transitions in isolation.
+
+### Code Simplification
+
+Scope discipline is a first-class backend concern. The smallest correct change
+is almost always the right change.
+
+| Rationalization | Counter |
+| --- | --- |
+| "I'll just quickly simplify this unrelated code too" | Unscoped simplification creates noisy diffs and risks regressions in code you didn't intend to change. Stay focused. |
+| "Fewer lines is always simpler" | A 1-line nested ternary is not simpler than a 5-line if/else. Simplicity is about comprehension speed, not line count. |
+| "This abstraction might be useful later" | Don't preserve speculative abstractions. If it's not used now, it's complexity without value. Remove it and re-add when needed. |
+| "I'll refactor while adding this feature" | Separate refactoring from feature work. Mixed changes are harder to review, revert, and understand in history. |
+| "premature abstraction saves time" | Abstractions cost understanding on every future read. Introduce them only when the duplication is proven painful. |

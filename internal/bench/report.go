@@ -1,12 +1,14 @@
 package bench
 
 import (
+	"encoding/csv"
 	"encoding/json"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"text/tabwriter"
 	"time"
 )
@@ -206,6 +208,90 @@ func RenderMarkdown(w io.Writer, r Report) error {
 	tw.Flush()
 	fmt.Fprintln(w)
 
+	// Failure categories
+	categoryCounts := make(map[FailureCategory]int)
+	for _, tr := range r.PerTask {
+		if tr.Failure != "" {
+			categoryCounts[tr.Failure]++
+		}
+	}
+	if len(categoryCounts) > 0 {
+		fmt.Fprintf(w, "## Failure Categories\n\n")
+		tw = tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
+		fmt.Fprintln(tw, "Category\tCount")
+		fmt.Fprintln(tw, "--------\t-----")
+		for _, cat := range []FailureCategory{
+			FailureModelLimit, FailureWorkerCrash, FailureReviewerBlock,
+			FailureScopeViolation, FailureVerifier, FailureSetup, FailureOther,
+		} {
+			if n := categoryCounts[cat]; n > 0 {
+				fmt.Fprintf(tw, "%s\t%d\n", cat, n)
+			}
+		}
+		tw.Flush()
+		fmt.Fprintln(w)
+	}
+
+	// Per-profile breakdown table
+	type profileStats struct {
+		tasks   int
+		solved  int
+		repair  int
+		review  int
+		costUSD float64
+	}
+	profileMap := make(map[string]*profileStats)
+	for _, tr := range r.PerTask {
+		ps := profileMap[tr.ProfileID]
+		if ps == nil {
+			ps = &profileStats{}
+			profileMap[tr.ProfileID] = ps
+		}
+		ps.tasks++
+		if tr.Status == TaskStatusSolved {
+			ps.solved++
+		}
+		ps.repair += tr.RepairCycles
+		ps.review += tr.ReviewCycles
+		for _, u := range tr.Usage {
+			ps.costUSD += u.CostUSD
+		}
+	}
+	if len(profileMap) > 0 {
+		fmt.Fprintf(w, "## Per-Profile Breakdown\n\n")
+		tw = tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
+		fmt.Fprintln(tw, "Profile\tTasks\tSolved\tSolve %\tAvg Repair\tAvg Review\tTotal Cost")
+		fmt.Fprintln(tw, "-------\t-----\t------\t-------\t----------\t----------\t----------")
+		// iterate r.Profiles for stable ordering; profiles absent from the snapshot
+		// but present in PerTask will appear at the end.
+		seen := make(map[string]bool)
+		for _, prof := range r.Profiles {
+			ps := profileMap[prof.ID]
+			if ps == nil || ps.tasks == 0 {
+				continue
+			}
+			seen[prof.ID] = true
+			solveRate := 100.0 * float64(ps.solved) / float64(ps.tasks)
+			avgRepair := float64(ps.repair) / float64(ps.tasks)
+			avgReview := float64(ps.review) / float64(ps.tasks)
+			fmt.Fprintf(tw, "%s\t%d\t%d\t%.1f%%\t%.2f\t%.2f\t$%.4f\n",
+				prof.ID, ps.tasks, ps.solved, solveRate, avgRepair, avgReview, ps.costUSD)
+		}
+		// Include profile IDs not in the snapshot but present in PerTask.
+		for id, ps := range profileMap {
+			if seen[id] || ps.tasks == 0 {
+				continue
+			}
+			solveRate := 100.0 * float64(ps.solved) / float64(ps.tasks)
+			avgRepair := float64(ps.repair) / float64(ps.tasks)
+			avgReview := float64(ps.review) / float64(ps.tasks)
+			fmt.Fprintf(tw, "%s\t%d\t%d\t%.1f%%\t%.2f\t%.2f\t$%.4f\n",
+				id, ps.tasks, ps.solved, solveRate, avgRepair, avgReview, ps.costUSD)
+		}
+		tw.Flush()
+		fmt.Fprintln(w)
+	}
+
 	// Non-comparable warning
 	if slices.Contains(r.Labels, "non-comparable") {
 		fmt.Fprintf(w, "> **Warning:** This run is marked non-comparable and should not be used for external claims.\n\n")
@@ -223,4 +309,55 @@ func RenderJSON(w io.Writer, r Report) error {
 	data = append(data, '\n')
 	_, err = w.Write(data)
 	return err
+}
+
+// RenderCSV writes a CSV report (one row per task result).
+// Columns: task_id,profile_id,status,failure,repair_cycles,review_cycles,duration_ms,cost_usd,cost_confidence
+func RenderCSV(w io.Writer, r Report) error {
+	cw := csv.NewWriter(w)
+	if err := cw.Write([]string{
+		"task_id", "profile_id", "status", "failure",
+		"repair_cycles", "review_cycles", "duration_ms", "cost_usd", "cost_confidence",
+	}); err != nil {
+		return fmt.Errorf("bench: render csv header: %w", err)
+	}
+	for _, tr := range r.PerTask {
+		var totalCost float64
+		var confidence string
+		for _, u := range tr.Usage {
+			totalCost += u.CostUSD
+			if confidence == "" {
+				confidence = u.Confidence
+			}
+		}
+		confidence = defaultUsageConfidence(UsageRecord{CostUSD: totalCost, Confidence: confidence})
+		if err := cw.Write([]string{
+			tr.TaskID,
+			tr.ProfileID,
+			string(tr.Status),
+			string(tr.Failure),
+			strconv.Itoa(tr.RepairCycles),
+			strconv.Itoa(tr.ReviewCycles),
+			strconv.FormatInt(tr.DurationMS, 10),
+			strconv.FormatFloat(totalCost, 'f', 6, 64),
+			confidence,
+		}); err != nil {
+			return fmt.Errorf("bench: render csv row for task %q: %w", tr.TaskID, err)
+		}
+	}
+	cw.Flush()
+	return cw.Error()
+}
+
+// defaultUsageConfidence returns a confidence label for a UsageRecord.
+// "exact" when already set, "estimated" when cost is non-zero but confidence unset,
+// "unavailable" when no cost data.
+func defaultUsageConfidence(u UsageRecord) string {
+	if u.Confidence != "" {
+		return u.Confidence
+	}
+	if u.CostUSD > 0 {
+		return "estimated"
+	}
+	return "unavailable"
 }

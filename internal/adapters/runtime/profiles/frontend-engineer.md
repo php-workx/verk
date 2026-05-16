@@ -33,3 +33,27 @@ they cannot catch focus traps, event propagation bugs, or CSS layout failures.
 Component props are a public API. Every prop name, type, and default value is
 a contract with every consumer of the component. Prefer explicit required props
 over ambient context where the dependency is load-bearing.
+
+### Browser Testing with DevTools
+
+Real-render verification is required. Mental models and unit test mocks do not
+catch browser-specific layout failures, event propagation bugs, or console errors.
+
+| Rationalization | Counter |
+| --- | --- |
+| "It looks right in my mental model" | Runtime behavior regularly differs from what code suggests. Verify with actual browser state. |
+| "Console warnings are fine" | Warnings become errors. Clean consoles catch bugs early. |
+| "I'll check the browser manually later" | DevTools MCP lets the agent verify now, in the same session, automatically. |
+| "The DOM must be correct if the tests pass" | Unit tests don't test CSS, layout, or real browser rendering. DevTools does. |
+| "The accessibility tree is probably fine" | Inspect the accessibility tree explicitly. ARIA roles, labels, and focus order are invisible in code review. |
+
+### Code Simplification
+
+Frontend components accumulate complexity through prop sprawl and speculative
+abstraction. Keep components focused on a single responsibility.
+
+| Rationalization | Counter |
+| --- | --- |
+| "I'll just quickly simplify this unrelated component too" | Unscoped simplification creates noisy diffs and risks regressions in untested rendering paths. Stay focused. |
+| "This abstraction might be useful later" | Don't preserve speculative component abstractions. If it's not used now, it's complexity without value. |
+| "Fewer props is always simpler" | Collapsing props into an opaque config object hides the contract. Explicit named props are simpler to read and review. |

@@ -103,3 +103,68 @@ func TestBenchCompare_NotYetImplemented(t *testing.T) {
 		t.Fatal("bench compare: expected non-zero exit code for unimplemented command, got 0")
 	}
 }
+
+// holdoutProvider is a bench.Provider with a single holdout suite.
+type holdoutProvider struct {
+	stubProvider
+	tasksLoaded bool
+}
+
+func newHoldoutProvider() *holdoutProvider {
+	return &holdoutProvider{
+		stubProvider: stubProvider{
+			name: "verk-native",
+			suites: []bench.SuiteMeta{
+				{Name: "holdout-suite", TaskCount: 5, SamplingMode: bench.SamplingModeHoldout},
+			},
+		},
+	}
+}
+
+func (h *holdoutProvider) LoadTasks(suite string) ([]bench.Task, error) {
+	h.tasksLoaded = true
+	return []bench.Task{{ID: "t1", Suite: suite}}, nil
+}
+
+func (h *holdoutProvider) Capabilities() bench.ProviderCapabilities {
+	return bench.ProviderCapabilities{
+		SupportedModes: []bench.BenchmarkMode{bench.ModeWorkerOnly},
+	}
+}
+
+func TestRunBench_RefusesHoldoutWithoutFlag(t *testing.T) {
+	original := benchRegistryFactory
+	t.Cleanup(func() { benchRegistryFactory = original })
+	benchRegistryFactory = func() *bench.Registry {
+		r := bench.NewRegistry()
+		_ = r.Register(newHoldoutProvider())
+		return r
+	}
+
+	_, _, code := runBenchCmd(t, "run", "holdout-suite")
+	if code != 2 {
+		t.Fatalf("expected exit code 2 for holdout without --include-holdout, got %d", code)
+	}
+}
+
+func TestRunBench_AllowsHoldoutWithFlag(t *testing.T) {
+	original := benchRegistryFactory
+	t.Cleanup(func() { benchRegistryFactory = original })
+
+	hp := newHoldoutProvider()
+	benchRegistryFactory = func() *bench.Registry {
+		r := bench.NewRegistry()
+		_ = r.Register(hp)
+		return r
+	}
+
+	// Inject a fast executor so we don't need a real git repo or file system.
+	// The run will fail because we don't have a valid repo root for git checks,
+	// but it must pass the holdout guard (exit code must NOT be 2).
+	_, _, code := runBenchCmd(t, "run", "--include-holdout", "--allow-dirty", "holdout-suite")
+	// The command may fail (non-zero) for other reasons (no git repo, etc.),
+	// but must not fail with exit 2 (holdout refusal).
+	if code == 2 {
+		t.Fatal("bench run --include-holdout should not refuse with exit 2 (holdout guard should be bypassed)")
+	}
+}
