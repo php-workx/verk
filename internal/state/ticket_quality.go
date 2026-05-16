@@ -53,6 +53,18 @@ type TicketQualityRepair struct {
 	Applied   bool   `json:"applied"`
 }
 
+// TicketQualityTrace records the traceability information for a single
+// ticket's acceptance criterion. The Source Reference is extracted from
+// ticket body or frontmatter; ValidationRefs is the union of test cases
+// and validation commands that exercise this criterion.
+type TicketQualityTrace struct {
+	SourceRef      string   `json:"source_ref,omitempty"`
+	TicketID       string   `json:"ticket_id"`
+	Criterion      string   `json:"criterion"`
+	ValidationRefs []string `json:"validation_refs,omitempty"`
+	PublicContract bool     `json:"public_contract,omitempty"`
+}
+
 // TicketQualityArtifact is the durable record of a ticket quality gate run.
 // Status is passed when all checks pass, repaired when auto-repairs resolved
 // all findings, and blocked when unresolvable findings remain.
@@ -64,6 +76,7 @@ type TicketQualityArtifact struct {
 	Status       TicketQualityStatus    `json:"status"`
 	Findings     []TicketQualityFinding `json:"findings"`
 	Repairs      []TicketQualityRepair  `json:"repairs,omitempty"`
+	Traces       []TicketQualityTrace   `json:"traces,omitempty"`
 	Blocked      bool                   `json:"blocked"`
 	BlockReason  string                 `json:"block_reason,omitempty"`
 }

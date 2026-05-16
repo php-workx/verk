@@ -168,6 +168,50 @@ func ValidatedExecutable(binary string) (string, error) {
 	return trimmed, nil
 }
 
+// TicketSummary is a compact summary of a ticket used by planner-role
+// review. It deliberately omits Body to keep prompts bounded; planner
+// review focuses on observable signals (criteria, paths, deps).
+type TicketSummary struct {
+	ID                 string   `json:"id"`
+	Title              string   `json:"title"`
+	Type               string   `json:"type,omitempty"`
+	OwnedPaths         []string `json:"owned_paths,omitempty"`
+	AcceptanceCriteria []string `json:"acceptance_criteria,omitempty"`
+	TestCases          []string `json:"test_cases,omitempty"`
+	ValidationCommands []string `json:"validation_commands,omitempty"`
+	Deps               []string `json:"deps,omitempty"`
+}
+
+// RawTicketQualityFinding is the JSON shape the planner LLM is asked to
+// produce. Engine normalizes this into state.TicketQualityFinding (with
+// stable IDs) after parsing the response.
+type RawTicketQualityFinding struct {
+	TicketID string   `json:"ticket_id"`
+	Code     string   `json:"code"`
+	Severity string   `json:"severity"`
+	Title    string   `json:"title"`
+	Body     string   `json:"body"`
+	Evidence []string `json:"evidence,omitempty"`
+}
+
+// PlannerReviewRequest is the input for a planner-role ticket quality
+// review. It is intentionally separate from ReviewRequest so adapters can
+// route planner requests differently if needed.
+type PlannerReviewRequest struct {
+	RootTicketID             string
+	Tickets                  []TicketSummary
+	DeterministicFindings    []RawTicketQualityFinding
+	EffectiveReviewThreshold Severity
+	LeaseID                  string
+}
+
+// PlannerReviewResult is the parsed output of a planner-role review.
+type PlannerReviewResult struct {
+	Status   string                    `json:"status"`
+	Summary  string                    `json:"summary"`
+	Findings []RawTicketQualityFinding `json:"findings"`
+}
+
 var severityOrder = map[Severity]int{
 	SeverityP0: 0,
 	SeverityP1: 1,

@@ -319,6 +319,98 @@ func TestTicketQualityRepair_AmbiguousCriterionNotRewritten(t *testing.T) {
 	}
 }
 
+func TestTicketQualityTraceability_ExtractsSourceRefFromBody(t *testing.T) {
+	tk := mkQualityTicket("ver-tr1", "Implement widget")
+	tk.OwnedPaths = []string{"internal/widget"}
+	tk.Body = "See docs/plans/widget.md for the full spec."
+	tk.AcceptanceCriteria = []string{"verk widget --enable exits 0"}
+	in := TicketQualityInput{RootTicket: tk, Tickets: []epos.Ticket{tk}, Config: policy.DefaultConfig()}
+	art := EvaluateTicketQuality(in)
+	if len(art.Traces) == 0 {
+		t.Fatalf("expected at least one trace, got none")
+	}
+	if art.Traces[0].SourceRef != "docs/plans/widget.md" {
+		t.Fatalf("expected SourceRef %q, got %q", "docs/plans/widget.md", art.Traces[0].SourceRef)
+	}
+}
+
+func TestTicketQualityTraceability_ExtractsSourceRefFromFrontmatter(t *testing.T) {
+	tk := mkQualityTicket("ver-tr2", "Implement widget")
+	tk.OwnedPaths = []string{"internal/widget"}
+	tk.UnknownFrontmatter = map[string]any{
+		"plan_refs": []any{"docs/plans/widget-plan.md", "docs/plans/other.md"},
+	}
+	tk.AcceptanceCriteria = []string{"verk widget --enable exits 0"}
+	in := TicketQualityInput{RootTicket: tk, Tickets: []epos.Ticket{tk}, Config: policy.DefaultConfig()}
+	art := EvaluateTicketQuality(in)
+	if len(art.Traces) == 0 {
+		t.Fatalf("expected at least one trace, got none")
+	}
+	if art.Traces[0].SourceRef != "docs/plans/widget-plan.md" {
+		t.Fatalf("expected SourceRef %q, got %q", "docs/plans/widget-plan.md", art.Traces[0].SourceRef)
+	}
+}
+
+func TestTicketQualityTraceability_PopulatesValidationRefs(t *testing.T) {
+	tk := mkQualityTicket("ver-tr3", "Implement widget")
+	tk.OwnedPaths = []string{"internal/widget"}
+	tk.AcceptanceCriteria = []string{"verk widget --enable exits 0"}
+	tk.TestCases = []string{"test_widget_enable"}
+	tk.ValidationCommands = []string{"go test ./internal/widget/..."}
+	in := TicketQualityInput{RootTicket: tk, Tickets: []epos.Ticket{tk}, Config: policy.DefaultConfig()}
+	art := EvaluateTicketQuality(in)
+	if len(art.Traces) == 0 {
+		t.Fatalf("expected at least one trace, got none")
+	}
+	refs := art.Traces[0].ValidationRefs
+	if len(refs) != 2 {
+		t.Fatalf("expected 2 validation refs, got %d: %v", len(refs), refs)
+	}
+	if refs[0] != "test_widget_enable" {
+		t.Fatalf("expected test case first, got %q", refs[0])
+	}
+	if refs[1] != "go test ./internal/widget/..." {
+		t.Fatalf("expected validation command second, got %q", refs[1])
+	}
+}
+
+func TestTicketQualityTraceability_MarksPublicContract(t *testing.T) {
+	tk := mkQualityTicket("ver-tr4", "Add subcommand cleanup")
+	tk.OwnedPaths = []string{"cmd/verk"}
+	tk.AcceptanceCriteria = []string{"verk cleanup --force exits 0 and prints \"cleaned\" to stdout"}
+	in := TicketQualityInput{RootTicket: tk, Tickets: []epos.Ticket{tk}, Config: policy.DefaultConfig()}
+	art := EvaluateTicketQuality(in)
+	if len(art.Traces) == 0 {
+		t.Fatalf("expected at least one trace, got none")
+	}
+	if !art.Traces[0].PublicContract {
+		t.Fatalf("expected PublicContract=true for cmd/ owned ticket, got false")
+	}
+}
+
+func TestTicketQualityTraceability_OneTracePerCriterion(t *testing.T) {
+	tk := mkQualityTicket("ver-tr5", "Implement widget")
+	tk.OwnedPaths = []string{"internal/widget"}
+	tk.AcceptanceCriteria = []string{
+		"verk widget --enable exits 0",
+		"verk widget --disable exits 0",
+		"verk widget --status prints enabled or disabled on stdout",
+	}
+	in := TicketQualityInput{RootTicket: tk, Tickets: []epos.Ticket{tk}, Config: policy.DefaultConfig()}
+	art := EvaluateTicketQuality(in)
+	if len(art.Traces) != 3 {
+		t.Fatalf("expected 3 traces (one per criterion), got %d", len(art.Traces))
+	}
+	for i, tr := range art.Traces {
+		if tr.TicketID != tk.ID {
+			t.Fatalf("trace[%d] has wrong TicketID %q", i, tr.TicketID)
+		}
+		if tr.Criterion != tk.AcceptanceCriteria[i] {
+			t.Fatalf("trace[%d] criterion mismatch: want %q got %q", i, tk.AcceptanceCriteria[i], tr.Criterion)
+		}
+	}
+}
+
 func TestTicketQualityRepair_PlannerNoteRecorded(t *testing.T) {
 	tk := mkQualityTicket("ver-docs", "Document cleanup")
 	tk.OwnedPaths = []string{"docs/cleanup.md"}

@@ -85,15 +85,70 @@ func EvaluateTicketQuality(input TicketQualityInput) state.TicketQualityArtifact
 	}
 	sort.Strings(ticketIDs)
 
+	traces := buildTraces(tickets)
+
 	return state.TicketQualityArtifact{
 		Scope:        scope,
 		RootTicketID: input.RootTicket.ID,
 		TicketIDs:    ticketIDs,
 		Status:       status,
 		Findings:     findings,
+		Traces:       traces,
 		Blocked:      blocked,
 		BlockReason:  blockReason,
 	}
+}
+
+// buildTraces extracts one trace per acceptance criterion across all
+// tickets in the input. Traces propagate source refs from ticket body
+// (links to docs/plans/), test cases, validation commands, and detected
+// public-contract status.
+func buildTraces(tickets []epos.Ticket) []state.TicketQualityTrace {
+	var traces []state.TicketQualityTrace
+	for _, t := range tickets {
+		srcRef := extractSourceRef(t)
+		validationRefs := append([]string{}, t.TestCases...)
+		validationRefs = append(validationRefs, t.ValidationCommands...)
+		pc := isPublicContractTicket(t)
+		for _, c := range t.AcceptanceCriteria {
+			traces = append(traces, state.TicketQualityTrace{
+				SourceRef:      srcRef,
+				TicketID:       t.ID,
+				Criterion:      c,
+				ValidationRefs: validationRefs,
+				PublicContract: pc,
+			})
+		}
+	}
+	return traces
+}
+
+// extractSourceRef returns the first plan reference found in the ticket
+// body (line containing "docs/plans/") or "" if none found. Also checks
+// UnknownFrontmatter["plan_refs"] for a list of strings.
+func extractSourceRef(t epos.Ticket) string {
+	// Check plan_refs frontmatter first
+	if t.UnknownFrontmatter != nil {
+		if refs, ok := t.UnknownFrontmatter["plan_refs"].([]any); ok && len(refs) > 0 {
+			if s, ok := refs[0].(string); ok {
+				return s
+			}
+		}
+	}
+	// Scan body for docs/plans/ link
+	for _, line := range strings.Split(t.Body, "\n") {
+		if i := strings.Index(line, "docs/plans/"); i >= 0 {
+			ref := line[i:]
+			// Trim trailing punctuation/whitespace
+			ref = strings.TrimRight(ref, ".,;: )")
+			// Stop at next whitespace
+			if j := strings.IndexAny(ref, " \t)"); j >= 0 {
+				ref = ref[:j]
+			}
+			return ref
+		}
+	}
+	return ""
 }
 
 // ticketType returns the ticket "type" stored in UnknownFrontmatter["type"].

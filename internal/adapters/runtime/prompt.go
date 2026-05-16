@@ -361,6 +361,83 @@ func parseLastJSON[T any](text string) (T, bool) {
 	return zero, false
 }
 
+// PlannerSystemPrompt is the system prompt for planner-role ticket quality
+// review. It must explicitly differentiate from code review.
+const PlannerSystemPrompt = `You are reviewing ticket quality before implementation. Do not review code.
+Your job is to decide whether these tickets are specific, complete, and
+verifiable enough for workers to deliver the whole epic.
+
+Output a JSON object with shape:
+{
+  "status": "passed" | "blocked",
+  "summary": "<short prose summary>",
+  "findings": [
+    {
+      "ticket_id": "<id>",
+      "code": "<one of: missing_public_contract_scenario, ambiguous_acceptance_criterion, plan_traceability_gap, integration_gap, docs_descope_risk, missing_negative_case, reviewer_instruction_gap>",
+      "severity": "P0" | "P1" | "P2" | "P3" | "P4",
+      "title": "<short title>",
+      "body": "<2-4 sentence explanation>",
+      "evidence": ["<quoted ticket fragments>"]
+    }
+  ]
+}
+
+Respond with JSON only. No prose before or after the JSON.`
+
+// BuildPlannerReviewPrompt assembles the user prompt for a planner-role
+// review request.
+func BuildPlannerReviewPrompt(req PlannerReviewRequest) string {
+	var b strings.Builder
+
+	fmt.Fprintf(&b, "Root ticket: %s\n", req.RootTicketID)
+
+	b.WriteString("\n### Tickets Under Review\n\n")
+	for _, t := range req.Tickets {
+		fmt.Fprintf(&b, "- **%s**: %s\n", t.ID, t.Title)
+		for _, p := range t.OwnedPaths {
+			fmt.Fprintf(&b, "  - owned_path: %s\n", p)
+		}
+		for _, ac := range t.AcceptanceCriteria {
+			fmt.Fprintf(&b, "  - acceptance_criterion: %s\n", ac)
+		}
+		for _, tc := range t.TestCases {
+			fmt.Fprintf(&b, "  - test_case: %s\n", tc)
+		}
+		for _, vc := range t.ValidationCommands {
+			fmt.Fprintf(&b, "  - validation_command: %s\n", vc)
+		}
+		for _, dep := range t.Deps {
+			fmt.Fprintf(&b, "  - dep: %s\n", dep)
+		}
+	}
+
+	b.WriteString("\n### Deterministic Findings\n\n")
+	if len(req.DeterministicFindings) == 0 {
+		b.WriteString("None.\n")
+	} else {
+		b.WriteString("The following findings have already been identified deterministically. Do not re-flag them:\n")
+		for _, f := range req.DeterministicFindings {
+			fmt.Fprintf(&b, "- [%s/%s] %s: %s\n", f.TicketID, f.Code, f.Severity, f.Title)
+		}
+	}
+
+	b.WriteString("\n### Your Job\n\n")
+	b.WriteString("This is NOT implementation review. Do not evaluate code.\n")
+	b.WriteString("Look for:\n")
+	b.WriteString("- missing traceability between tickets and a source plan\n")
+	b.WriteString("- missing black-box scenarios for CLI/API tickets\n")
+	b.WriteString("- docs that appear to descope planned behavior (docs descope risk)\n")
+	b.WriteString("- integration and e2e coverage gaps for multi-surface epics\n")
+	b.WriteString("- ambiguous acceptance criteria that workers cannot verify\n")
+	fmt.Fprintf(&b, "Effective review threshold: %s\n", req.EffectiveReviewThreshold)
+
+	b.WriteString("\n### Response Format\n\n")
+	b.WriteString("Respond with a JSON object matching the schema in the system prompt. JSON only — no prose before or after.\n")
+
+	return b.String()
+}
+
 // CLIOutputJSON is the JSON structure returned by `claude -p --output-format json`.
 type CLIOutputJSON struct {
 	Type          string  `json:"type"`

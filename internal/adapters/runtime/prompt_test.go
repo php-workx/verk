@@ -568,3 +568,102 @@ func TestBuildReviewPrompt_NoFilesUnderReviewWhenEmpty(t *testing.T) {
 		t.Fatal("expected no Files Under Review section when ChangedFiles is empty")
 	}
 }
+
+func TestBuildPlannerReviewPrompt_IncludesRootAndChildren(t *testing.T) {
+	req := PlannerReviewRequest{
+		RootTicketID:             "EPIC-1",
+		EffectiveReviewThreshold: "P2",
+		LeaseID:                  "lease-42",
+		Tickets: []TicketSummary{
+			{
+				ID:         "TICK-1",
+				Title:      "Add auth endpoint",
+				OwnedPaths: []string{"internal/api/auth.go", "internal/api/auth_test.go"},
+			},
+			{
+				ID:         "TICK-2",
+				Title:      "Add user store",
+				OwnedPaths: []string{"internal/store/user.go"},
+			},
+		},
+	}
+	prompt := BuildPlannerReviewPrompt(req)
+
+	for _, want := range []string{
+		"EPIC-1",
+		"TICK-1",
+		"TICK-2",
+		"internal/api/auth.go",
+		"internal/api/auth_test.go",
+		"internal/store/user.go",
+	} {
+		if !strings.Contains(prompt, want) {
+			t.Errorf("expected prompt to contain %q:\n%s", want, prompt)
+		}
+	}
+}
+
+func TestBuildPlannerReviewPrompt_IncludesDeterministicFindings(t *testing.T) {
+	req := PlannerReviewRequest{
+		RootTicketID:             "EPIC-1",
+		EffectiveReviewThreshold: "P2",
+		LeaseID:                  "lease-42",
+		Tickets: []TicketSummary{
+			{ID: "TICK-1", Title: "Do something"},
+		},
+		DeterministicFindings: []RawTicketQualityFinding{
+			{
+				TicketID: "TICK-1",
+				Code:     "missing_negative_case",
+				Severity: "P1",
+				Title:    "No error path tested",
+				Body:     "The acceptance criteria lack any negative test case.",
+			},
+		},
+	}
+	prompt := BuildPlannerReviewPrompt(req)
+
+	for _, want := range []string{
+		"missing_negative_case",
+		"No error path tested",
+		"TICK-1",
+	} {
+		if !strings.Contains(prompt, want) {
+			t.Errorf("expected prompt to contain %q:\n%s", want, prompt)
+		}
+	}
+}
+
+func TestBuildPlannerReviewPrompt_StatesNonImplementationReview(t *testing.T) {
+	if !strings.Contains(PlannerSystemPrompt, "Do not review code") {
+		t.Fatalf("expected PlannerSystemPrompt to contain 'Do not review code':\n%s", PlannerSystemPrompt)
+	}
+}
+
+func TestBuildPlannerReviewPrompt_MentionsRequiredCheckCategories(t *testing.T) {
+	req := PlannerReviewRequest{
+		RootTicketID:             "EPIC-1",
+		EffectiveReviewThreshold: "P2",
+		LeaseID:                  "lease-42",
+		Tickets:                  []TicketSummary{{ID: "TICK-1", Title: "Do something"}},
+	}
+	prompt := BuildPlannerReviewPrompt(req)
+
+	for _, want := range []string{
+		"traceability",
+		"black-box",
+		"docs",
+		"integration",
+		"ambiguous",
+	} {
+		if !strings.Contains(prompt, want) {
+			t.Errorf("expected prompt to contain %q:\n%s", want, prompt)
+		}
+	}
+}
+
+func TestBuildPlannerReviewPrompt_StatesJSONOnly(t *testing.T) {
+	if !strings.Contains(PlannerSystemPrompt, "JSON only") {
+		t.Fatalf("expected PlannerSystemPrompt to contain 'JSON only':\n%s", PlannerSystemPrompt)
+	}
+}
