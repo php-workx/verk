@@ -138,6 +138,12 @@ func BuildWorkerPrompt(req WorkerRequest) string {
 		b.WriteString("\n")
 	}
 
+	if req.Standards != "" {
+		b.WriteString("\n### Engineering Standards\n\n")
+		b.WriteString(truncateStandards(req.Standards))
+		b.WriteString("\n")
+	}
+
 	if len(req.OwnedPaths) > 0 {
 		b.WriteString("\n## Hard Edit Guard\n\n")
 		b.WriteString("This worker is scoped to the following owned paths. Any edit outside this set\n")

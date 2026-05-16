@@ -344,6 +344,7 @@ func RunTicket(ctx context.Context, req RunTicketRequest) (result RunTicketResul
 				WorktreePath:    st.worktreePath,
 				Instructions:    buildImplementPhaseInstructions(st, st.implementationAttempts+1),
 				OwnedPaths:      req.Plan.OwnedPaths,
+				Standards:       runtime.BuildReviewStandards(runtime.DetectLanguagesFromPaths(req.Plan.OwnedPaths)),
 				ExecutionConfig: executionConfigFromPolicy(cfg),
 				OnProgress:      func(detail string) { st.progressDetail(detail) },
 			}
@@ -525,6 +526,7 @@ func RunTicket(ctx context.Context, req RunTicketRequest) (result RunTicketResul
 				WorktreePath:    st.worktreePath,
 				Instructions:    renderRepairInstructions(st),
 				OwnedPaths:      req.Plan.OwnedPaths,
+				Standards:       runtime.BuildReviewStandards(runtime.DetectLanguagesFromPaths(req.Plan.OwnedPaths)),
 				ExecutionConfig: executionConfigFromPolicy(cfg),
 				OnProgress:      func(detail string) { st.progressDetail(detail) },
 			}

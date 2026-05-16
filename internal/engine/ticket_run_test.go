@@ -4143,3 +4143,65 @@ func TestRunTicket_WritesFreezeArtifact(t *testing.T) {
 		}
 	}
 }
+
+func TestRunTicket_WorkerRequestIncludesStandards(t *testing.T) {
+	repoRoot := t.TempDir()
+	cfg := policy.DefaultConfig()
+	ticket := epos.Ticket{
+		ID:                 "ver-standards",
+		Title:              "Standards injection test",
+		AcceptanceCriteria: []string{"verk test --x exits 0"},
+		OwnedPaths:         []string{"internal/engine/ticket_run.go", "internal/engine/ticket_run_test.go"},
+		UnknownFrontmatter: map[string]any{"type": "task"},
+	}
+	plan, claim := testPlanAndClaim(t, repoRoot, ticket, cfg, "run-standards", "lease-standards", []string{`true`})
+
+	started, finished := testRunTimes()
+	adapter := runtimefake.New(
+		[]runtime.WorkerResult{
+			{
+				Status:             runtime.WorkerStatusDone,
+				RetryClass:         runtime.RetryClassTerminal,
+				LeaseID:            claim.LeaseID,
+				StartedAt:          started,
+				FinishedAt:         finished,
+				ResultArtifactPath: filepath.Join(repoRoot, "worker.json"),
+			},
+		},
+		[]runtime.ReviewResult{
+			{
+				Status:             runtime.WorkerStatusDone,
+				RetryClass:         runtime.RetryClassTerminal,
+				LeaseID:            claim.LeaseID,
+				StartedAt:          finished.Add(time.Second),
+				FinishedAt:         finished.Add(2 * time.Second),
+				ReviewStatus:       runtime.ReviewStatusPassed,
+				Summary:            "clean",
+				ResultArtifactPath: filepath.Join(repoRoot, "review.json"),
+			},
+		},
+	)
+
+	_, err := RunTicket(context.Background(), RunTicketRequest{
+		RepoRoot: repoRoot,
+		RunID:    "run-standards",
+		Ticket:   ticket,
+		Plan:     plan,
+		Claim:    claim,
+		Adapter:  adapter,
+		Config:   cfg,
+	})
+	if err != nil {
+		t.Fatalf("RunTicket returned error: %v", err)
+	}
+	if len(adapter.WorkerRequests()) == 0 {
+		t.Fatal("expected at least one worker request")
+	}
+	workerReq := adapter.WorkerRequests()[0]
+	if workerReq.Standards == "" {
+		t.Fatal("expected Standards to be populated in WorkerRequest for .go owned_paths")
+	}
+	if !strings.Contains(workerReq.Standards, "Universal Review Standards") {
+		t.Errorf("expected universal standards in WorkerRequest.Standards, got: %q", workerReq.Standards[:min(200, len(workerReq.Standards))])
+	}
+}

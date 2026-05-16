@@ -823,3 +823,82 @@ func TestBuildWorkerPrompt_OmitsGuardWhenOwnedPathsEmpty(t *testing.T) {
 		t.Error("expected no 'scope_escape_attempt' when OwnedPaths is empty")
 	}
 }
+
+func TestBuildProfilePrompt_ContractIncludesSourceDriven(t *testing.T) {
+	profile := BuildProfilePrompt("contract-engineer")
+	lower := strings.ToLower(profile)
+	if !strings.Contains(lower, "fetching docs") && !strings.Contains(lower, "verify the api") {
+		t.Fatalf("expected 'fetching docs' or 'verify the api' in contract-engineer profile:\n%s", profile)
+	}
+}
+
+func TestBuildProfilePrompt_BackendIncludesCodeSimplification(t *testing.T) {
+	profile := BuildProfilePrompt("backend-engineer")
+	lower := strings.ToLower(profile)
+	if !strings.Contains(lower, "unscoped") && !strings.Contains(lower, "premature abstraction") {
+		t.Fatalf("expected 'unscoped' or 'premature abstraction' in backend-engineer profile:\n%s", profile)
+	}
+}
+
+func TestBuildProfilePrompt_FrontendIncludesBrowserTesting(t *testing.T) {
+	profile := BuildProfilePrompt("frontend-engineer")
+	lower := strings.ToLower(profile)
+	if !strings.Contains(lower, "devtools") && !strings.Contains(lower, "console") {
+		t.Fatalf("expected 'devtools' or 'console' in frontend-engineer profile:\n%s", profile)
+	}
+}
+
+func TestBuildWorkerPrompt_IncludesStandardsWhenProvided(t *testing.T) {
+	standards := BuildReviewStandards([]string{"go"})
+	req := WorkerRequest{
+		TicketID:  "VER-300",
+		LeaseID:   "lease-300",
+		Standards: standards,
+	}
+	prompt := BuildWorkerPrompt(req)
+
+	if !strings.Contains(prompt, "### Engineering Standards") {
+		t.Fatal("expected '### Engineering Standards' section in prompt")
+	}
+	// Universal standards are always included; verify a known snippet is present.
+	if !strings.Contains(prompt, "Universal Review Standards") {
+		t.Fatal("expected universal review standards snippet in prompt")
+	}
+}
+
+func TestBuildWorkerPrompt_OmitsStandardsSectionWhenEmpty(t *testing.T) {
+	req := WorkerRequest{
+		TicketID:  "VER-301",
+		LeaseID:   "lease-301",
+		Standards: "",
+	}
+	prompt := BuildWorkerPrompt(req)
+
+	if strings.Contains(prompt, "### Engineering Standards") {
+		t.Error("expected no '### Engineering Standards' section when Standards is empty")
+	}
+}
+
+func TestBuildWorkerPrompt_StandardsAppearBeforeHardEditGuard(t *testing.T) {
+	standards := BuildReviewStandards([]string{"go"})
+	req := WorkerRequest{
+		TicketID:   "VER-302",
+		LeaseID:    "lease-302",
+		Standards:  standards,
+		OwnedPaths: []string{"internal/widget.go"},
+	}
+	prompt := BuildWorkerPrompt(req)
+
+	standardsIdx := strings.Index(prompt, "### Engineering Standards")
+	guardIdx := strings.Index(prompt, "## Hard Edit Guard")
+
+	if standardsIdx < 0 {
+		t.Fatal("expected '### Engineering Standards' section in prompt")
+	}
+	if guardIdx < 0 {
+		t.Fatal("expected '## Hard Edit Guard' section in prompt")
+	}
+	if standardsIdx > guardIdx {
+		t.Fatalf("expected standards (pos %d) to appear before Hard Edit Guard (pos %d)", standardsIdx, guardIdx)
+	}
+}

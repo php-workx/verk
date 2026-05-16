@@ -71,7 +71,10 @@ type WorkerRequest struct {
 	// OwnedPaths lists the file paths this worker is permitted to edit.
 	// When non-empty, BuildWorkerPrompt renders a Hard Edit Guard section
 	// instructing the worker to stay within this set.
-	OwnedPaths      []string            `json:"owned_paths,omitempty"`
+	OwnedPaths []string `json:"owned_paths,omitempty"`
+	// Standards is a pre-rendered language standards block injected into the
+	// worker prompt. Empty string omits the Engineering Standards section.
+	Standards       string              `json:"standards,omitempty"`
 	ExecutionConfig ExecutionConfig     `json:"execution_config,omitempty"`
 	OnProgress      func(detail string) `json:"-"` // called with tool-use summaries during execution
 }
