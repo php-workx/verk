@@ -36,7 +36,15 @@ type closeoutRequest struct {
 	implementation    *state.ImplementationArtifact
 	criteriaEvidence  []state.CriteriaEvidence
 	requiredArtifacts []string
+	repoRoot          string // optional: when set, test references are AST-resolved
 }
+
+// CloseoutRepoRoot is a typed wrapper around a filesystem path. Pass it as a
+// variadic argument to BuildCloseoutArtifact / DeriveGateResults to enable
+// AST-level test reference resolution. When omitted (or empty), the resolution
+// step is skipped — this preserves unit-test ergonomics for callers that do
+// not have a worktree.
+type CloseoutRepoRoot string
 
 func ReviewFindingBlocks(f any, threshold state.Severity) bool {
 	finding, ok := normalizeReviewFinding(f)
@@ -307,6 +315,8 @@ func parseCloseoutRequest(args ...any) (closeoutRequest, error) {
 			req.criteriaEvidence = append([]state.CriteriaEvidence(nil), v...)
 		case []string:
 			req.requiredArtifacts = append([]string(nil), v...)
+		case CloseoutRepoRoot:
+			req.repoRoot = string(v)
 		}
 	}
 
@@ -423,7 +433,7 @@ func validateArtifactIntegrity(req closeoutRequest, currentRunID string) error {
 			return fmt.Errorf("review artifact run %q does not match current run %q", req.review.RunID, currentRunID)
 		}
 		for _, finding := range req.review.Findings {
-			if err := validateReviewFinding(finding, req.plan.EffectiveReviewThreshold, req.plan.OwnedPaths); err != nil {
+			if err := validateReviewFindingWithRepoRoot(finding, req.plan.EffectiveReviewThreshold, req.plan.OwnedPaths, req.repoRoot); err != nil {
 				return err
 			}
 		}
@@ -648,7 +658,7 @@ func requiredValidationCoveragePassed(coverage state.ValidationCoverageArtifact)
 // Non-blocking findings may omit file/line (speculative/informational findings are
 // allowed without precise location), but a non-empty file that is whitespace-only
 // is always rejected as a programming error.
-func validateReviewFinding(f state.ReviewFinding, threshold state.Severity, ownedPaths []string) error {
+func validateReviewFindingWithRepoRoot(f state.ReviewFinding, threshold state.Severity, ownedPaths []string, repoRoot string) error {
 	if f.ID == "" {
 		return fmt.Errorf("review finding missing id")
 	}
@@ -677,7 +687,7 @@ func validateReviewFinding(f state.ReviewFinding, threshold state.Severity, owne
 	case "open":
 		return nil
 	case "resolved":
-		return validateResolutionEvidence(f, ownedPaths)
+		return validateResolutionEvidence(f, ownedPaths, repoRoot)
 	case "waived":
 		if strings.TrimSpace(f.WaivedBy) == "" {
 			return fmt.Errorf("waived review finding %q missing waived_by", f.ID)
@@ -704,12 +714,9 @@ func validateReviewFinding(f state.ReviewFinding, threshold state.Severity, owne
 //  3. Every DiffRange.File must lie within the ticket's owned_paths (scope
 //     violation — distinct from generic closeout failure; spec SR-4 rule 4).
 //  4. TestReferences must be non-empty; each must pass ValidateTestReference.
+//     When repoRoot is provided, each reference must resolve to a real Go test.
 //  5. RepairCycleID must be non-empty.
-//
-// TODO(P4-stretch): Validate that each TestReference actually exists in
-// the worktree by walking the AST. Deferred — requires build-time symbol
-// resolution which is out of scope for the foundational gate MVP.
-func validateResolutionEvidence(f state.ReviewFinding, ownedPaths []string) error {
+func validateResolutionEvidence(f state.ReviewFinding, ownedPaths []string, repoRoot string) error {
 	ev := f.ResolutionEvidence
 	if ev == nil {
 		return fmt.Errorf("resolved review finding %q missing resolution_evidence", f.ID)
@@ -735,6 +742,9 @@ func validateResolutionEvidence(f state.ReviewFinding, ownedPaths []string) erro
 	}
 	for i, ref := range ev.TestReferences {
 		if err := state.ValidateTestReference(ref); err != nil {
+			return fmt.Errorf("resolved review finding %q resolution_evidence test_reference[%d]: %w", f.ID, i, err)
+		}
+		if err := resolveTestReference(repoRoot, ref); err != nil {
 			return fmt.Errorf("resolved review finding %q resolution_evidence test_reference[%d]: %w", f.ID, i, err)
 		}
 	}
