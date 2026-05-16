@@ -1609,6 +1609,10 @@ func executeEpicTicket(ctx context.Context, req RunEpicRequest, cfg policy.Confi
 		Config:               cfg,
 		VerificationCommands: verificationCommandsFor(req, ticket),
 		Progress:             req.Progress,
+		// RunEpic already ran the epic-level ticket-quality gate and
+		// persisted ticket-quality.json for the whole epic; suppress the
+		// per-ticket gate so we don't overwrite the epic-scoped artifact.
+		SkipTicketQualityGate: true,
 	})
 	if err != nil {
 		outcome.err = err

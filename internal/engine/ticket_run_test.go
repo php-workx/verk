@@ -921,9 +921,10 @@ func TestRunTicket_ScopeViolationBlocksTicket(t *testing.T) {
 
 	cfg := policy.DefaultConfig()
 	ticket := epos.Ticket{
-		ID:         "ver-scope-viol",
-		Title:      "Ticket ver-scope-viol",
-		OwnedPaths: []string{"internal/engine"},
+		ID:                 "ver-scope-viol",
+		Title:              "Ticket ver-scope-viol",
+		AcceptanceCriteria: []string{"verk test --x exits 0"},
+		OwnedPaths:         []string{"internal/engine"},
 		UnknownFrontmatter: map[string]any{
 			"type": "task",
 		},
@@ -995,8 +996,18 @@ func TestRunTicket_ScopeCheckBlocksWhenOwnedPathsEmpty(t *testing.T) {
 	mustRunGit(t, repoRoot, "commit", "-m", "change")
 
 	cfg := policy.DefaultConfig()
-	// No OwnedPaths set - G9 requires scope checks to default to deny/fail-closed.
-	ticket := testTicket("ver-no-scope")
+	// OwnedPaths is set to a path that does NOT cover the worker-written file
+	// "anywhere/file.go", so the runtime scope check still fires. We can't
+	// leave OwnedPaths empty here because the deterministic ticket-quality
+	// gate (which runs earlier) would block on missing_owned_paths first,
+	// preventing the runtime scope check from being exercised.
+	ticket := epos.Ticket{
+		ID:                 "ver-no-scope",
+		Title:              "Ticket ver-no-scope",
+		AcceptanceCriteria: []string{"verk test --x exits 0"},
+		OwnedPaths:         []string{"internal/different"},
+		UnknownFrontmatter: map[string]any{"type": "task"},
+	}
 	plan, claim := testPlanAndClaim(t, repoRoot, ticket, cfg, "run-no-scope", "lease-no-scope", []string{`true`})
 
 	started, finished := testRunTimes()
@@ -1036,7 +1047,9 @@ func TestRunTicket_ScopeCheckBlocksWhenOwnedPathsEmpty(t *testing.T) {
 		Config:             cfg,
 		EnforceSingleScope: true,
 	})
-	// With no owned_paths, G9 requires scope checks to fail closed, so the ticket transitions to blocked.
+	// With owned_paths set to a path that does not cover the worker-written
+	// file, the runtime scope check fails closed and the ticket transitions
+	// to blocked.
 	if err != nil {
 		t.Fatalf("RunTicket returned error: %v", err)
 	}
@@ -1046,8 +1059,8 @@ func TestRunTicket_ScopeCheckBlocksWhenOwnedPathsEmpty(t *testing.T) {
 	if !strings.Contains(result.Snapshot.BlockReason, "single-ticket scope violation") {
 		t.Fatalf("expected scope violation block reason, got %q", result.Snapshot.BlockReason)
 	}
-	if !strings.Contains(result.Snapshot.BlockReason, ticket.ID) {
-		t.Fatalf("expected block reason to contain ticket ID %q, got %q", ticket.ID, result.Snapshot.BlockReason)
+	if !strings.Contains(result.Snapshot.BlockReason, "anywhere/file.go") {
+		t.Fatalf("expected block reason to mention out-of-scope file, got %q", result.Snapshot.BlockReason)
 	}
 }
 
@@ -1057,25 +1070,18 @@ func TestRunTicket_ScopeMissingThenReopensToProceed(t *testing.T) {
 
 	runID := "run-scope-reopen"
 	ticketID := "ver-scope-reopen"
-	ticket := testTicket(ticketID)
-
-	// First run: no OwnedPaths set, so single-ticket scope check should block.
+	// First run: ticket has no OwnedPaths set, so the deterministic
+	// ticket-quality gate (which runs before the first worker) should block
+	// on missing_owned_paths before any worker is invoked.
+	ticket := epos.Ticket{
+		ID:                 ticketID,
+		Title:              "Ticket " + ticketID,
+		AcceptanceCriteria: []string{"verk test --x exits 0"},
+		UnknownFrontmatter: map[string]any{"type": "task"},
+	}
 	firstPlan, firstClaim := testPlanAndClaim(t, repoRoot, ticket, cfg, runID, "lease-scope-reopen-empty", []string{`true`})
 
-	started, finished := testRunTimes()
-	firstAdapter := runtimefake.New(
-		[]runtime.WorkerResult{
-			{
-				Status:             runtime.WorkerStatusDone,
-				RetryClass:         runtime.RetryClassTerminal,
-				LeaseID:            firstClaim.LeaseID,
-				StartedAt:          started,
-				FinishedAt:         finished,
-				ResultArtifactPath: filepath.Join(repoRoot, "worker-empty.json"),
-			},
-		},
-		nil,
-	)
+	firstAdapter := runtimefake.New(nil, nil)
 
 	blockedResult, err := RunTicket(context.Background(), RunTicketRequest{
 		RepoRoot:           repoRoot,
@@ -1093,8 +1099,11 @@ func TestRunTicket_ScopeMissingThenReopensToProceed(t *testing.T) {
 	if blockedResult.Snapshot.CurrentPhase != state.TicketPhaseBlocked {
 		t.Fatalf("expected blocked phase on first run, got %q", blockedResult.Snapshot.CurrentPhase)
 	}
-	if !strings.Contains(blockedResult.Snapshot.BlockReason, "single-ticket scope violation") {
-		t.Fatalf("expected scope violation block reason, got %q", blockedResult.Snapshot.BlockReason)
+	if blockedResult.Snapshot.BlockReason == "" {
+		t.Fatalf("expected non-empty block reason on first run, got empty")
+	}
+	if len(firstAdapter.WorkerRequests()) != 0 {
+		t.Fatalf("expected no worker invocations when quality gate blocks, got %d", len(firstAdapter.WorkerRequests()))
 	}
 
 	// Simulate reopen flow artifacts that would normally exist in an epic run.
@@ -1156,7 +1165,7 @@ func TestRunTicket_ScopeMissingThenReopensToProceed(t *testing.T) {
 		[]string{`true`},
 	)
 
-	started, finished = testRunTimes()
+	started, finished := testRunTimes()
 	reopenedAdapter := runtimefake.New(
 		[]runtime.WorkerResult{
 			{
@@ -1323,6 +1332,12 @@ func testTicket(id string) epos.Ticket {
 	return epos.Ticket{
 		ID:    id,
 		Title: "Ticket " + id,
+		// Minimal fields to satisfy the deterministic ticket-quality gate that
+		// runs before the first worker in RunTicket. Tests that need a failing
+		// quality gate, or a specific scope/owned-paths setup, should
+		// construct an inline epos.Ticket instead of using this helper.
+		AcceptanceCriteria: []string{"verk test --x exits 0"},
+		OwnedPaths:         []string{"internal/test"},
 		UnknownFrontmatter: map[string]any{
 			"type": "task",
 		},
@@ -2323,9 +2338,10 @@ func TestRunTicket_ScopeViolationOutcomeIsNeedsDecision(t *testing.T) {
 
 	cfg := policy.DefaultConfig()
 	ticket := epos.Ticket{
-		ID:         "ver-scope-outcome",
-		Title:      "Ticket ver-scope-outcome",
-		OwnedPaths: []string{"internal/engine"},
+		ID:                 "ver-scope-outcome",
+		Title:              "Ticket ver-scope-outcome",
+		AcceptanceCriteria: []string{"verk test --x exits 0"},
+		OwnedPaths:         []string{"internal/engine"},
 		UnknownFrontmatter: map[string]any{
 			"type": "task",
 		},
@@ -3931,5 +3947,118 @@ func TestRunTicket_ReviewerDoesNotReceiveUnrelatedDirtyWorktree(t *testing.T) {
 	prompt := runtime.BuildReviewPrompt(reviewReq)
 	if strings.Contains(prompt, "unrelated/") {
 		t.Errorf("unrelated/ paths must not appear in review prompt; prompt:\n%s", prompt)
+	}
+}
+
+// TestRunTicket_BlocksBeforeWorkerWhenTicketQualityFails asserts that a
+// single-ticket run whose ticket fails the deterministic ticket-quality
+// evaluator returns a Blocked result WITHOUT invoking any worker. The gate
+// runs in the early-init phase of RunTicket before the implement loop.
+func TestRunTicket_BlocksBeforeWorkerWhenTicketQualityFails(t *testing.T) {
+	repoRoot := t.TempDir()
+	cfg := policy.DefaultConfig()
+	runID := "run-tq-block"
+
+	// Ticket has no acceptance criteria, no test cases, no validation
+	// commands, and no owned paths. The deterministic gate raises two P1
+	// findings (missing AC, missing owned paths); the default block
+	// threshold is P2 so the gate blocks.
+	ticket := epos.Ticket{
+		ID:    "ver-tq-block",
+		Title: "Ticket ver-tq-block",
+		UnknownFrontmatter: map[string]any{
+			"type": "task",
+		},
+	}
+	plan, claim := testPlanAndClaim(t, repoRoot, ticket, cfg, runID, "lease-tq-block", nil)
+
+	adapter := runtimefake.New(nil, nil)
+
+	result, err := RunTicket(context.Background(), RunTicketRequest{
+		RepoRoot: repoRoot,
+		RunID:    runID,
+		Ticket:   ticket,
+		Plan:     plan,
+		Claim:    claim,
+		Adapter:  adapter,
+		Config:   cfg,
+	})
+	if err != nil {
+		t.Fatalf("RunTicket returned error: %v", err)
+	}
+	if result.Snapshot.CurrentPhase != state.TicketPhaseBlocked {
+		t.Fatalf("expected blocked phase, got %q", result.Snapshot.CurrentPhase)
+	}
+	if result.Snapshot.Outcome != state.TicketOutcomeBlocked {
+		t.Fatalf("expected blocked outcome, got %q", result.Snapshot.Outcome)
+	}
+	if !strings.Contains(result.Snapshot.BlockReason, "ticket quality gate") {
+		t.Fatalf("expected block reason to mention ticket quality gate, got %q", result.Snapshot.BlockReason)
+	}
+	if reqs := adapter.WorkerRequests(); len(reqs) != 0 {
+		t.Fatalf("expected no worker invocations when gate blocks, got %d", len(reqs))
+	}
+	if reqs := adapter.ReviewRequests(); len(reqs) != 0 {
+		t.Fatalf("expected no review invocations when gate blocks, got %d", len(reqs))
+	}
+}
+
+// TestRunTicket_PersistsTicketQualityArtifact asserts that a single-ticket
+// run always writes .verk/runs/<run-id>/ticket-quality.json and that the
+// artifact's TicketIDs list contains exactly the root ticket ID.
+func TestRunTicket_PersistsTicketQualityArtifact(t *testing.T) {
+	repoRoot := t.TempDir()
+	cfg := policy.DefaultConfig()
+	runID := "run-tq-persist"
+
+	// Use testTicket which now ships minimal fields that satisfy the gate
+	// so we exercise the persistence path even on the passing branch.
+	ticket := testTicket("ver-tq-persist")
+	plan, claim := testPlanAndClaim(t, repoRoot, ticket, cfg, runID, "lease-tq-persist", []string{`true`})
+
+	started, finished := testRunTimes()
+	adapter := runtimefake.New(
+		[]runtime.WorkerResult{{
+			Status:             runtime.WorkerStatusDone,
+			RetryClass:         runtime.RetryClassTerminal,
+			LeaseID:            claim.LeaseID,
+			StartedAt:          started,
+			FinishedAt:         finished,
+			ResultArtifactPath: filepath.Join(repoRoot, "worker.json"),
+		}},
+		[]runtime.ReviewResult{{
+			Status:             runtime.WorkerStatusDone,
+			RetryClass:         runtime.RetryClassTerminal,
+			LeaseID:            claim.LeaseID,
+			StartedAt:          finished.Add(time.Second),
+			FinishedAt:         finished.Add(2 * time.Second),
+			ReviewStatus:       runtime.ReviewStatusPassed,
+			Summary:            "clean",
+			ResultArtifactPath: filepath.Join(repoRoot, "review.json"),
+		}},
+	)
+
+	_, err := RunTicket(context.Background(), RunTicketRequest{
+		RepoRoot: repoRoot,
+		RunID:    runID,
+		Ticket:   ticket,
+		Plan:     plan,
+		Claim:    claim,
+		Adapter:  adapter,
+		Config:   cfg,
+	})
+	if err != nil {
+		t.Fatalf("RunTicket returned error: %v", err)
+	}
+
+	artifact := loadQualityArtifact(t, repoRoot, runID)
+	if artifact.RootTicketID != ticket.ID {
+		t.Fatalf("expected root ticket id %q, got %q", ticket.ID, artifact.RootTicketID)
+	}
+	if len(artifact.TicketIDs) != 1 || artifact.TicketIDs[0] != ticket.ID {
+		t.Fatalf("expected ticket IDs to contain only %q, got %v", ticket.ID, artifact.TicketIDs)
+	}
+	if artifact.Scope != "ticket" {
+		t.Fatalf("expected scope %q, got %q", "ticket", artifact.Scope)
 	}
 }

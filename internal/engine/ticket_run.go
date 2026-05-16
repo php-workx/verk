@@ -44,6 +44,13 @@ type RunTicketRequest struct {
 	VerificationCommands []string
 	EnforceSingleScope   bool
 	Progress             chan<- ProgressEvent
+	// SkipTicketQualityGate suppresses the deterministic ticket-quality gate
+	// in RunTicket. RunEpic sets this true when invoking RunTicket for each
+	// child because the epic-level gate already evaluated and persisted the
+	// artifact for the whole epic; re-running per child would overwrite
+	// .verk/runs/<run-id>/ticket-quality.json with a single-ticket scoped
+	// artifact.
+	SkipTicketQualityGate bool
 }
 
 type RunTicketResult struct {
@@ -255,6 +262,33 @@ func RunTicket(ctx context.Context, req RunTicketRequest) (result RunTicketResul
 	}
 	if err := state.SaveJSONAtomic(filepath.Join(st.paths.runDir, "plan.json"), req.Plan); err != nil {
 		return RunTicketResult{}, err
+	}
+
+	// Deterministic ticket-quality gate: runs before the first worker is
+	// dispatched. Single-ticket runs evaluate just the root ticket (no
+	// children). When the gate blocks, persist a Blocked snapshot, release
+	// the claim, and return without invoking any worker. Mirrors the
+	// pattern used by RunEpic's quality-gate integration (Task 6). Gating
+	// keys off currentPhase == Intake so resumed runs that are already past
+	// the implement phase skip the gate (the worker has already taken the
+	// ticket into account); fresh runs and resumes from Intake re-evaluate.
+	if !req.SkipTicketQualityGate && st.currentPhase == state.TicketPhaseIntake {
+		qualityArtifact, qErr := RunTicketQualityGate(ctx, absRepoRoot, req.RunID, cfg, req.Ticket, nil)
+		if qErr != nil {
+			return RunTicketResult{}, fmt.Errorf("ticket quality gate: %w", qErr)
+		}
+		if qualityArtifact.Blocked {
+			st.currentPhase = state.TicketPhaseBlocked
+			st.currentOutcome = state.TicketOutcomeBlocked
+			st.blockReason = fmt.Sprintf("ticket quality gate blocked: %s", qualityArtifact.BlockReason)
+			if err := st.persist(); err != nil {
+				return RunTicketResult{}, err
+			}
+			if err := st.releaseClaim(); err != nil {
+				return RunTicketResult{}, err
+			}
+			return RunTicketResult{Snapshot: st.snapshot(), Path: st.paths.snapshotPath}, nil
+		}
 	}
 
 	if st.currentPhase == state.TicketPhaseIntake {
