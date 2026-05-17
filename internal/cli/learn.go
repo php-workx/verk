@@ -204,8 +204,8 @@ func newLearnPromoteCmd() *cobra.Command {
 		Args:         cobra.ExactArgs(1),
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			if ruleID == "" {
-				return cmdError(cmd, fmt.Errorf("--rule-id is required"), 2)
+			if strings.TrimSpace(ruleID) == "" {
+				return cmdError(cmd, fmt.Errorf("--rule-id must not be blank"), 1)
 			}
 
 			repoRoot, err := resolveRepoRoot()

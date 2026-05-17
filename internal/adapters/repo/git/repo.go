@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path"
@@ -428,7 +429,15 @@ func (r *Repo) syntheticUntrackedDiff(paths []string) (string, error) {
 			if info.Mode()&0o111 != 0 {
 				mode = "100755"
 			}
-			read, readErr := os.ReadFile(fullPath)
+			f, openErr := os.Open(fullPath)
+			if openErr != nil {
+				if errors.Is(openErr, os.ErrNotExist) {
+					continue
+				}
+				return "", fmt.Errorf("open untracked file %q: %w", p, openErr)
+			}
+			read, readErr := io.ReadAll(io.LimitReader(f, syntheticDiffSizeLimit+1))
+			_ = f.Close()
 			if readErr != nil {
 				if errors.Is(readErr, os.ErrNotExist) {
 					continue

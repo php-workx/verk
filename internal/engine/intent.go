@@ -67,12 +67,6 @@ func runIntentGate(
 		}
 	}
 
-	// Build the set of owned paths for subset validation.
-	ownedSet := make(map[string]struct{}, len(plan.OwnedPaths))
-	for _, p := range plan.OwnedPaths {
-		ownedSet[p] = struct{}{}
-	}
-
 	var lastArtifact *state.IntentArtifact
 
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
@@ -114,7 +108,7 @@ func runIntentGate(
 
 		lastArtifact = artifact
 
-		rejectReason := validateIntentResult(result, requiredCriteria, ownedSet)
+		rejectReason := validateIntentResult(result, requiredCriteria, plan.OwnedPaths)
 		if rejectReason == "" {
 			return intentGateResult{
 				Artifact: artifact,
@@ -137,7 +131,7 @@ func runIntentGate(
 func validateIntentResult(
 	result runtime.IntentResult,
 	requiredCriteria map[string]struct{},
-	ownedSet map[string]struct{},
+	ownedPaths []string,
 ) string {
 	// Rule 1: every required criterion must appear in CoveredCriteria.
 	if len(requiredCriteria) > 0 {
@@ -152,9 +146,10 @@ func validateIntentResult(
 		}
 	}
 
-	// Rule 2: TargetFiles must be a subset of OwnedPaths (empty TargetFiles is OK).
+	// Rule 2: TargetFiles must be a subset of OwnedPaths using prefix matching
+	// (consistent with fileInOwned in wave_scheduler.go).
 	for _, f := range result.TargetFiles {
-		if _, ok := ownedSet[f]; !ok {
+		if !fileInOwned(f, ownedPaths) {
 			return "superset_paths"
 		}
 	}

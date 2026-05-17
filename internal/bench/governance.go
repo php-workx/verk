@@ -43,6 +43,9 @@ func ValidateSuiteMeta(s SuiteMeta) error {
 	if s.Sampling.Sampled == 0 {
 		return fmt.Errorf("bench: public suite %q must specify sampling.sampled", s.Name)
 	}
+	if s.Sampling.Sampled > s.Sampling.TotalCorpus {
+		return fmt.Errorf("bench: public suite %q: sampling.sampled (%d) exceeds sampling.total_corpus (%d)", s.Name, s.Sampling.Sampled, s.Sampling.TotalCorpus)
+	}
 	if s.TaskCount < minPublicTaskCount {
 		return fmt.Errorf(
 			"bench: public suite %q has only %d tasks; at least %d required for meaningful uncertainty reporting",

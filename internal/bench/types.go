@@ -94,6 +94,10 @@ const (
 	TaskStatusVerifierFlaky TaskResultStatus = "verifier_flaky"
 	TaskStatusBlocked       TaskResultStatus = "blocked"
 	TaskStatusCancelled     TaskResultStatus = "cancelled"
+	// TaskStatusSkipped is an internal sentinel returned by the resume executor
+	// wrapper for already-completed pairs. It is never written to results.jsonl
+	// and is excluded from aggregated report totals.
+	TaskStatusSkipped TaskResultStatus = "skipped"
 )
 
 // FailureCategory groups failures into a coarse taxonomy.

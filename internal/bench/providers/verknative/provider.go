@@ -116,7 +116,11 @@ func Score(task bench.Task, workspaceDir string) bench.Score {
 	}
 
 	path := filepath.Join(workspaceDir, filepath.FromSlash(marker))
-	data, err := os.ReadFile(path)
+	cleanPath := filepath.Clean(path)
+	if !strings.HasPrefix(cleanPath, filepath.Clean(workspaceDir)+string(filepath.Separator)) {
+		return bench.Score{Solved: false}
+	}
+	data, err := os.ReadFile(cleanPath)
 	if err != nil {
 		// File missing or unreadable — not solved.
 		return bench.Score{Solved: false}

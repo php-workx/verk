@@ -20,6 +20,12 @@ func NewRegistry() *Registry {
 // Register adds a provider to the registry. Returns an error if a provider
 // with the same name is already registered.
 func (r *Registry) Register(p Provider) error {
+	if p == nil {
+		return fmt.Errorf("bench: cannot register nil provider")
+	}
+	if p.Name() == "" {
+		return fmt.Errorf("bench: cannot register provider with empty name")
+	}
 	name := p.Name()
 	if _, exists := r.providers[name]; exists {
 		return fmt.Errorf("bench: provider %q is already registered", name)

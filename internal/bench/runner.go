@@ -115,6 +115,11 @@ func (opts RunOptions) clock() func() time.Time {
 func Run(ctx context.Context, opts RunOptions) (RunSummary, error) {
 	now := opts.clock()
 
+	// 0. Guard nil provider.
+	if opts.Provider == nil {
+		return RunSummary{}, fmt.Errorf("bench: RunOptions.Provider must not be nil")
+	}
+
 	// 1. Validate matrix.
 	if err := ValidateMatrix(opts.Matrix); err != nil {
 		return RunSummary{}, err
@@ -208,12 +213,18 @@ func Run(ctx context.Context, opts RunOptions) (RunSummary, error) {
 				return RunSummary{}, ferr
 			}
 
+			// Skip already-completed pairs entirely (resume path): do not append
+			// to in-memory results and do not write to results.jsonl.
+			if result.Status == TaskStatusSkipped {
+				continue
+			}
+
 			results = append(results, result)
 			if skip {
 				continue
 			}
 
-			completedTaskKeys = append(completedTaskKeys, task.ID+"/"+workerProfile.ID)
+			completedTaskKeys = append(completedTaskKeys, task.ID+"/"+cellID(workerProfile))
 
 			// Atomic append to results.jsonl.
 			line, merr := json.Marshal(result)
@@ -371,12 +382,12 @@ func Resume(ctx context.Context, outDir string, opts RunOptions) (RunSummary, er
 		innerExec = DefaultExecutor(opts.Provider)
 	}
 	opts.Executor = func(ctx context.Context, task Task, profile MatrixProfile, workDir string) TaskResult {
-		key := task.ID + "/" + profile.ID
+		key := task.ID + "/" + cellID(profile)
 		if completed[key] {
 			return TaskResult{
 				TaskID:    task.ID,
 				ProfileID: profile.ID,
-				Status:    TaskStatusCancelled,
+				Status:    TaskStatusSkipped,
 				Notes:     "skipped: already completed in prior run",
 			}
 		}

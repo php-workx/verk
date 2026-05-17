@@ -17,21 +17,6 @@ type CandidateInfo struct {
 
 // ListCandidates returns all candidates sorted by distinct-ticket count desc.
 func ListCandidates(store *Store) ([]CandidateInfo, error) {
-	idx, err := store.Load()
-	if err != nil {
-		return nil, fmt.Errorf("load constraint index: %w", err)
-	}
-
-	// Collect promoted signatures so we can detect already-promoted ones.
-	promoted := make(map[Signature]struct{})
-	for _, c := range idx.Constraints {
-		promoted[Signature(c.ID)] = struct{}{}
-		// Also track by finding signature patterns
-		for _, pf := range c.PromotedFrom {
-			_ = pf // just a marker
-		}
-	}
-
 	// Scan candidate files to build list.
 	// candidatesDir may not exist yet.
 	entries, err := candidateDirEntries(store.candidatesDir)

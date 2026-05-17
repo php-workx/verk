@@ -41,6 +41,11 @@ func resolveTestReference(repoRoot string, ref state.TestReference) error {
 // files under repoRoot/pkg.
 func resolveTestFunction(repoRoot, pkg, name string) error {
 	dir := filepath.Join(repoRoot, pkg)
+	cleanDir := filepath.Clean(dir)
+	cleanRoot := filepath.Clean(repoRoot)
+	if !strings.HasPrefix(cleanDir, cleanRoot+string(filepath.Separator)) && cleanDir != cleanRoot {
+		return fmt.Errorf("test_reference_unresolved: package path %q escapes repository root", pkg)
+	}
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -80,6 +85,11 @@ func resolveTestFunction(repoRoot, pkg, name string) error {
 // top-level FuncDecl whose name starts with "Test".
 func resolveFileLine(repoRoot, file string, line int) error {
 	path := filepath.Join(repoRoot, file)
+	cleanPath := filepath.Clean(path)
+	cleanRoot := filepath.Clean(repoRoot)
+	if !strings.HasPrefix(cleanPath, cleanRoot+string(filepath.Separator)) && cleanPath != cleanRoot {
+		return fmt.Errorf("test_reference_unresolved: file path %q escapes repository root", file)
+	}
 	fset := token.NewFileSet()
 	f, err := parser.ParseFile(fset, path, nil, 0)
 	if err != nil {

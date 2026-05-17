@@ -274,7 +274,7 @@ func TestIntentGate_PassesOnSecondAttempt(t *testing.T) {
 // TestValidateIntentResult_AllRulesPass is a direct unit test of validateIntentResult.
 func TestValidateIntentResult_AllRulesPass(t *testing.T) {
 	required := map[string]struct{}{"AC-1": {}, "AC-2": {}}
-	owned := map[string]struct{}{"internal/app": {}, "internal/lib": {}}
+	owned := []string{"internal/app", "internal/lib"}
 
 	result := runtime.IntentResult{
 		CoveredCriteria: []string{"AC-1", "AC-2"},
@@ -289,7 +289,7 @@ func TestValidateIntentResult_AllRulesPass(t *testing.T) {
 // TestValidateIntentResult_MissingCriteria unit test for rule 1.
 func TestValidateIntentResult_MissingCriteria(t *testing.T) {
 	required := map[string]struct{}{"AC-1": {}, "AC-2": {}}
-	owned := map[string]struct{}{"internal/app": {}}
+	owned := []string{"internal/app"}
 
 	result := runtime.IntentResult{
 		CoveredCriteria: []string{"AC-1"}, // AC-2 missing
@@ -304,7 +304,7 @@ func TestValidateIntentResult_MissingCriteria(t *testing.T) {
 // TestValidateIntentResult_SupersetPaths unit test for rule 2.
 func TestValidateIntentResult_SupersetPaths(t *testing.T) {
 	required := map[string]struct{}{}
-	owned := map[string]struct{}{"internal/app": {}}
+	owned := []string{"internal/app"}
 
 	result := runtime.IntentResult{
 		CoveredCriteria: nil,
@@ -319,7 +319,7 @@ func TestValidateIntentResult_SupersetPaths(t *testing.T) {
 // TestValidateIntentResult_EmptyTestPlan unit test for rule 3.
 func TestValidateIntentResult_EmptyTestPlan(t *testing.T) {
 	required := map[string]struct{}{}
-	owned := map[string]struct{}{"internal/app": {}}
+	owned := []string{"internal/app"}
 
 	result := runtime.IntentResult{
 		CoveredCriteria: nil,

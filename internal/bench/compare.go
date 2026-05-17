@@ -208,17 +208,27 @@ func buildDiff(pairs []PairedTaskComparison, baseline, candidate RunResult) Comp
 
 // RenderComparisonMarkdown writes a Markdown comparison report.
 func RenderComparisonMarkdown(w io.Writer, cmp Comparison) error {
-	fmt.Fprintf(w, "# Benchmark Comparison\n\n")
-	fmt.Fprintf(w, "**Baseline:** %s (%s)  \n", cmp.Baseline.RunID, cmp.Baseline.SuiteName)
-	fmt.Fprintf(w, "**Candidate:** %s (%s)  \n\n", cmp.Candidate.RunID, cmp.Candidate.SuiteName)
+	if _, err := fmt.Fprintf(w, "# Benchmark Comparison\n\n"); err != nil {
+		return err
+	}
+	if _, err := fmt.Fprintf(w, "**Baseline:** %s (%s)  \n", cmp.Baseline.RunID, cmp.Baseline.SuiteName); err != nil {
+		return err
+	}
+	if _, err := fmt.Fprintf(w, "**Candidate:** %s (%s)  \n\n", cmp.Candidate.RunID, cmp.Candidate.SuiteName); err != nil {
+		return err
+	}
 
 	if cmp.Refusal != "" {
-		fmt.Fprintf(w, "> **Refused:** %s\n\n", cmp.Refusal)
+		if _, err := fmt.Fprintf(w, "> **Refused:** %s\n\n", cmp.Refusal); err != nil {
+			return err
+		}
 		return nil
 	}
 
 	// Diff summary
-	fmt.Fprintf(w, "## Summary\n\n")
+	if _, err := fmt.Fprintf(w, "## Summary\n\n"); err != nil {
+		return err
+	}
 	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
 	fmt.Fprintln(tw, "Metric\tValue")
 	fmt.Fprintln(tw, "------\t-----")
@@ -228,11 +238,17 @@ func RenderComparisonMarkdown(w io.Writer, cmp Comparison) error {
 	fmt.Fprintf(tw, "Missing\t%d\n", cmp.Diff.MissingCount)
 	fmt.Fprintf(tw, "Exact Cost Delta\t$%.4f\n", cmp.Diff.ExactCostDelta)
 	fmt.Fprintf(tw, "Estimated Cost Delta\t$%.4f\n", cmp.Diff.EstimatedCostDelta)
-	tw.Flush()
-	fmt.Fprintln(w)
+	if err := tw.Flush(); err != nil {
+		return err
+	}
+	if _, err := fmt.Fprintln(w); err != nil {
+		return err
+	}
 
 	// Per-task pairs
-	fmt.Fprintf(w, "## Per-Task Comparison\n\n")
+	if _, err := fmt.Fprintf(w, "## Per-Task Comparison\n\n"); err != nil {
+		return err
+	}
 	tw = tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
 	fmt.Fprintln(tw, "Task ID\tOutcome\tBaseline Status\tCandidate Status")
 	fmt.Fprintln(tw, "-------\t-------\t---------------\t----------------")
@@ -247,8 +263,12 @@ func RenderComparisonMarkdown(w io.Writer, cmp Comparison) error {
 		}
 		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\n", p.TaskID, p.Outcome, bStatus, cStatus)
 	}
-	tw.Flush()
-	fmt.Fprintln(w)
+	if err := tw.Flush(); err != nil {
+		return err
+	}
+	if _, err := fmt.Fprintln(w); err != nil {
+		return err
+	}
 
 	return nil
 }

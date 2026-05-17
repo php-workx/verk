@@ -105,8 +105,11 @@ func collectReviewDelta(repoRoot, baseCommit string, baseline reviewBaseline) (r
 		current, readErr := os.ReadFile(abs)
 		if readErr != nil {
 			if os.IsNotExist(readErr) {
-				// File was deleted by the worker — include it.
-				workerChanged = append(workerChanged, f)
+				if snap.Exists {
+					// File existed at baseline but worker deleted it — include.
+					workerChanged = append(workerChanged, f)
+				}
+				// If !snap.Exists and not present now: unchanged, skip.
 				continue
 			}
 			return reviewDelta{}, fmt.Errorf("collectReviewDelta: read %s: %w", f, readErr)

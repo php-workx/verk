@@ -38,6 +38,9 @@ func RunTicketQualityGate(ctx context.Context, repoRoot, runID string, cfg polic
 }
 
 func persistTicketQualityArtifact(repoRoot, runID string, artifact state.TicketQualityArtifact) error {
+	if err := ValidateArtifactIdentifier(runID, "run id"); err != nil {
+		return fmt.Errorf("ticket quality gate: %w", err)
+	}
 	dir := filepath.Join(repoRoot, ".verk", "runs", runID)
 	path := filepath.Join(dir, "ticket-quality.json")
 	data, err := json.MarshalIndent(artifact, "", "  ")

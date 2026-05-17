@@ -323,7 +323,6 @@ func requiredRuntimeOptions(runtimeName string) []llmclient.OptionName {
 	if strings.TrimSpace(runtimeName) == RuntimeCodex {
 		opts = append(opts,
 			llmclient.OptionCodexJSONL,
-			llmclient.OptionReasoningEffort,
 		)
 	}
 	return opts

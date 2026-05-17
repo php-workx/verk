@@ -1,6 +1,7 @@
 package bench
 
 import (
+	"bufio"
 	"encoding/csv"
 	"encoding/json"
 	"fmt"
@@ -109,6 +110,10 @@ func aggregateTotals(results []TaskResult) ReportTotals {
 				t.EstimatedCostUSD += u.CostUSD
 			}
 		}
+		// If Usage is empty but the provider reported a cost on Score, use it.
+		if len(r.Usage) == 0 && r.Score.CostUSD > 0 {
+			t.EstimatedCostUSD += r.Score.CostUSD
+		}
 	}
 	if t.TotalTasks > 0 {
 		t.RawSolveRate = float64(t.Solved) / float64(t.TotalTasks)
@@ -136,25 +141,26 @@ func modeClaimLabel(mode BenchmarkMode) string {
 
 // RenderMarkdown writes a Markdown report.
 func RenderMarkdown(w io.Writer, r Report) error {
+	bw := bufio.NewWriter(w)
 	claim := modeClaimLabel(r.Mode)
 
-	fmt.Fprintf(w, "# Benchmark Report\n\n")
-	fmt.Fprintf(w, "**Run ID:** %s  \n", r.RunID)
-	fmt.Fprintf(w, "**Suite:** %s  \n", r.SuiteName)
-	fmt.Fprintf(w, "**Mode:** %s (%s)  \n\n", r.Mode, claim)
+	fmt.Fprintf(bw, "# Benchmark Report\n\n")
+	fmt.Fprintf(bw, "**Run ID:** %s  \n", r.RunID)
+	fmt.Fprintf(bw, "**Suite:** %s  \n", r.SuiteName)
+	fmt.Fprintf(bw, "**Mode:** %s (%s)  \n\n", r.Mode, claim)
 
 	// Labels block
 	if len(r.Labels) > 0 {
-		fmt.Fprintf(w, "## Labels\n\n")
+		fmt.Fprintf(bw, "## Labels\n\n")
 		for _, l := range r.Labels {
-			fmt.Fprintf(w, "- %s\n", l)
+			fmt.Fprintf(bw, "- %s\n", l)
 		}
-		fmt.Fprintf(w, "\n")
+		fmt.Fprintf(bw, "\n")
 	}
 
 	// Profile snapshot table
-	fmt.Fprintf(w, "## Profiles\n\n")
-	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
+	fmt.Fprintf(bw, "## Profiles\n\n")
+	tw := tabwriter.NewWriter(bw, 0, 0, 2, ' ', 0)
 	fmt.Fprintln(tw, "ID\tWorker Runtime\tWorker Model\tReviewer Runtime\tReviewer Model\tResolved At")
 	fmt.Fprintln(tw, "---\t--------------\t------------\t----------------\t--------------\t-----------")
 	for _, p := range r.Profiles {
@@ -165,12 +171,14 @@ func RenderMarkdown(w io.Writer, r Report) error {
 			p.ResolvedAt.UTC().Format(time.RFC3339),
 		)
 	}
-	tw.Flush()
-	fmt.Fprintln(w)
+	if err := tw.Flush(); err != nil {
+		return err
+	}
+	fmt.Fprintln(bw)
 
 	// Solve rates
-	fmt.Fprintf(w, "## Solve Rate\n\n")
-	tw = tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
+	fmt.Fprintf(bw, "## Solve Rate\n\n")
+	tw = tabwriter.NewWriter(bw, 0, 0, 2, ' ', 0)
 	fmt.Fprintln(tw, "Metric\tValue")
 	fmt.Fprintln(tw, "------\t-----")
 	fmt.Fprintf(tw, "Total Tasks\t%d\n", r.Totals.TotalTasks)
@@ -181,21 +189,25 @@ func RenderMarkdown(w io.Writer, r Report) error {
 	fmt.Fprintf(tw, "Verifier Flaky\t%d\n", r.Totals.VerifierFlaky)
 	fmt.Fprintf(tw, "Raw Solve Rate\t%.1f%%\n", r.Totals.RawSolveRate*100)
 	fmt.Fprintf(tw, "Flake-Adjusted Rate\t%.1f%%\n", r.Totals.FlakeAdjusted*100)
-	tw.Flush()
-	fmt.Fprintln(w)
+	if err := tw.Flush(); err != nil {
+		return err
+	}
+	fmt.Fprintln(bw)
 
 	// Cost
-	fmt.Fprintf(w, "## Cost\n\n")
-	tw = tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
+	fmt.Fprintf(bw, "## Cost\n\n")
+	tw = tabwriter.NewWriter(bw, 0, 0, 2, ' ', 0)
 	fmt.Fprintln(tw, "Exact Cost (USD)\tEstimated Cost (USD)")
 	fmt.Fprintln(tw, "----------------\t--------------------")
 	fmt.Fprintf(tw, "$%.4f\t$%.4f\n", r.Totals.ExactCostUSD, r.Totals.EstimatedCostUSD)
-	tw.Flush()
-	fmt.Fprintln(w)
+	if err := tw.Flush(); err != nil {
+		return err
+	}
+	fmt.Fprintln(bw)
 
 	// Per-task table
-	fmt.Fprintf(w, "## Per-Task Results\n\n")
-	tw = tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
+	fmt.Fprintf(bw, "## Per-Task Results\n\n")
+	tw = tabwriter.NewWriter(bw, 0, 0, 2, ' ', 0)
 	fmt.Fprintln(tw, "Task ID\tProfile\tStatus\tRepair Cycles\tReview Cycles\tDuration")
 	fmt.Fprintln(tw, "-------\t-------\t------\t-------------\t-------------\t--------")
 	for _, tr := range r.PerTask {
@@ -205,8 +217,10 @@ func RenderMarkdown(w io.Writer, r Report) error {
 			tr.RepairCycles, tr.ReviewCycles, dur.Round(time.Millisecond),
 		)
 	}
-	tw.Flush()
-	fmt.Fprintln(w)
+	if err := tw.Flush(); err != nil {
+		return err
+	}
+	fmt.Fprintln(bw)
 
 	// Failure categories
 	categoryCounts := make(map[FailureCategory]int)
@@ -216,8 +230,8 @@ func RenderMarkdown(w io.Writer, r Report) error {
 		}
 	}
 	if len(categoryCounts) > 0 {
-		fmt.Fprintf(w, "## Failure Categories\n\n")
-		tw = tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
+		fmt.Fprintf(bw, "## Failure Categories\n\n")
+		tw = tabwriter.NewWriter(bw, 0, 0, 2, ' ', 0)
 		fmt.Fprintln(tw, "Category\tCount")
 		fmt.Fprintln(tw, "--------\t-----")
 		for _, cat := range []FailureCategory{
@@ -228,8 +242,10 @@ func RenderMarkdown(w io.Writer, r Report) error {
 				fmt.Fprintf(tw, "%s\t%d\n", cat, n)
 			}
 		}
-		tw.Flush()
-		fmt.Fprintln(w)
+		if err := tw.Flush(); err != nil {
+			return err
+		}
+		fmt.Fprintln(bw)
 	}
 
 	// Per-profile breakdown table
@@ -258,8 +274,8 @@ func RenderMarkdown(w io.Writer, r Report) error {
 		}
 	}
 	if len(profileMap) > 0 {
-		fmt.Fprintf(w, "## Per-Profile Breakdown\n\n")
-		tw = tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
+		fmt.Fprintf(bw, "## Per-Profile Breakdown\n\n")
+		tw = tabwriter.NewWriter(bw, 0, 0, 2, ' ', 0)
 		fmt.Fprintln(tw, "Profile\tTasks\tSolved\tSolve %\tAvg Repair\tAvg Review\tTotal Cost")
 		fmt.Fprintln(tw, "-------\t-----\t------\t-------\t----------\t----------\t----------")
 		// iterate r.Profiles for stable ordering; profiles absent from the snapshot
@@ -288,16 +304,18 @@ func RenderMarkdown(w io.Writer, r Report) error {
 			fmt.Fprintf(tw, "%s\t%d\t%d\t%.1f%%\t%.2f\t%.2f\t$%.4f\n",
 				id, ps.tasks, ps.solved, solveRate, avgRepair, avgReview, ps.costUSD)
 		}
-		tw.Flush()
-		fmt.Fprintln(w)
+		if err := tw.Flush(); err != nil {
+			return err
+		}
+		fmt.Fprintln(bw)
 	}
 
 	// Non-comparable warning
 	if slices.Contains(r.Labels, "non-comparable") {
-		fmt.Fprintf(w, "> **Warning:** This run is marked non-comparable and should not be used for external claims.\n\n")
+		fmt.Fprintf(bw, "> **Warning:** This run is marked non-comparable and should not be used for external claims.\n\n")
 	}
 
-	return nil
+	return bw.Flush()
 }
 
 // RenderJSON writes a JSON report.

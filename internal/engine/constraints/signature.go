@@ -3,7 +3,7 @@ package constraints
 import (
 	"crypto/sha256"
 	"fmt"
-	"path/filepath"
+	"path"
 	"strings"
 	"unicode"
 )
@@ -24,11 +24,14 @@ func DeriveSignature(titlePrefix6Words, filePath, severity string) Signature {
 
 // fileToGlob maps a concrete file path to a directory glob.
 // "internal/engine/epic_run.go" → "internal/engine/*.go"
-func fileToGlob(path string) string {
-	dir := filepath.Dir(path)
-	ext := filepath.Ext(path)
+// Uses path (forward-slash) rather than filepath to produce stable, cross-platform signatures.
+func fileToGlob(filePath string) string {
+	// Normalise to forward-slash so the signature is platform-independent.
+	filePath = strings.ReplaceAll(filePath, "\\", "/")
+	dir := path.Dir(filePath)
+	ext := path.Ext(filePath)
 	if ext == "" {
-		return path
+		return filePath
 	}
 	return dir + "/*" + ext
 }
