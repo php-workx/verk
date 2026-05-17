@@ -533,3 +533,22 @@ type WaveReviewArtifact struct {
 	TokensIn          int                 `json:"tokens_in,omitempty"`
 	TokensOut         int                 `json:"tokens_out,omitempty"`
 }
+
+// EpicPlanReviewArtifact is persisted at
+// .verk/runs/<run-id>/epic-review-plan.json
+//
+// It records the outcome of a single fresh-context reviewer call over the
+// epic's plan (root ticket + child tickets) before the first wave dispatches.
+// This is the plan-time pass only; the acceptance-time epic review is handled
+// by the existing epic closure gate (epic_gate.go).
+type EpicPlanReviewArtifact struct {
+	ArtifactMeta
+	ReviewScope      string              `json:"review_scope"` // always "epic_plan"
+	TicketSummaries  []WaveTicketSummary `json:"ticket_summaries"`
+	Findings         []ReviewFinding     `json:"findings"`
+	BlockingFindings []string            `json:"blocking_findings"`
+	Passed           bool                `json:"passed"`
+	Mode             string              `json:"mode"` // "shadow" | "enforce"
+	TokensIn         int                 `json:"tokens_in,omitempty"`
+	TokensOut        int                 `json:"tokens_out,omitempty"`
+}

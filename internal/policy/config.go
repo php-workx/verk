@@ -162,6 +162,29 @@ type WaveReviewConfig struct {
 	SkipSingleTicket bool `yaml:"skip_single_ticket" json:"skip_single_ticket"`
 }
 
+// EpicReviewConfig controls the epic plan-time reviewer that runs before the
+// first wave dispatches. This is the plan-time pass only; the acceptance-time
+// epic review is handled by the existing epic closure gate.
+type EpicReviewConfig struct {
+	// PlanMode controls the plan-time epic reviewer.
+	//   "disabled" — no plan review is run.
+	//   "shadow"   — the review runs and is persisted, but findings do not
+	//                block the epic. Persisted at
+	//                .verk/runs/<run-id>/epic-review-plan.json.
+	//   "enforce"  — any open finding at or above Threshold blocks the epic
+	//                before any wave is dispatched.
+	// Default: "shadow"
+	PlanMode string `yaml:"plan_mode" json:"plan_mode"`
+	// PlanMinTickets is the minimum number of child tickets required to
+	// trigger the plan-time review. Epics with fewer children skip it.
+	// Default: 3
+	PlanMinTickets int `yaml:"plan_min_tickets" json:"plan_min_tickets"`
+	// Threshold is the minimum severity level that constitutes a blocking
+	// finding in enforce mode.
+	// Default: "P2"
+	Threshold string `yaml:"threshold" json:"threshold"`
+}
+
 // TicketQualityConfig controls the deterministic ticket quality gate that runs
 // before a worker is dispatched. All fields have safe defaults via DefaultConfig.
 type TicketQualityConfig struct {
@@ -193,6 +216,7 @@ type Config struct {
 	TicketQuality TicketQualityConfig `yaml:"ticket_quality" json:"ticket_quality"`
 	Intent        IntentConfig        `yaml:"intent" json:"intent"`
 	WaveReview    WaveReviewConfig    `yaml:"wave_review" json:"wave_review"`
+	EpicReview    EpicReviewConfig    `yaml:"epic_review" json:"epic_review"`
 }
 
 func LoadConfig(repoRoot string) (Config, error) {

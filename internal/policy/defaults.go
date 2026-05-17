@@ -52,5 +52,10 @@ func DefaultConfig() Config {
 			Threshold:        "P2",
 			SkipSingleTicket: true,
 		},
+		EpicReview: EpicReviewConfig{
+			PlanMode:       "shadow",
+			PlanMinTickets: 3,
+			Threshold:      "P2",
+		},
 	}
 }

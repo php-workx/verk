@@ -304,6 +304,51 @@ func RunEpic(ctx context.Context, req RunEpicRequest) (RunEpicResult, error) { /
 	}
 	// -------------------------------------------------------------------------
 
+	// --- Epic plan-time reviewer (P6) ----------------------------------------
+	// Run after the ticket quality gate, before the first wave is dispatched.
+	// On crash-recovery (resume), skip if the artifact already exists on disk.
+	// Pre-check skip conditions before resolving the adapter to avoid consuming
+	// adapter resources (e.g. scripted reviewer slots in tests) unnecessarily.
+	epicPlanReviewMode := strings.TrimSpace(cfg.EpicReview.PlanMode)
+	if epicPlanReviewMode == "" {
+		epicPlanReviewMode = "shadow"
+	}
+	epicPlanReviewEligible := epicPlanReviewMode != "disabled" &&
+		len(children) >= cfg.EpicReview.PlanMinTickets &&
+		!epicPlanReviewArtifactExists(req.RepoRoot, req.RunID)
+	if epicPlanReviewEligible {
+		planReviewAdapter, adapterErr := resolveWaveAdapter(req)
+		if adapterErr != nil {
+			log.Printf("[WARN] epic plan review %s: resolve adapter: %v", req.RootTicketID, adapterErr)
+		} else {
+			planReviewArtifact, planReviewErr := RunEpicPlanReview(
+				ctx,
+				planReviewAdapter,
+				req.RepoRoot,
+				rootTicket,
+				children,
+				cfg.EpicReview,
+				req.RunID,
+			)
+			if planReviewErr != nil {
+				// Enforce mode: block epic before any wave is dispatched.
+				result.Run.Status = state.EpicRunStatusBlocked
+				result.Run.CurrentPhase = state.TicketPhaseBlocked
+				result.Run.UpdatedAt = time.Now().UTC()
+				if saveErr := state.SaveJSONAtomic(runPath, result.Run); saveErr != nil {
+					return result, errors.Join(planReviewErr, fmt.Errorf("persist run state: %w", saveErr))
+				}
+				return result, &BlockedRunError{
+					RunID:  req.RunID,
+					Status: state.EpicRunStatusBlocked,
+					Cause:  planReviewErr,
+				}
+			}
+			_ = planReviewArtifact // artifact persisted to disk; nil when skipped
+		}
+	}
+	// -------------------------------------------------------------------------
+
 	for {
 		if err := ctx.Err(); err != nil {
 			return result, err
