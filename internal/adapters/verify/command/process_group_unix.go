@@ -19,8 +19,9 @@ const defaultProcessGroupWaitDelay = 5 * time.Second
 // go test, cargo); putting them in a process group ensures those grandchildren
 // are also terminated when the parent context is cancelled.
 //
-// See internal/adapters/runtime/claude/process_group_unix.go for full rationale.
-// The runtime and verification helpers must remain behaviourally consistent.
+// Runtime adapters delegate process supervision to Fabrikk llmcli. Verification
+// commands still execute local shell commands directly, so they keep this
+// process-group helper and its own cancellation coverage.
 func setupProcessGroup(cmd *exec.Cmd) {
 	if cmd.SysProcAttr == nil {
 		cmd.SysProcAttr = &syscall.SysProcAttr{}

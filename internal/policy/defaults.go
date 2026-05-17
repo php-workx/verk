@@ -35,5 +35,33 @@ func DefaultConfig() Config {
 			DefaultTimeoutMinutes: 15,
 			EnvPassthrough:        []string{"PATH", "HOME", "CI"},
 		},
+		TicketQuality: TicketQualityConfig{
+			Enabled:                        true,
+			PlannerReview:                  true,
+			AutoFixSafe:                    false,
+			BlockThreshold:                 "P2",
+			RequirePublicContractScenarios: true,
+			RequireEpicIntegrationTicket:   true,
+		},
+		Intent: IntentConfig{
+			Enabled:     false,
+			MaxAttempts: 2,
+		},
+		WaveReview: WaveReviewConfig{
+			Mode:             "shadow",
+			Threshold:        "P2",
+			SkipSingleTicket: true,
+		},
+		EpicReview: EpicReviewConfig{
+			PlanMode:       "shadow",
+			PlanMinTickets: 3,
+			Threshold:      "P2",
+		},
+		Constraints: ConstraintsConfig{
+			Enabled:             false,
+			ActivationThreshold: 3,
+			StaleDays:           90,
+			MaxRuntimeTotalMs:   120000,
+		},
 	}
 }

@@ -1,6 +1,9 @@
 package state
 
-import "time"
+import (
+	"fmt"
+	"time"
+)
 
 type (
 	TicketPhase   string
@@ -13,6 +16,7 @@ type (
 
 const (
 	TicketPhaseIntake    TicketPhase = "intake"
+	TicketPhaseIntent    TicketPhase = "intent"
 	TicketPhaseImplement TicketPhase = "implement"
 	TicketPhaseVerify    TicketPhase = "verify"
 	TicketPhaseReview    TicketPhase = "review"
@@ -63,6 +67,7 @@ const (
 const (
 	EscalationNonConvergentVerification = "non_convergent_verification"
 	EscalationNonConvergentReview       = "non_convergent_review"
+	EscalationNonConvergentIntent       = "non_convergent_intent"
 )
 
 type ArtifactMeta struct {
@@ -130,6 +135,10 @@ type PlanArtifact struct {
 	ReviewThreshold          Severity        `json:"review_threshold"`
 	EffectiveReviewThreshold Severity        `json:"effective_review_threshold"`
 	RuntimePreference        string          `json:"runtime_preference"`
+	// AgentProfile is the resolved agent role profile (e.g. "backend-engineer")
+	// for this ticket. Set during intake: detected automatically when the
+	// ticket's profile field is empty, or validated and copied when explicit.
+	AgentProfile string `json:"agent_profile,omitempty"`
 	// WorkerProfile and ReviewerProfile snapshot the effective role profiles
 	// (runtime/model/reasoning) as of intake. They are informational only:
 	// retry and resume always re-resolve profiles from the current config,
@@ -156,28 +165,34 @@ type PlanCriterion struct {
 
 type ImplementationArtifact struct {
 	ArtifactMeta
-	TicketID              string                `json:"ticket_id"`
-	Attempt               int                   `json:"attempt"`
-	Runtime               string                `json:"runtime"`
-	Model                 string                `json:"model,omitempty"`
-	Reasoning             string                `json:"reasoning,omitempty"`
-	FallbackReason        string                `json:"fallback_reason,omitempty"`
-	Status                string                `json:"status"`
-	CompletionCode        string                `json:"completion_code"`
-	RetryClass            RetryClass            `json:"retry_class"`
-	Concerns              []string              `json:"concerns"`
-	FailureReason         string                `json:"failure_reason"`
-	BlockReason           string                `json:"block_reason"`
-	RawChangedFiles       []string              `json:"raw_changed_files,omitempty"`
-	EffectiveChangedFiles []string              `json:"effective_changed_files,omitempty"`
-	ChangedFiles          []string              `json:"changed_files"`
-	Artifacts             []string              `json:"artifacts"`
-	TokenUsage            *RuntimeTokenUsage    `json:"token_usage,omitempty"`
-	ActivityStats         *RuntimeActivityStats `json:"activity_stats,omitempty"`
-	LeaseID               string                `json:"lease_id"`
-	InputArtifactPath     string                `json:"input_artifact_path,omitempty"`
-	StartedAt             time.Time             `json:"started_at"`
-	FinishedAt            time.Time             `json:"finished_at"`
+	TicketID              string     `json:"ticket_id"`
+	Attempt               int        `json:"attempt"`
+	Runtime               string     `json:"runtime"`
+	Model                 string     `json:"model,omitempty"`
+	Reasoning             string     `json:"reasoning,omitempty"`
+	FallbackReason        string     `json:"fallback_reason,omitempty"`
+	Status                string     `json:"status"`
+	CompletionCode        string     `json:"completion_code"`
+	RetryClass            RetryClass `json:"retry_class"`
+	Concerns              []string   `json:"concerns"`
+	FailureReason         string     `json:"failure_reason"`
+	BlockReason           string     `json:"block_reason"`
+	RawChangedFiles       []string   `json:"raw_changed_files,omitempty"`
+	EffectiveChangedFiles []string   `json:"effective_changed_files,omitempty"`
+	ChangedFiles          []string   `json:"changed_files"`
+	// OutOfScopeFiles lists files changed by the worker that are outside the
+	// planned owned_paths set declared in the IntentArtifact (SR-1 alignment
+	// check). Populated only when the intent gate ran and a mismatch is
+	// detected; empty otherwise. This is an advisory warning: it does not
+	// block the ticket but is surfaced in audit artifacts.
+	OutOfScopeFiles   []string              `json:"out_of_scope_files,omitempty"`
+	Artifacts         []string              `json:"artifacts"`
+	TokenUsage        *RuntimeTokenUsage    `json:"token_usage,omitempty"`
+	ActivityStats     *RuntimeActivityStats `json:"activity_stats,omitempty"`
+	LeaseID           string                `json:"lease_id"`
+	InputArtifactPath string                `json:"input_artifact_path,omitempty"`
+	StartedAt         time.Time             `json:"started_at"`
+	FinishedAt        time.Time             `json:"finished_at"`
 }
 
 type RuntimeTokenUsage struct {
@@ -222,18 +237,75 @@ type VerificationArtifact struct {
 	ValidationCoverage *ValidationCoverageArtifact `json:"validation_coverage,omitempty"`
 }
 
+// ResolutionEvidence documents how a review finding was resolved by a
+// repair worker. Required when a finding's disposition is "resolved".
+type ResolutionEvidence struct {
+	DiffRanges     []DiffRange     `json:"diff_ranges"`
+	TestReferences []TestReference `json:"test_references"`
+	RepairCycleID  string          `json:"repair_cycle_id"`
+	ResolvedAt     time.Time       `json:"resolved_at"`
+	Legacy         bool            `json:"legacy,omitempty"` // migration marker only
+}
+
+// DiffRange identifies a contiguous changed region in a file.
+type DiffRange struct {
+	File      string `json:"file"`
+	StartLine int    `json:"start_line"`
+	EndLine   int    `json:"end_line"`
+}
+
+// TestReference is a normalized pointer to a test or assertion. Free-form
+// strings are rejected by the closeout gate to prevent reviewers from
+// accepting unverifiable claims.
+type TestReference struct {
+	Kind    string `json:"kind"`              // "test_function" | "file_line"
+	Package string `json:"package,omitempty"` // for test_function
+	Name    string `json:"name,omitempty"`    // for test_function
+	File    string `json:"file,omitempty"`    // for file_line
+	Line    int    `json:"line,omitempty"`    // for file_line
+}
+
+// ValidateTestReference returns nil for a well-formed reference, error otherwise.
+func ValidateTestReference(r TestReference) error {
+	switch r.Kind {
+	case "test_function":
+		if r.Package == "" {
+			return fmt.Errorf("test_function reference missing package")
+		}
+		if r.Name == "" {
+			return fmt.Errorf("test_function reference missing name")
+		}
+		return nil
+	case "file_line":
+		if r.File == "" {
+			return fmt.Errorf("file_line reference missing file")
+		}
+		if r.Line <= 0 {
+			return fmt.Errorf("file_line reference missing line")
+		}
+		return nil
+	default:
+		return fmt.Errorf("unknown test reference kind %q; must be one of: test_function, file_line", r.Kind)
+	}
+}
+
 type ReviewFinding struct {
-	ID              string    `json:"id"`
-	Severity        Severity  `json:"severity"`
-	Title           string    `json:"title"`
-	Body            string    `json:"body"`
-	File            string    `json:"file,omitempty"`
-	Line            int       `json:"line,omitempty"`
-	Disposition     string    `json:"disposition"`
-	WaivedBy        string    `json:"waived_by,omitempty"`
-	WaivedAt        time.Time `json:"waived_at,omitempty"`
-	WaiverReason    string    `json:"waiver_reason,omitempty"`
-	WaiverExpiresAt time.Time `json:"waiver_expires_at,omitempty"`
+	ID                 string              `json:"id"`
+	Severity           Severity            `json:"severity"`
+	Title              string              `json:"title"`
+	Body               string              `json:"body"`
+	File               string              `json:"file,omitempty"`
+	Line               int                 `json:"line,omitempty"`
+	Disposition        string              `json:"disposition"`
+	WaivedBy           string              `json:"waived_by,omitempty"`
+	WaivedAt           time.Time           `json:"waived_at,omitempty"`
+	WaiverReason       string              `json:"waiver_reason,omitempty"`
+	WaiverExpiresAt    time.Time           `json:"waiver_expires_at,omitempty"`
+	ResolutionEvidence *ResolutionEvidence `json:"resolution_evidence,omitempty"`
+	// Promotable controls whether this finding is eligible for constraint
+	// promotion. nil means default true (the finding may be promoted).
+	// Set to false to suppress promotion for this specific finding.
+	Promotable *bool `json:"promotable,omitempty"`
 }
 
 type ReviewFindingsArtifact struct {
@@ -397,4 +469,90 @@ type ClaimArtifact struct {
 	ReleaseReason         string    `json:"release_reason,omitempty"`
 	State                 string    `json:"state"`
 	LastSeenLiveClaimPath string    `json:"last_seen_live_claim_path,omitempty"`
+}
+
+// FreezeArtifact records the owned_paths edit guard that was active for
+// a run at orchestration start. Persisted at
+// .verk/runs/<run-id>/tickets/<ticket-id>/freeze.json.
+type FreezeArtifact struct {
+	ArtifactMeta
+	RunID        string    `json:"run_id"`
+	TicketID     string    `json:"ticket_id"`
+	AllowedPaths []string  `json:"allowed_paths"`
+	Active       bool      `json:"active"`
+	StartedAt    time.Time `json:"started_at"`
+}
+
+// IntentArtifact records the worker's pre-implementation understanding of the
+// ticket. Persisted at
+// .verk/runs/<run-id>/tickets/<ticket-id>/intent-<attempt>.json.
+// The intent phase runs between Intake and Implement when policy.IntentRequired
+// is true. On validation failure the engine retries with corrective context
+// up to MaxIntentAttempts before blocking the ticket.
+type IntentArtifact struct {
+	ArtifactMeta
+	Attempt         int      `json:"attempt"`
+	CoveredCriteria []string `json:"covered_criteria"` // criteria worker plans to address
+	TargetFiles     []string `json:"target_files"`     // files worker plans to touch
+	TestPlan        string   `json:"test_plan"`        // prose summary of test approach
+	RawResponse     string   `json:"raw_response,omitempty"`
+}
+
+// WaveTicketSummary holds compact per-ticket context for wave and epic-plan
+// review artifacts.
+type WaveTicketSummary struct {
+	TicketID     string   `json:"ticket_id"`
+	CriterionIDs []string `json:"criterion_ids"`
+	OwnedPaths   []string `json:"owned_paths"`
+	ReviewPassed bool     `json:"review_passed"`
+}
+
+// WaveReviewArtifact is persisted at
+// .verk/runs/<run-id>/waves/wave-<n>/wave-review.json
+//
+// It records the outcome of a single fresh-context reviewer call over the
+// union diff produced by all tickets in the wave. The reviewer checks for
+// cross-ticket contradictions, integration drift, incomplete fanout, and
+// orphaned references that per-ticket reviewers may not catch.
+//
+// TargetTicketIDs per-finding assignment (mapping a finding's file to a
+// specific ticket's owned_paths) is a planned enhancement; for v1 the
+// wave-level artifact records the finding without per-ticket routing.
+type WaveReviewArtifact struct {
+	ArtifactMeta
+	WaveID            string              `json:"wave_id"`
+	Ordinal           int                 `json:"ordinal"`
+	ReviewerRuntime   string              `json:"reviewer_runtime,omitempty"`
+	Model             string              `json:"model,omitempty"`
+	ReviewScope       string              `json:"review_scope"` // always "wave"
+	BaseCommit        string              `json:"base_commit"`
+	ScopeUnion        []string            `json:"scope_union"` // union of owned_paths across tickets
+	TicketSummaries   []WaveTicketSummary `json:"ticket_summaries"`
+	Findings          []ReviewFinding     `json:"findings"`
+	BlockingFindings  []string            `json:"blocking_findings"`
+	Passed            bool                `json:"passed"`
+	Mode              string              `json:"mode"` // "shadow" | "enforce"
+	FullDiffBytes     int                 `json:"full_diff_bytes"`
+	IncludedDiffBytes int                 `json:"included_diff_bytes"`
+	TokensIn          int                 `json:"tokens_in,omitempty"`
+	TokensOut         int                 `json:"tokens_out,omitempty"`
+}
+
+// EpicPlanReviewArtifact is persisted at
+// .verk/runs/<run-id>/epic-review-plan.json
+//
+// It records the outcome of a single fresh-context reviewer call over the
+// epic's plan (root ticket + child tickets) before the first wave dispatches.
+// This is the plan-time pass only; the acceptance-time epic review is handled
+// by the existing epic closure gate (epic_gate.go).
+type EpicPlanReviewArtifact struct {
+	ArtifactMeta
+	ReviewScope      string              `json:"review_scope"` // always "epic_plan"
+	TicketSummaries  []WaveTicketSummary `json:"ticket_summaries"`
+	Findings         []ReviewFinding     `json:"findings"`
+	BlockingFindings []string            `json:"blocking_findings"`
+	Passed           bool                `json:"passed"`
+	Mode             string              `json:"mode"` // "shadow" | "enforce"
+	TokensIn         int                 `json:"tokens_in,omitempty"`
+	TokensOut        int                 `json:"tokens_out,omitempty"`
 }

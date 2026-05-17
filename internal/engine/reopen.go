@@ -101,6 +101,30 @@ func ReopenTicket(ctx context.Context, req ReopenRequest) error {
 	return nil
 }
 
+// DefaultReopenTargetForSnapshot derives the default reopen target from a
+// ticket run snapshot. When the snapshot carries a non-empty Outcome, that
+// outcome drives the decision:
+//   - failed_retryable: safe to retry; reopen to implement.
+//   - needs_decision: operator must choose; not automatically retryable.
+//   - blocked: external blocker; not automatically retryable.
+//   - any other non-empty outcome (e.g. closed, cancelled): not retryable.
+//
+// When Outcome is empty the function falls back to DefaultReopenTargetForPhase
+// using the snapshot's CurrentPhase, preserving backward compatibility with
+// legacy snapshots that predate the Outcome field.
+func DefaultReopenTargetForSnapshot(snapshot TicketRunSnapshot) (state.TicketPhase, bool) {
+	switch snapshot.Outcome {
+	case state.TicketOutcomeFailedRetryable:
+		return state.TicketPhaseImplement, true
+	case state.TicketOutcomeNeedsDecision, state.TicketOutcomeBlocked:
+		return "", false
+	case "":
+		return DefaultReopenTargetForPhase(snapshot.CurrentPhase)
+	default:
+		return "", false
+	}
+}
+
 func validateReopenTransition(from, to state.TicketPhase) error {
 	defaultTarget, ok := DefaultReopenTargetForPhase(from)
 	switch {

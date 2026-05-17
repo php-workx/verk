@@ -1,5 +1,7 @@
 # Ticket Quality Gate Implementation Plan
 
+> **Status: Implemented.** See [docs/ticket-quality-gate.md](../ticket-quality-gate.md).
+
 > **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
 
 **Goal:** Add a pre-run ticket quality gate that prevents `verk run` from dispatching workers against underspecified, ambiguous, or incomplete tickets.

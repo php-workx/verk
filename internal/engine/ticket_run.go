@@ -14,6 +14,7 @@ import (
 	"verk/internal/adapters/repo/git"
 	"verk/internal/adapters/runtime"
 	"verk/internal/adapters/ticketstore/epos"
+	"verk/internal/engine/constraints"
 	"verk/internal/policy"
 	"verk/internal/state"
 
@@ -44,6 +45,13 @@ type RunTicketRequest struct {
 	VerificationCommands []string
 	EnforceSingleScope   bool
 	Progress             chan<- ProgressEvent
+	// SkipTicketQualityGate suppresses the deterministic ticket-quality gate
+	// in RunTicket. RunEpic sets this true when invoking RunTicket for each
+	// child because the epic-level gate already evaluated and persisted the
+	// artifact for the whole epic; re-running per child would overwrite
+	// .verk/runs/<run-id>/ticket-quality.json with a single-ticket scoped
+	// artifact.
+	SkipTicketQualityGate bool
 }
 
 type RunTicketResult struct {
@@ -67,6 +75,35 @@ type TicketRunSnapshot struct {
 	Closeout               *state.CloseoutArtifact       `json:"closeout,omitempty"`
 }
 
+// stopKind classifies the reason a ticket stopped, allowing the engine to
+// assign a precise outcome without needing LLM input.
+type stopKind int
+
+const (
+	stopKindGeneric         stopKind = iota
+	stopKindBudgetExhausted          // repair or impl budget exhausted
+	stopKindNeedsContext             // worker explicitly needs context
+	stopKindClaimLost                // claim renewal lost mid-execution
+	stopKindScopeViolation           // changed files outside owned scope
+	stopKindCancelled                // operator-initiated cancellation
+)
+
+// classifyTicketStop maps a stop phase and reason kind to the correct
+// TicketOutcome. All rules are deterministic; no LLM is involved.
+func classifyTicketStop(phase state.TicketPhase, kind stopKind) state.TicketOutcome {
+	switch kind {
+	case stopKindCancelled:
+		return state.TicketOutcomeCancelled
+	case stopKindNeedsContext, stopKindClaimLost:
+		return state.TicketOutcomeBlocked
+	case stopKindBudgetExhausted, stopKindScopeViolation:
+		return state.TicketOutcomeNeedsDecision
+	default:
+		_ = phase // reserved for future phase-specific rules
+		return state.TicketOutcomeBlocked
+	}
+}
+
 type ticketRunState struct {
 	ctx                    context.Context
 	req                    RunTicketRequest
@@ -75,8 +112,10 @@ type ticketRunState struct {
 	repoRoot               string
 	worktreePath           string
 	currentPhase           state.TicketPhase
+	currentOutcome         state.TicketOutcome
 	blockReason            string
-	createdAt              time.Time // set once; zero means lazy-init on first snapshot()
+	createdAt              time.Time             // set once; zero means lazy-init on first snapshot()
+	intent                 *state.IntentArtifact // last intent artifact when gate ran; nil otherwise
 	implementation         *state.ImplementationArtifact
 	verification           *state.VerificationArtifact
 	review                 *state.ReviewFindingsArtifact
@@ -85,6 +124,19 @@ type ticketRunState struct {
 	implementationAttempts int
 	verificationAttempts   int
 	reviewAttempts         int
+	reviewBaseline         *reviewBaseline // captured before each worker attempt; nil on resumed runs
+}
+
+// currentReviewBaseline returns the review baseline for delta computation.
+// If no baseline was captured (e.g. a run resumed directly into review from
+// older artifacts), it returns a conservative compatibility baseline that
+// treats no files as pre-existing dirty. This preserves current behavior for
+// old runs rather than crashing.
+func (st *ticketRunState) currentReviewBaseline() reviewBaseline {
+	if st.reviewBaseline == nil {
+		return reviewBaseline{BaseCommit: st.req.BaseCommit}
+	}
+	return *st.reviewBaseline
 }
 
 type ticketRunPaths struct {
@@ -214,6 +266,96 @@ func RunTicket(ctx context.Context, req RunTicketRequest) (result RunTicketResul
 		return RunTicketResult{}, err
 	}
 
+	// Deterministic ticket-quality gate: runs before the first worker is
+	// dispatched. Single-ticket runs evaluate just the root ticket (no
+	// children). When the gate blocks, persist a Blocked snapshot, release
+	// the claim, and return without invoking any worker. Mirrors the
+	// pattern used by RunEpic's quality-gate integration (Task 6). Gating
+	// keys off currentPhase == Intake so resumed runs that are already past
+	// the implement phase skip the gate (the worker has already taken the
+	// ticket into account); fresh runs and resumes from Intake re-evaluate.
+	if !req.SkipTicketQualityGate && st.currentPhase == state.TicketPhaseIntake {
+		qualityArtifact, qErr := RunTicketQualityGate(ctx, absRepoRoot, req.RunID, cfg, req.Ticket, nil)
+		if qErr != nil {
+			return RunTicketResult{}, fmt.Errorf("ticket quality gate: %w", qErr)
+		}
+		if qualityArtifact.Blocked {
+			st.currentPhase = state.TicketPhaseBlocked
+			st.currentOutcome = state.TicketOutcomeBlocked
+			st.blockReason = fmt.Sprintf("ticket quality gate blocked: %s", qualityArtifact.BlockReason)
+			if err := st.persist(); err != nil {
+				return RunTicketResult{}, err
+			}
+			if err := st.releaseClaim(); err != nil {
+				return RunTicketResult{}, err
+			}
+			return RunTicketResult{Snapshot: st.snapshot(), Path: st.paths.snapshotPath}, nil
+		}
+	}
+
+	// Intent echo gate: runs once at Intake before the first worker dispatch.
+	// Skipped when cfg.Intent.Enabled is false (default). Resumed runs that
+	// are already past Intake do not re-run the gate.
+	if cfg.Intent.Enabled && st.currentPhase == state.TicketPhaseIntake {
+		workerProfile := workerProfileForPlan(req.Plan, cfg)
+		intentReq := runtime.IntentRequest{
+			RunID:        req.RunID,
+			TicketID:     req.Ticket.ID,
+			LeaseID:      req.Claim.LeaseID,
+			Runtime:      workerProfile.Runtime,
+			Model:        workerProfile.Model,
+			Reasoning:    workerProfile.Reasoning,
+			WorktreePath: st.worktreePath,
+			Instructions: runtime.BuildIntentPrompt(runtime.IntentRequest{
+				TicketID:     req.Ticket.ID,
+				LeaseID:      req.Claim.LeaseID,
+				WorktreePath: st.worktreePath,
+				Instructions: buildImplementPhaseInstructions(st, 1),
+				OwnedPaths:   req.Plan.OwnedPaths,
+			}),
+			OwnedPaths: req.Plan.OwnedPaths,
+		}
+		gateResult, gErr := runIntentGate(
+			ctx, absRepoRoot, req.RunID, req.Ticket.ID,
+			req.Adapter, intentReq, req.Plan, cfg.Intent,
+		)
+		if gErr != nil {
+			return RunTicketResult{}, fmt.Errorf("intent gate: %w", gErr)
+		}
+		if !gateResult.Passed {
+			st.currentPhase = state.TicketPhaseBlocked
+			st.currentOutcome = state.TicketOutcomeBlocked
+			st.blockReason = fmt.Sprintf("intent gate blocked: %s", gateResult.BlockReason)
+			if err := st.persist(); err != nil {
+				return RunTicketResult{}, err
+			}
+			if err := st.releaseClaim(); err != nil {
+				return RunTicketResult{}, err
+			}
+			return RunTicketResult{Snapshot: st.snapshot(), Path: st.paths.snapshotPath}, nil
+		}
+		st.intent = gateResult.Artifact
+	}
+
+	// Write freeze.json at run start so artifacts can audit the owned_paths
+	// edit guard that was active when orchestration began.
+	freezeArtifact := state.FreezeArtifact{
+		ArtifactMeta: state.ArtifactMeta{
+			SchemaVersion: artifactSchemaVersion,
+			RunID:         req.RunID,
+			CreatedAt:     stateTime(),
+			UpdatedAt:     stateTime(),
+		},
+		RunID:        req.RunID,
+		TicketID:     req.Ticket.ID,
+		AllowedPaths: req.Plan.OwnedPaths,
+		Active:       true,
+		StartedAt:    stateTime(),
+	}
+	if err := state.SaveJSONAtomic(filepath.Join(st.paths.runDir, "freeze.json"), freezeArtifact); err != nil {
+		return RunTicketResult{}, fmt.Errorf("write freeze artifact: %w", err)
+	}
+
 	if st.currentPhase == state.TicketPhaseIntake {
 		if err := st.transitionTo(state.TicketPhaseImplement); err != nil {
 			return RunTicketResult{}, err
@@ -230,6 +372,11 @@ func RunTicket(ctx context.Context, req RunTicketRequest) (result RunTicketResul
 
 		switch st.currentPhase {
 		case state.TicketPhaseImplement:
+			reviewBaseline, err := captureReviewBaseline(st.worktreePath, req.BaseCommit)
+			if err != nil {
+				return RunTicketResult{}, fmt.Errorf("capture review baseline: %w", err)
+			}
+			st.reviewBaseline = &reviewBaseline
 			workerProfile := workerProfileForPlan(req.Plan, cfg)
 			workerReq := runtime.WorkerRequest{
 				RunID:           req.RunID,
@@ -239,8 +386,11 @@ func RunTicket(ctx context.Context, req RunTicketRequest) (result RunTicketResul
 				Runtime:         workerProfile.Runtime,
 				Model:           workerProfile.Model,
 				Reasoning:       workerProfile.Reasoning,
+				Profile:         req.Plan.AgentProfile,
 				WorktreePath:    st.worktreePath,
 				Instructions:    buildImplementPhaseInstructions(st, st.implementationAttempts+1),
+				OwnedPaths:      req.Plan.OwnedPaths,
+				Standards:       runtime.BuildReviewStandards(runtime.DetectLanguagesFromPaths(req.Plan.OwnedPaths)),
 				ExecutionConfig: executionConfigFromPolicy(cfg),
 				OnProgress:      func(detail string) { st.progressDetail(detail) },
 			}
@@ -294,9 +444,9 @@ func RunTicket(ctx context.Context, req RunTicketRequest) (result RunTicketResul
 			}
 
 		case state.TicketPhaseReview:
-			diffForReview, err := collectDiff(st.worktreePath, req.BaseCommit)
+			delta, err := collectReviewDelta(st.worktreePath, req.BaseCommit, st.currentReviewBaseline())
 			if err != nil {
-				return RunTicketResult{}, fmt.Errorf("collect diff for review: %w", err)
+				return RunTicketResult{}, fmt.Errorf("collect review delta: %w", err)
 			}
 			reviewerProfile := reviewerProfileForPlan(req.Plan, cfg)
 			reviewReq := runtime.ReviewRequest{
@@ -310,8 +460,9 @@ func RunTicket(ctx context.Context, req RunTicketRequest) (result RunTicketResul
 				WorktreePath:             st.worktreePath,
 				InputArtifactPath:        st.paths.verificationPath,
 				Instructions:             renderReviewInstructions(req.Plan, st.reviewAttempts+1),
-				Diff:                     diffForReview,
-				Standards:                runtime.BuildReviewStandards(runtime.DetectLanguages(diffForReview)),
+				Diff:                     delta.Diff,
+				ChangedFiles:             delta.ChangedFiles,
+				Standards:                runtime.BuildReviewStandards(runtime.DetectLanguages(delta.Diff)),
 				EffectiveReviewThreshold: req.Plan.EffectiveReviewThreshold,
 				ExecutionConfig:          executionConfigFromPolicy(cfg),
 				OnProgress:               func(detail string) { st.progressDetail(detail) },
@@ -384,6 +535,10 @@ func RunTicket(ctx context.Context, req RunTicketRequest) (result RunTicketResul
 			if st.closeout.Closable {
 				st.progressDetail("all gates passed")
 				st.blockReason = ""
+				// Record constraint candidates from review findings on successful closeout.
+				if cfg.Constraints.Enabled && st.review != nil {
+					recordConstraintCandidates(absRepoRoot, req.RunID, req.Ticket.ID, st.review.Findings)
+				}
 				if err := st.transitionTo(state.TicketPhaseClosed); err != nil {
 					return RunTicketResult{}, err
 				}
@@ -403,6 +558,11 @@ func RunTicket(ctx context.Context, req RunTicketRequest) (result RunTicketResul
 			continue
 
 		case state.TicketPhaseRepair:
+			repairBaseline, err := captureReviewBaseline(st.worktreePath, req.BaseCommit)
+			if err != nil {
+				return RunTicketResult{}, fmt.Errorf("capture review baseline: %w", err)
+			}
+			st.reviewBaseline = &repairBaseline
 			workerProfile := workerProfileForPlan(req.Plan, cfg)
 			workerReq := runtime.WorkerRequest{
 				RunID:           req.RunID,
@@ -412,8 +572,11 @@ func RunTicket(ctx context.Context, req RunTicketRequest) (result RunTicketResul
 				Runtime:         workerProfile.Runtime,
 				Model:           workerProfile.Model,
 				Reasoning:       workerProfile.Reasoning,
+				Profile:         req.Plan.AgentProfile,
 				WorktreePath:    st.worktreePath,
 				Instructions:    renderRepairInstructions(st),
+				OwnedPaths:      req.Plan.OwnedPaths,
+				Standards:       runtime.BuildReviewStandards(runtime.DetectLanguagesFromPaths(req.Plan.OwnedPaths)),
 				ExecutionConfig: executionConfigFromPolicy(cfg),
 				OnProgress:      func(detail string) { st.progressDetail(detail) },
 			}
@@ -553,10 +716,34 @@ func handleImplementResult(st *ticketRunState, result runtime.WorkerResult, req 
 		st.implementation.RawChangedFiles = rawChangedFiles
 		st.implementation.EffectiveChangedFiles = effectiveChangedFiles
 		st.implementation.ChangedFiles = effectiveChangedFiles
+
+		// SR-1 post-implementation alignment: when the intent gate ran,
+		// compare changed files against the intent's planned TargetFiles.
+		// Files changed outside the planned set are surfaced as an advisory
+		// warning (out_of_scope_files) and logged; they do not block the
+		// ticket.
+		if st.intent != nil && len(st.intent.TargetFiles) > 0 {
+			plannedSet := make(map[string]struct{}, len(st.intent.TargetFiles))
+			for _, f := range st.intent.TargetFiles {
+				plannedSet[f] = struct{}{}
+			}
+			var outOfScope []string
+			for _, f := range effectiveChangedFiles {
+				if _, ok := plannedSet[f]; !ok {
+					outOfScope = append(outOfScope, f)
+				}
+			}
+			if len(outOfScope) > 0 {
+				st.implementation.OutOfScopeFiles = outOfScope
+				log.Printf("[INFO] ticket %s: %d file(s) changed outside intent-planned scope: %s",
+					st.req.Ticket.ID, len(outOfScope), strings.Join(outOfScope, ", "))
+			}
+		}
 	case runtime.WorkerStatusNeedsContext, runtime.WorkerStatusBlocked:
 		reason := workerBlockReason(result)
 		st.blockReason = reason
 		st.implementation.BlockReason = reason
+		st.currentOutcome = classifyTicketStop(st.currentPhase, stopKindNeedsContext)
 		if err := st.transitionTo(state.TicketPhaseBlocked); err != nil {
 			return err
 		}
@@ -628,6 +815,50 @@ func (st *ticketRunState) executeVerification(ctx context.Context) (bool, error)
 		return false, nil
 	}
 
+	// Run compiled constraints when enabled. A failing constraint blocks the
+	// verify gate and causes the ticket to re-enter the implement → verify loop.
+	if st.cfg.Constraints.Enabled {
+		constraintStore := constraints.NewStore(st.repoRoot)
+		budgetMs := st.cfg.Constraints.MaxRuntimeTotalMs
+		if budgetMs <= 0 {
+			budgetMs = 120000
+		}
+		constraintResults, _, constraintErr := constraints.Execute(ctx, constraintStore, st.repoRoot, st.worktreePath, budgetMs)
+		if constraintErr != nil {
+			// Non-fatal: log and continue rather than hard-failing the ticket.
+			log.Printf("constraint execution error for ticket %s: %v", st.req.Ticket.ID, constraintErr)
+		} else {
+			failing := constraints.FailingConstraints(constraintResults)
+			if len(failing) > 0 {
+				// Inject a synthetic VerificationResult into the artifact so the
+				// constraint failure is visible in the verification output.
+				summary := constraints.ConstraintFailureSummary(failing)
+				syntheticResult := state.VerificationResult{
+					Command:    "verk-constraints",
+					ExitCode:   1,
+					Passed:     false,
+					DurationMS: 0,
+					StartedAt:  time.Now().UTC(),
+					FinishedAt: time.Now().UTC(),
+				}
+				verifyArtifact.Results = append(verifyArtifact.Results, syntheticResult)
+				verifyArtifact.Passed = false
+				st.verification = verifyArtifact
+				if err := st.persist(); err != nil {
+					return false, err
+				}
+				st.progressDetail(fmt.Sprintf("constraint check failed: %s", summary))
+				if err := handleVerificationFailure(st, *verifyArtifact); err != nil {
+					return false, err
+				}
+				if err := st.persist(); err != nil {
+					return false, err
+				}
+				return false, nil
+			}
+		}
+	}
+
 	if err := st.transitionTo(state.TicketPhaseReview); err != nil {
 		return false, err
 	}
@@ -644,6 +875,7 @@ func checkSingleTicketScope(st *ticketRunState) error {
 	ownedPaths := st.req.Ticket.OwnedPaths
 	if len(ownedPaths) == 0 {
 		st.blockReason = fmt.Sprintf("single-ticket scope violation: ticket %q has no scope declarations", st.req.Ticket.ID)
+		st.currentOutcome = classifyTicketStop(st.currentPhase, stopKindScopeViolation)
 		return st.transitionTo(state.TicketPhaseBlocked)
 	}
 	var changedFiles []string
@@ -655,6 +887,7 @@ func checkSingleTicketScope(st *ticketRunState) error {
 	}
 	if err := CheckScopeViolation(changedFiles, ownedPaths); err != nil {
 		st.blockReason = fmt.Sprintf("single-ticket scope violation: %v", err)
+		st.currentOutcome = classifyTicketStop(st.currentPhase, stopKindScopeViolation)
 		return st.transitionTo(state.TicketPhaseBlocked)
 	}
 	return nil
@@ -676,7 +909,6 @@ func collectDiff(repoRoot, baseCommit string) (string, error) {
 	return diff, nil
 }
 
-//nolint:unparam // retained as the backward-compatible filtered helper used by tests
 func collectChangedFiles(repoRoot, baseCommit string) ([]string, error) {
 	files, err := collectRawChangedFiles(repoRoot, baseCommit)
 	if err != nil {
@@ -709,6 +941,7 @@ func handleVerificationFailure(st *ticketRunState, verification state.Verificati
 	failingIDs := verificationFailingCheckIDs(st.verification)
 	if st.implementationAttempts >= st.cfg.Policy.MaxImplementationAttempts {
 		st.blockReason = buildVerificationBlockReason(st.implementationAttempts, failingIDs)
+		st.currentOutcome = classifyTicketStop(st.currentPhase, stopKindBudgetExhausted)
 		if err := st.transitionTo(state.TicketPhaseBlocked); err != nil {
 			return err
 		}
@@ -979,6 +1212,7 @@ func handleReviewOutcome(st *ticketRunState, result runtime.ReviewResult, req ru
 			Reason:    st.blockReason,
 			PolicyRef: "policy.max_repair_cycles",
 		}
+		st.currentOutcome = classifyTicketStop(st.currentPhase, stopKindBudgetExhausted)
 		if err := st.transitionTo(state.TicketPhaseBlocked); err != nil {
 			return err
 		}
@@ -1116,6 +1350,7 @@ func (st *ticketRunState) runWorkerWithRuntimeControls(ctx context.Context, req 
 		result, err := st.runWorkerWithClaimRenewal(ctx, effectiveReq)
 		if err != nil {
 			if errors.Is(err, errClaimRenewalLost) {
+				st.currentOutcome = classifyTicketStop(st.currentPhase, stopKindClaimLost)
 				if err := st.blockRuntimeExecution(fmt.Sprintf("claim renewal lost during worker execution: %v", err)); err != nil {
 					return runtime.WorkerResult{}, effectiveReq, err
 				}
@@ -1150,6 +1385,7 @@ func (st *ticketRunState) runWorkerWithRuntimeControls(ctx context.Context, req 
 				BlockReason:    result.BlockReason,
 				RetryClass:     result.RetryClass,
 			}))
+			st.currentOutcome = classifyTicketStop(st.currentPhase, stopKindCancelled)
 			if err := st.blockRuntimeExecution(reason); err != nil {
 				return runtime.WorkerResult{}, effectiveReq, err
 			}
@@ -1169,6 +1405,7 @@ func (st *ticketRunState) runWorkerWithRuntimeControls(ctx context.Context, req 
 	if !shouldRetryRuntimeError(lastErr) {
 		return runtime.WorkerResult{}, effectiveReq, lastErr
 	}
+	st.currentOutcome = classifyTicketStop(st.currentPhase, stopKindGeneric)
 	if err := st.blockRuntimeExecution(fmt.Sprintf("retryable worker failure after %d retries: %v", maxRuntimeRetryAttempts, lastErr)); err != nil {
 		return runtime.WorkerResult{}, effectiveReq, err
 	}
@@ -1195,6 +1432,7 @@ func (st *ticketRunState) runReviewerWithRuntimeControls(ctx context.Context, re
 		result, err := st.runReviewerWithClaimRenewal(ctx, effectiveReq)
 		if err != nil {
 			if errors.Is(err, errClaimRenewalLost) {
+				st.currentOutcome = classifyTicketStop(st.currentPhase, stopKindClaimLost)
 				if err := st.blockRuntimeExecution(fmt.Sprintf("claim renewal lost during reviewer execution: %v", err)); err != nil {
 					return runtime.ReviewResult{}, effectiveReq, err
 				}
@@ -1227,6 +1465,7 @@ func (st *ticketRunState) runReviewerWithRuntimeControls(ctx context.Context, re
 				CompletionCode: result.CompletionCode,
 				RetryClass:     result.RetryClass,
 			}))
+			st.currentOutcome = classifyTicketStop(st.currentPhase, stopKindCancelled)
 			if err := st.blockRuntimeExecution(reason); err != nil {
 				return runtime.ReviewResult{}, effectiveReq, err
 			}
@@ -1246,6 +1485,7 @@ func (st *ticketRunState) runReviewerWithRuntimeControls(ctx context.Context, re
 	if !shouldRetryRuntimeError(lastErr) {
 		return runtime.ReviewResult{}, effectiveReq, lastErr
 	}
+	st.currentOutcome = classifyTicketStop(st.currentPhase, stopKindGeneric)
 	if err := st.blockRuntimeExecution(fmt.Sprintf("retryable reviewer failure after %d retries: %v", maxRuntimeRetryAttempts, lastErr)); err != nil {
 		return runtime.ReviewResult{}, effectiveReq, err
 	}
@@ -1481,6 +1721,10 @@ func (st *ticketRunState) snapshot() TicketRunSnapshot {
 	if st.createdAt.IsZero() {
 		st.createdAt = stateTime()
 	}
+	outcome := st.currentOutcome
+	if outcome == "" {
+		outcome = ticketOutcomeForPhase(st.currentPhase)
+	}
 	snapshot := TicketRunSnapshot{
 		ArtifactMeta: state.ArtifactMeta{
 			SchemaVersion: artifactSchemaVersion,
@@ -1490,7 +1734,7 @@ func (st *ticketRunState) snapshot() TicketRunSnapshot {
 		},
 		TicketID:               st.req.Ticket.ID,
 		CurrentPhase:           st.currentPhase,
-		Outcome:                ticketOutcomeForPhase(st.currentPhase),
+		Outcome:                outcome,
 		BlockReason:            st.blockReason,
 		ImplementationAttempts: st.implementationAttempts,
 		VerificationAttempts:   st.verificationAttempts,
@@ -2131,4 +2375,21 @@ func derefReviewExpiry(value *time.Time) time.Time {
 		return time.Time{}
 	}
 	return *value
+}
+
+// recordConstraintCandidates appends promotable review findings to the
+// constraint candidate store after a successful ticket closeout.
+// Errors are logged but not propagated so they do not block ticket closure.
+func recordConstraintCandidates(repoRoot, runID, ticketID string, findings []state.ReviewFinding) {
+	store := constraints.NewStore(repoRoot)
+	for _, f := range findings {
+		// nil Promotable means default true.
+		if f.Promotable != nil && !*f.Promotable {
+			continue
+		}
+		sig := constraints.DeriveSignature(f.Title, f.File, string(f.Severity))
+		if _, err := store.AppendCandidate(sig, runID, ticketID, f.ID); err != nil {
+			log.Printf("constraint candidate record error ticket=%s finding=%s: %v", ticketID, f.ID, err)
+		}
+	}
 }

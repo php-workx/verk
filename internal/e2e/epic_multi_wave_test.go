@@ -178,6 +178,13 @@ func (a *routingAdapter) RunReviewer(ctx context.Context, req runtime.ReviewRequ
 	return result, nil
 }
 
+func (a *routingAdapter) RunIntent(ctx context.Context, req runtime.IntentRequest) (runtime.IntentResult, error) {
+	if err := ctx.Err(); err != nil {
+		return runtime.IntentResult{}, err
+	}
+	return runtime.IntentResult{TargetFiles: req.OwnedPaths, TestPlan: "test"}, nil
+}
+
 func TestEpicThreeLevelHierarchy(t *testing.T) {
 	repoRoot := t.TempDir()
 	baseCommit := initRepo(t, repoRoot)
@@ -281,6 +288,13 @@ func (a *e2eReflectingAdapter) RunReviewer(ctx context.Context, req runtime.Revi
 	a.reviewIndex++
 	a.mu.Unlock()
 	return result, nil
+}
+
+func (a *e2eReflectingAdapter) RunIntent(ctx context.Context, req runtime.IntentRequest) (runtime.IntentResult, error) {
+	if err := ctx.Err(); err != nil {
+		return runtime.IntentResult{}, err
+	}
+	return runtime.IntentResult{TargetFiles: req.OwnedPaths, TestPlan: "test"}, nil
 }
 
 func (a *e2eReflectingAdapter) WorkerRequests() []runtime.WorkerRequest {

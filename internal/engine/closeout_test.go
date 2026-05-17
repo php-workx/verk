@@ -1,6 +1,8 @@
 package engine
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -668,6 +670,16 @@ func baseCloseoutRequest() closeoutRequest {
 				File:        "internal/engine/closeout.go",
 				Line:        10,
 				Disposition: "resolved",
+				ResolutionEvidence: &state.ResolutionEvidence{
+					DiffRanges: []state.DiffRange{
+						{File: "internal/engine/closeout.go", StartLine: 1, EndLine: 50},
+					},
+					TestReferences: []state.TestReference{
+						{Kind: "test_function", Package: "engine", Name: "TestBaseCloseout"},
+					},
+					RepairCycleID: "cycle-1",
+					ResolvedAt:    now,
+				},
 			},
 		},
 		BlockingFindings:         []string{},
@@ -681,6 +693,176 @@ func baseCloseoutRequest() closeoutRequest {
 		verification:      verification,
 		review:            review,
 		requiredArtifacts: []string{"verification.json", "review-findings.json"},
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Resolution evidence gate tests
+// ---------------------------------------------------------------------------
+
+func validResolvedFinding(id string) state.ReviewFinding {
+	now := fixedTime()
+	return state.ReviewFinding{
+		ID:          id,
+		Severity:    state.SeverityP3,
+		Title:       "resolved finding",
+		Body:        "resolved finding body",
+		File:        "internal/engine/closeout.go",
+		Line:        10,
+		Disposition: "resolved",
+		ResolutionEvidence: &state.ResolutionEvidence{
+			DiffRanges: []state.DiffRange{
+				{File: "internal/engine/closeout.go", StartLine: 1, EndLine: 50},
+			},
+			TestReferences: []state.TestReference{
+				{Kind: "test_function", Package: "engine", Name: "TestSomething"},
+			},
+			RepairCycleID: "cycle-1",
+			ResolvedAt:    now,
+		},
+	}
+}
+
+func TestValidateReviewFinding_ResolvedWithoutEvidenceBlocks(t *testing.T) {
+	f := validResolvedFinding("f-res-1")
+	f.ResolutionEvidence = nil
+	if err := validateReviewFindingWithRepoRoot(f, state.SeverityP2, nil, ""); err == nil || !strings.Contains(err.Error(), "missing resolution_evidence") {
+		t.Fatalf("expected missing resolution_evidence error, got: %v", err)
+	}
+}
+
+func TestValidateReviewFinding_ResolvedWithEmptyDiffRangesBlocks(t *testing.T) {
+	f := validResolvedFinding("f-res-2")
+	f.ResolutionEvidence.DiffRanges = nil
+	if err := validateReviewFindingWithRepoRoot(f, state.SeverityP2, nil, ""); err == nil || !strings.Contains(err.Error(), "no diff_ranges") {
+		t.Fatalf("expected no diff_ranges error, got: %v", err)
+	}
+}
+
+func TestValidateReviewFinding_ResolvedWithEmptyTestReferencesBlocks(t *testing.T) {
+	f := validResolvedFinding("f-res-3")
+	f.ResolutionEvidence.TestReferences = nil
+	if err := validateReviewFindingWithRepoRoot(f, state.SeverityP2, nil, ""); err == nil || !strings.Contains(err.Error(), "no test_references") {
+		t.Fatalf("expected no test_references error, got: %v", err)
+	}
+}
+
+func TestValidateReviewFinding_ResolvedWithMalformedTestReferenceBlocks(t *testing.T) {
+	f := validResolvedFinding("f-res-4")
+	// test_function missing Name
+	f.ResolutionEvidence.TestReferences = []state.TestReference{
+		{Kind: "test_function", Package: "engine"},
+	}
+	if err := validateReviewFindingWithRepoRoot(f, state.SeverityP2, nil, ""); err == nil || !strings.Contains(err.Error(), "missing name") {
+		t.Fatalf("expected missing name error, got: %v", err)
+	}
+}
+
+func TestValidateReviewFinding_ResolvedWithValidEvidencePasses(t *testing.T) {
+	f := validResolvedFinding("f-res-5")
+	if err := validateReviewFindingWithRepoRoot(f, state.SeverityP2, nil, ""); err != nil {
+		t.Fatalf("expected valid resolved finding to pass, got: %v", err)
+	}
+}
+
+func TestValidateReviewFinding_ResolvedWithRepoRootRequiresExistingTestReference(t *testing.T) {
+	repoRoot := t.TempDir()
+	testDir := filepath.Join(repoRoot, "internal", "engine")
+	if err := os.MkdirAll(testDir, 0o755); err != nil {
+		t.Fatalf("mkdir test dir: %v", err)
+	}
+	testFile := filepath.Join(testDir, "closeout_test.go")
+	if err := os.WriteFile(testFile, []byte("package engine\n\nfunc TestSomething(t *testing.T) {}\n"), 0o644); err != nil {
+		t.Fatalf("write test file: %v", err)
+	}
+
+	f := validResolvedFinding("f-res-repo")
+	f.ResolutionEvidence.TestReferences = []state.TestReference{
+		{Kind: "test_function", Package: "internal/engine", Name: "TestSomething"},
+	}
+
+	if err := validateReviewFindingWithRepoRoot(f, state.SeverityP2, nil, repoRoot); err != nil {
+		t.Fatalf("expected existing test reference to pass, got: %v", err)
+	}
+}
+
+func TestValidateReviewFinding_ResolvedWithRepoRootRejectsMissingTestReference(t *testing.T) {
+	repoRoot := t.TempDir()
+	testDir := filepath.Join(repoRoot, "internal", "engine")
+	if err := os.MkdirAll(testDir, 0o755); err != nil {
+		t.Fatalf("mkdir test dir: %v", err)
+	}
+
+	f := validResolvedFinding("f-res-missing")
+	f.ResolutionEvidence.TestReferences = []state.TestReference{
+		{Kind: "test_function", Package: "internal/engine", Name: "TestMissing"},
+	}
+
+	err := validateReviewFindingWithRepoRoot(f, state.SeverityP2, nil, repoRoot)
+	if err == nil {
+		t.Fatal("expected missing test reference to fail")
+	}
+	if !strings.Contains(err.Error(), "test_reference_unresolved") {
+		t.Fatalf("expected test_reference_unresolved error, got: %v", err)
+	}
+}
+
+func TestValidateReviewFinding_LegacyEvidenceGrandfathered(t *testing.T) {
+	f := validResolvedFinding("f-res-6")
+	// Legacy flag bypasses all evidence checks.
+	f.ResolutionEvidence = &state.ResolutionEvidence{Legacy: true}
+	if err := validateReviewFindingWithRepoRoot(f, state.SeverityP2, nil, ""); err != nil {
+		t.Fatalf("expected legacy evidence to be grandfathered, got: %v", err)
+	}
+}
+
+func TestValidateReviewFinding_ResolvedWithoutRepairCycleIDBlocks(t *testing.T) {
+	f := validResolvedFinding("f-res-7")
+	f.ResolutionEvidence.RepairCycleID = ""
+	if err := validateReviewFindingWithRepoRoot(f, state.SeverityP2, nil, ""); err == nil || !strings.Contains(err.Error(), "missing repair_cycle_id") {
+		t.Fatalf("expected missing repair_cycle_id error, got: %v", err)
+	}
+}
+
+func TestValidateResolutionEvidence_DiffOutsideOwnedPathsFails(t *testing.T) {
+	f := validResolvedFinding("f-scope-1")
+	// DiffRange.File is outside owned_paths → scope violation error.
+	f.ResolutionEvidence.DiffRanges = []state.DiffRange{
+		{File: "internal/other/module.go", StartLine: 1, EndLine: 10},
+	}
+	ownedPaths := []string{"internal/engine"}
+	err := validateReviewFindingWithRepoRoot(f, state.SeverityP2, ownedPaths, "")
+	if err == nil {
+		t.Fatal("expected scope violation error, got nil")
+	}
+	if !strings.Contains(err.Error(), "scope violation") {
+		t.Fatalf("expected 'scope violation' in error, got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "internal/other/module.go") {
+		t.Fatalf("expected out-of-scope file name in error, got: %v", err)
+	}
+}
+
+func TestValidateResolutionEvidence_DiffWithinOwnedPathsPasses(t *testing.T) {
+	f := validResolvedFinding("f-scope-2")
+	// DiffRange.File is within owned_paths → passes.
+	f.ResolutionEvidence.DiffRanges = []state.DiffRange{
+		{File: "internal/engine/closeout.go", StartLine: 1, EndLine: 50},
+	}
+	ownedPaths := []string{"internal/engine"}
+	if err := validateReviewFindingWithRepoRoot(f, state.SeverityP2, ownedPaths, ""); err != nil {
+		t.Fatalf("expected in-scope diff to pass, got: %v", err)
+	}
+}
+
+func TestValidateResolutionEvidence_EmptyOwnedPathsSkipsBoundsCheck(t *testing.T) {
+	f := validResolvedFinding("f-scope-3")
+	// When owned_paths is empty, bounds check is skipped (no scope declared).
+	f.ResolutionEvidence.DiffRanges = []state.DiffRange{
+		{File: "anywhere/else.go", StartLine: 1, EndLine: 10},
+	}
+	if err := validateReviewFindingWithRepoRoot(f, state.SeverityP2, nil, ""); err != nil {
+		t.Fatalf("expected empty owned_paths to skip bounds check, got: %v", err)
 	}
 }
 

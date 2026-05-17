@@ -298,21 +298,17 @@ func TestRunTicket_ReviewDiffIncludesWorktreeOnlyFile(t *testing.T) {
 	worktreePath := filepath.Join(t.TempDir(), "worktree-review")
 	mustRunGit(t, repoRoot, "worktree", "add", worktreePath, "HEAD")
 	t.Cleanup(func() { _ = exec.Command("git", "-C", repoRoot, "worktree", "remove", "--force", worktreePath).Run() })
-	if err := os.WriteFile(filepath.Join(worktreePath, "ticket-only.txt"), []byte("worktree file\n"), 0o644); err != nil {
-		t.Fatalf("write worktree-only file: %v", err)
-	}
-	mustRunGit(t, worktreePath, "add", "ticket-only.txt")
-	mustRunGit(t, worktreePath, "commit", "-m", "ticket-only change")
 
 	cfg := policy.DefaultConfig()
 	cfg.Runtime.WorkerTimeoutMinutes = 7
 	cfg.Runtime.ReviewerTimeoutMinutes = 9
 	cfg.Runtime.AuthEnvVars = []string{"VERK_API_KEY"}
+	stubToolSignals(t, ToolSignals{}) // no derived checks
 	ticket := testTicket("ver-wi20-worktree")
 	plan, claim := testPlanAndClaim(t, repoRoot, ticket, cfg, "run-wi20-review-diff", "lease-wi20-review-diff", []string{`true`})
 
 	started, finished := testRunTimes()
-	adapter := runtimefake.New(
+	base := runtimefake.New(
 		[]runtime.WorkerResult{
 			{
 				Status:             runtime.WorkerStatusDone,
@@ -336,6 +332,19 @@ func TestRunTicket_ReviewDiffIncludesWorktreeOnlyFile(t *testing.T) {
 			},
 		},
 	)
+	// The worker commits ticket-only.txt during its execution; this is
+	// what the review diff should capture (a worker-attributed change).
+	adapter := &mutatingRuntimeAdapter{
+		Adapter: base,
+		onWorker: func() {
+			if err := os.WriteFile(filepath.Join(worktreePath, "ticket-only.txt"), []byte("worktree file\n"), 0o644); err != nil {
+				t.Errorf("write worktree-only file: %v", err)
+				return
+			}
+			mustRunGit(t, worktreePath, "add", "ticket-only.txt")
+			mustRunGit(t, worktreePath, "commit", "-m", "ticket-only change")
+		},
+	}
 
 	_, err = RunTicket(context.Background(), RunTicketRequest{
 		RepoRoot:     repoRoot,
@@ -912,9 +921,10 @@ func TestRunTicket_ScopeViolationBlocksTicket(t *testing.T) {
 
 	cfg := policy.DefaultConfig()
 	ticket := epos.Ticket{
-		ID:         "ver-scope-viol",
-		Title:      "Ticket ver-scope-viol",
-		OwnedPaths: []string{"internal/engine"},
+		ID:                 "ver-scope-viol",
+		Title:              "Ticket ver-scope-viol",
+		AcceptanceCriteria: []string{"verk test --x exits 0"},
+		OwnedPaths:         []string{"internal/engine"},
 		UnknownFrontmatter: map[string]any{
 			"type": "task",
 		},
@@ -986,8 +996,18 @@ func TestRunTicket_ScopeCheckBlocksWhenOwnedPathsEmpty(t *testing.T) {
 	mustRunGit(t, repoRoot, "commit", "-m", "change")
 
 	cfg := policy.DefaultConfig()
-	// No OwnedPaths set - G9 requires scope checks to default to deny/fail-closed.
-	ticket := testTicket("ver-no-scope")
+	// OwnedPaths is set to a path that does NOT cover the worker-written file
+	// "anywhere/file.go", so the runtime scope check still fires. We can't
+	// leave OwnedPaths empty here because the deterministic ticket-quality
+	// gate (which runs earlier) would block on missing_owned_paths first,
+	// preventing the runtime scope check from being exercised.
+	ticket := epos.Ticket{
+		ID:                 "ver-no-scope",
+		Title:              "Ticket ver-no-scope",
+		AcceptanceCriteria: []string{"verk test --x exits 0"},
+		OwnedPaths:         []string{"internal/different"},
+		UnknownFrontmatter: map[string]any{"type": "task"},
+	}
 	plan, claim := testPlanAndClaim(t, repoRoot, ticket, cfg, "run-no-scope", "lease-no-scope", []string{`true`})
 
 	started, finished := testRunTimes()
@@ -1027,7 +1047,9 @@ func TestRunTicket_ScopeCheckBlocksWhenOwnedPathsEmpty(t *testing.T) {
 		Config:             cfg,
 		EnforceSingleScope: true,
 	})
-	// With no owned_paths, G9 requires scope checks to fail closed, so the ticket transitions to blocked.
+	// With owned_paths set to a path that does not cover the worker-written
+	// file, the runtime scope check fails closed and the ticket transitions
+	// to blocked.
 	if err != nil {
 		t.Fatalf("RunTicket returned error: %v", err)
 	}
@@ -1037,8 +1059,8 @@ func TestRunTicket_ScopeCheckBlocksWhenOwnedPathsEmpty(t *testing.T) {
 	if !strings.Contains(result.Snapshot.BlockReason, "single-ticket scope violation") {
 		t.Fatalf("expected scope violation block reason, got %q", result.Snapshot.BlockReason)
 	}
-	if !strings.Contains(result.Snapshot.BlockReason, ticket.ID) {
-		t.Fatalf("expected block reason to contain ticket ID %q, got %q", ticket.ID, result.Snapshot.BlockReason)
+	if !strings.Contains(result.Snapshot.BlockReason, "anywhere/file.go") {
+		t.Fatalf("expected block reason to mention out-of-scope file, got %q", result.Snapshot.BlockReason)
 	}
 }
 
@@ -1048,25 +1070,18 @@ func TestRunTicket_ScopeMissingThenReopensToProceed(t *testing.T) {
 
 	runID := "run-scope-reopen"
 	ticketID := "ver-scope-reopen"
-	ticket := testTicket(ticketID)
-
-	// First run: no OwnedPaths set, so single-ticket scope check should block.
+	// First run: ticket has no OwnedPaths set, so the deterministic
+	// ticket-quality gate (which runs before the first worker) should block
+	// on missing_owned_paths before any worker is invoked.
+	ticket := epos.Ticket{
+		ID:                 ticketID,
+		Title:              "Ticket " + ticketID,
+		AcceptanceCriteria: []string{"verk test --x exits 0"},
+		UnknownFrontmatter: map[string]any{"type": "task"},
+	}
 	firstPlan, firstClaim := testPlanAndClaim(t, repoRoot, ticket, cfg, runID, "lease-scope-reopen-empty", []string{`true`})
 
-	started, finished := testRunTimes()
-	firstAdapter := runtimefake.New(
-		[]runtime.WorkerResult{
-			{
-				Status:             runtime.WorkerStatusDone,
-				RetryClass:         runtime.RetryClassTerminal,
-				LeaseID:            firstClaim.LeaseID,
-				StartedAt:          started,
-				FinishedAt:         finished,
-				ResultArtifactPath: filepath.Join(repoRoot, "worker-empty.json"),
-			},
-		},
-		nil,
-	)
+	firstAdapter := runtimefake.New(nil, nil)
 
 	blockedResult, err := RunTicket(context.Background(), RunTicketRequest{
 		RepoRoot:           repoRoot,
@@ -1084,8 +1099,11 @@ func TestRunTicket_ScopeMissingThenReopensToProceed(t *testing.T) {
 	if blockedResult.Snapshot.CurrentPhase != state.TicketPhaseBlocked {
 		t.Fatalf("expected blocked phase on first run, got %q", blockedResult.Snapshot.CurrentPhase)
 	}
-	if !strings.Contains(blockedResult.Snapshot.BlockReason, "single-ticket scope violation") {
-		t.Fatalf("expected scope violation block reason, got %q", blockedResult.Snapshot.BlockReason)
+	if blockedResult.Snapshot.BlockReason == "" {
+		t.Fatalf("expected non-empty block reason on first run, got empty")
+	}
+	if len(firstAdapter.WorkerRequests()) != 0 {
+		t.Fatalf("expected no worker invocations when quality gate blocks, got %d", len(firstAdapter.WorkerRequests()))
 	}
 
 	// Simulate reopen flow artifacts that would normally exist in an epic run.
@@ -1147,7 +1165,7 @@ func TestRunTicket_ScopeMissingThenReopensToProceed(t *testing.T) {
 		[]string{`true`},
 	)
 
-	started, finished = testRunTimes()
+	started, finished := testRunTimes()
 	reopenedAdapter := runtimefake.New(
 		[]runtime.WorkerResult{
 			{
@@ -1314,6 +1332,12 @@ func testTicket(id string) epos.Ticket {
 	return epos.Ticket{
 		ID:    id,
 		Title: "Ticket " + id,
+		// Minimal fields to satisfy the deterministic ticket-quality gate that
+		// runs before the first worker in RunTicket. Tests that need a failing
+		// quality gate, or a specific scope/owned-paths setup, should
+		// construct an inline epos.Ticket instead of using this helper.
+		AcceptanceCriteria: []string{"verk test --x exits 0"},
+		OwnedPaths:         []string{"internal/test"},
 		UnknownFrontmatter: map[string]any{
 			"type": "task",
 		},
@@ -1383,6 +1407,13 @@ func (a *sleepyRuntimeAdapter) RunReviewer(ctx context.Context, req runtime.Revi
 		return runtime.ReviewResult{}, ctx.Err()
 	}
 	return a.reviewResult, nil
+}
+
+func (a *sleepyRuntimeAdapter) RunIntent(ctx context.Context, req runtime.IntentRequest) (runtime.IntentResult, error) {
+	if err := ctx.Err(); err != nil {
+		return runtime.IntentResult{}, err
+	}
+	return runtime.IntentResult{TargetFiles: req.OwnedPaths, TestPlan: "test"}, nil
 }
 
 func TestRunTicket_ChangedFilesCaptured(t *testing.T) {
@@ -1537,9 +1568,12 @@ func testRunTimes() (time.Time, time.Time) {
 }
 
 func TestCollectDiff_ReturnsErrorOnInvalidRepo(t *testing.T) {
-	_, err := collectDiff("/nonexistent/path/that/does/not/exist", "abc123")
+	diff, err := collectDiff("/nonexistent/path/that/does/not/exist", "abc123")
 	if err == nil {
 		t.Fatal("expected error from collectDiff with invalid repo path")
+	}
+	if diff != "" {
+		t.Fatalf("expected empty diff on error, got %q", diff)
 	}
 }
 
@@ -1552,9 +1586,12 @@ func TestCollectDiff_ReturnsErrorOnInvalidBaseCommit(t *testing.T) {
 	mustRunGit(t, repoRoot, "add", "file.txt")
 	mustRunGit(t, repoRoot, "commit", "-m", "initial")
 
-	_, err := collectDiff(repoRoot, "nonexistent-commit-hash")
+	diff, err := collectDiff(repoRoot, "nonexistent-commit-hash")
 	if err == nil {
 		t.Fatal("expected error from collectDiff with invalid base commit")
+	}
+	if diff != "" {
+		t.Fatalf("expected empty diff on error, got %q", diff)
 	}
 }
 
@@ -2028,6 +2065,375 @@ func TestTicketRunState_snapshotOutcome(t *testing.T) {
 				t.Fatalf("expected outcome %q for phase %q, got %q", tc.want, tc.phase, snap.Outcome)
 			}
 		})
+	}
+}
+
+// TestClassifyTicketStop covers the deterministic outcome rules.
+func TestClassifyTicketStop(t *testing.T) {
+	cases := []struct {
+		name  string
+		phase state.TicketPhase
+		kind  stopKind
+		want  state.TicketOutcome
+	}{
+		{
+			name:  "cancelled_kind",
+			phase: state.TicketPhaseImplement,
+			kind:  stopKindCancelled,
+			want:  state.TicketOutcomeCancelled,
+		},
+		{
+			name:  "needs_context_kind",
+			phase: state.TicketPhaseImplement,
+			kind:  stopKindNeedsContext,
+			want:  state.TicketOutcomeBlocked,
+		},
+		{
+			name:  "claim_lost_kind",
+			phase: state.TicketPhaseReview,
+			kind:  stopKindClaimLost,
+			want:  state.TicketOutcomeBlocked,
+		},
+		{
+			name:  "budget_exhausted_kind",
+			phase: state.TicketPhaseVerify,
+			kind:  stopKindBudgetExhausted,
+			want:  state.TicketOutcomeNeedsDecision,
+		},
+		{
+			name:  "scope_violation_kind",
+			phase: state.TicketPhaseVerify,
+			kind:  stopKindScopeViolation,
+			want:  state.TicketOutcomeNeedsDecision,
+		},
+		{
+			name:  "generic_kind_falls_back_to_blocked",
+			phase: state.TicketPhaseImplement,
+			kind:  stopKindGeneric,
+			want:  state.TicketOutcomeBlocked,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := classifyTicketStop(tc.phase, tc.kind)
+			if got != tc.want {
+				t.Fatalf("classifyTicketStop(%q, %d) = %q, want %q", tc.phase, tc.kind, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestTicketRunState_snapshotPrefersCurrentOutcome verifies that an explicitly
+// set currentOutcome wins over the phase-derived fallback.
+func TestTicketRunState_snapshotPrefersCurrentOutcome(t *testing.T) {
+	st := &ticketRunState{
+		req: RunTicketRequest{
+			RunID:  "run-outcome-pref",
+			Ticket: epos.Ticket{ID: "ver-outcome-pref"},
+		},
+		currentPhase:   state.TicketPhaseBlocked,
+		currentOutcome: state.TicketOutcomeNeedsDecision,
+	}
+	snap := st.snapshot()
+	if snap.Outcome != state.TicketOutcomeNeedsDecision {
+		t.Fatalf("expected needs_decision outcome, got %q", snap.Outcome)
+	}
+}
+
+// TestRunTicket_VerificationBudgetExhaustionIsNeedsDecision verifies that when
+// the implementation attempt budget runs out, the outcome is needs_decision (not
+// the generic blocked).
+func TestRunTicket_VerificationBudgetExhaustionIsNeedsDecision(t *testing.T) {
+	repoRoot := t.TempDir()
+	cfg := policy.DefaultConfig()
+	cfg.Policy.MaxImplementationAttempts = 1
+	ticket := testTicket("ver-budget-exhausted")
+	plan, claim := testPlanAndClaim(t, repoRoot, ticket, cfg, "run-budget-exhausted", "lease-budget-exhausted", []string{`exit 1`})
+
+	started, finished := testRunTimes()
+	adapter := runtimefake.New(
+		[]runtime.WorkerResult{
+			{
+				Status:             runtime.WorkerStatusDone,
+				RetryClass:         runtime.RetryClassTerminal,
+				LeaseID:            claim.LeaseID,
+				StartedAt:          started,
+				FinishedAt:         finished,
+				ResultArtifactPath: filepath.Join(repoRoot, "worker.json"),
+			},
+		},
+		nil,
+	)
+
+	result, err := RunTicket(context.Background(), RunTicketRequest{
+		RepoRoot: repoRoot,
+		RunID:    "run-budget-exhausted",
+		Ticket:   ticket,
+		Plan:     plan,
+		Claim:    claim,
+		Adapter:  adapter,
+		Config:   cfg,
+	})
+	if err != nil {
+		t.Fatalf("RunTicket returned error: %v", err)
+	}
+	if result.Snapshot.CurrentPhase != state.TicketPhaseBlocked {
+		t.Fatalf("expected blocked phase, got %q", result.Snapshot.CurrentPhase)
+	}
+	if result.Snapshot.Outcome != state.TicketOutcomeNeedsDecision {
+		t.Fatalf("expected needs_decision outcome for budget exhaustion, got %q", result.Snapshot.Outcome)
+	}
+}
+
+// TestRunTicket_RepairBudgetExhaustionIsNeedsDecision verifies that when the
+// repair cycle budget runs out, the outcome is needs_decision.
+func TestRunTicket_RepairBudgetExhaustionIsNeedsDecision(t *testing.T) {
+	repoRoot := t.TempDir()
+	cfg := policy.DefaultConfig()
+	cfg.Policy.MaxRepairCycles = 1
+	ticket := testTicket("ver-repair-budget")
+	plan, claim := testPlanAndClaim(t, repoRoot, ticket, cfg, "run-repair-budget", "lease-repair-budget", []string{`true`})
+
+	started, finished := testRunTimes()
+	blockingFinding := runtime.ReviewFinding{
+		ID:          "finding-1",
+		Severity:    runtime.SeverityP2,
+		Title:       "blocking issue",
+		Body:        "blocking issue",
+		File:        "internal/example.go",
+		Line:        12,
+		Disposition: runtime.ReviewDispositionOpen,
+	}
+	adapter := runtimefake.New(
+		[]runtime.WorkerResult{
+			{
+				Status:             runtime.WorkerStatusDone,
+				RetryClass:         runtime.RetryClassTerminal,
+				LeaseID:            claim.LeaseID,
+				StartedAt:          started,
+				FinishedAt:         finished,
+				ResultArtifactPath: filepath.Join(repoRoot, "worker-1.json"),
+			},
+			{
+				Status:             runtime.WorkerStatusDone,
+				RetryClass:         runtime.RetryClassTerminal,
+				LeaseID:            claim.LeaseID,
+				StartedAt:          finished.Add(3 * time.Second),
+				FinishedAt:         finished.Add(4 * time.Second),
+				ResultArtifactPath: filepath.Join(repoRoot, "worker-2.json"),
+			},
+		},
+		[]runtime.ReviewResult{
+			{
+				Status:             runtime.WorkerStatusDone,
+				RetryClass:         runtime.RetryClassTerminal,
+				LeaseID:            claim.LeaseID,
+				StartedAt:          finished.Add(5 * time.Second),
+				FinishedAt:         finished.Add(6 * time.Second),
+				ReviewStatus:       runtime.ReviewStatusFindings,
+				Summary:            "needs repair",
+				Findings:           []runtime.ReviewFinding{blockingFinding},
+				ResultArtifactPath: filepath.Join(repoRoot, "review-1.json"),
+			},
+			{
+				Status:             runtime.WorkerStatusDone,
+				RetryClass:         runtime.RetryClassTerminal,
+				LeaseID:            claim.LeaseID,
+				StartedAt:          finished.Add(7 * time.Second),
+				FinishedAt:         finished.Add(8 * time.Second),
+				ReviewStatus:       runtime.ReviewStatusFindings,
+				Summary:            "still blocked",
+				Findings:           []runtime.ReviewFinding{blockingFinding},
+				ResultArtifactPath: filepath.Join(repoRoot, "review-2.json"),
+			},
+		},
+	)
+
+	result, err := RunTicket(context.Background(), RunTicketRequest{
+		RepoRoot: repoRoot,
+		RunID:    "run-repair-budget",
+		Ticket:   ticket,
+		Plan:     plan,
+		Claim:    claim,
+		Adapter:  adapter,
+		Config:   cfg,
+	})
+	if err != nil {
+		t.Fatalf("RunTicket returned error: %v", err)
+	}
+	if result.Snapshot.CurrentPhase != state.TicketPhaseBlocked {
+		t.Fatalf("expected blocked phase, got %q", result.Snapshot.CurrentPhase)
+	}
+	if result.Snapshot.Outcome != state.TicketOutcomeNeedsDecision {
+		t.Fatalf("expected needs_decision outcome for repair budget exhaustion, got %q", result.Snapshot.Outcome)
+	}
+}
+
+// TestRunTicket_NeedsContextOutcomeIsBlocked verifies that worker needs_context
+// sets outcome=blocked.
+func TestRunTicket_NeedsContextOutcomeIsBlocked(t *testing.T) {
+	repoRoot := t.TempDir()
+	cfg := policy.DefaultConfig()
+	ticket := testTicket("ver-needs-ctx-outcome")
+	plan, claim := testPlanAndClaim(t, repoRoot, ticket, cfg, "run-needs-ctx-outcome", "lease-needs-ctx-outcome", []string{`true`})
+
+	started, finished := testRunTimes()
+	adapter := runtimefake.New(
+		[]runtime.WorkerResult{
+			{
+				Status:             runtime.WorkerStatusNeedsContext,
+				CompletionCode:     "needs_context",
+				BlockReason:        "missing API key",
+				RetryClass:         runtime.RetryClassTerminal,
+				LeaseID:            claim.LeaseID,
+				StartedAt:          started,
+				FinishedAt:         finished,
+				ResultArtifactPath: filepath.Join(repoRoot, "worker.json"),
+			},
+		},
+		nil,
+	)
+
+	result, err := RunTicket(context.Background(), RunTicketRequest{
+		RepoRoot: repoRoot,
+		RunID:    "run-needs-ctx-outcome",
+		Ticket:   ticket,
+		Plan:     plan,
+		Claim:    claim,
+		Adapter:  adapter,
+		Config:   cfg,
+	})
+	if err != nil {
+		t.Fatalf("RunTicket returned error: %v", err)
+	}
+	if result.Snapshot.CurrentPhase != state.TicketPhaseBlocked {
+		t.Fatalf("expected blocked phase, got %q", result.Snapshot.CurrentPhase)
+	}
+	if result.Snapshot.Outcome != state.TicketOutcomeBlocked {
+		t.Fatalf("expected blocked outcome for needs_context, got %q", result.Snapshot.Outcome)
+	}
+}
+
+// TestRunTicket_ScopeViolationOutcomeIsNeedsDecision verifies that scope
+// violations produce needs_decision, not the generic blocked.
+func TestRunTicket_ScopeViolationOutcomeIsNeedsDecision(t *testing.T) {
+	repoRoot := t.TempDir()
+
+	mustRunGit(t, repoRoot, "init")
+	if err := os.WriteFile(filepath.Join(repoRoot, "tracked.txt"), []byte("base\n"), 0o644); err != nil {
+		t.Fatalf("seed repo: %v", err)
+	}
+	mustRunGit(t, repoRoot, "add", "tracked.txt")
+	mustRunGit(t, repoRoot, "commit", "-m", "base")
+
+	headOut, err := gitOutput(repoRoot, "rev-parse", "HEAD")
+	if err != nil {
+		t.Fatalf("rev-parse HEAD: %v", err)
+	}
+	baseCommit := strings.TrimSpace(headOut)
+
+	outsideDir := filepath.Join(repoRoot, "outside")
+	if err := os.MkdirAll(outsideDir, 0o755); err != nil {
+		t.Fatalf("mkdir outside: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(outsideDir, "violation.go"), []byte("package outside\n"), 0o644); err != nil {
+		t.Fatalf("write violation file: %v", err)
+	}
+	mustRunGit(t, repoRoot, "add", "outside/violation.go")
+	mustRunGit(t, repoRoot, "commit", "-m", "out-of-scope change")
+
+	cfg := policy.DefaultConfig()
+	ticket := epos.Ticket{
+		ID:                 "ver-scope-outcome",
+		Title:              "Ticket ver-scope-outcome",
+		AcceptanceCriteria: []string{"verk test --x exits 0"},
+		OwnedPaths:         []string{"internal/engine"},
+		UnknownFrontmatter: map[string]any{
+			"type": "task",
+		},
+	}
+	plan, claim := testPlanAndClaim(t, repoRoot, ticket, cfg, "run-scope-outcome", "lease-scope-outcome", []string{`true`})
+
+	started, finished := testRunTimes()
+	adapter := runtimefake.New(
+		[]runtime.WorkerResult{
+			{
+				Status:             runtime.WorkerStatusDone,
+				RetryClass:         runtime.RetryClassTerminal,
+				LeaseID:            claim.LeaseID,
+				StartedAt:          started,
+				FinishedAt:         finished,
+				ResultArtifactPath: filepath.Join(repoRoot, "worker.json"),
+			},
+		},
+		nil,
+	)
+
+	result, err := RunTicket(context.Background(), RunTicketRequest{
+		RepoRoot:           repoRoot,
+		RunID:              "run-scope-outcome",
+		BaseCommit:         baseCommit,
+		Ticket:             ticket,
+		Plan:               plan,
+		Claim:              claim,
+		Adapter:            adapter,
+		Config:             cfg,
+		EnforceSingleScope: true,
+	})
+	if err != nil {
+		t.Fatalf("RunTicket returned error: %v", err)
+	}
+	if result.Snapshot.CurrentPhase != state.TicketPhaseBlocked {
+		t.Fatalf("expected blocked phase, got %q", result.Snapshot.CurrentPhase)
+	}
+	if result.Snapshot.Outcome != state.TicketOutcomeNeedsDecision {
+		t.Fatalf("expected needs_decision outcome for scope violation, got %q", result.Snapshot.Outcome)
+	}
+}
+
+// TestRunTicket_OperatorCancellationIsOutcomeCancelled verifies that when a
+// worker returns RetryClassBlockedByOperatorInput, the outcome is cancelled.
+func TestRunTicket_OperatorCancellationIsOutcomeCancelled(t *testing.T) {
+	repoRoot := t.TempDir()
+	cfg := policy.DefaultConfig()
+	ticket := testTicket("ver-op-cancel")
+	plan, claim := testPlanAndClaim(t, repoRoot, ticket, cfg, "run-op-cancel", "lease-op-cancel", []string{`true`})
+
+	started, finished := testRunTimes()
+	adapter := runtimefake.New(
+		[]runtime.WorkerResult{
+			{
+				Status:             runtime.WorkerStatusBlocked,
+				CompletionCode:     "operator_cancelled",
+				BlockReason:        "operator cancelled the run",
+				RetryClass:         runtime.RetryClassBlockedByOperatorInput,
+				LeaseID:            claim.LeaseID,
+				StartedAt:          started,
+				FinishedAt:         finished,
+				ResultArtifactPath: filepath.Join(repoRoot, "worker.json"),
+			},
+		},
+		nil,
+	)
+
+	result, err := RunTicket(context.Background(), RunTicketRequest{
+		RepoRoot: repoRoot,
+		RunID:    "run-op-cancel",
+		Ticket:   ticket,
+		Plan:     plan,
+		Claim:    claim,
+		Adapter:  adapter,
+		Config:   cfg,
+	})
+	if err != nil {
+		t.Fatalf("RunTicket returned error: %v", err)
+	}
+	if result.Snapshot.CurrentPhase != state.TicketPhaseBlocked {
+		t.Fatalf("expected blocked phase, got %q", result.Snapshot.CurrentPhase)
+	}
+	if result.Snapshot.Outcome != state.TicketOutcomeCancelled {
+		t.Fatalf("expected cancelled outcome for operator input block, got %q", result.Snapshot.Outcome)
 	}
 }
 
@@ -2977,5 +3383,832 @@ func TestBuildImplementPhaseInstructions_RetryWithoutVerificationCyclesUnchanged
 	want := renderImplementInstructions(plan, state.TicketPhaseImplement, 2)
 	if got != want {
 		t.Fatalf("expected retry with only review cycles to return base instructions unchanged")
+	}
+}
+
+// mutatingRuntimeAdapter wraps runtimefake.Adapter and calls an optional hook
+// during RunWorker so tests can mutate files while the worker is "running".
+type mutatingRuntimeAdapter struct {
+	*runtimefake.Adapter
+	onWorker func()
+}
+
+func (a *mutatingRuntimeAdapter) RunWorker(ctx context.Context, req runtime.WorkerRequest) (runtime.WorkerResult, error) {
+	if a.onWorker != nil {
+		a.onWorker()
+	}
+	return a.Adapter.RunWorker(ctx, req)
+}
+
+// TestRunTicket_ReviewDiffExcludesPreExistingDirtyFiles verifies that dirty
+// files present before RunTicket are not included in the review diff unless
+// the worker further modifies them.
+func TestRunTicket_ReviewDiffExcludesPreExistingDirtyFiles(t *testing.T) {
+	repoRoot := t.TempDir()
+	baseCommit := initEpicRepo(t, repoRoot)
+	stubToolSignals(t, ToolSignals{}) // no derived checks — keeps verify deterministic
+
+	// Create a tracked dirty file pre-existing before RunTicket.
+	trackedDirty := filepath.Join(repoRoot, "tracked.txt")
+	if err := os.WriteFile(trackedDirty, []byte("dirty-before-run\n"), 0o644); err != nil {
+		t.Fatalf("write tracked dirty: %v", err)
+	}
+
+	// Create an untracked dirty file pre-existing before RunTicket.
+	untrackedDirty := filepath.Join(repoRoot, "untracked-dirty.txt")
+	if err := os.WriteFile(untrackedDirty, []byte("untracked dirty\n"), 0o644); err != nil {
+		t.Fatalf("write untracked dirty: %v", err)
+	}
+
+	cfg := policy.DefaultConfig()
+	ticket := testTicket("ver-review-delta-preexist")
+	plan, claim := testPlanAndClaim(t, repoRoot, ticket, cfg, "run-review-delta-preexist", "lease-review-delta-preexist", []string{`true`})
+
+	started, finished := testRunTimes()
+
+	// The worker creates a new file — this is the only thing it should write.
+	// Use a .md file so Go test derivation (addGoChecks) doesn't trigger.
+	workerFile := filepath.Join(repoRoot, "src", "worker-output.md")
+
+	base := runtimefake.New(
+		[]runtime.WorkerResult{{
+			Status:             runtime.WorkerStatusDone,
+			RetryClass:         runtime.RetryClassTerminal,
+			LeaseID:            claim.LeaseID,
+			StartedAt:          started,
+			FinishedAt:         finished,
+			ResultArtifactPath: filepath.Join(repoRoot, "worker.json"),
+		}},
+		[]runtime.ReviewResult{{
+			Status:             runtime.WorkerStatusDone,
+			RetryClass:         runtime.RetryClassTerminal,
+			LeaseID:            claim.LeaseID,
+			StartedAt:          finished.Add(time.Second),
+			FinishedAt:         finished.Add(2 * time.Second),
+			ReviewStatus:       runtime.ReviewStatusPassed,
+			Summary:            "clean",
+			ResultArtifactPath: filepath.Join(repoRoot, "review.json"),
+		}},
+	)
+	adapter := &mutatingRuntimeAdapter{
+		Adapter: base,
+		onWorker: func() {
+			if err := os.MkdirAll(filepath.Dir(workerFile), 0o755); err != nil {
+				t.Errorf("mkdir worker output dir: %v", err)
+				return
+			}
+			if err := os.WriteFile(workerFile, []byte("# worker output\n"), 0o644); err != nil {
+				t.Errorf("write worker file: %v", err)
+			}
+		},
+	}
+
+	_, err := RunTicket(context.Background(), RunTicketRequest{
+		RepoRoot:   repoRoot,
+		RunID:      "run-review-delta-preexist",
+		BaseCommit: baseCommit,
+		Ticket:     ticket,
+		Plan:       plan,
+		Claim:      claim,
+		Adapter:    adapter,
+		Config:     cfg,
+	})
+	if err != nil {
+		t.Fatalf("RunTicket error: %v", err)
+	}
+	if len(adapter.ReviewRequests()) != 1 {
+		t.Fatalf("expected 1 review request, got %d", len(adapter.ReviewRequests()))
+	}
+	reviewReq := adapter.ReviewRequests()[0]
+
+	// Worker file content must appear in the diff.
+	if !strings.Contains(reviewReq.Diff, "worker-output.md") {
+		t.Errorf("expected worker file in review diff; diff:\n%s", reviewReq.Diff)
+	}
+	if !strings.Contains(reviewReq.Diff, "# worker output") {
+		t.Errorf("expected worker file content in review diff; diff:\n%s", reviewReq.Diff)
+	}
+
+	// Pre-existing dirty tracked file must NOT appear in diff.
+	if strings.Contains(reviewReq.Diff, "dirty-before-run") {
+		t.Errorf("pre-existing tracked dirty content must not appear in review diff; diff:\n%s", reviewReq.Diff)
+	}
+
+	// ChangedFiles must contain only the worker file.
+	if len(reviewReq.ChangedFiles) != 1 || reviewReq.ChangedFiles[0] != "src/worker-output.md" {
+		t.Errorf("expected ChangedFiles=[src/worker-output.md], got %v", reviewReq.ChangedFiles)
+	}
+}
+
+// TestRunTicket_ReviewDiffIncludesUntrackedWorkerFile verifies that an
+// untracked file created by the worker appears in the review diff with the
+// expected git diff markers.
+func TestRunTicket_ReviewDiffIncludesUntrackedWorkerFile(t *testing.T) {
+	repoRoot := t.TempDir()
+	baseCommit := initEpicRepo(t, repoRoot)
+	stubToolSignals(t, ToolSignals{}) // no derived checks
+
+	cfg := policy.DefaultConfig()
+	ticket := testTicket("ver-review-delta-untracked")
+	plan, claim := testPlanAndClaim(t, repoRoot, ticket, cfg, "run-review-delta-untracked", "lease-review-delta-untracked", []string{`true`})
+
+	started, finished := testRunTimes()
+
+	newWorkerFile := filepath.Join(repoRoot, "docs", "new-worker-file.md")
+
+	base := runtimefake.New(
+		[]runtime.WorkerResult{{
+			Status:             runtime.WorkerStatusDone,
+			RetryClass:         runtime.RetryClassTerminal,
+			LeaseID:            claim.LeaseID,
+			StartedAt:          started,
+			FinishedAt:         finished,
+			ResultArtifactPath: filepath.Join(repoRoot, "worker.json"),
+		}},
+		[]runtime.ReviewResult{{
+			Status:             runtime.WorkerStatusDone,
+			RetryClass:         runtime.RetryClassTerminal,
+			LeaseID:            claim.LeaseID,
+			StartedAt:          finished.Add(time.Second),
+			FinishedAt:         finished.Add(2 * time.Second),
+			ReviewStatus:       runtime.ReviewStatusPassed,
+			Summary:            "clean",
+			ResultArtifactPath: filepath.Join(repoRoot, "review.json"),
+		}},
+	)
+	adapter := &mutatingRuntimeAdapter{
+		Adapter: base,
+		onWorker: func() {
+			if err := os.MkdirAll(filepath.Dir(newWorkerFile), 0o755); err != nil {
+				t.Errorf("mkdir docs: %v", err)
+				return
+			}
+			if err := os.WriteFile(newWorkerFile, []byte("# New worker doc\n"), 0o644); err != nil {
+				t.Errorf("write new worker file: %v", err)
+			}
+			mustRunGit(t, repoRoot, "add", "docs/new-worker-file.md")
+		},
+	}
+
+	_, err := RunTicket(context.Background(), RunTicketRequest{
+		RepoRoot:   repoRoot,
+		RunID:      "run-review-delta-untracked",
+		BaseCommit: baseCommit,
+		Ticket:     ticket,
+		Plan:       plan,
+		Claim:      claim,
+		Adapter:    adapter,
+		Config:     cfg,
+	})
+	if err != nil {
+		t.Fatalf("RunTicket error: %v", err)
+	}
+	if len(adapter.ReviewRequests()) != 1 {
+		t.Fatalf("expected 1 review request, got %d", len(adapter.ReviewRequests()))
+	}
+	reviewReq := adapter.ReviewRequests()[0]
+
+	if !strings.Contains(reviewReq.Diff, "new file mode") {
+		t.Errorf("expected 'new file mode' in review diff for untracked file; diff:\n%s", reviewReq.Diff)
+	}
+	if !strings.Contains(reviewReq.Diff, "+++ b/docs/new-worker-file.md") {
+		t.Errorf("expected '+++ b/docs/new-worker-file.md' in review diff; diff:\n%s", reviewReq.Diff)
+	}
+	if !strings.Contains(reviewReq.Diff, "# New worker doc") {
+		t.Errorf("expected worker file content in review diff; diff:\n%s", reviewReq.Diff)
+	}
+}
+
+// TestRunTicket_ReviewChangedFilesMatchesWorkerDelta verifies that the
+// ReviewRequest.ChangedFiles field contains only worker-produced files,
+// excludes engine-owned paths (.verk/, .tickets/), and is sorted.
+func TestRunTicket_ReviewChangedFilesMatchesWorkerDelta(t *testing.T) {
+	repoRoot := t.TempDir()
+	baseCommit := initEpicRepo(t, repoRoot)
+	stubToolSignals(t, ToolSignals{}) // no derived checks
+
+	cfg := policy.DefaultConfig()
+	ticket := testTicket("ver-review-delta-changedfiles")
+	plan, claim := testPlanAndClaim(t, repoRoot, ticket, cfg, "run-review-delta-cf", "lease-review-delta-cf", []string{`true`})
+
+	started, finished := testRunTimes()
+
+	base := runtimefake.New(
+		[]runtime.WorkerResult{{
+			Status:             runtime.WorkerStatusDone,
+			RetryClass:         runtime.RetryClassTerminal,
+			LeaseID:            claim.LeaseID,
+			StartedAt:          started,
+			FinishedAt:         finished,
+			ResultArtifactPath: filepath.Join(repoRoot, "worker.json"),
+		}},
+		[]runtime.ReviewResult{{
+			Status:             runtime.WorkerStatusDone,
+			RetryClass:         runtime.RetryClassTerminal,
+			LeaseID:            claim.LeaseID,
+			StartedAt:          finished.Add(time.Second),
+			FinishedAt:         finished.Add(2 * time.Second),
+			ReviewStatus:       runtime.ReviewStatusPassed,
+			Summary:            "clean",
+			ResultArtifactPath: filepath.Join(repoRoot, "review.json"),
+		}},
+	)
+	adapter := &mutatingRuntimeAdapter{
+		Adapter: base,
+		onWorker: func() {
+			// Worker creates two user files. Use .md to avoid Go test derivation.
+			for _, entry := range []struct{ dir, name, content string }{
+				{"docs", "alpha.md", "# alpha\n"},
+				{"docs", "beta.md", "# beta\n"},
+			} {
+				dir := filepath.Join(repoRoot, entry.dir)
+				if err := os.MkdirAll(dir, 0o755); err != nil {
+					t.Errorf("mkdir %s: %v", dir, err)
+					return
+				}
+				if err := os.WriteFile(filepath.Join(dir, entry.name), []byte(entry.content), 0o644); err != nil {
+					t.Errorf("write %s/%s: %v", entry.dir, entry.name, err)
+				}
+			}
+		},
+	}
+
+	_, err := RunTicket(context.Background(), RunTicketRequest{
+		RepoRoot:   repoRoot,
+		RunID:      "run-review-delta-cf",
+		BaseCommit: baseCommit,
+		Ticket:     ticket,
+		Plan:       plan,
+		Claim:      claim,
+		Adapter:    adapter,
+		Config:     cfg,
+	})
+	if err != nil {
+		t.Fatalf("RunTicket error: %v", err)
+	}
+	if len(adapter.ReviewRequests()) != 1 {
+		t.Fatalf("expected 1 review request, got %d", len(adapter.ReviewRequests()))
+	}
+	reviewReq := adapter.ReviewRequests()[0]
+
+	// Engine-owned paths must not appear.
+	for _, f := range reviewReq.ChangedFiles {
+		if strings.HasPrefix(f, ".verk/") || strings.HasPrefix(f, ".tickets/") {
+			t.Errorf("engine-owned path %q must not appear in ReviewRequest.ChangedFiles", f)
+		}
+	}
+
+	// Worker files must be present and sorted.
+	want := []string{"docs/alpha.md", "docs/beta.md"}
+	if len(reviewReq.ChangedFiles) < len(want) {
+		t.Fatalf("expected at least %d ChangedFiles, got %v", len(want), reviewReq.ChangedFiles)
+	}
+	foundAlpha, foundBeta := false, false
+	for _, f := range reviewReq.ChangedFiles {
+		if f == "docs/alpha.md" {
+			foundAlpha = true
+		}
+		if f == "docs/beta.md" {
+			foundBeta = true
+		}
+	}
+	if !foundAlpha {
+		t.Errorf("expected docs/alpha.md in ChangedFiles, got %v", reviewReq.ChangedFiles)
+	}
+	if !foundBeta {
+		t.Errorf("expected docs/beta.md in ChangedFiles, got %v", reviewReq.ChangedFiles)
+	}
+
+	// Files must be sorted.
+	for i := 1; i < len(reviewReq.ChangedFiles); i++ {
+		if reviewReq.ChangedFiles[i-1] > reviewReq.ChangedFiles[i] {
+			t.Errorf("ChangedFiles not sorted: %v", reviewReq.ChangedFiles)
+			break
+		}
+	}
+}
+
+// TestRunTicket_RepairReviewDiffOnlyIncludesRepairDelta verifies that the
+// second review request (post-repair) contains only files changed by the repair
+// worker, not files changed by the initial implementation worker unless the
+// repair worker also touched them.
+//
+// Flow:
+//  1. Initial worker creates docs/impl.md (impl delta).
+//  2. First reviewer returns a blocking finding.
+//  3. Repair worker creates docs/repair-notes.md only (repair delta).
+//  4. Second reviewer request must contain docs/repair-notes.md.
+//  5. Second reviewer request must NOT contain docs/impl.md (impl worker did it).
+//
+// Note: .md files are used to avoid triggering Go-package derived checks which
+// would run go test in the temp dir and cause advisory repair loops.
+func TestRunTicket_RepairReviewDiffOnlyIncludesRepairDelta(t *testing.T) {
+	repoRoot := t.TempDir()
+	baseCommit := initEpicRepo(t, repoRoot)
+	stubToolSignals(t, ToolSignals{}) // no derived checks — keeps verify deterministic
+
+	cfg := policy.DefaultConfig()
+	ticket := testTicket("ver-repair-delta")
+	plan, claim := testPlanAndClaim(t, repoRoot, ticket, cfg, "run-repair-delta", "lease-repair-delta", []string{`true`})
+
+	started, finished := testRunTimes()
+
+	implFile := filepath.Join(repoRoot, "docs", "impl.md")
+	repairFile := filepath.Join(repoRoot, "docs", "repair-notes.md")
+
+	blockingFinding := runtime.ReviewFinding{
+		ID:          "finding-repair-delta",
+		Severity:    runtime.SeverityP2,
+		Title:       "missing repair notes",
+		Body:        "docs/impl.md has no accompanying repair notes.",
+		File:        "docs/impl.md",
+		Line:        1,
+		Disposition: runtime.ReviewDispositionOpen,
+	}
+
+	workerCallCount := 0
+	base := runtimefake.New(
+		[]runtime.WorkerResult{
+			// Initial implementation worker result.
+			{
+				Status:             runtime.WorkerStatusDone,
+				RetryClass:         runtime.RetryClassTerminal,
+				LeaseID:            claim.LeaseID,
+				StartedAt:          started,
+				FinishedAt:         finished,
+				ResultArtifactPath: filepath.Join(repoRoot, "worker-1.json"),
+			},
+			// Repair worker result.
+			{
+				Status:             runtime.WorkerStatusDone,
+				RetryClass:         runtime.RetryClassTerminal,
+				LeaseID:            claim.LeaseID,
+				StartedAt:          finished.Add(5 * time.Second),
+				FinishedAt:         finished.Add(6 * time.Second),
+				ResultArtifactPath: filepath.Join(repoRoot, "worker-repair.json"),
+			},
+		},
+		[]runtime.ReviewResult{
+			// First review: blocking finding triggers repair.
+			{
+				Status:             runtime.WorkerStatusDone,
+				RetryClass:         runtime.RetryClassTerminal,
+				LeaseID:            claim.LeaseID,
+				StartedAt:          finished.Add(2 * time.Second),
+				FinishedAt:         finished.Add(3 * time.Second),
+				ReviewStatus:       runtime.ReviewStatusFindings,
+				Summary:            "needs repair notes",
+				Findings:           []runtime.ReviewFinding{blockingFinding},
+				ResultArtifactPath: filepath.Join(repoRoot, "review-1.json"),
+			},
+			// Second review: passes after repair.
+			{
+				Status:             runtime.WorkerStatusDone,
+				RetryClass:         runtime.RetryClassTerminal,
+				LeaseID:            claim.LeaseID,
+				StartedAt:          finished.Add(7 * time.Second),
+				FinishedAt:         finished.Add(8 * time.Second),
+				ReviewStatus:       runtime.ReviewStatusPassed,
+				Summary:            "clean after repair",
+				ResultArtifactPath: filepath.Join(repoRoot, "review-2.json"),
+			},
+		},
+	)
+
+	adapter := &mutatingRuntimeAdapter{
+		Adapter: base,
+		onWorker: func() {
+			workerCallCount++
+			switch workerCallCount {
+			case 1:
+				// Initial worker: creates docs/impl.md.
+				if err := os.MkdirAll(filepath.Join(repoRoot, "docs"), 0o755); err != nil {
+					t.Errorf("mkdir docs: %v", err)
+					return
+				}
+				if err := os.WriteFile(implFile, []byte("# Implementation\n"), 0o644); err != nil {
+					t.Errorf("write impl.md: %v", err)
+				}
+			case 2:
+				// Repair worker: creates docs/repair-notes.md only — does NOT touch impl.md.
+				if err := os.WriteFile(repairFile, []byte("# Repair Notes\n"), 0o644); err != nil {
+					t.Errorf("write repair-notes.md: %v", err)
+				}
+			}
+		},
+	}
+
+	result, err := RunTicket(context.Background(), RunTicketRequest{
+		RepoRoot:   repoRoot,
+		RunID:      "run-repair-delta",
+		BaseCommit: baseCommit,
+		Ticket:     ticket,
+		Plan:       plan,
+		Claim:      claim,
+		Adapter:    adapter,
+		Config:     cfg,
+	})
+	if err != nil {
+		t.Fatalf("RunTicket returned error: %v", err)
+	}
+	if result.Snapshot.CurrentPhase != state.TicketPhaseClosed {
+		t.Fatalf("expected closed phase after repair, got %q (block=%q)",
+			result.Snapshot.CurrentPhase, result.Snapshot.BlockReason)
+	}
+	if len(adapter.ReviewRequests()) != 2 {
+		t.Fatalf("expected 2 review requests (initial + post-repair), got %d", len(adapter.ReviewRequests()))
+	}
+
+	// First review: should contain docs/impl.md (initial implementation delta).
+	firstReview := adapter.ReviewRequests()[0]
+	if !strings.Contains(firstReview.Diff, "docs/impl.md") {
+		t.Errorf("expected docs/impl.md in first review diff; diff:\n%s", firstReview.Diff)
+	}
+
+	// Second review: should contain docs/repair-notes.md (repair delta only).
+	secondReview := adapter.ReviewRequests()[1]
+	if !strings.Contains(secondReview.Diff, "docs/repair-notes.md") {
+		t.Errorf("expected docs/repair-notes.md in second (repair) review diff; diff:\n%s", secondReview.Diff)
+	}
+	// docs/impl.md was not touched by the repair worker — it must NOT appear in the repair delta.
+	if strings.Contains(secondReview.Diff, "docs/impl.md") {
+		t.Errorf("docs/impl.md must not appear in repair review diff (was only changed by initial worker); diff:\n%s", secondReview.Diff)
+	}
+
+	// ChangedFiles in the repair review must be exactly [docs/repair-notes.md].
+	repairChangedFiles := secondReview.ChangedFiles
+	if len(repairChangedFiles) != 1 || repairChangedFiles[0] != "docs/repair-notes.md" {
+		t.Errorf("expected repair review ChangedFiles=[docs/repair-notes.md], got %v", repairChangedFiles)
+	}
+}
+
+// TestRunTicket_ReviewerDoesNotReceiveUnrelatedDirtyWorktree is the primary
+// user-facing regression guard for the "dirty worktree pollutes reviewer" bug.
+//
+// Before RunTicket the repo contains:
+//   - a tracked dirty file at unrelated/tracked.txt (modified but not committed)
+//   - an untracked file at unrelated/untracked.txt
+//
+// The worker creates owned/worker.md (and nothing else).
+//
+// The review request must contain only owned/worker.md and must not mention
+// any path under unrelated/.
+func TestRunTicket_ReviewerDoesNotReceiveUnrelatedDirtyWorktree(t *testing.T) {
+	repoRoot := t.TempDir()
+	baseCommit := initEpicRepo(t, repoRoot)
+	stubToolSignals(t, ToolSignals{}) // no derived checks
+
+	// Write a tracked dirty file under unrelated/ before RunTicket.
+	if err := os.MkdirAll(filepath.Join(repoRoot, "unrelated"), 0o755); err != nil {
+		t.Fatalf("mkdir unrelated: %v", err)
+	}
+	trackedDirty := filepath.Join(repoRoot, "unrelated", "tracked.txt")
+	mustRunGit(t, repoRoot, "add", "unrelated")
+	if err := os.WriteFile(trackedDirty, []byte("pre-existing tracked content\n"), 0o644); err != nil {
+		t.Fatalf("write unrelated/tracked.txt: %v", err)
+	}
+	// Stage it so it is a tracked dirty file (added but not committed).
+	mustRunGit(t, repoRoot, "add", "unrelated/tracked.txt")
+
+	// Write an untracked file under unrelated/ before RunTicket.
+	untrackedDirty := filepath.Join(repoRoot, "unrelated", "untracked.txt")
+	if err := os.WriteFile(untrackedDirty, []byte("pre-existing untracked content\n"), 0o644); err != nil {
+		t.Fatalf("write unrelated/untracked.txt: %v", err)
+	}
+
+	cfg := policy.DefaultConfig()
+	ticket := testTicket("ver-unrelated-dirty")
+	plan, claim := testPlanAndClaim(t, repoRoot, ticket, cfg, "run-unrelated-dirty", "lease-unrelated-dirty", []string{`true`})
+
+	started, finished := testRunTimes()
+
+	workerFile := filepath.Join(repoRoot, "owned", "worker.md")
+
+	base := runtimefake.New(
+		[]runtime.WorkerResult{{
+			Status:             runtime.WorkerStatusDone,
+			RetryClass:         runtime.RetryClassTerminal,
+			LeaseID:            claim.LeaseID,
+			StartedAt:          started,
+			FinishedAt:         finished,
+			ResultArtifactPath: filepath.Join(repoRoot, "worker.json"),
+		}},
+		[]runtime.ReviewResult{{
+			Status:             runtime.WorkerStatusDone,
+			RetryClass:         runtime.RetryClassTerminal,
+			LeaseID:            claim.LeaseID,
+			StartedAt:          finished.Add(time.Second),
+			FinishedAt:         finished.Add(2 * time.Second),
+			ReviewStatus:       runtime.ReviewStatusPassed,
+			Summary:            "clean",
+			ResultArtifactPath: filepath.Join(repoRoot, "review.json"),
+		}},
+	)
+	adapter := &mutatingRuntimeAdapter{
+		Adapter: base,
+		onWorker: func() {
+			if err := os.MkdirAll(filepath.Dir(workerFile), 0o755); err != nil {
+				t.Errorf("mkdir owned: %v", err)
+				return
+			}
+			if err := os.WriteFile(workerFile, []byte("# worker output\n"), 0o644); err != nil {
+				t.Errorf("write owned/worker.md: %v", err)
+			}
+		},
+	}
+
+	_, err := RunTicket(context.Background(), RunTicketRequest{
+		RepoRoot:   repoRoot,
+		RunID:      "run-unrelated-dirty",
+		BaseCommit: baseCommit,
+		Ticket:     ticket,
+		Plan:       plan,
+		Claim:      claim,
+		Adapter:    adapter,
+		Config:     cfg,
+	})
+	if err != nil {
+		t.Fatalf("RunTicket error: %v", err)
+	}
+	if len(adapter.ReviewRequests()) != 1 {
+		t.Fatalf("expected 1 review request, got %d", len(adapter.ReviewRequests()))
+	}
+	reviewReq := adapter.ReviewRequests()[0]
+
+	// The worker-created file must appear in the diff.
+	if !strings.Contains(reviewReq.Diff, "owned/worker.md") {
+		t.Errorf("expected owned/worker.md in review diff; diff:\n%s", reviewReq.Diff)
+	}
+
+	// Unrelated dirty files must NOT appear in the diff or ChangedFiles.
+	if strings.Contains(reviewReq.Diff, "unrelated/") {
+		t.Errorf("unrelated/ paths must not appear in review diff; diff:\n%s", reviewReq.Diff)
+	}
+	for _, f := range reviewReq.ChangedFiles {
+		if strings.HasPrefix(f, "unrelated/") {
+			t.Errorf("unrelated path %q must not appear in ReviewRequest.ChangedFiles", f)
+		}
+	}
+
+	// The review prompt must not mention unrelated paths either.
+	prompt := runtime.BuildReviewPrompt(reviewReq)
+	if strings.Contains(prompt, "unrelated/") {
+		t.Errorf("unrelated/ paths must not appear in review prompt; prompt:\n%s", prompt)
+	}
+}
+
+// TestRunTicket_BlocksBeforeWorkerWhenTicketQualityFails asserts that a
+// single-ticket run whose ticket fails the deterministic ticket-quality
+// evaluator returns a Blocked result WITHOUT invoking any worker. The gate
+// runs in the early-init phase of RunTicket before the implement loop.
+func TestRunTicket_BlocksBeforeWorkerWhenTicketQualityFails(t *testing.T) {
+	repoRoot := t.TempDir()
+	cfg := policy.DefaultConfig()
+	runID := "run-tq-block"
+
+	// Ticket has no acceptance criteria, no test cases, no validation
+	// commands, and no owned paths. The deterministic gate raises two P1
+	// findings (missing AC, missing owned paths); the default block
+	// threshold is P2 so the gate blocks.
+	ticket := epos.Ticket{
+		ID:    "ver-tq-block",
+		Title: "Ticket ver-tq-block",
+		UnknownFrontmatter: map[string]any{
+			"type": "task",
+		},
+	}
+	plan, claim := testPlanAndClaim(t, repoRoot, ticket, cfg, runID, "lease-tq-block", nil)
+
+	adapter := runtimefake.New(nil, nil)
+
+	result, err := RunTicket(context.Background(), RunTicketRequest{
+		RepoRoot: repoRoot,
+		RunID:    runID,
+		Ticket:   ticket,
+		Plan:     plan,
+		Claim:    claim,
+		Adapter:  adapter,
+		Config:   cfg,
+	})
+	if err != nil {
+		t.Fatalf("RunTicket returned error: %v", err)
+	}
+	if result.Snapshot.CurrentPhase != state.TicketPhaseBlocked {
+		t.Fatalf("expected blocked phase, got %q", result.Snapshot.CurrentPhase)
+	}
+	if result.Snapshot.Outcome != state.TicketOutcomeBlocked {
+		t.Fatalf("expected blocked outcome, got %q", result.Snapshot.Outcome)
+	}
+	if !strings.Contains(result.Snapshot.BlockReason, "ticket quality gate") {
+		t.Fatalf("expected block reason to mention ticket quality gate, got %q", result.Snapshot.BlockReason)
+	}
+	if reqs := adapter.WorkerRequests(); len(reqs) != 0 {
+		t.Fatalf("expected no worker invocations when gate blocks, got %d", len(reqs))
+	}
+	if reqs := adapter.ReviewRequests(); len(reqs) != 0 {
+		t.Fatalf("expected no review invocations when gate blocks, got %d", len(reqs))
+	}
+}
+
+// TestRunTicket_PersistsTicketQualityArtifact asserts that a single-ticket
+// run always writes .verk/runs/<run-id>/ticket-quality.json and that the
+// artifact's TicketIDs list contains exactly the root ticket ID.
+func TestRunTicket_PersistsTicketQualityArtifact(t *testing.T) {
+	repoRoot := t.TempDir()
+	cfg := policy.DefaultConfig()
+	runID := "run-tq-persist"
+
+	// Use testTicket which now ships minimal fields that satisfy the gate
+	// so we exercise the persistence path even on the passing branch.
+	ticket := testTicket("ver-tq-persist")
+	plan, claim := testPlanAndClaim(t, repoRoot, ticket, cfg, runID, "lease-tq-persist", []string{`true`})
+
+	started, finished := testRunTimes()
+	adapter := runtimefake.New(
+		[]runtime.WorkerResult{{
+			Status:             runtime.WorkerStatusDone,
+			RetryClass:         runtime.RetryClassTerminal,
+			LeaseID:            claim.LeaseID,
+			StartedAt:          started,
+			FinishedAt:         finished,
+			ResultArtifactPath: filepath.Join(repoRoot, "worker.json"),
+		}},
+		[]runtime.ReviewResult{{
+			Status:             runtime.WorkerStatusDone,
+			RetryClass:         runtime.RetryClassTerminal,
+			LeaseID:            claim.LeaseID,
+			StartedAt:          finished.Add(time.Second),
+			FinishedAt:         finished.Add(2 * time.Second),
+			ReviewStatus:       runtime.ReviewStatusPassed,
+			Summary:            "clean",
+			ResultArtifactPath: filepath.Join(repoRoot, "review.json"),
+		}},
+	)
+
+	_, err := RunTicket(context.Background(), RunTicketRequest{
+		RepoRoot: repoRoot,
+		RunID:    runID,
+		Ticket:   ticket,
+		Plan:     plan,
+		Claim:    claim,
+		Adapter:  adapter,
+		Config:   cfg,
+	})
+	if err != nil {
+		t.Fatalf("RunTicket returned error: %v", err)
+	}
+
+	artifact := loadQualityArtifact(t, repoRoot, runID)
+	if artifact.RootTicketID != ticket.ID {
+		t.Fatalf("expected root ticket id %q, got %q", ticket.ID, artifact.RootTicketID)
+	}
+	if len(artifact.TicketIDs) != 1 || artifact.TicketIDs[0] != ticket.ID {
+		t.Fatalf("expected ticket IDs to contain only %q, got %v", ticket.ID, artifact.TicketIDs)
+	}
+	if artifact.Scope != "ticket" {
+		t.Fatalf("expected scope %q, got %q", "ticket", artifact.Scope)
+	}
+}
+
+// TestRunTicket_WritesFreezeArtifact asserts that RunTicket writes
+// freeze.json under the ticket run directory when owned_paths are set,
+// and that the artifact records the correct ticket id and paths.
+func TestRunTicket_WritesFreezeArtifact(t *testing.T) {
+	repoRoot := t.TempDir()
+	cfg := policy.DefaultConfig()
+	runID := "run-freeze"
+
+	ticket := epos.Ticket{
+		ID:                 "ver-freeze",
+		Title:              "Freeze test ticket",
+		AcceptanceCriteria: []string{"verk test --x exits 0"},
+		OwnedPaths:         []string{"internal/widget", "docs/widget.md"},
+		UnknownFrontmatter: map[string]any{"type": "task"},
+	}
+	plan, claim := testPlanAndClaim(t, repoRoot, ticket, cfg, runID, "lease-freeze", []string{`true`})
+
+	started, finished := testRunTimes()
+	adapter := runtimefake.New(
+		[]runtime.WorkerResult{{
+			Status:             runtime.WorkerStatusDone,
+			RetryClass:         runtime.RetryClassTerminal,
+			LeaseID:            claim.LeaseID,
+			StartedAt:          started,
+			FinishedAt:         finished,
+			ResultArtifactPath: filepath.Join(repoRoot, "worker.json"),
+		}},
+		[]runtime.ReviewResult{{
+			Status:             runtime.WorkerStatusDone,
+			RetryClass:         runtime.RetryClassTerminal,
+			LeaseID:            claim.LeaseID,
+			StartedAt:          finished.Add(time.Second),
+			FinishedAt:         finished.Add(2 * time.Second),
+			ReviewStatus:       runtime.ReviewStatusPassed,
+			Summary:            "ok",
+			ResultArtifactPath: filepath.Join(repoRoot, "review.json"),
+		}},
+	)
+
+	_, err := RunTicket(context.Background(), RunTicketRequest{
+		RepoRoot: repoRoot,
+		RunID:    runID,
+		Ticket:   ticket,
+		Plan:     plan,
+		Claim:    claim,
+		Adapter:  adapter,
+		Config:   cfg,
+	})
+	if err != nil {
+		t.Fatalf("RunTicket returned error: %v", err)
+	}
+
+	freezePath := filepath.Join(repoRoot, ".verk", "runs", runID, "tickets", ticket.ID, "freeze.json")
+	if _, statErr := os.Stat(freezePath); os.IsNotExist(statErr) {
+		t.Fatalf("expected freeze.json at %s, but file does not exist", freezePath)
+	}
+
+	var freeze state.FreezeArtifact
+	if err := state.LoadJSON(freezePath, &freeze); err != nil {
+		t.Fatalf("failed to load freeze.json: %v", err)
+	}
+	if freeze.TicketID != ticket.ID {
+		t.Errorf("freeze.TicketID = %q, want %q", freeze.TicketID, ticket.ID)
+	}
+	if freeze.RunID != runID {
+		t.Errorf("freeze.RunID = %q, want %q", freeze.RunID, runID)
+	}
+	if !freeze.Active {
+		t.Error("expected freeze.Active to be true")
+	}
+	wantPaths := []string{"internal/widget", "docs/widget.md"}
+	if len(freeze.AllowedPaths) != len(wantPaths) {
+		t.Fatalf("freeze.AllowedPaths = %v, want %v", freeze.AllowedPaths, wantPaths)
+	}
+	for i, p := range wantPaths {
+		if freeze.AllowedPaths[i] != p {
+			t.Errorf("freeze.AllowedPaths[%d] = %q, want %q", i, freeze.AllowedPaths[i], p)
+		}
+	}
+}
+
+func TestRunTicket_WorkerRequestIncludesStandards(t *testing.T) {
+	repoRoot := t.TempDir()
+	cfg := policy.DefaultConfig()
+	ticket := epos.Ticket{
+		ID:                 "ver-standards",
+		Title:              "Standards injection test",
+		AcceptanceCriteria: []string{"verk test --x exits 0"},
+		OwnedPaths:         []string{"internal/engine/ticket_run.go", "internal/engine/ticket_run_test.go"},
+		UnknownFrontmatter: map[string]any{"type": "task"},
+	}
+	plan, claim := testPlanAndClaim(t, repoRoot, ticket, cfg, "run-standards", "lease-standards", []string{`true`})
+
+	started, finished := testRunTimes()
+	adapter := runtimefake.New(
+		[]runtime.WorkerResult{
+			{
+				Status:             runtime.WorkerStatusDone,
+				RetryClass:         runtime.RetryClassTerminal,
+				LeaseID:            claim.LeaseID,
+				StartedAt:          started,
+				FinishedAt:         finished,
+				ResultArtifactPath: filepath.Join(repoRoot, "worker.json"),
+			},
+		},
+		[]runtime.ReviewResult{
+			{
+				Status:             runtime.WorkerStatusDone,
+				RetryClass:         runtime.RetryClassTerminal,
+				LeaseID:            claim.LeaseID,
+				StartedAt:          finished.Add(time.Second),
+				FinishedAt:         finished.Add(2 * time.Second),
+				ReviewStatus:       runtime.ReviewStatusPassed,
+				Summary:            "clean",
+				ResultArtifactPath: filepath.Join(repoRoot, "review.json"),
+			},
+		},
+	)
+
+	_, err := RunTicket(context.Background(), RunTicketRequest{
+		RepoRoot: repoRoot,
+		RunID:    "run-standards",
+		Ticket:   ticket,
+		Plan:     plan,
+		Claim:    claim,
+		Adapter:  adapter,
+		Config:   cfg,
+	})
+	if err != nil {
+		t.Fatalf("RunTicket returned error: %v", err)
+	}
+	if len(adapter.WorkerRequests()) == 0 {
+		t.Fatal("expected at least one worker request")
+	}
+	workerReq := adapter.WorkerRequests()[0]
+	if workerReq.Standards == "" {
+		t.Fatal("expected Standards to be populated in WorkerRequest for .go owned_paths")
+	}
+	if !strings.Contains(workerReq.Standards, "Universal Review Standards") {
+		t.Errorf("expected universal standards in WorkerRequest.Standards, got: %q", workerReq.Standards[:min(200, len(workerReq.Standards))])
 	}
 }

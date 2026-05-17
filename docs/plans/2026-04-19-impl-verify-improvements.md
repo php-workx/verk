@@ -5,7 +5,7 @@
 - Date: 2026-04-19
 - Scope: lightweight correctness + completeness tightening for verk's impl→verify→review→repair→closeout slice
 - Out of scope: deep semantic review (owned by `vakt`); cross-agent skill delivery (owned by [verk-as-skill-cross-agent](2026-04-19-verk-as-skill-cross-agent.md))
-- Status: planned
+- Status: active / partially implemented
 
 ## Summary
 

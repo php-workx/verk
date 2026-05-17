@@ -37,6 +37,10 @@ func toEpos(t Ticket) *eposticket.Ticket { //nolint:cyclop // table-style bridge
 		out.Extra["model"] = t.Model
 		out.Present["model"] = true
 	}
+	if t.Profile != "" {
+		out.Extra["profile"] = t.Profile
+		out.Present["profile"] = true
+	}
 	for key, value := range t.UnknownFrontmatter {
 		switch key {
 		case "parent":
@@ -107,6 +111,10 @@ func toEpos(t Ticket) *eposticket.Ticket { //nolint:cyclop // table-style bridge
 			if t.Model == "" {
 				out.Extra["model"] = value
 			}
+		case "profile":
+			if t.Profile == "" {
+				out.Extra["profile"] = value
+			}
 		default:
 			out.Extra[key] = value
 		}
@@ -169,10 +177,16 @@ func fromEpos(t *eposticket.Ticket) Ticket {
 	copyNamedStringSlice(unknown, "grouped_requirement_ids", t.GroupedRequirementIDs, t.Present)
 
 	model := ""
+	profile := ""
 	for key, value := range t.Extra {
 		if key == "model" {
 			model = asString(value)
 			unknown[key] = value
+			continue
+		}
+		if key == "profile" {
+			profile = asString(value)
+			// do not propagate to unknown frontmatter; it is a first-class field
 			continue
 		}
 		unknown[key] = value
@@ -193,6 +207,7 @@ func fromEpos(t *eposticket.Ticket) Ticket {
 		ReviewThreshold:    t.ReviewThreshold,
 		Runtime:            t.RuntimePreference,
 		Model:              model,
+		Profile:            profile,
 		UnknownFrontmatter: unknown,
 		present:            cloneBoolMap(t.Present),
 		titleDerived:       t.TitleDerived,

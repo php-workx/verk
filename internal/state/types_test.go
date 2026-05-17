@@ -1,6 +1,9 @@
 package state
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestValidateTicketTransition_AllowsSpecifiedTransitions(t *testing.T) {
 	cases := []struct {
@@ -45,6 +48,50 @@ func TestValidateTicketTransition_RejectsForbiddenTransitions(t *testing.T) {
 	for _, tc := range cases {
 		if err := ValidateTicketTransition(tc.from, tc.to); err == nil {
 			t.Fatalf("expected %q -> %q to be rejected", tc.from, tc.to)
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// ValidateTestReference tests
+// ---------------------------------------------------------------------------
+
+func TestValidateTestReference_TestFunctionRequiresPackageAndName(t *testing.T) {
+	// Missing Package
+	if err := ValidateTestReference(TestReference{Kind: "test_function", Name: "TestSomething"}); err == nil || !strings.Contains(err.Error(), "missing package") {
+		t.Fatalf("expected missing package error, got: %v", err)
+	}
+	// Missing Name
+	if err := ValidateTestReference(TestReference{Kind: "test_function", Package: "engine"}); err == nil || !strings.Contains(err.Error(), "missing name") {
+		t.Fatalf("expected missing name error, got: %v", err)
+	}
+}
+
+func TestValidateTestReference_FileLineRequiresFileAndLine(t *testing.T) {
+	// Missing File
+	if err := ValidateTestReference(TestReference{Kind: "file_line", Line: 10}); err == nil || !strings.Contains(err.Error(), "missing file") {
+		t.Fatalf("expected missing file error, got: %v", err)
+	}
+	// Missing Line (zero value)
+	if err := ValidateTestReference(TestReference{Kind: "file_line", File: "internal/foo.go"}); err == nil || !strings.Contains(err.Error(), "missing line") {
+		t.Fatalf("expected missing line error, got: %v", err)
+	}
+}
+
+func TestValidateTestReference_UnknownKindRejected(t *testing.T) {
+	if err := ValidateTestReference(TestReference{Kind: "free_form_string"}); err == nil || !strings.Contains(err.Error(), "unknown test reference kind") {
+		t.Fatalf("expected unknown kind error, got: %v", err)
+	}
+}
+
+func TestValidateTestReference_AcceptsValid(t *testing.T) {
+	cases := []TestReference{
+		{Kind: "test_function", Package: "engine", Name: "TestFoo"},
+		{Kind: "file_line", File: "internal/engine/closeout.go", Line: 42},
+	}
+	for _, ref := range cases {
+		if err := ValidateTestReference(ref); err != nil {
+			t.Fatalf("expected valid reference (kind=%q) to pass, got: %v", ref.Kind, err)
 		}
 	}
 }

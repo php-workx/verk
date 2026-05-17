@@ -25,6 +25,7 @@ func TestTicketTypeShape(t *testing.T) {
 		{"ReviewThreshold", "string"},
 		{"Runtime", "string"},
 		{"Model", "string"},
+		{"Profile", "string"},
 		{"Body", "string"},
 		{"UnknownFrontmatter", "map[string]interface {}"},
 		{"present", "map[string]bool"},

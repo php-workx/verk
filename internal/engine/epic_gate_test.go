@@ -748,6 +748,13 @@ func (a *staleWordingRepairAdapter) RunReviewer(ctx context.Context, req runtime
 	return a.inner.RunReviewer(ctx, req)
 }
 
+func (a *staleWordingRepairAdapter) RunIntent(ctx context.Context, req runtime.IntentRequest) (runtime.IntentResult, error) {
+	if err := ctx.Err(); err != nil {
+		return runtime.IntentResult{}, err
+	}
+	return runtime.IntentResult{TargetFiles: req.OwnedPaths, TestPlan: "test"}, nil
+}
+
 // ---- Reviewer finds blocking finding, repair disabled ------------------------
 
 // TestRunEpicClosureGate_ReviewerFindingBlocks verifies that when the epic

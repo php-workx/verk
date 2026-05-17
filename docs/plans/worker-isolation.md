@@ -1,5 +1,9 @@
 # Worker Isolation via Git Worktrees
 
+> **Status: Implemented / Reference.** `ver-wi0p` and the `ver-wi01` through
+> `ver-wi22` implementation tickets are closed; this document is the durable
+> behavior and invariant reference.
+
 ## Context
 
 When `verk run` processes multiple tickets in parallel within a wave, all workers

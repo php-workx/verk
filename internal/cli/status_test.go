@@ -2,8 +2,10 @@ package cli
 
 import (
 	"bytes"
+	"os"
 	"strings"
 	"testing"
+	"time"
 	"verk/internal/engine"
 	"verk/internal/state"
 )
@@ -89,5 +91,87 @@ func TestRenderStatusStep_ShowsTimingAndUsage(t *testing.T) {
 		if !strings.Contains(out, want) {
 			t.Fatalf("expected %q in output, got %q", want, out)
 		}
+	}
+}
+
+func TestStatusCLI_DisplaysProfile(t *testing.T) {
+	dir := t.TempDir()
+	initCLITestRepo(t, dir)
+
+	runID := "run-profile-cli"
+	ticketID := "ticket-profile-cli"
+
+	// Write run artifact.
+	runArtifact := state.RunArtifact{
+		ArtifactMeta: state.ArtifactMeta{
+			SchemaVersion: 1,
+			RunID:         runID,
+			CreatedAt:     time.Date(2026, 4, 2, 12, 0, 0, 0, time.UTC),
+			UpdatedAt:     time.Date(2026, 4, 2, 12, 0, 0, 0, time.UTC),
+		},
+		Mode:         "ticket",
+		RootTicketID: ticketID,
+		Status:       state.EpicRunStatusRunning,
+		CurrentPhase: state.TicketPhaseImplement,
+		TicketIDs:    []string{ticketID},
+	}
+	runDir := func(parts ...string) string {
+		base := make([]string, 0, 4+len(parts))
+		base = append(base, dir, ".verk", "runs", runID)
+		base = append(base, parts...)
+		return strings.Join(base, string(os.PathSeparator))
+	}
+	if err := os.MkdirAll(runDir("tickets", ticketID), 0o755); err != nil {
+		t.Fatalf("mkdir ticket dir: %v", err)
+	}
+	if err := state.SaveJSONAtomic(runDir("run.json"), runArtifact); err != nil {
+		t.Fatalf("save run artifact: %v", err)
+	}
+
+	// Write plan artifact with AgentProfile set.
+	planArtifact := state.PlanArtifact{
+		ArtifactMeta: state.ArtifactMeta{SchemaVersion: 1, RunID: runID},
+		TicketID:     ticketID,
+		AgentProfile: "contract-engineer",
+	}
+	if err := state.SaveJSONAtomic(runDir("tickets", ticketID, "plan.json"), planArtifact); err != nil {
+		t.Fatalf("save plan artifact: %v", err)
+	}
+
+	// Write ticket snapshot.
+	snapshot := engine.TicketRunSnapshot{
+		ArtifactMeta: state.ArtifactMeta{
+			SchemaVersion: 1,
+			RunID:         runID,
+			CreatedAt:     time.Date(2026, 4, 2, 12, 0, 0, 0, time.UTC),
+			UpdatedAt:     time.Date(2026, 4, 2, 12, 0, 0, 0, time.UTC),
+		},
+		TicketID:     ticketID,
+		CurrentPhase: state.TicketPhaseImplement,
+	}
+	if err := state.SaveJSONAtomic(runDir("tickets", ticketID, "ticket-run.json"), snapshot); err != nil {
+		t.Fatalf("save ticket snapshot: %v", err)
+	}
+
+	// Run `verk status <runID>` from within the repo directory.
+	originalWD, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("get wd: %v", err)
+	}
+	if err := os.Chdir(dir); err != nil {
+		t.Fatalf("chdir: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(originalWD) })
+
+	var stdout bytes.Buffer
+	root := newRootCmd()
+	root.SetArgs([]string{"status", runID})
+	root.SetOut(&stdout)
+	root.SetErr(&stdout)
+	_ = root.Execute()
+
+	out := stdout.String()
+	if !strings.Contains(out, "contract-engineer") {
+		t.Fatalf("expected 'contract-engineer' in status output, got:\n%s", out)
 	}
 }

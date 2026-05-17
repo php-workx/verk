@@ -53,20 +53,30 @@ const (
 )
 
 type WorkerRequest struct {
-	RunID             string              `json:"run_id,omitempty"`
-	TicketID          string              `json:"ticket_id,omitempty"`
-	WaveID            string              `json:"wave_id,omitempty"`
-	LeaseID           string              `json:"lease_id"`
-	Attempt           int                 `json:"attempt,omitempty"`
-	Runtime           string              `json:"runtime,omitempty"`
-	Model             string              `json:"model,omitempty"`
-	Reasoning         string              `json:"reasoning,omitempty"`
-	FallbackReason    string              `json:"fallback_reason,omitempty"`
-	WorktreePath      string              `json:"worktree_path,omitempty"`
-	InputArtifactPath string              `json:"input_artifact_path,omitempty"`
-	Instructions      string              `json:"instructions,omitempty"`
-	ExecutionConfig   ExecutionConfig     `json:"execution_config,omitempty"`
-	OnProgress        func(detail string) `json:"-"` // called with tool-use summaries during execution
+	RunID             string `json:"run_id,omitempty"`
+	TicketID          string `json:"ticket_id,omitempty"`
+	WaveID            string `json:"wave_id,omitempty"`
+	LeaseID           string `json:"lease_id"`
+	Attempt           int    `json:"attempt,omitempty"`
+	Runtime           string `json:"runtime,omitempty"`
+	Model             string `json:"model,omitempty"`
+	Reasoning         string `json:"reasoning,omitempty"`
+	FallbackReason    string `json:"fallback_reason,omitempty"`
+	WorktreePath      string `json:"worktree_path,omitempty"`
+	InputArtifactPath string `json:"input_artifact_path,omitempty"`
+	Instructions      string `json:"instructions,omitempty"`
+	// Profile is the agent role profile for this ticket (e.g. "security-engineer").
+	// Empty string means no profile framing is injected into the prompt.
+	Profile string `json:"profile,omitempty"`
+	// OwnedPaths lists the file paths this worker is permitted to edit.
+	// When non-empty, BuildWorkerPrompt renders a Hard Edit Guard section
+	// instructing the worker to stay within this set.
+	OwnedPaths []string `json:"owned_paths,omitempty"`
+	// Standards is a pre-rendered language standards block injected into the
+	// worker prompt. Empty string omits the Engineering Standards section.
+	Standards       string              `json:"standards,omitempty"`
+	ExecutionConfig ExecutionConfig     `json:"execution_config,omitempty"`
+	OnProgress      func(detail string) `json:"-"` // called with tool-use summaries during execution
 }
 
 type ReviewRequest struct {
@@ -83,6 +93,7 @@ type ReviewRequest struct {
 	InputArtifactPath        string              `json:"input_artifact_path,omitempty"`
 	Instructions             string              `json:"instructions,omitempty"`
 	Diff                     string              `json:"diff,omitempty"`
+	ChangedFiles             []string            `json:"changed_files,omitempty"`
 	Standards                string              `json:"standards,omitempty"`
 	EffectiveReviewThreshold Severity            `json:"effective_review_threshold"`
 	ExecutionConfig          ExecutionConfig     `json:"execution_config,omitempty"`
@@ -142,9 +153,39 @@ type ReviewResult struct {
 	Findings           []ReviewFinding             `json:"findings"`
 }
 
+// IntentRequest is the input for a pre-implementation intent echo. The worker
+// is asked to return structured JSON describing which acceptance criteria it
+// plans to address, which files it intends to touch, and how it will test.
+type IntentRequest struct {
+	RunID        string
+	TicketID     string
+	LeaseID      string
+	Attempt      int
+	Runtime      string
+	Model        string
+	Reasoning    string
+	WorktreePath string
+	Instructions string
+	OwnedPaths   []string
+}
+
+// IntentResult is the parsed output of an intent echo call.
+type IntentResult struct {
+	CoveredCriteria []string
+	TargetFiles     []string
+	TestPlan        string
+	RawResponse     string
+}
+
 type Adapter interface {
 	RunWorker(ctx context.Context, req WorkerRequest) (WorkerResult, error)
 	RunReviewer(ctx context.Context, req ReviewRequest) (ReviewResult, error)
+	// RunIntent executes a pre-implementation intent echo against the worker.
+	// The worker returns a structured JSON object describing which acceptance
+	// criteria it plans to address, which files it intends to touch, and how
+	// it will test. The engine validates the result before dispatching the
+	// implementation worker.
+	RunIntent(ctx context.Context, req IntentRequest) (IntentResult, error)
 }
 
 // ValidatedExecutable normalizes a runtime executable name or path before it is
@@ -165,6 +206,59 @@ func ValidatedExecutable(binary string) (string, error) {
 		}
 	}
 	return trimmed, nil
+}
+
+// TicketSummary is a compact summary of a ticket used by planner-role
+// review. It deliberately omits Body to keep prompts bounded; planner
+// review focuses on observable signals (criteria, paths, deps).
+type TicketSummary struct {
+	ID                 string   `json:"id"`
+	Title              string   `json:"title"`
+	Type               string   `json:"type,omitempty"`
+	OwnedPaths         []string `json:"owned_paths,omitempty"`
+	AcceptanceCriteria []string `json:"acceptance_criteria,omitempty"`
+	TestCases          []string `json:"test_cases,omitempty"`
+	ValidationCommands []string `json:"validation_commands,omitempty"`
+	Deps               []string `json:"deps,omitempty"`
+}
+
+// RawTicketQualityFinding is the JSON shape the planner LLM is asked to
+// produce. Engine normalizes this into state.TicketQualityFinding (with
+// stable IDs) after parsing the response.
+type RawTicketQualityFinding struct {
+	TicketID string   `json:"ticket_id"`
+	Code     string   `json:"code"`
+	Severity string   `json:"severity"`
+	Title    string   `json:"title"`
+	Body     string   `json:"body"`
+	Evidence []string `json:"evidence,omitempty"`
+}
+
+// PromotedRuleContext is a compact representation of a promoted memory rule
+// for inclusion in planner review prompts. It is intentionally minimal to
+// keep prompt size bounded.
+type PromotedRuleContext struct {
+	RuleID  string `json:"rule_id"`
+	Summary string `json:"summary"`
+}
+
+// PlannerReviewRequest is the input for a planner-role ticket quality
+// review. It is intentionally separate from ReviewRequest so adapters can
+// route planner requests differently if needed.
+type PlannerReviewRequest struct {
+	RootTicketID             string
+	Tickets                  []TicketSummary
+	DeterministicFindings    []RawTicketQualityFinding
+	EffectiveReviewThreshold Severity
+	LeaseID                  string
+	PromotedRules            []PromotedRuleContext `json:"promoted_rules,omitempty"`
+}
+
+// PlannerReviewResult is the parsed output of a planner-role review.
+type PlannerReviewResult struct {
+	Status   string                    `json:"status"`
+	Summary  string                    `json:"summary"`
+	Findings []RawTicketQualityFinding `json:"findings"`
 }
 
 var severityOrder = map[Severity]int{

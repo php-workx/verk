@@ -403,3 +403,111 @@ func countWorktreeMetadataDirs(t *testing.T, repoRoot string) int {
 	}
 	return count
 }
+
+func mustWriteFile(t *testing.T, path, content string) {
+	t.Helper()
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatalf("write file %q: %v", path, err)
+	}
+}
+
+func TestDiffAgainstFiles_ExcludesUnselectedTrackedFiles(t *testing.T) {
+	repo, root, baseCommit := newTestRepo(t)
+
+	mustWriteFile(t, filepath.Join(root, "other.txt"), "other\n")
+	runGit(t, root, "add", "other.txt")
+	runGit(t, root, "commit", "-m", "add other")
+	mustWriteFile(t, filepath.Join(root, "tracked.txt"), "selected update\n")
+	mustWriteFile(t, filepath.Join(root, "other.txt"), "unrelated update\n")
+
+	diff, err := repo.DiffAgainstFiles(baseCommit, []string{"tracked.txt"})
+	if err != nil {
+		t.Fatalf("DiffAgainstFiles: %v", err)
+	}
+	if !strings.Contains(diff, "tracked.txt") {
+		t.Fatalf("expected selected file in diff:\n%s", diff)
+	}
+	if strings.Contains(diff, "other.txt") {
+		t.Fatalf("did not expect unselected file in diff:\n%s", diff)
+	}
+}
+
+func TestDiffAgainstFiles_IncludesUntrackedFileContent(t *testing.T) {
+	repo, root, baseCommit := newTestRepo(t)
+	mustWriteFile(t, filepath.Join(root, "new.txt"), "first\nsecond\n")
+
+	diff, err := repo.DiffAgainstFiles(baseCommit, []string{"new.txt"})
+	if err != nil {
+		t.Fatalf("DiffAgainstFiles: %v", err)
+	}
+	for _, want := range []string{
+		"diff --git a/new.txt b/new.txt",
+		"new file mode",
+		"+++ b/new.txt",
+		"+first",
+		"+second",
+	} {
+		if !strings.Contains(diff, want) {
+			t.Fatalf("expected %q in diff:\n%s", want, diff)
+		}
+	}
+}
+
+func TestDiffAgainstFiles_RejectsRepoEscape(t *testing.T) {
+	repo, _, baseCommit := newTestRepo(t)
+	if _, err := repo.DiffAgainstFiles(baseCommit, []string{"../escape.txt"}); err == nil {
+		t.Fatal("expected repo escape path to be rejected")
+	}
+}
+
+func TestDiffAgainstFiles_NoTrailingNewlineMarker(t *testing.T) {
+	repo, root, baseCommit := newTestRepo(t)
+	mustWriteFile(t, filepath.Join(root, "noeol.txt"), "no newline at end") // no trailing \n
+
+	diff, err := repo.DiffAgainstFiles(baseCommit, []string{"noeol.txt"})
+	if err != nil {
+		t.Fatalf("DiffAgainstFiles: %v", err)
+	}
+	if !strings.Contains(diff, "\\ No newline at end of file") {
+		t.Fatalf("expected no-newline marker in diff:\n%s", diff)
+	}
+}
+
+func TestDiffAgainstFiles_BinaryFileGetsMarker(t *testing.T) {
+	repo, root, baseCommit := newTestRepo(t)
+	// Write a file with NUL byte to trigger binary detection
+	binaryContent := []byte("start\x00end")
+	if err := os.WriteFile(filepath.Join(root, "bin.dat"), binaryContent, 0o644); err != nil {
+		t.Fatalf("write binary file: %v", err)
+	}
+
+	diff, err := repo.DiffAgainstFiles(baseCommit, []string{"bin.dat"})
+	if err != nil {
+		t.Fatalf("DiffAgainstFiles: %v", err)
+	}
+	if !strings.Contains(diff, "Binary files") {
+		t.Fatalf("expected binary marker in diff:\n%s", diff)
+	}
+	// Should not contain the raw binary content
+	if strings.Contains(diff, "\x00") {
+		t.Fatalf("raw NUL byte should not appear in diff:\n%s", diff)
+	}
+}
+
+func TestDiffAgainstFiles_EmptyListReturnsEmpty(t *testing.T) {
+	repo, _, baseCommit := newTestRepo(t)
+	diff, err := repo.DiffAgainstFiles(baseCommit, nil)
+	if err != nil {
+		t.Fatalf("DiffAgainstFiles with nil files: %v", err)
+	}
+	if diff != "" {
+		t.Fatalf("expected empty diff for nil file list, got: %s", diff)
+	}
+	diff, err = repo.DiffAgainstFiles(baseCommit, []string{})
+	if err != nil {
+		t.Fatalf("DiffAgainstFiles with empty files: %v", err)
+	}
+	if diff != "" {
+		t.Fatalf("expected empty diff for empty file list, got: %s", diff)
+	}
+}

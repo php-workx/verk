@@ -41,6 +41,9 @@ type BlockedTicket struct {
 	Status epos.Status
 	// Phase is the ticket run phase from the latest snapshot, when available.
 	Phase state.TicketPhase
+	// Outcome is the terminal outcome recorded in the ticket snapshot, when
+	// available. Empty means no outcome has been persisted (legacy snapshots).
+	Outcome state.TicketOutcome
 	// RetryPhase is the default phase this ticket may be reopened to. Empty
 	// means the ticket is not automatically retryable from its current phase.
 	RetryPhase state.TicketPhase
@@ -121,23 +124,36 @@ func collectBlockedTickets(repoRoot, runID string, children []epos.Ticket) []Blo
 		reason := describeNotReady(repoRoot, runID, child)
 		claimReason := isClaimWaitReason(reason)
 		phase := state.TicketPhaseIntake
+		var outcome state.TicketOutcome
+		var snapLoaded bool
 		if runID != "" {
 			var snap TicketRunSnapshot
 			if err := loadTicketSnapshot(repoRoot, runID, child.ID, &snap); err == nil {
+				snapLoaded = true
 				if snap.CurrentPhase != "" {
 					phase = snap.CurrentPhase
 				}
+				outcome = snap.Outcome
 				if trimmed := ticketStatusReason(snap); trimmed != "" && !claimReason {
 					reason = trimmed
 				}
 			}
 		}
-		retryPhase, _ := DefaultReopenTargetForPhase(phase)
+		var retryPhase state.TicketPhase
+		if snapLoaded {
+			retryPhase, _ = DefaultReopenTargetForSnapshot(TicketRunSnapshot{
+				ArtifactMeta: state.ArtifactMeta{},
+				TicketID:     child.ID,
+				CurrentPhase: phase,
+				Outcome:      outcome,
+			})
+		}
 		out = append(out, BlockedTicket{
 			ID:         child.ID,
 			Title:      child.Title,
 			Status:     child.Status,
 			Phase:      phase,
+			Outcome:    outcome,
 			RetryPhase: retryPhase,
 			Reason:     reason,
 		})
@@ -258,6 +274,80 @@ func RunEpic(ctx context.Context, req RunEpicRequest) (RunEpicResult, error) { /
 	if err != nil {
 		return result, err
 	}
+
+	// --- Ticket quality gate --------------------------------------------------
+	// Run before the first wave is dispatched so workers never receive tickets
+	// that fail the deterministic quality checks.
+	rootTicket, err := loadEpicTicket(req.RepoRoot, req.RootTicketID)
+	if err != nil {
+		return result, fmt.Errorf("load root ticket for quality gate: %w", err)
+	}
+	qualityArtifact, err := RunTicketQualityGate(ctx, req.RepoRoot, req.RunID, cfg, rootTicket, children)
+	if err != nil {
+		return result, fmt.Errorf("ticket quality gate: %w", err)
+	}
+	if qualityArtifact.Blocked {
+		result.Run.Status = state.EpicRunStatusBlocked
+		result.Run.CurrentPhase = state.TicketPhaseBlocked
+		result.Run.UpdatedAt = time.Now().UTC()
+		if saveErr := state.SaveJSONAtomic(runPath, result.Run); saveErr != nil {
+			return result, errors.Join(
+				fmt.Errorf("ticket quality gate blocked: %s", qualityArtifact.BlockReason),
+				fmt.Errorf("persist run state: %w", saveErr),
+			)
+		}
+		return result, &BlockedRunError{
+			RunID:  req.RunID,
+			Status: state.EpicRunStatusBlocked,
+			Cause:  fmt.Errorf("ticket quality gate blocked: %s", qualityArtifact.BlockReason),
+		}
+	}
+	// -------------------------------------------------------------------------
+
+	// --- Epic plan-time reviewer (P6) ----------------------------------------
+	// Run after the ticket quality gate, before the first wave is dispatched.
+	// On crash-recovery (resume), skip if the artifact already exists on disk.
+	// Pre-check skip conditions before resolving the adapter to avoid consuming
+	// adapter resources (e.g. scripted reviewer slots in tests) unnecessarily.
+	epicPlanReviewMode := strings.TrimSpace(cfg.EpicReview.PlanMode)
+	if epicPlanReviewMode == "" {
+		epicPlanReviewMode = "shadow"
+	}
+	epicPlanReviewEligible := epicPlanReviewMode != "disabled" &&
+		len(children) >= cfg.EpicReview.PlanMinTickets &&
+		!epicPlanReviewArtifactExists(req.RepoRoot, req.RunID)
+	if epicPlanReviewEligible {
+		planReviewAdapter, adapterErr := resolveWaveAdapter(req)
+		if adapterErr != nil {
+			log.Printf("[WARN] epic plan review %s: resolve adapter: %v", req.RootTicketID, adapterErr)
+		} else {
+			planReviewArtifact, planReviewErr := RunEpicPlanReview(
+				ctx,
+				planReviewAdapter,
+				req.RepoRoot,
+				rootTicket,
+				children,
+				cfg.EpicReview,
+				req.RunID,
+			)
+			if planReviewErr != nil {
+				// Enforce mode: block epic before any wave is dispatched.
+				result.Run.Status = state.EpicRunStatusBlocked
+				result.Run.CurrentPhase = state.TicketPhaseBlocked
+				result.Run.UpdatedAt = time.Now().UTC()
+				if saveErr := state.SaveJSONAtomic(runPath, result.Run); saveErr != nil {
+					return result, errors.Join(planReviewErr, fmt.Errorf("persist run state: %w", saveErr))
+				}
+				return result, &BlockedRunError{
+					RunID:  req.RunID,
+					Status: state.EpicRunStatusBlocked,
+					Cause:  planReviewErr,
+				}
+			}
+			_ = planReviewArtifact // artifact persisted to disk; nil when skipped
+		}
+	}
+	// -------------------------------------------------------------------------
 
 	for {
 		if err := ctx.Err(); err != nil {
@@ -618,6 +708,73 @@ func RunEpic(ctx context.Context, req RunEpicRequest) (RunEpicResult, error) { /
 			}
 			acceptedWave.Acceptance["diff_persist_error"] = diffArtifactErr.Error()
 		}
+
+		// --- Wave-level cross-ticket reviewer (P5) --------------------------------
+		// Run after all tickets reach closeout/blocked and diff artifacts are
+		// persisted, but before the wave status is finalized. Only runs when the
+		// wave was not already failed by a hard error so the reviewer sees a
+		// consistent state.
+		// Pre-check skip conditions before resolving the adapter to avoid consuming
+		// adapter resources (e.g. scripted reviewer slots in tests) unnecessarily.
+		waveReviewMode := strings.TrimSpace(cfg.WaveReview.Mode)
+		if waveReviewMode == "" {
+			waveReviewMode = "shadow"
+		}
+		waveReviewEligible := !waveFailed && acceptErr == nil &&
+			waveReviewMode != "disabled" &&
+			len(wave.TicketIDs) > 0 &&
+			(!cfg.WaveReview.SkipSingleTicket || len(wave.TicketIDs) != 1) &&
+			!waveReviewArtifactExists(req.RepoRoot, req.RunID, waveID)
+		if waveReviewEligible {
+			waveTickets := make([]epos.Ticket, 0, len(wave.TicketIDs))
+			for _, tid := range wave.TicketIDs {
+				if t, loadErr := loadEpicTicket(req.RepoRoot, tid); loadErr == nil {
+					waveTickets = append(waveTickets, t)
+				}
+			}
+			waveReviewAdapter, adapterErr := resolveWaveAdapter(req)
+			if adapterErr != nil {
+				log.Printf("[WARN] wave review %s: resolve adapter: %v", waveID, adapterErr)
+			} else {
+				waveReviewArtifact, waveReviewErr := RunWaveReview(
+					ctx,
+					waveReviewAdapter,
+					req.RepoRoot,
+					waveID,
+					waveOrdinal,
+					waveTickets,
+					wave.WaveBaseCommit,
+					cfg.WaveReview,
+					req.RunID,
+				)
+				if waveReviewErr != nil {
+					// Enforce mode: wave fails due to blocking review findings.
+					waveFailed = true
+					if waveErr == nil {
+						waveErr = waveReviewErr
+					} else {
+						waveErr = errors.Join(waveErr, waveReviewErr)
+					}
+					if acceptedWave.Status == state.WaveStatusAccepted {
+						acceptedWave.Status = state.WaveStatusFailed
+					}
+					if acceptedWave.Acceptance == nil {
+						acceptedWave.Acceptance = map[string]any{}
+					}
+					acceptedWave.Acceptance["wave_review_failed"] = waveReviewErr.Error()
+				}
+				if waveReviewArtifact != nil && acceptedWave.Acceptance != nil {
+					acceptedWave.Acceptance["wave_review_mode"] = waveReviewArtifact.Mode
+					acceptedWave.Acceptance["wave_review_passed"] = waveReviewArtifact.Passed
+				} else if waveReviewArtifact != nil {
+					acceptedWave.Acceptance = map[string]any{
+						"wave_review_mode":   waveReviewArtifact.Mode,
+						"wave_review_passed": waveReviewArtifact.Passed,
+					}
+				}
+			}
+		}
+		// -------------------------------------------------------------------------
 
 		acceptedWave.UpdatedAt = time.Now().UTC()
 		if acceptedWave.FinishedAt.IsZero() {
@@ -1532,6 +1689,13 @@ func executeEpicTicket(ctx context.Context, req RunEpicRequest, cfg policy.Confi
 		})
 	}
 
+	ticketsDir := filepath.Join(req.RepoRoot, ".tickets")
+	if _, profileErr := ResolveTicketProfile(ticketsDir, &ticket); profileErr != nil {
+		outcome.err = profileErr
+		outcome.phase = snapshotPhaseOrImplement(req.RepoRoot, req.RunID, ticketID)
+		return outcome
+	}
+
 	plan, err := BuildPlanArtifact(ticket, cfg)
 	if err != nil {
 		outcome.err = err
@@ -1564,6 +1728,10 @@ func executeEpicTicket(ctx context.Context, req RunEpicRequest, cfg policy.Confi
 		Config:               cfg,
 		VerificationCommands: verificationCommandsFor(req, ticket),
 		Progress:             req.Progress,
+		// RunEpic already ran the epic-level ticket-quality gate and
+		// persisted ticket-quality.json for the whole epic; suppress the
+		// per-ticket gate so we don't overwrite the epic-scoped artifact.
+		SkipTicketQualityGate: true,
 	})
 	if err != nil {
 		outcome.err = err

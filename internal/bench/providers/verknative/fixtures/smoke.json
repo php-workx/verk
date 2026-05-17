@@ -1,0 +1,29 @@
+[
+  {
+    "id": "smoke-001",
+    "title": "Create marker file done.txt",
+    "spec": {
+      "instruction": "Create a file named done.txt with contents 'ok' at the workspace root",
+      "expect_marker": "done.txt",
+      "expect_contents": "ok"
+    }
+  },
+  {
+    "id": "smoke-002",
+    "title": "Write hello.go with package main",
+    "spec": {
+      "instruction": "Create hello.go containing 'package main' as the only line",
+      "expect_marker": "hello.go",
+      "expect_contents": "package main"
+    }
+  },
+  {
+    "id": "smoke-003",
+    "title": "Create nested directory layout/result.md",
+    "spec": {
+      "instruction": "Create layout/result.md with body '# result'",
+      "expect_marker": "layout/result.md",
+      "expect_contents": "# result"
+    }
+  }
+]

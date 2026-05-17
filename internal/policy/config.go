@@ -124,12 +124,118 @@ type LoggingConfig struct {
 	ArtifactRetention int    `yaml:"artifact_retention" json:"artifact_retention"`
 }
 
+// IntentConfig controls the pre-implementation intent echo gate.
+// When Enabled is true, the engine calls RunIntent on the adapter up to
+// MaxAttempts times before dispatching the implementation worker. A failing
+// gate (after all retries) blocks the ticket with reason "intent_non_convergent".
+// Enabled defaults to false so existing runs are unaffected until opted in.
+type IntentConfig struct {
+	// Enabled turns the intent gate on or off. Defaults to false.
+	Enabled bool `yaml:"enabled" json:"enabled"`
+	// MaxAttempts is the maximum number of RunIntent calls per ticket attempt.
+	// Defaults to 2.
+	MaxAttempts int `yaml:"max_attempts" json:"max_attempts"`
+}
+
+// WaveReviewConfig controls the wave-level cross-ticket reviewer that runs
+// after all tickets in a wave complete but before the wave is accepted.
+//
+// The reviewer looks at the union diff across all wave tickets to catch
+// cross-ticket contradictions, integration drift, incomplete fanout, and
+// orphaned references that per-ticket reviewers may not catch.
+type WaveReviewConfig struct {
+	// Mode controls when the wave reviewer is active.
+	//   "disabled" — no wave review is run.
+	//   "shadow"   — the review runs and is persisted, but findings do not
+	//                block the wave. Operators can inspect the artifact at
+	//                .verk/runs/<run-id>/waves/wave-<n>/wave-review.json.
+	//   "enforce"  — any open finding at or above Threshold blocks the wave.
+	// Default: "shadow"
+	Mode string `yaml:"mode" json:"mode"`
+	// Threshold is the minimum severity level that constitutes a blocking
+	// finding in enforce mode. Accepted values: P0, P1, P2, P3, P4.
+	// Default: "P2"
+	Threshold string `yaml:"threshold" json:"threshold"`
+	// SkipSingleTicket, when true, skips the wave review when the wave
+	// contains only one ticket (a per-ticket reviewer already ran for it).
+	// Default: true
+	SkipSingleTicket bool `yaml:"skip_single_ticket" json:"skip_single_ticket"`
+}
+
+// EpicReviewConfig controls the epic plan-time reviewer that runs before the
+// first wave dispatches. This is the plan-time pass only; the acceptance-time
+// epic review is handled by the existing epic closure gate.
+type EpicReviewConfig struct {
+	// PlanMode controls the plan-time epic reviewer.
+	//   "disabled" — no plan review is run.
+	//   "shadow"   — the review runs and is persisted, but findings do not
+	//                block the epic. Persisted at
+	//                .verk/runs/<run-id>/epic-review-plan.json.
+	//   "enforce"  — any open finding at or above Threshold blocks the epic
+	//                before any wave is dispatched.
+	// Default: "shadow"
+	PlanMode string `yaml:"plan_mode" json:"plan_mode"`
+	// PlanMinTickets is the minimum number of child tickets required to
+	// trigger the plan-time review. Epics with fewer children skip it.
+	// Default: 3
+	PlanMinTickets int `yaml:"plan_min_tickets" json:"plan_min_tickets"`
+	// Threshold is the minimum severity level that constitutes a blocking
+	// finding in enforce mode.
+	// Default: "P2"
+	Threshold string `yaml:"threshold" json:"threshold"`
+}
+
+// TicketQualityConfig controls the deterministic ticket quality gate that runs
+// before a worker is dispatched. All fields have safe defaults via DefaultConfig.
+type TicketQualityConfig struct {
+	// Enabled turns the gate on or off. Defaults to true.
+	Enabled bool `yaml:"enabled" json:"enabled"`
+	// PlannerReview enables the planner-review advisory path. Defaults to true.
+	PlannerReview bool `yaml:"planner_review" json:"planner_review"`
+	// AutoFixSafe, when true, allows verk run to apply safe auto-repairs
+	// (e.g. inferring epic owned_paths from children) without --fix. Defaults
+	// to false so operators opt in explicitly.
+	AutoFixSafe bool `yaml:"auto_fix_safe" json:"auto_fix_safe"`
+	// BlockThreshold is the minimum severity that causes the gate to block.
+	// Accepted values: P0, P1, P2, P3, P4. Defaults to P2.
+	BlockThreshold string `yaml:"block_threshold" json:"block_threshold"`
+	// RequirePublicContractScenarios enforces the missing_public_contract_scenario
+	// rule. Defaults to true.
+	RequirePublicContractScenarios bool `yaml:"require_public_contract_scenarios" json:"require_public_contract_scenarios"`
+	// RequireEpicIntegrationTicket enforces the integration_gap rule for epics.
+	// Defaults to true.
+	RequireEpicIntegrationTicket bool `yaml:"require_epic_integration_ticket" json:"require_epic_integration_ticket"`
+}
+
+// ConstraintsConfig controls the compiled-constraint promotion system.
+// When Enabled is false (the default), no constraints are run at verify time
+// and no candidates are recorded at closeout.
+type ConstraintsConfig struct {
+	// Enabled turns the constraint system on or off. Defaults to false.
+	Enabled bool `yaml:"enabled" json:"enabled"`
+	// ActivationThreshold is the number of distinct tickets that must surface
+	// the same finding pattern before a constraint is auto-promoted to active.
+	// Defaults to 3.
+	ActivationThreshold int `yaml:"activation_threshold" json:"activation_threshold"`
+	// StaleDays is the number of days after which an inactive constraint is
+	// considered stale and eligible for pruning. Defaults to 90.
+	StaleDays int `yaml:"stale_days" json:"stale_days"`
+	// MaxRuntimeTotalMs is the total millisecond budget for all constraint
+	// checks in a single verify pass. Defaults to 120000 (2 minutes).
+	MaxRuntimeTotalMs int `yaml:"max_runtime_total_ms" json:"max_runtime_total_ms"`
+}
+
 type Config struct {
-	Scheduler    SchedulerConfig    `yaml:"scheduler" json:"scheduler"`
-	Policy       PolicyConfig       `yaml:"policy" json:"policy"`
-	Runtime      RuntimeConfig      `yaml:"runtime" json:"runtime"`
-	Verification VerificationConfig `yaml:"verification" json:"verification"`
-	Logging      LoggingConfig      `yaml:"logging" json:"logging"`
+	Scheduler     SchedulerConfig     `yaml:"scheduler" json:"scheduler"`
+	Policy        PolicyConfig        `yaml:"policy" json:"policy"`
+	Runtime       RuntimeConfig       `yaml:"runtime" json:"runtime"`
+	Verification  VerificationConfig  `yaml:"verification" json:"verification"`
+	Logging       LoggingConfig       `yaml:"logging" json:"logging"`
+	TicketQuality TicketQualityConfig `yaml:"ticket_quality" json:"ticket_quality"`
+	Intent        IntentConfig        `yaml:"intent" json:"intent"`
+	WaveReview    WaveReviewConfig    `yaml:"wave_review" json:"wave_review"`
+	EpicReview    EpicReviewConfig    `yaml:"epic_review" json:"epic_review"`
+	Constraints   ConstraintsConfig   `yaml:"constraints" json:"constraints"`
 }
 
 func LoadConfig(repoRoot string) (Config, error) {

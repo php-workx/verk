@@ -1,5 +1,7 @@
 # Ticket State Machine Implementation Plan
 
+> **Status: Implemented** — All six tasks landed. User-facing reference: [docs/ticket-state-machine.md](../ticket-state-machine.md).
+
 > **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
 
 **Goal:** Make ticket execution use explicit, user-facing state-machine outcomes so failures, decision points, and true blockers are not all collapsed into `blocked`.

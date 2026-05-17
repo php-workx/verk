@@ -10,6 +10,7 @@ import (
 const (
 	ResultSentinel = "VERK_RESULT:"
 	ReviewSentinel = "VERK_REVIEW:"
+	IntentSentinel = "VERK_INTENT:"
 )
 
 // EpicReviewFraming is the canonical wording shown to epic-level reviewers so
@@ -103,7 +104,29 @@ When you are finished, your final message MUST be ONLY a JSON object — no pros
 If no issues are found, set review_status to "passed" and findings to an empty array.`
 }
 
+// IntentSystemPrompt returns the system prompt for a pre-implementation intent
+// echo. This phase is read-only: it confirms understanding before edits begin.
+func IntentSystemPrompt() string {
+	return `You are a verk implementation worker doing a pre-implementation intent echo.
+
+Rules:
+- Do not edit files.
+- Read the ticket instructions and declared owned_paths carefully.
+- State which acceptance criteria you intend to cover, which files you expect to touch, and how you plan to test.
+- If the task is unclear, return the best narrow plan and leave implementation concerns for the next phase.
+
+When you are finished, your final message MUST be ONLY a JSON object — no prose, no markdown, no explanation. The JSON must conform to this schema:
+
+{
+  "covered_criteria": ["short criterion descriptions"],
+  "target_files": ["relative/path.go"],
+  "test_plan": "brief validation plan"
+}`
+}
+
 // BuildWorkerPrompt constructs the user prompt for an implementation worker.
+// If req.Profile is set, the profile's rationalization framing is injected
+// after the ticket content and before the standards block.
 func BuildWorkerPrompt(req WorkerRequest) string {
 	var b strings.Builder
 
@@ -128,6 +151,62 @@ func BuildWorkerPrompt(req WorkerRequest) string {
 
 	if req.InputArtifactPath != "" {
 		fmt.Fprintf(&b, "\nPrior artifact: %s\n", req.InputArtifactPath)
+	}
+
+	if profileBlock := BuildProfilePrompt(req.Profile); profileBlock != "" {
+		b.WriteString("\n### Role Profile\n\n")
+		b.WriteString(profileBlock)
+		b.WriteString("\n")
+	}
+
+	if req.Standards != "" {
+		b.WriteString("\n### Engineering Standards\n\n")
+		b.WriteString(truncateStandards(req.Standards))
+		b.WriteString("\n")
+	}
+
+	if len(req.OwnedPaths) > 0 {
+		b.WriteString("\n## Hard Edit Guard\n\n")
+		b.WriteString("This worker is scoped to the following owned paths. Any edit outside this set\n")
+		b.WriteString("must stop immediately and return status: blocked with reason scope_escape_attempt.\n\n")
+		for _, p := range req.OwnedPaths {
+			fmt.Fprintf(&b, "- %s\n", p)
+		}
+	}
+
+	return b.String()
+}
+
+// BuildIntentPrompt constructs the user prompt for a pre-implementation intent
+// echo. It mirrors the worker prompt's ticket and scope context, but explicitly
+// forbids edits.
+func BuildIntentPrompt(req IntentRequest) string {
+	var b strings.Builder
+
+	if req.TicketID != "" {
+		fmt.Fprintf(&b, "Ticket: %s\n", req.TicketID)
+	}
+	if req.Attempt > 1 {
+		fmt.Fprintf(&b, "Intent attempt: %d (previous intent was insufficient)\n", req.Attempt)
+	}
+	fmt.Fprintf(&b, "Lease ID: %s\n", req.LeaseID)
+
+	if req.WorktreePath != "" {
+		fmt.Fprintf(&b, "Working directory: %s\n", req.WorktreePath)
+	}
+
+	b.WriteString("This is an intent echo only. Do not edit files.\n")
+
+	if req.Instructions != "" {
+		b.WriteString("\n")
+		b.WriteString(req.Instructions)
+	}
+
+	if len(req.OwnedPaths) > 0 {
+		b.WriteString("\n## Owned Paths\n\n")
+		for _, p := range req.OwnedPaths {
+			fmt.Fprintf(&b, "- %s\n", p)
+		}
 	}
 
 	return b.String()
@@ -186,6 +265,13 @@ func BuildReviewPrompt(req ReviewRequest) string {
 		b.WriteString("\n")
 	}
 
+	if len(req.ChangedFiles) > 0 {
+		b.WriteString("\n### Files Under Review\n\n")
+		for _, file := range req.ChangedFiles {
+			fmt.Fprintf(&b, "- %s\n", file)
+		}
+	}
+
 	if req.Diff != "" {
 		b.WriteString("\n### Diff\n\n")
 		b.WriteString("```diff\n")
@@ -216,6 +302,13 @@ type VerkReviewBlock struct {
 	ReviewStatus string       `json:"review_status"`
 	Summary      string       `json:"summary"`
 	Findings     []RawFinding `json:"findings"`
+}
+
+// VerkIntentBlock is the JSON structure intent echo workers must return.
+type VerkIntentBlock struct {
+	CoveredCriteria []string `json:"covered_criteria"`
+	TargetFiles     []string `json:"target_files"`
+	TestPlan        string   `json:"test_plan"`
 }
 
 // RawFinding matches the JSON shape expected from reviewers.
@@ -293,6 +386,35 @@ func ParseReviewBlock(text string) (VerkReviewBlock, bool) {
 	return VerkReviewBlock{}, false
 }
 
+// ParseIntentBlock extracts a VerkIntentBlock from AI output.
+// Same three-strategy approach as ParseResultBlock.
+func ParseIntentBlock(text string) (VerkIntentBlock, bool) {
+	text = strings.TrimSpace(text)
+
+	var block VerkIntentBlock
+	if err := json.Unmarshal([]byte(text), &block); err == nil {
+		return finalizeIntentBlock(block)
+	}
+
+	if b, ok := parseSentinelLine[VerkIntentBlock](text, IntentSentinel); ok {
+		return finalizeIntentBlock(b)
+	}
+
+	if b, ok := parseLastJSON[VerkIntentBlock](stripSentinelLines(text, IntentSentinel)); ok {
+		return finalizeIntentBlock(b)
+	}
+
+	return VerkIntentBlock{}, false
+}
+
+func finalizeIntentBlock(b VerkIntentBlock) (VerkIntentBlock, bool) {
+	if len(b.CoveredCriteria) == 0 && len(b.TargetFiles) == 0 && strings.TrimSpace(b.TestPlan) == "" {
+		return VerkIntentBlock{}, false
+	}
+	b.TestPlan = strings.TrimSpace(b.TestPlan)
+	return b, true
+}
+
 func finalizeReviewBlock(b VerkReviewBlock) (VerkReviewBlock, bool) {
 	switch NormalizeKey(b.ReviewStatus) {
 	case string(ReviewStatusPassed):
@@ -352,6 +474,91 @@ func parseLastJSON[T any](text string) (T, bool) {
 		}
 	}
 	return zero, false
+}
+
+// PlannerSystemPrompt is the system prompt for planner-role ticket quality
+// review. It must explicitly differentiate from code review.
+const PlannerSystemPrompt = `You are reviewing ticket quality before implementation. Do not review code.
+Your job is to decide whether these tickets are specific, complete, and
+verifiable enough for workers to deliver the whole epic.
+
+Output a JSON object with shape:
+{
+  "status": "passed" | "blocked",
+  "summary": "<short prose summary>",
+  "findings": [
+    {
+      "ticket_id": "<id>",
+      "code": "<one of: missing_public_contract_scenario, ambiguous_acceptance_criterion, plan_traceability_gap, integration_gap, docs_descope_risk, missing_negative_case, reviewer_instruction_gap>",
+      "severity": "P0" | "P1" | "P2" | "P3" | "P4",
+      "title": "<short title>",
+      "body": "<2-4 sentence explanation>",
+      "evidence": ["<quoted ticket fragments>"]
+    }
+  ]
+}
+
+Respond with JSON only. No prose before or after the JSON.`
+
+// BuildPlannerReviewPrompt assembles the user prompt for a planner-role
+// review request.
+func BuildPlannerReviewPrompt(req PlannerReviewRequest) string {
+	var b strings.Builder
+
+	fmt.Fprintf(&b, "Root ticket: %s\n", req.RootTicketID)
+
+	b.WriteString("\n### Tickets Under Review\n\n")
+	for _, t := range req.Tickets {
+		fmt.Fprintf(&b, "- **%s**: %s\n", t.ID, t.Title)
+		for _, p := range t.OwnedPaths {
+			fmt.Fprintf(&b, "  - owned_path: %s\n", p)
+		}
+		for _, ac := range t.AcceptanceCriteria {
+			fmt.Fprintf(&b, "  - acceptance_criterion: %s\n", ac)
+		}
+		for _, tc := range t.TestCases {
+			fmt.Fprintf(&b, "  - test_case: %s\n", tc)
+		}
+		for _, vc := range t.ValidationCommands {
+			fmt.Fprintf(&b, "  - validation_command: %s\n", vc)
+		}
+		for _, dep := range t.Deps {
+			fmt.Fprintf(&b, "  - dep: %s\n", dep)
+		}
+	}
+
+	b.WriteString("\n### Deterministic Findings\n\n")
+	if len(req.DeterministicFindings) == 0 {
+		b.WriteString("None.\n")
+	} else {
+		b.WriteString("The following findings have already been identified deterministically. Do not re-flag them:\n")
+		for _, f := range req.DeterministicFindings {
+			fmt.Fprintf(&b, "- [%s/%s] %s: %s\n", f.TicketID, f.Code, f.Severity, f.Title)
+		}
+	}
+
+	if len(req.PromotedRules) > 0 {
+		b.WriteString("\n### Lessons From Prior Escaped Defects\n\n")
+		for _, r := range req.PromotedRules {
+			fmt.Fprintf(&b, "- %s: %s\n", r.RuleID, r.Summary)
+		}
+		b.WriteString("\nUse these lessons as context. Do not block solely because a lesson applies; raise a finding only if you see concrete evidence the issue exists.\n")
+	}
+
+	b.WriteString("\n### Your Job\n\n")
+	b.WriteString("This is NOT implementation review. Do not evaluate code.\n")
+	b.WriteString("Look for:\n")
+	b.WriteString("- missing traceability between tickets and a source plan\n")
+	b.WriteString("- missing black-box scenarios for CLI/API tickets\n")
+	b.WriteString("- docs that appear to descope planned behavior (docs descope risk)\n")
+	b.WriteString("- integration and e2e coverage gaps for multi-surface epics\n")
+	b.WriteString("- ambiguous acceptance criteria that workers cannot verify\n")
+	fmt.Fprintf(&b, "Effective review threshold: %s\n", req.EffectiveReviewThreshold)
+
+	b.WriteString("\n### Response Format\n\n")
+	b.WriteString("Respond with a JSON object matching the schema in the system prompt. JSON only — no prose before or after.\n")
+
+	return b.String()
 }
 
 // CLIOutputJSON is the JSON structure returned by `claude -p --output-format json`.

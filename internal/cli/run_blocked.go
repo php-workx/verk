@@ -7,14 +7,59 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"verk/internal/adapters/runtime"
 	"verk/internal/engine"
 	"verk/internal/policy"
+	"verk/internal/state"
 
 	term "github.com/charmbracelet/x/term"
 )
+
+// ticketQualityGateMarker is the prefix embedded in block reasons and
+// BlockedRunError.Cause strings when a ticket quality gate blocks a run.
+// It is a named constant so callers can do a cheap strings.Contains check
+// without importing the engine package's internals.
+const ticketQualityGateMarker = "ticket quality gate blocked"
+
+// printTicketQualityBlock reads the ticket-quality.json artifact for runID and
+// writes the structured block summary to w. The output format follows the spec:
+//
+//	Ticket quality gate blocked before worker dispatch
+//	  <ticket-id> <severity> <finding-code>
+//	  …
+//	Artifact: .verk/runs/<run-id>/ticket-quality.json
+//	Retry: verk inspect epic <root-ticket-id> --fix
+//
+// If the artifact cannot be read (e.g. it is missing because the gate ran
+// on a single ticket without a run-id), a one-line fallback is printed instead.
+// The function always writes at least one line — callers should not guard it
+// with an "if artifact exists" check.
+func printTicketQualityBlock(w io.Writer, repoRoot, runID string) {
+	artifactPath := filepath.Join(repoRoot, ".verk", "runs", runID, "ticket-quality.json")
+	relPath := filepath.Join(".verk", "runs", runID, "ticket-quality.json")
+
+	var qa state.TicketQualityArtifact
+	if err := state.LoadJSON(artifactPath, &qa); err != nil {
+		_, _ = fmt.Fprintln(w, "Ticket quality gate blocked before worker dispatch")
+		_, _ = fmt.Fprintf(w, "  (artifact not available: %v)\n", err)
+		return
+	}
+
+	_, _ = fmt.Fprintln(w, "Ticket quality gate blocked before worker dispatch")
+	for _, f := range qa.Findings {
+		if f.Disposition == "pass" {
+			continue
+		}
+		_, _ = fmt.Fprintf(w, "  %s %s %s\n", f.TicketID, f.Severity, f.Code)
+	}
+	_, _ = fmt.Fprintf(w, "Artifact: %s\n", relPath)
+	if qa.RootTicketID != "" {
+		_, _ = fmt.Fprintf(w, "Retry: verk inspect epic %s --fix\n", qa.RootTicketID)
+	}
+}
 
 // blockedRunInteractor is the subset of os.File capabilities needed to
 // interactively prompt the operator after a blocked epic run. It is factored
@@ -43,9 +88,140 @@ var blockedRunInteractorFor = func() blockedRunInteractor {
 	return blockedRunInteractor{in: os.Stdin, out: os.Stdout}
 }
 
+// noReasonRecorded is the fallback string used when a blocked ticket has no
+// recorded stop reason. It is a named constant to satisfy the goconst linter.
+const noReasonRecorded = "blocked (no reason recorded)"
+
+// ticketDecision represents the operator's choice for a needs_decision ticket.
+type ticketDecision int
+
+const (
+	ticketDecisionRetryImplement  ticketDecision = iota // reopen → implement
+	ticketDecisionRetryRepair                           // reopen → repair
+	ticketDecisionLeaveAsDecision                       // keep outcome=needs_decision
+	ticketDecisionMarkBlocked                           // mark as explicitly blocked
+	ticketDecisionStop                                  // abort the whole interaction
+)
+
+// decisionPrompter asks the operator what to do with a needs_decision ticket.
+// The interface exists so tests can inject stub answers without a real terminal.
+type decisionPrompter interface {
+	ChooseTicketDecision(ticket engine.BlockedTicket) (ticketDecision, error)
+}
+
+// terminalDecisionPrompter implements decisionPrompter using a real terminal.
+// It uses single-keystroke input when running in raw mode and falls back to
+// line-buffered input (e.g. for pipe-based testing without a real TTY).
+type terminalDecisionPrompter struct {
+	r io.Reader
+	w io.Writer
+}
+
+// ChooseTicketDecision presents a numbered menu for the given ticket and reads
+// a single-character reply. The menu maps:
+//
+//	1 → retry from implement
+//	2 → retry from repair
+//	3 → leave as needs_decision
+//	4 → mark blocked
+//	s → stop
+//
+// Any other character is ignored; the prompt repeats until a valid choice or
+// EOF/error is received, at which point the function returns
+// ticketDecisionLeaveAsDecision (fail-open: safest option for the ticket).
+func (p terminalDecisionPrompter) ChooseTicketDecision(ticket engine.BlockedTicket) (ticketDecision, error) {
+	reason := strings.TrimSpace(ticket.Reason)
+	if reason == "" {
+		reason = noReasonRecorded
+	}
+	_, _ = fmt.Fprintf(p.w, "\r\nDecision for %s: %s\r\n", ticket.ID, reason)
+	_, _ = fmt.Fprint(p.w, "  [1] retry from implement\r\n")
+	_, _ = fmt.Fprint(p.w, "  [2] retry from repair\r\n")
+	_, _ = fmt.Fprint(p.w, "  [3] leave as needs decision\r\n")
+	_, _ = fmt.Fprint(p.w, "  [4] mark blocked\r\n")
+	_, _ = fmt.Fprint(p.w, "  [s] stop\r\n")
+
+	ctx := context.Background()
+	for {
+		_, _ = fmt.Fprint(p.w, "  Choice: ")
+		b, ok, cancelled := readPromptByte(ctx, p.r)
+		if cancelled || !ok {
+			_, _ = fmt.Fprint(p.w, "\r\n")
+			return ticketDecisionLeaveAsDecision, nil
+		}
+		_, _ = fmt.Fprintf(p.w, "%c\r\n", b)
+		switch b {
+		case '1':
+			return ticketDecisionRetryImplement, nil
+		case '2':
+			return ticketDecisionRetryRepair, nil
+		case '3':
+			return ticketDecisionLeaveAsDecision, nil
+		case '4':
+			return ticketDecisionMarkBlocked, nil
+		case 's', 'S':
+			return ticketDecisionStop, nil
+		case 0x03, 0x18: // Ctrl+C, Ctrl+X
+			return ticketDecisionStop, nil
+		default:
+			// Unknown key — show menu again.
+		}
+	}
+}
+
+// promptNeedsDecisionTickets asks the operator, one ticket at a time, what to
+// do with each needs_decision ticket. It records each decision and prints what
+// it would do (ticket writes are deferred to a later task). Returns true if the
+// loop was stopped early by the operator.
+func promptNeedsDecisionTickets(ctx context.Context, w io.Writer, prompter decisionPrompter, blocked *engine.BlockedRunError) (stopped bool) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	var ndTickets []engine.BlockedTicket
+	for _, t := range blocked.BlockedTickets {
+		if t.Outcome == state.TicketOutcomeNeedsDecision {
+			ndTickets = append(ndTickets, t)
+		}
+	}
+	if len(ndTickets) == 0 {
+		return false
+	}
+	_, _ = fmt.Fprintln(w)
+	_, _ = fmt.Fprintln(w, "Tickets needing your decision:")
+	for _, t := range ndTickets {
+		select {
+		case <-ctx.Done():
+			return true
+		default:
+		}
+		decision, err := prompter.ChooseTicketDecision(t)
+		if err != nil {
+			return false
+		}
+		switch decision {
+		case ticketDecisionRetryImplement:
+			_, _ = fmt.Fprintf(w, "  → would reopen %s to implement\r\n", t.ID)
+		case ticketDecisionRetryRepair:
+			_, _ = fmt.Fprintf(w, "  → would reopen %s to repair\r\n", t.ID)
+		case ticketDecisionLeaveAsDecision:
+			_, _ = fmt.Fprintf(w, "  → leaving %s as needs_decision\r\n", t.ID)
+		case ticketDecisionMarkBlocked:
+			_, _ = fmt.Fprintf(w, "  → would mark %s as blocked\r\n", t.ID)
+		case ticketDecisionStop:
+			_, _ = fmt.Fprintf(w, "  → stopping at %s\r\n", t.ID)
+			return true
+		}
+	}
+	return false
+}
+
 // printBlockedRunGuidance writes a stable, testable representation of a blocked
-// epic run to w: one line per blocked ticket with its reason, followed by a
-// concrete retry command for each ticket and a final `verk run` resume line.
+// epic run to w. Tickets are grouped into three distinct sections based on
+// their outcome:
+//   - "Retryable tickets": failed_retryable outcome — safe to reopen automatically.
+//   - "Tickets needing decision": needs_decision outcome — operator must choose
+//     between implement, repair, or blocking the ticket explicitly.
+//   - "Blocked tickets": all other non-closed, non-retryable tickets.
 //
 // The output contract is covered by CLI tests and the ticket's acceptance
 // criteria — avoid changing it without updating both.
@@ -61,24 +237,68 @@ func printBlockedRunGuidance(w io.Writer, blocked *engine.BlockedRunError) {
 		}
 		return
 	}
-	_, _ = fmt.Fprintln(w, "Blocked tickets:")
+
+	// Partition tickets into three buckets by outcome.
+	var retryable, needsDecision, hardBlocked []engine.BlockedTicket
 	for _, t := range blocked.BlockedTickets {
-		reason := strings.TrimSpace(t.Reason)
-		if reason == "" {
-			reason = "blocked (no reason recorded)"
+		switch {
+		case t.RetryPhase != "" && t.Outcome != state.TicketOutcomeNeedsDecision:
+			retryable = append(retryable, t)
+		case t.Outcome == state.TicketOutcomeNeedsDecision:
+			needsDecision = append(needsDecision, t)
+		default:
+			hardBlocked = append(hardBlocked, t)
 		}
-		_, _ = fmt.Fprintf(w, "  %s: %s\n", t.ID, reason)
 	}
-	_, _ = fmt.Fprintln(w)
-	retryable := retryableBlockedTickets(blocked)
-	if len(retryable) == 0 {
+
+	// Section: retryable tickets.
+	if len(retryable) > 0 {
+		_, _ = fmt.Fprintln(w, "Retryable tickets:")
+		for _, t := range retryable {
+			reason := strings.TrimSpace(t.Reason)
+			if reason == "" {
+				reason = noReasonRecorded
+			}
+			_, _ = fmt.Fprintf(w, "  %s: %s\n", t.ID, reason)
+			_, _ = fmt.Fprintf(w, "  To retry:  verk reopen %s %s --to %s\n", blocked.RunID, t.ID, t.RetryPhase)
+		}
+		_, _ = fmt.Fprintln(w)
+	}
+
+	// Section: needs-decision tickets.
+	if len(needsDecision) > 0 {
+		_, _ = fmt.Fprintln(w, "Tickets needing decision:")
+		for _, t := range needsDecision {
+			reason := strings.TrimSpace(t.Reason)
+			if reason == "" {
+				reason = noReasonRecorded
+			}
+			_, _ = fmt.Fprintf(w, "  %s: %s\n", t.ID, reason)
+			_, _ = fmt.Fprintf(w, "  To retry:  verk reopen %s %s --to implement\n", blocked.RunID, t.ID)
+			_, _ = fmt.Fprintf(w, "  To retry:  verk reopen %s %s --to repair\n", blocked.RunID, t.ID)
+			_, _ = fmt.Fprintf(w, "  To block:  verk block %s --reason \"...\"\n", t.ID)
+		}
+		_, _ = fmt.Fprintln(w)
+	}
+
+	// Section: hard-blocked tickets (no retry possible).
+	if len(hardBlocked) > 0 {
+		_, _ = fmt.Fprintln(w, "Blocked tickets:")
+		for _, t := range hardBlocked {
+			reason := strings.TrimSpace(t.Reason)
+			if reason == "" {
+				reason = noReasonRecorded
+			}
+			_, _ = fmt.Fprintf(w, "  %s: %s\n", t.ID, reason)
+		}
+		_, _ = fmt.Fprintln(w)
+	}
+
+	// If nothing is retryable at all, emit a hint.
+	if len(retryable) == 0 && len(needsDecision) == 0 {
 		_, _ = fmt.Fprintln(w, "Retry: no tickets can be reopened automatically")
 		_, _ = fmt.Fprintln(w, "  resolve blockers or dependencies, then run verk run")
 		return
-	}
-	_, _ = fmt.Fprintln(w, "Retry:")
-	for _, t := range retryable {
-		_, _ = fmt.Fprintf(w, "  verk reopen %s %s --to %s\n", blocked.RunID, t.ID, t.RetryPhase)
 	}
 	_, _ = fmt.Fprintln(w, "  verk run")
 }
@@ -90,6 +310,9 @@ func retryableBlockedTickets(blocked *engine.BlockedRunError) []engine.BlockedTi
 	out := make([]engine.BlockedTicket, 0, len(blocked.BlockedTickets))
 	for _, ticket := range blocked.BlockedTickets {
 		if ticket.RetryPhase == "" {
+			continue
+		}
+		if ticket.Outcome == state.TicketOutcomeNeedsDecision {
 			continue
 		}
 		out = append(out, ticket)
@@ -343,11 +566,34 @@ func handleBlockedEpicRun(
 	cfg contextCfgForResume,
 	blocked *engine.BlockedRunError,
 ) (retried bool, err error) {
+	// Quality-gate blocks have a Cause containing the gate marker and no
+	// individual BlockedTickets. Render the structured quality-gate summary
+	// to stdout (not errw) so operators can pipe it; the generic guidance
+	// path handles all other block variants.
+	if blocked.Cause != nil && strings.Contains(blocked.Cause.Error(), ticketQualityGateMarker) {
+		printTicketQualityBlock(w, repoRoot, blocked.RunID)
+		return false, nil
+	}
 	printBlockedRunGuidance(errw, blocked)
 
 	interactor := blockedRunInteractorFor()
 	if !interactor.isTTY() {
 		return false, nil
+	}
+
+	// Handle needs_decision tickets interactively before retrying retryable ones.
+	var hasNeedsDecision bool
+	for _, t := range blocked.BlockedTickets {
+		if t.Outcome == state.TicketOutcomeNeedsDecision {
+			hasNeedsDecision = true
+			break
+		}
+	}
+	if hasNeedsDecision {
+		prompter := terminalDecisionPrompter{r: interactor.in, w: interactor.out}
+		if stopped := promptNeedsDecisionTickets(ctx, interactor.out, prompter, blocked); stopped {
+			return false, context.Canceled
+		}
 	}
 
 	selected, cancelled := promptBlockedRetryTTY(ctx, interactor.in, interactor.out, blocked)

@@ -36,7 +36,15 @@ type closeoutRequest struct {
 	implementation    *state.ImplementationArtifact
 	criteriaEvidence  []state.CriteriaEvidence
 	requiredArtifacts []string
+	repoRoot          string // optional: when set, test references are AST-resolved
 }
+
+// CloseoutRepoRoot is a typed wrapper around a filesystem path. Pass it as a
+// variadic argument to BuildCloseoutArtifact / DeriveGateResults to enable
+// AST-level test reference resolution. When omitted (or empty), the resolution
+// step is skipped — this preserves unit-test ergonomics for callers that do
+// not have a worktree.
+type CloseoutRepoRoot string
 
 func ReviewFindingBlocks(f any, threshold state.Severity) bool {
 	finding, ok := normalizeReviewFinding(f)
@@ -307,6 +315,8 @@ func parseCloseoutRequest(args ...any) (closeoutRequest, error) {
 			req.criteriaEvidence = append([]state.CriteriaEvidence(nil), v...)
 		case []string:
 			req.requiredArtifacts = append([]string(nil), v...)
+		case CloseoutRepoRoot:
+			req.repoRoot = string(v)
 		}
 	}
 
@@ -423,7 +433,7 @@ func validateArtifactIntegrity(req closeoutRequest, currentRunID string) error {
 			return fmt.Errorf("review artifact run %q does not match current run %q", req.review.RunID, currentRunID)
 		}
 		for _, finding := range req.review.Findings {
-			if err := validateReviewFinding(finding, req.plan.EffectiveReviewThreshold); err != nil {
+			if err := validateReviewFindingWithRepoRoot(finding, req.plan.EffectiveReviewThreshold, req.plan.OwnedPaths, req.repoRoot); err != nil {
 				return err
 			}
 		}
@@ -648,7 +658,7 @@ func requiredValidationCoveragePassed(coverage state.ValidationCoverageArtifact)
 // Non-blocking findings may omit file/line (speculative/informational findings are
 // allowed without precise location), but a non-empty file that is whitespace-only
 // is always rejected as a programming error.
-func validateReviewFinding(f state.ReviewFinding, threshold state.Severity) error {
+func validateReviewFindingWithRepoRoot(f state.ReviewFinding, threshold state.Severity, ownedPaths []string, repoRoot string) error {
 	if f.ID == "" {
 		return fmt.Errorf("review finding missing id")
 	}
@@ -674,8 +684,10 @@ func validateReviewFinding(f state.ReviewFinding, threshold state.Severity) erro
 		return fmt.Errorf("review finding %q has whitespace-only file", f.ID)
 	}
 	switch f.Disposition {
-	case "open", "resolved":
+	case "open":
 		return nil
+	case "resolved":
+		return validateResolutionEvidence(f, ownedPaths, repoRoot)
 	case "waived":
 		if strings.TrimSpace(f.WaivedBy) == "" {
 			return fmt.Errorf("waived review finding %q missing waived_by", f.ID)
@@ -690,6 +702,56 @@ func validateReviewFinding(f state.ReviewFinding, threshold state.Severity) erro
 	default:
 		return fmt.Errorf("review finding %q has invalid disposition %q", f.ID, f.Disposition)
 	}
+}
+
+// validateResolutionEvidence enforces gate rules for a finding with
+// disposition "resolved". The Legacy flag grandfathers pre-evidence
+// artifacts during migration; set it only via the migration tool.
+//
+// Gate rules:
+//  1. ResolutionEvidence must be non-nil (or Legacy == true).
+//  2. DiffRanges must be non-empty.
+//  3. Every DiffRange.File must lie within the ticket's owned_paths (scope
+//     violation — distinct from generic closeout failure; spec SR-4 rule 4).
+//  4. TestReferences must be non-empty; each must pass ValidateTestReference.
+//     When repoRoot is provided, each reference must resolve to a real Go test.
+//  5. RepairCycleID must be non-empty.
+func validateResolutionEvidence(f state.ReviewFinding, ownedPaths []string, repoRoot string) error {
+	ev := f.ResolutionEvidence
+	if ev == nil {
+		return fmt.Errorf("resolved review finding %q missing resolution_evidence", f.ID)
+	}
+	if ev.Legacy {
+		return nil
+	}
+	if len(ev.DiffRanges) == 0 {
+		return fmt.Errorf("resolved review finding %q resolution_evidence has no diff_ranges", f.ID)
+	}
+	// Owned-paths bounds check: every DiffRange.File must be within scope.
+	// A diff outside scope is a scope violation — separate from generic
+	// closeout failure — so callers can distinguish the two error kinds.
+	if len(ownedPaths) > 0 {
+		for _, dr := range ev.DiffRanges {
+			if !fileInOwned(dr.File, ownedPaths) {
+				return fmt.Errorf("scope violation: resolved review finding %q resolution_evidence diff_range file %q is outside owned_paths", f.ID, dr.File)
+			}
+		}
+	}
+	if len(ev.TestReferences) == 0 {
+		return fmt.Errorf("resolved review finding %q resolution_evidence has no test_references", f.ID)
+	}
+	for i, ref := range ev.TestReferences {
+		if err := state.ValidateTestReference(ref); err != nil {
+			return fmt.Errorf("resolved review finding %q resolution_evidence test_reference[%d]: %w", f.ID, i, err)
+		}
+		if err := resolveTestReference(repoRoot, ref); err != nil {
+			return fmt.Errorf("resolved review finding %q resolution_evidence test_reference[%d]: %w", f.ID, i, err)
+		}
+	}
+	if ev.RepairCycleID == "" {
+		return fmt.Errorf("resolved review finding %q resolution_evidence missing repair_cycle_id", f.ID)
+	}
+	return nil
 }
 
 func derivedReviewPassed(findings []state.ReviewFinding, threshold state.Severity) bool {

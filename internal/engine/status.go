@@ -21,6 +21,7 @@ type StatusTicket struct {
 	TicketID                 string            `json:"ticket_id"`
 	Title                    string            `json:"title,omitempty"`
 	Phase                    state.TicketPhase `json:"phase"`
+	Profile                  string            `json:"profile,omitempty"`
 	EffectiveReviewThreshold state.Severity    `json:"effective_review_threshold,omitempty"`
 	BlockReason              string            `json:"block_reason,omitempty"`
 	Steps                    []StatusStep      `json:"steps,omitempty"`
@@ -96,6 +97,7 @@ func DeriveStatus(req StatusRequest) (StatusReport, error) {
 			TicketID:                 ticketID,
 			Title:                    title,
 			Phase:                    snapshot.CurrentPhase,
+			Profile:                  plan.AgentProfile,
 			EffectiveReviewThreshold: plan.EffectiveReviewThreshold,
 			BlockReason:              snapshot.BlockReason,
 			Steps:                    deriveStatusSteps(snapshot),

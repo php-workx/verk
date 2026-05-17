@@ -120,6 +120,47 @@ func TestParseResultBlock_MalformedJSON(t *testing.T) {
 	}
 }
 
+func TestParseIntentBlock_ValidatesAllParsePaths(t *testing.T) {
+	tests := []struct {
+		name      string
+		input     string
+		wantFound bool
+	}{
+		{
+			name:      "direct JSON",
+			input:     `{"covered_criteria":["criterion one"],"target_files":["internal/foo.go"],"test_plan":"go test ./..."}`,
+			wantFound: true,
+		},
+		{
+			name:      "sentinel JSON",
+			input:     `VERK_INTENT:{"covered_criteria":["criterion one"],"target_files":["internal/foo.go"],"test_plan":"go test ./..."}`,
+			wantFound: true,
+		},
+		{
+			name:      "last JSON fallback",
+			input:     "Intent follows:\n{\"covered_criteria\":[\"criterion one\"],\"target_files\":[\"internal/foo.go\"],\"test_plan\":\"go test ./...\"}",
+			wantFound: true,
+		},
+		{
+			name:      "empty object rejected",
+			input:     `{}`,
+			wantFound: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			block, found := ParseIntentBlock(tt.input)
+			if found != tt.wantFound {
+				t.Fatalf("found=%v, want %v", found, tt.wantFound)
+			}
+			if found && block.TestPlan != "go test ./..." {
+				t.Fatalf("test_plan=%q, want go test ./...", block.TestPlan)
+			}
+		})
+	}
+}
+
 func TestParseReviewBlock_DirectJSON(t *testing.T) {
 	text := `{
   "review_status": "findings",
@@ -369,6 +410,31 @@ func TestBuildWorkerPrompt_AsksWorkerToInspectExistingImplementation(t *testing.
 	}
 }
 
+func TestBuildIntentPrompt_ForbidsEditsAndIncludesScope(t *testing.T) {
+	prompt := BuildIntentPrompt(IntentRequest{
+		TicketID:     "VER-INTENT",
+		LeaseID:      "lease-intent",
+		Attempt:      2,
+		WorktreePath: "/workspace",
+		Instructions: "Implement the feature",
+		OwnedPaths:   []string{"internal/foo.go"},
+	})
+
+	for _, want := range []string{
+		"Ticket: VER-INTENT",
+		"Intent attempt: 2",
+		"Lease ID: lease-intent",
+		"Working directory: /workspace",
+		"This is an intent echo only. Do not edit files.",
+		"Implement the feature",
+		"- internal/foo.go",
+	} {
+		if !strings.Contains(prompt, want) {
+			t.Fatalf("expected %q in prompt:\n%s", want, prompt)
+		}
+	}
+}
+
 func TestBuildReviewPrompt_ContainsThreshold(t *testing.T) {
 	prompt := BuildReviewPrompt(ReviewRequest{
 		TicketID:                 "VER-002",
@@ -535,5 +601,370 @@ func TestBuildReviewPrompt_NoDiffWhenEmpty(t *testing.T) {
 	})
 	if strings.Contains(prompt, "```diff") {
 		t.Fatal("expected no diff block when diff is empty")
+	}
+}
+
+func TestBuildReviewPrompt_IncludesFilesUnderReview(t *testing.T) {
+	prompt := BuildReviewPrompt(ReviewRequest{
+		TicketID:                 "VER-001",
+		LeaseID:                  "lease-1",
+		EffectiveReviewThreshold: "P2",
+		ChangedFiles:             []string{"src/app.go", "docs/readme.md"},
+		Diff:                     "diff --git a/src/app.go b/src/app.go\n",
+	})
+
+	for _, want := range []string{
+		"### Files Under Review",
+		"- src/app.go",
+		"- docs/readme.md",
+	} {
+		if !strings.Contains(prompt, want) {
+			t.Fatalf("expected %q in prompt:\n%s", want, prompt)
+		}
+	}
+}
+
+func TestBuildReviewPrompt_NoFilesUnderReviewWhenEmpty(t *testing.T) {
+	prompt := BuildReviewPrompt(ReviewRequest{
+		TicketID:                 "VER-001",
+		LeaseID:                  "lease-1",
+		EffectiveReviewThreshold: "P2",
+	})
+	if strings.Contains(prompt, "### Files Under Review") {
+		t.Fatal("expected no Files Under Review section when ChangedFiles is empty")
+	}
+}
+
+func TestBuildPlannerReviewPrompt_IncludesRootAndChildren(t *testing.T) {
+	req := PlannerReviewRequest{
+		RootTicketID:             "EPIC-1",
+		EffectiveReviewThreshold: "P2",
+		LeaseID:                  "lease-42",
+		Tickets: []TicketSummary{
+			{
+				ID:         "TICK-1",
+				Title:      "Add auth endpoint",
+				OwnedPaths: []string{"internal/api/auth.go", "internal/api/auth_test.go"},
+			},
+			{
+				ID:         "TICK-2",
+				Title:      "Add user store",
+				OwnedPaths: []string{"internal/store/user.go"},
+			},
+		},
+	}
+	prompt := BuildPlannerReviewPrompt(req)
+
+	for _, want := range []string{
+		"EPIC-1",
+		"TICK-1",
+		"TICK-2",
+		"internal/api/auth.go",
+		"internal/api/auth_test.go",
+		"internal/store/user.go",
+	} {
+		if !strings.Contains(prompt, want) {
+			t.Errorf("expected prompt to contain %q:\n%s", want, prompt)
+		}
+	}
+}
+
+func TestBuildPlannerReviewPrompt_IncludesDeterministicFindings(t *testing.T) {
+	req := PlannerReviewRequest{
+		RootTicketID:             "EPIC-1",
+		EffectiveReviewThreshold: "P2",
+		LeaseID:                  "lease-42",
+		Tickets: []TicketSummary{
+			{ID: "TICK-1", Title: "Do something"},
+		},
+		DeterministicFindings: []RawTicketQualityFinding{
+			{
+				TicketID: "TICK-1",
+				Code:     "missing_negative_case",
+				Severity: "P1",
+				Title:    "No error path tested",
+				Body:     "The acceptance criteria lack any negative test case.",
+			},
+		},
+	}
+	prompt := BuildPlannerReviewPrompt(req)
+
+	for _, want := range []string{
+		"missing_negative_case",
+		"No error path tested",
+		"TICK-1",
+	} {
+		if !strings.Contains(prompt, want) {
+			t.Errorf("expected prompt to contain %q:\n%s", want, prompt)
+		}
+	}
+}
+
+func TestBuildPlannerReviewPrompt_StatesNonImplementationReview(t *testing.T) {
+	if !strings.Contains(PlannerSystemPrompt, "Do not review code") {
+		t.Fatalf("expected PlannerSystemPrompt to contain 'Do not review code':\n%s", PlannerSystemPrompt)
+	}
+}
+
+func TestBuildPlannerReviewPrompt_MentionsRequiredCheckCategories(t *testing.T) {
+	req := PlannerReviewRequest{
+		RootTicketID:             "EPIC-1",
+		EffectiveReviewThreshold: "P2",
+		LeaseID:                  "lease-42",
+		Tickets:                  []TicketSummary{{ID: "TICK-1", Title: "Do something"}},
+	}
+	prompt := BuildPlannerReviewPrompt(req)
+
+	for _, want := range []string{
+		"traceability",
+		"black-box",
+		"docs",
+		"integration",
+		"ambiguous",
+	} {
+		if !strings.Contains(prompt, want) {
+			t.Errorf("expected prompt to contain %q:\n%s", want, prompt)
+		}
+	}
+}
+
+func TestBuildPlannerReviewPrompt_StatesJSONOnly(t *testing.T) {
+	if !strings.Contains(PlannerSystemPrompt, "JSON only") {
+		t.Fatalf("expected PlannerSystemPrompt to contain 'JSON only':\n%s", PlannerSystemPrompt)
+	}
+}
+
+func TestBuildPlannerReviewPrompt_IncludesPromotedRules(t *testing.T) {
+	req := PlannerReviewRequest{
+		RootTicketID:             "EPIC-1",
+		EffectiveReviewThreshold: "P2",
+		LeaseID:                  "lease-99",
+		Tickets: []TicketSummary{
+			{ID: "TICK-1", Title: "Do something"},
+		},
+		PromotedRules: []PromotedRuleContext{
+			{RuleID: "rule-abc", Summary: "always validate inputs before processing"},
+		},
+	}
+	prompt := BuildPlannerReviewPrompt(req)
+
+	if !strings.Contains(prompt, "Lessons From Prior Escaped Defects") {
+		t.Errorf("expected 'Lessons From Prior Escaped Defects' section header in prompt:\n%s", prompt)
+	}
+	if !strings.Contains(prompt, "rule-abc") {
+		t.Errorf("expected rule ID 'rule-abc' in prompt:\n%s", prompt)
+	}
+	if !strings.Contains(prompt, "always validate inputs before processing") {
+		t.Errorf("expected rule summary in prompt:\n%s", prompt)
+	}
+	if !strings.Contains(prompt, "Do not block solely because a lesson applies") {
+		t.Errorf("expected advisory instruction in prompt:\n%s", prompt)
+	}
+}
+
+func TestBuildPlannerReviewPrompt_OmitsPromotedRulesSectionWhenEmpty(t *testing.T) {
+	req := PlannerReviewRequest{
+		RootTicketID:             "EPIC-1",
+		EffectiveReviewThreshold: "P2",
+		LeaseID:                  "lease-99",
+		Tickets: []TicketSummary{
+			{ID: "TICK-1", Title: "Do something"},
+		},
+		// PromotedRules intentionally omitted / nil
+	}
+	prompt := BuildPlannerReviewPrompt(req)
+
+	if strings.Contains(prompt, "Lessons From Prior") {
+		t.Errorf("expected 'Lessons From Prior' section to be absent when PromotedRules is empty:\n%s", prompt)
+	}
+}
+
+// Profile prompt tests.
+
+func TestBuildProfilePrompt_SecurityContainsCredentialKeyword(t *testing.T) {
+	profile := BuildProfilePrompt("security-engineer")
+	if !strings.Contains(strings.ToLower(profile), "credential") {
+		t.Fatalf("expected 'credential' in security-engineer profile:\n%s", profile)
+	}
+}
+
+func TestBuildProfilePrompt_ContractContainsExitCode(t *testing.T) {
+	profile := BuildProfilePrompt("contract-engineer")
+	if !strings.Contains(strings.ToLower(profile), "exit code") {
+		t.Fatalf("expected 'exit code' in contract-engineer profile:\n%s", profile)
+	}
+}
+
+func TestBuildProfilePrompt_UnknownReturnsEmpty(t *testing.T) {
+	profile := BuildProfilePrompt("unknown-role")
+	if profile != "" {
+		t.Fatalf("expected empty string for unknown profile, got %q", profile)
+	}
+}
+
+func TestBuildWorkerPrompt_ProfileBlockAppearsAfterTicketContentBeforeStandards(t *testing.T) {
+	req := WorkerRequest{
+		TicketID:     "VER-100",
+		LeaseID:      "lease-100",
+		Instructions: "Add cleanup subcommand",
+		Profile:      "contract-engineer",
+	}
+	prompt := BuildWorkerPrompt(req)
+
+	ticketIdx := strings.Index(prompt, "Add cleanup subcommand")
+	profileIdx := strings.Index(prompt, "contract-engineer")
+	roleProfileIdx := strings.Index(prompt, "### Role Profile")
+
+	if ticketIdx < 0 {
+		t.Fatal("expected ticket content 'Add cleanup subcommand' in prompt")
+	}
+	if profileIdx < 0 {
+		t.Fatal("expected 'contract-engineer' in prompt")
+	}
+	if roleProfileIdx < 0 {
+		t.Fatal("expected '### Role Profile' section in prompt")
+	}
+	if ticketIdx > profileIdx {
+		t.Fatalf("expected ticket content (pos %d) to appear before profile block (pos %d)", ticketIdx, profileIdx)
+	}
+}
+
+func TestBuildWorkerPrompt_EmptyProfileSkipsBlock(t *testing.T) {
+	req := WorkerRequest{
+		TicketID:     "VER-101",
+		LeaseID:      "lease-101",
+		Instructions: "Some task",
+		Profile:      "",
+	}
+	prompt := BuildWorkerPrompt(req)
+
+	// None of the profile-specific markers should appear.
+	for _, marker := range []string{
+		"security-engineer",
+		"contract-engineer",
+		"frontend-engineer",
+		"backend-engineer",
+		"### Role Profile",
+		"Rationalizations to resist",
+	} {
+		if strings.Contains(prompt, marker) {
+			t.Errorf("expected no profile content in prompt with empty profile, but found %q", marker)
+		}
+	}
+}
+
+func TestBuildWorkerPrompt_IncludesHardEditGuardWhenOwnedPathsSet(t *testing.T) {
+	req := WorkerRequest{
+		TicketID:   "VER-200",
+		LeaseID:    "lease-200",
+		OwnedPaths: []string{"internal/widget", "docs/widget.md"},
+	}
+	prompt := BuildWorkerPrompt(req)
+
+	if !strings.Contains(prompt, "## Hard Edit Guard") {
+		t.Fatal("expected '## Hard Edit Guard' section in prompt")
+	}
+	for _, p := range req.OwnedPaths {
+		if !strings.Contains(prompt, p) {
+			t.Errorf("expected owned path %q to appear in prompt", p)
+		}
+	}
+	if !strings.Contains(prompt, "scope_escape_attempt") {
+		t.Error("expected 'scope_escape_attempt' in hard edit guard section")
+	}
+}
+
+func TestBuildWorkerPrompt_OmitsGuardWhenOwnedPathsEmpty(t *testing.T) {
+	req := WorkerRequest{
+		TicketID:   "VER-201",
+		LeaseID:    "lease-201",
+		OwnedPaths: nil,
+	}
+	prompt := BuildWorkerPrompt(req)
+
+	if strings.Contains(prompt, "## Hard Edit Guard") {
+		t.Error("expected no '## Hard Edit Guard' section when OwnedPaths is empty")
+	}
+	if strings.Contains(prompt, "scope_escape_attempt") {
+		t.Error("expected no 'scope_escape_attempt' when OwnedPaths is empty")
+	}
+}
+
+func TestBuildProfilePrompt_ContractIncludesSourceDriven(t *testing.T) {
+	profile := BuildProfilePrompt("contract-engineer")
+	lower := strings.ToLower(profile)
+	if !strings.Contains(lower, "fetching docs") && !strings.Contains(lower, "verify the api") {
+		t.Fatalf("expected 'fetching docs' or 'verify the api' in contract-engineer profile:\n%s", profile)
+	}
+}
+
+func TestBuildProfilePrompt_BackendIncludesCodeSimplification(t *testing.T) {
+	profile := BuildProfilePrompt("backend-engineer")
+	lower := strings.ToLower(profile)
+	if !strings.Contains(lower, "unscoped") && !strings.Contains(lower, "premature abstraction") {
+		t.Fatalf("expected 'unscoped' or 'premature abstraction' in backend-engineer profile:\n%s", profile)
+	}
+}
+
+func TestBuildProfilePrompt_FrontendIncludesBrowserTesting(t *testing.T) {
+	profile := BuildProfilePrompt("frontend-engineer")
+	lower := strings.ToLower(profile)
+	if !strings.Contains(lower, "devtools") && !strings.Contains(lower, "console") {
+		t.Fatalf("expected 'devtools' or 'console' in frontend-engineer profile:\n%s", profile)
+	}
+}
+
+func TestBuildWorkerPrompt_IncludesStandardsWhenProvided(t *testing.T) {
+	standards := BuildReviewStandards([]string{"go"})
+	req := WorkerRequest{
+		TicketID:  "VER-300",
+		LeaseID:   "lease-300",
+		Standards: standards,
+	}
+	prompt := BuildWorkerPrompt(req)
+
+	if !strings.Contains(prompt, "### Engineering Standards") {
+		t.Fatal("expected '### Engineering Standards' section in prompt")
+	}
+	// Universal standards are always included; verify a known snippet is present.
+	if !strings.Contains(prompt, "Universal Review Standards") {
+		t.Fatal("expected universal review standards snippet in prompt")
+	}
+}
+
+func TestBuildWorkerPrompt_OmitsStandardsSectionWhenEmpty(t *testing.T) {
+	req := WorkerRequest{
+		TicketID:  "VER-301",
+		LeaseID:   "lease-301",
+		Standards: "",
+	}
+	prompt := BuildWorkerPrompt(req)
+
+	if strings.Contains(prompt, "### Engineering Standards") {
+		t.Error("expected no '### Engineering Standards' section when Standards is empty")
+	}
+}
+
+func TestBuildWorkerPrompt_StandardsAppearBeforeHardEditGuard(t *testing.T) {
+	standards := BuildReviewStandards([]string{"go"})
+	req := WorkerRequest{
+		TicketID:   "VER-302",
+		LeaseID:    "lease-302",
+		Standards:  standards,
+		OwnedPaths: []string{"internal/widget.go"},
+	}
+	prompt := BuildWorkerPrompt(req)
+
+	standardsIdx := strings.Index(prompt, "### Engineering Standards")
+	guardIdx := strings.Index(prompt, "## Hard Edit Guard")
+
+	if standardsIdx < 0 {
+		t.Fatal("expected '### Engineering Standards' section in prompt")
+	}
+	if guardIdx < 0 {
+		t.Fatal("expected '## Hard Edit Guard' section in prompt")
+	}
+	if standardsIdx > guardIdx {
+		t.Fatalf("expected standards (pos %d) to appear before Hard Edit Guard (pos %d)", standardsIdx, guardIdx)
 	}
 }

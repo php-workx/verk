@@ -405,4 +405,4 @@ The rationalizations catalog is the first line of defense, not the last. It is c
 | [impl-verify-improvements](2026-04-19-impl-verify-improvements.md) P3 | This is the detailed spec for P3. P3 is "anti-rationalization in worker prompts"; this catalog defines what to inject and where. |
 | [impl-verify-improvements](2026-04-19-impl-verify-improvements.md) P7 | Compiled-constraint promotion is the mechanical fallback when rationalization preemption fails. This catalog feeds the constraint candidates. |
 | [verk-run-repair-oriented-gates](2026-04-19-verk-run-repair-oriented-gates.md) | Repair-phase rationalizations (Debugging group) apply when a worker is reopened after a failed verification. |
-| INDEX.md "Ticket quality pre-run gate" (Gap) | The verk-specific rationalizations section directly feeds the ticket quality gate design. |
+| INDEX.md "Ticket quality pre-run gate" | The verk-specific rationalizations section directly feeds the ticket quality gate design. |

@@ -10,6 +10,8 @@ or ticket first, then update this file.
 - Implemented: feature track has landed; document is retained as the durable
   design/reference.
 - Planned: design exists, but no active implementation was found.
+- Backburner: design and tickets remain tracked, but the work is intentionally
+  deprioritized behind higher-risk tool reliability work.
 - Blocked: design exists, but another plan or capability must land first.
 - Reference: baseline or support spec that other plans build on.
 - Gap: repeatedly identified need, but no dedicated plan was found.
@@ -20,25 +22,26 @@ or ticket first, then update this file.
 | --- | --- | --- | --- | --- |
 | Core engine v1 | Reference | [done/initial_v1.md](done/initial_v1.md) | historical baseline | Deterministic engine, phase state machine, artifacts, claims, policy contract, and scope enforcement. |
 | Validation coverage artifacts | Reference / Implemented | [validation-coverage.md](validation-coverage.md) | `ver-vyag`, `ver-rcgh`, `ver-y29o`, `ver-1qru`, `ver-ssp3` | Durable record for declared, derived, executed, skipped, repaired, and blocking checks. |
-| Worker isolation | Active | [worker-isolation.md](worker-isolation.md) | `ver-wi0p`, `ver-wi01` through `ver-wi22` | Per-ticket git worktrees for parallel worker isolation, merge-back, verification CWD split, and cleanup. |
+| Worker isolation | Reference / Implemented | [worker-isolation.md](worker-isolation.md) | `ver-wi0p`, `ver-wi01` through `ver-wi22` | Per-ticket git worktrees for parallel worker isolation, merge-back, verification CWD split, and cleanup. |
 
 ## Feature Tracks
 
 | Feature area | Status | Primary document | Related tickets | Scope |
 | --- | --- | --- | --- | --- |
 | Repair-oriented run gates | Implemented / Reference | [2026-04-19-verk-run-repair-oriented-gates.md](2026-04-19-verk-run-repair-oriented-gates.md) | `ver-vyag`, `ver-rcgh`, `ver-laq2`, `ver-y29o`, `ver-1qru`, `ver-tidw`, `ver-amsh`, `ver-ssp3`, `ver-bks9`, `ver-mbvz`, `ver-aw4j` | Ticket, wave, and epic closeout prefer repair over early blocking and surface actionable blocker reasons. |
-| Implementation and verification loop improvements | Planned / Reference | [2026-04-19-impl-verify-improvements.md](2026-04-19-impl-verify-improvements.md) | overlaps `ver-vyag` | Broader roadmap for the impl -> verify -> review -> repair loop, including intent echo, standards, validators, and reviewer gates. |
-| Per-worker review diffs | Active / Planned | [2026-04-20-per-worker-review-diffs.md](2026-04-20-per-worker-review-diffs.md) | no dedicated epic found in this index pass | Reviewers should inspect the current worker attempt's delta instead of the whole dirty worktree. |
-| Recursive sub-epic execution | Active | no dedicated plan found | `ver-vmgr` and children | Make sub-epics resumable, retryable, artifact-backed, depth-limited by scheduler policy, and safe when descendants block. |
-| High-severity review findings | Active | no dedicated plan found | `ver-wgxh` and children | Remediate claim safety, lease handling, runtime status normalization, verification environment behavior, and epic acceptance propagation. |
-| Benchmarking | Active / Planned | [2026-04-19-benchmark-adoption-and-creation.md](2026-04-19-benchmark-adoption-and-creation.md) | `ver-g9p2` and children | Public/private benchmark strategy, reproducibility, verifier integrity, flake taxonomy, cost accounting, and suite governance. |
+| Implementation and verification loop improvements | Active / Partially implemented | [2026-04-19-impl-verify-improvements.md](2026-04-19-impl-verify-improvements.md) | overlaps `ver-vyag` | Broader roadmap for the impl -> verify -> review -> repair loop. Standards, profiles, resolution evidence, and epic review pieces exist; intent and compiled-constraint work still need a dedicated completion pass. |
+| Per-worker review diffs | Implemented / Reference | [2026-04-20-per-worker-review-diffs.md](2026-04-20-per-worker-review-diffs.md) | no dedicated epic found in this index pass | Reviewers inspect the current worker attempt's delta instead of the whole dirty worktree. |
+| Recursive sub-epic execution | Implemented / No standalone plan | no dedicated plan found | `ver-vmgr` and children | Closed remediation track for recursive sub-epic review findings; a future standalone plan is only needed for new recursive execution scope. |
+| High-severity review findings | Implemented / No standalone plan | no dedicated plan found | `ver-wgxh` and children | Closed remediation track for claim safety, lease handling, runtime status normalization, verification environment behavior, and epic acceptance propagation. |
+| Benchmarking | Backburner / Planned | [2026-04-19-benchmark-adoption-and-creation.md](2026-04-19-benchmark-adoption-and-creation.md) | `ver-g9p2` and children | Public/private benchmark strategy, reproducibility, verifier integrity, flake taxonomy, cost accounting, and suite governance. Keep the tickets open, but do not treat them as the active priority while runtime/tool reliability is being stabilized. |
+| Fabrikk llmcli runtime adapter integration | Implemented / Reference | [2026-05-16-llmcli-runtime-adapter-integration.md](2026-05-16-llmcli-runtime-adapter-integration.md) | `fi-8ken` and children | Claude and Codex runtime execution now routes through Fabrikk `llmcli`/`llmclient` while preserving Verk runtime names, artifacts, worktree isolation, intent support, and retry classification. |
 | Verk as skill | Planned | [2026-04-19-verk-as-skill-cross-agent.md](2026-04-19-verk-as-skill-cross-agent.md) | no active epic found in this index pass | Claude Code skill-mode foundation for verk primitives and artifact-compatible execution. |
 | Skill host portability | Blocked | [2026-04-19-verk-skill-host-portability.md](2026-04-19-verk-skill-host-portability.md) | no active epic found in this index pass | Extend skill-mode support beyond Claude Code after the v1 skill surface is available. |
-| Ticket quality pre-run gate | Planned | [2026-04-21-ticket-quality-gate.md](2026-04-21-ticket-quality-gate.md) | no active epic found in this index pass | Needed before `verk run`: deterministic ticket lint, planner-role review, traceability checks, and safe auto-repair for underspecified tickets. |
-| Ticket state machine outcomes | Active / Planned | [2026-04-22-ticket-state-machine.md](2026-04-22-ticket-state-machine.md) | no dedicated epic yet | Separate retryable failures, operator decisions, and true blockers so `blocked` becomes a last-resort state instead of a generic stop reason. |
-| Memory learning loop | Planned | [2026-04-21-memory-learning-loop.md](2026-04-21-memory-learning-loop.md) | no active epic found in this index pass | Repo-local escaped-defect memory, human-reviewed lesson promotion, and advisory feedback into ticket quality review. |
+| Ticket quality pre-run gate | Implemented | [2026-04-21-ticket-quality-gate.md](2026-04-21-ticket-quality-gate.md) | no active epic found in this index pass | Deterministic ticket lint, planner-role review, traceability checks, and safe auto-repair for underspecified tickets. User-facing reference: [../ticket-quality-gate.md](../ticket-quality-gate.md). |
+| Ticket state machine outcomes | Implemented | [2026-04-22-ticket-state-machine.md](2026-04-22-ticket-state-machine.md) | no dedicated epic yet | Separate retryable failures, operator decisions, and true blockers so `blocked` becomes a last-resort state instead of a generic stop reason. User-facing reference: [../ticket-state-machine.md](../ticket-state-machine.md). |
+| Memory learning loop | Implemented | [2026-04-21-memory-learning-loop.md](2026-04-21-memory-learning-loop.md) | no active epic found in this index pass | Repo-local escaped-defect memory, human-reviewed lesson promotion, and advisory feedback into ticket quality review. User-facing reference: [../memory-learning-loop.md](../memory-learning-loop.md). |
 | Anti-rationalization catalog | Planned | [Rationalizations.md](Rationalizations.md) | none | Detailed spec for P3 (impl-verify-improvements). Full catalog of 91 named rationalizations + verk-specific additions, with injection point mapping per worker phase. |
-| Agent profiles | Planned | [2026-04-21-agent-profiles.md](2026-04-21-agent-profiles.md) | none | Role-based worker profiles (security-engineer, contract-engineer, frontend-engineer, backend-engineer). Project-agnostic detection, `profile` frontmatter field, pre-run validation, rationalization injection per profile, and prompt placement. Full implementation of P3. |
+| Agent profiles | Implemented / Reference | [2026-04-21-agent-profiles.md](2026-04-21-agent-profiles.md) | none | Role-based worker profiles (security-engineer, contract-engineer, frontend-engineer, backend-engineer). Project-agnostic detection, `profile` frontmatter field, pre-run validation, rationalization injection per profile, and prompt placement. Full implementation of P3. |
 
 ## Priority And Parallelism
 
@@ -47,32 +50,36 @@ new escaped defect changes the risk profile.
 
 ### Current Priority Order
 
-1. Land reviewer-scope correctness: prioritize
-   [2026-04-20-per-worker-review-diffs.md](2026-04-20-per-worker-review-diffs.md),
-   then [worker-isolation.md](worker-isolation.md).
-2. Land the ticket state-machine outcome model from
-   [2026-04-22-ticket-state-machine.md](2026-04-22-ticket-state-machine.md), because
-   retry/decision/block semantics affect every run failure path.
-3. Implement the deterministic and planner-reviewed ticket quality gate from
-   [2026-04-21-ticket-quality-gate.md](2026-04-21-ticket-quality-gate.md).
-4. Add the advisory memory and learning loop from
-   [2026-04-21-memory-learning-loop.md](2026-04-21-memory-learning-loop.md).
-5. Revisit benchmarking, skill packaging, and host portability after the core
-   run, review-scope, and quality gates are stable.
+1. Finish the remaining active tool-reliability pieces of
+   [2026-04-19-impl-verify-improvements.md](2026-04-19-impl-verify-improvements.md),
+   especially intent echo policy wiring/resume behavior and any compiled-constraint
+   promotion work not covered by the implemented profile and review-gate pieces.
+3. Implement the Claude Code foundation in
+   [2026-04-19-verk-as-skill-cross-agent.md](2026-04-19-verk-as-skill-cross-agent.md),
+   starting with the localhost HTTP daemon, after runtime execution is stable.
+4. Keep the benchmark implementation track from
+   [2026-04-19-benchmark-adoption-and-creation.md](2026-04-19-benchmark-adoption-and-creation.md)
+   on the backburner. Do not forget it; keep `ver-g9p2` and children as the
+   parked source of truth for reproducibility, verifier integrity, flake
+   accounting, cache/workspace isolation, and cost provenance.
+5. Keep [2026-04-19-verk-skill-host-portability.md](2026-04-19-verk-skill-host-portability.md)
+   blocked until the v1 skill surface is real enough to audit against other
+   host capabilities.
 
 ### Parallel Work Guidance
 
 Safe parallel tracks:
 
-- Per-worker review diffs.
-- Worker-isolation git adapter and placement tasks, before touching shared
-  epic orchestration.
-- Deterministic ticket-quality evaluator and inspection CLI, before wiring it
-  into `verk run`.
-- Ticket state-machine artifact additions, while CLI interaction and scheduler
-  behavior remain serialized with other execution changes.
-- Memory loop storage and CLI skeleton, while keeping it advisory until ticket
-  quality finding codes are stable.
+- `llmclibridge` package implementation and runtime diagnostic documentation,
+  provided adapter rewrites are serialized per package.
+- Claude and Codex adapter rewrites can proceed separately only after the bridge
+  interface is stable; shared runtime types and prompt files should remain
+  serialized.
+- Intent echo policy wiring/resume work, provided engine phase wiring is
+  serialized with active `ticket_run.go` changes.
+- Daemon state-file/startup-lock/auth work for the skill-mode plan, after
+  runtime execution stability is no longer the active bottleneck.
+- Documentation and report rendering updates for implemented tracks.
 
 Coordinate carefully or serialize when work touches shared execution files:
 
@@ -80,11 +87,13 @@ Coordinate carefully or serialize when work touches shared execution files:
 - `internal/engine/epic_run.go`
 - `internal/state/types.go`
 - `internal/adapters/runtime/prompt.go`
+- `internal/adapters/runtime/types.go`
 - `internal/policy/config.go`
 - `internal/cli/run.go`
 
 Benchmarking, verk-as-skill, and skill host portability are useful tracks, but
-they should not outrank core run correctness and quality gates.
+they should not outrank core run correctness, runtime adapter stability, and
+quality gates.
 
 ## Review Materials
 
@@ -101,8 +110,10 @@ they should not outrank core run correctness and quality gates.
 
 - Plan/ticket index automation: this file is manual today. A future command
   should derive most of it from `docs/plans/`, `.tickets/`, and ticket links.
-- Dedicated plans for `ver-vmgr` and `ver-wgxh`: both are active epics with
-  meaningful scope, but this pass did not find standalone plan documents.
+- Dedicated standalone plans for the now-closed `ver-vmgr` and `ver-wgxh`
+  remediation tracks were never created. Leave them as no-standalone-plan
+  history unless new recursive sub-epic or high-severity remediation scope
+  opens again.
 
 ## Maintenance Rules
 

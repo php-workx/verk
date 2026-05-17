@@ -1,5 +1,9 @@
 # Per-Worker Review Diffs Implementation Plan
 
+> **Status: Implemented / Reference.** The engine captures per-attempt review
+> baselines and sends scoped `ReviewRequest.ChangedFiles` plus path-scoped
+> diffs to reviewers.
+
 > **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
 
 **Goal:** Make ticket reviewers inspect the delta introduced by the current worker attempt instead of the entire dirty worktree diff against the run base commit.
@@ -835,4 +839,3 @@ git commit -m "style: format scoped review diff changes"
 - Per-ticket scope validation currently uses implementation changed files against the run base commit. If it still blocks on unrelated pre-existing dirty files, handle that as a separate scope-validation change.
 - Parallel workers that modify the exact same path remain inherently ambiguous in a shared worktree. The existing owned-path and scope checks should prevent this; stronger isolation would require per-ticket worktrees or merge orchestration.
 - Reviewer token budgeting can be improved after this change by measuring diff size before and after scoping.
-

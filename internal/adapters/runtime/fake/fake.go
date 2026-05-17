@@ -11,6 +11,7 @@ import (
 var (
 	ErrNoScriptedWorkerResult = errors.New("runtime fake: no scripted worker result available")
 	ErrNoScriptedReviewResult = errors.New("runtime fake: no scripted review result available")
+	ErrNoScriptedIntentResult = errors.New("runtime fake: no scripted intent result available")
 )
 
 type Adapter struct {
@@ -18,18 +19,29 @@ type Adapter struct {
 
 	workerResults []runtime.WorkerResult
 	reviewResults []runtime.ReviewResult
+	intentResults []runtime.IntentResult
 
 	workerRequests []runtime.WorkerRequest
 	reviewRequests []runtime.ReviewRequest
+	intentRequests []runtime.IntentRequest
 
 	workerIndex int
 	reviewIndex int
+	intentIndex int
 }
 
 func New(workerResults []runtime.WorkerResult, reviewResults []runtime.ReviewResult) *Adapter {
 	return &Adapter{
 		workerResults: append([]runtime.WorkerResult(nil), workerResults...),
 		reviewResults: cloneReviewResults(reviewResults),
+	}
+}
+
+func NewWithIntents(workerResults []runtime.WorkerResult, reviewResults []runtime.ReviewResult, intentResults []runtime.IntentResult) *Adapter {
+	return &Adapter{
+		workerResults: append([]runtime.WorkerResult(nil), workerResults...),
+		reviewResults: cloneReviewResults(reviewResults),
+		intentResults: append([]runtime.IntentResult(nil), intentResults...),
 	}
 }
 
@@ -45,6 +57,13 @@ func (a *Adapter) ReviewRequests() []runtime.ReviewRequest {
 	defer a.mu.Unlock()
 
 	return append([]runtime.ReviewRequest(nil), a.reviewRequests...)
+}
+
+func (a *Adapter) IntentRequests() []runtime.IntentRequest {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	return append([]runtime.IntentRequest(nil), a.intentRequests...)
 }
 
 func (a *Adapter) RunWorker(ctx context.Context, req runtime.WorkerRequest) (runtime.WorkerResult, error) {
@@ -91,6 +110,25 @@ func (a *Adapter) RunReviewer(ctx context.Context, req runtime.ReviewRequest) (r
 	}
 
 	return cloneReviewResult(result), nil
+}
+
+func (a *Adapter) RunIntent(ctx context.Context, req runtime.IntentRequest) (runtime.IntentResult, error) {
+	if err := ctx.Err(); err != nil {
+		return runtime.IntentResult{}, err
+	}
+
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	a.intentRequests = append(a.intentRequests, req)
+	if a.intentIndex >= len(a.intentResults) {
+		return runtime.IntentResult{}, ErrNoScriptedIntentResult
+	}
+
+	result := a.intentResults[a.intentIndex]
+	a.intentIndex++
+
+	return result, nil
 }
 
 func cloneReviewResults(in []runtime.ReviewResult) []runtime.ReviewResult {
