@@ -126,9 +126,10 @@ func aggregateTotals(results []TaskResult) ReportTotals {
 }
 
 const (
-	claimSystemResult = "system result"
-	confidenceExact   = "exact"
-	confidenceEstim   = "estimated"
+	claimSystemResult     = "system result"
+	confidenceExact       = "exact"
+	confidenceEstim       = "estimated"
+	confidenceUnavailable = "unavailable"
 )
 
 // modeClaimLabel returns the report-safe claim label for a benchmark mode.
@@ -374,7 +375,7 @@ func RenderCSV(w io.Writer, r Report) error {
 		case totalCost > 0:
 			confidence = confidenceEstim
 		default:
-			confidence = "unavailable"
+			confidence = confidenceUnavailable
 		}
 		if err := cw.Write([]string{
 			tr.TaskID,
@@ -396,7 +397,7 @@ func RenderCSV(w io.Writer, r Report) error {
 
 // defaultUsageConfidence returns a confidence label for a UsageRecord.
 // Returns the existing confidence if set, "estimated" when cost is non-zero,
-// or "unavailable" when there is no cost data.
+// or confidenceUnavailable when there is no cost data.
 func defaultUsageConfidence(u UsageRecord) string {
 	if u.Confidence != "" {
 		return u.Confidence
@@ -404,5 +405,5 @@ func defaultUsageConfidence(u UsageRecord) string {
 	if u.CostUSD > 0 {
 		return confidenceEstim
 	}
-	return "unavailable"
+	return confidenceUnavailable
 }
