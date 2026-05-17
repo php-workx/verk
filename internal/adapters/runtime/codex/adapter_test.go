@@ -581,3 +581,28 @@ func TestCommandResultFromBridgePreservesRawStdoutAndParsesBridgeText(t *testing
 		t.Fatalf("expected activity from raw stdout, got %#v", activity)
 	}
 }
+
+func TestExtractCodexTelemetryHandlesLargeJSONLLine(t *testing.T) {
+	stdout := []byte(strings.Repeat("x", 1024*1024+1) + "\n" +
+		`{"type":"turn.completed","usage":{"input_tokens":2,"output_tokens":3,"total_tokens":5}}` + "\n")
+
+	usage, activity := extractCodexTelemetry(stdout)
+
+	if usage == nil || usage.InputTokens != 2 || usage.OutputTokens != 3 || usage.TotalTokens != 5 {
+		t.Fatalf("expected telemetry after large JSONL line, got %#v", usage)
+	}
+	if activity == nil || activity.EventCount != 1 {
+		t.Fatalf("expected activity after large JSONL line, got %#v", activity)
+	}
+}
+
+func TestExtractCodexFailureMessageHandlesLargeJSONLLine(t *testing.T) {
+	stdout := []byte(strings.Repeat("x", 1024*1024+1) + "\n" +
+		`{"type":"turn.failed","error":{"message":"structured failure"}}` + "\n")
+
+	message := extractCodexFailureMessage(stdout, []byte("generic stderr"))
+
+	if message != "structured failure" {
+		t.Fatalf("expected structured failure after large JSONL line, got %q", message)
+	}
+}

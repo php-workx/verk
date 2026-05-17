@@ -290,14 +290,11 @@ func (a *Adapter) RunIntent(ctx context.Context, req runtime.IntentRequest) (run
 }
 
 func extractCodexTelemetry(stdout []byte) (*state.RuntimeTokenUsage, *state.RuntimeActivityStats) {
-	scanner := bufio.NewScanner(bytes.NewReader(stdout))
-	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 	stats := &state.RuntimeActivityStats{}
 	usage := &state.RuntimeTokenUsage{}
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
+	forEachCodexJSONLLine(stdout, func(line string) bool {
 		if line == "" {
-			continue
+			return true
 		}
 		var event struct {
 			Type string `json:"type"`
@@ -312,7 +309,7 @@ func extractCodexTelemetry(stdout []byte) (*state.RuntimeTokenUsage, *state.Runt
 			} `json:"usage"`
 		}
 		if err := json.Unmarshal([]byte(line), &event); err != nil || event.Type == "" {
-			continue
+			return true
 		}
 		stats.EventCount++
 		if event.Type == "item.completed" {
@@ -329,7 +326,8 @@ func extractCodexTelemetry(stdout []byte) (*state.RuntimeTokenUsage, *state.Runt
 			usage.OutputTokens += event.Usage.OutputTokens
 			usage.TotalTokens += event.Usage.TotalTokens
 		}
-	}
+		return true
+	})
 	if usage.TotalTokens == 0 && (usage.InputTokens != 0 || usage.OutputTokens != 0) {
 		usage.TotalTokens = usage.InputTokens + usage.OutputTokens
 	}
@@ -340,6 +338,19 @@ func extractCodexTelemetry(stdout []byte) (*state.RuntimeTokenUsage, *state.Runt
 		stats = nil
 	}
 	return usage, stats
+}
+
+func forEachCodexJSONLLine(stdout []byte, visit func(line string) bool) {
+	reader := bufio.NewReader(bytes.NewReader(stdout))
+	for {
+		line, err := reader.ReadString('\n')
+		if line != "" && !visit(strings.TrimSpace(line)) {
+			return
+		}
+		if err != nil {
+			return
+		}
+	}
 }
 
 func (a *Adapter) binary() string {
@@ -750,12 +761,10 @@ func looksLikeQuotaOrAvailabilityFailure(stdout, stderr []byte) bool {
 }
 
 func extractCodexFailureMessage(stdout, stderr []byte) string {
-	scanner := bufio.NewScanner(bytes.NewReader(stdout))
-	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
+	var message string
+	forEachCodexJSONLLine(stdout, func(line string) bool {
 		if line == "" {
-			continue
+			return true
 		}
 		var event struct {
 			Type    string `json:"type"`
@@ -765,18 +774,24 @@ func extractCodexFailureMessage(stdout, stderr []byte) string {
 			} `json:"error"`
 		}
 		if err := json.Unmarshal([]byte(line), &event); err != nil {
-			continue
+			return true
 		}
 		switch event.Type {
 		case "error":
 			if msg := strings.TrimSpace(event.Message); msg != "" {
-				return msg
+				message = msg
+				return false
 			}
 		case "turn.failed":
 			if msg := strings.TrimSpace(event.Error.Message); msg != "" {
-				return msg
+				message = msg
+				return false
 			}
 		}
+		return true
+	})
+	if message != "" {
+		return message
 	}
 	if msg := strings.TrimSpace(string(stderr)); msg != "" {
 		return msg
