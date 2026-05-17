@@ -1,7 +1,8 @@
 # Fabrikk llmcli Runtime Adapter Integration
 
-> **Status: Planned / High priority.** This is the current priority lane for
-> tool stability and coding-agent reliability.
+> **Status: Implemented / Reference.** The `fi-8ken` implementation track has
+> landed; this document remains the durable design and operations reference for
+> the Fabrikk `llmcli` runtime adapter path.
 
 > **Related tickets:** `fi-8ken` and children.
 

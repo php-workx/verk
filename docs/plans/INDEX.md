@@ -34,7 +34,7 @@ or ticket first, then update this file.
 | Recursive sub-epic execution | Implemented / No standalone plan | no dedicated plan found | `ver-vmgr` and children | Closed remediation track for recursive sub-epic review findings; a future standalone plan is only needed for new recursive execution scope. |
 | High-severity review findings | Implemented / No standalone plan | no dedicated plan found | `ver-wgxh` and children | Closed remediation track for claim safety, lease handling, runtime status normalization, verification environment behavior, and epic acceptance propagation. |
 | Benchmarking | Backburner / Planned | [2026-04-19-benchmark-adoption-and-creation.md](2026-04-19-benchmark-adoption-and-creation.md) | `ver-g9p2` and children | Public/private benchmark strategy, reproducibility, verifier integrity, flake taxonomy, cost accounting, and suite governance. Keep the tickets open, but do not treat them as the active priority while runtime/tool reliability is being stabilized. |
-| Fabrikk llmcli runtime adapter integration | Planned / High priority | [2026-05-16-llmcli-runtime-adapter-integration.md](2026-05-16-llmcli-runtime-adapter-integration.md) | `fi-8ken` and children | Migrate Claude and Codex runtime execution through Fabrikk `llmcli`/`llmclient` while preserving Verk runtime names, artifacts, worktree isolation, intent support, and retry classification. |
+| Fabrikk llmcli runtime adapter integration | Implemented / Reference | [2026-05-16-llmcli-runtime-adapter-integration.md](2026-05-16-llmcli-runtime-adapter-integration.md) | `fi-8ken` and children | Claude and Codex runtime execution now routes through Fabrikk `llmcli`/`llmclient` while preserving Verk runtime names, artifacts, worktree isolation, intent support, and retry classification. |
 | Verk as skill | Planned | [2026-04-19-verk-as-skill-cross-agent.md](2026-04-19-verk-as-skill-cross-agent.md) | no active epic found in this index pass | Claude Code skill-mode foundation for verk primitives and artifact-compatible execution. |
 | Skill host portability | Blocked | [2026-04-19-verk-skill-host-portability.md](2026-04-19-verk-skill-host-portability.md) | no active epic found in this index pass | Extend skill-mode support beyond Claude Code after the v1 skill surface is available. |
 | Ticket quality pre-run gate | Implemented | [2026-04-21-ticket-quality-gate.md](2026-04-21-ticket-quality-gate.md) | no active epic found in this index pass | Deterministic ticket lint, planner-role review, traceability checks, and safe auto-repair for underspecified tickets. User-facing reference: [../ticket-quality-gate.md](../ticket-quality-gate.md). |
@@ -50,11 +50,7 @@ new escaped defect changes the risk profile.
 
 ### Current Priority Order
 
-1. Stabilize the coding-agent runtime path with
-   [2026-05-16-llmcli-runtime-adapter-integration.md](2026-05-16-llmcli-runtime-adapter-integration.md),
-   starting with shared `llmcli` bridge coverage for Claude, Codex, and intent
-   calls.
-2. Finish the remaining active tool-reliability pieces of
+1. Finish the remaining active tool-reliability pieces of
    [2026-04-19-impl-verify-improvements.md](2026-04-19-impl-verify-improvements.md),
    especially intent echo policy wiring/resume behavior and any compiled-constraint
    promotion work not covered by the implemented profile and review-gate pieces.
