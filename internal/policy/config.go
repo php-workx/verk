@@ -207,6 +207,24 @@ type TicketQualityConfig struct {
 	RequireEpicIntegrationTicket bool `yaml:"require_epic_integration_ticket" json:"require_epic_integration_ticket"`
 }
 
+// ConstraintsConfig controls the compiled-constraint promotion system.
+// When Enabled is false (the default), no constraints are run at verify time
+// and no candidates are recorded at closeout.
+type ConstraintsConfig struct {
+	// Enabled turns the constraint system on or off. Defaults to false.
+	Enabled bool `yaml:"enabled" json:"enabled"`
+	// ActivationThreshold is the number of distinct tickets that must surface
+	// the same finding pattern before a constraint is auto-promoted to active.
+	// Defaults to 3.
+	ActivationThreshold int `yaml:"activation_threshold" json:"activation_threshold"`
+	// StaleDays is the number of days after which an inactive constraint is
+	// considered stale and eligible for pruning. Defaults to 90.
+	StaleDays int `yaml:"stale_days" json:"stale_days"`
+	// MaxRuntimeTotalMs is the total millisecond budget for all constraint
+	// checks in a single verify pass. Defaults to 120000 (2 minutes).
+	MaxRuntimeTotalMs int `yaml:"max_runtime_total_ms" json:"max_runtime_total_ms"`
+}
+
 type Config struct {
 	Scheduler     SchedulerConfig     `yaml:"scheduler" json:"scheduler"`
 	Policy        PolicyConfig        `yaml:"policy" json:"policy"`
@@ -217,6 +235,7 @@ type Config struct {
 	Intent        IntentConfig        `yaml:"intent" json:"intent"`
 	WaveReview    WaveReviewConfig    `yaml:"wave_review" json:"wave_review"`
 	EpicReview    EpicReviewConfig    `yaml:"epic_review" json:"epic_review"`
+	Constraints   ConstraintsConfig   `yaml:"constraints" json:"constraints"`
 }
 
 func LoadConfig(repoRoot string) (Config, error) {

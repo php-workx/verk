@@ -57,5 +57,11 @@ func DefaultConfig() Config {
 			PlanMinTickets: 3,
 			Threshold:      "P2",
 		},
+		Constraints: ConstraintsConfig{
+			Enabled:             false,
+			ActivationThreshold: 3,
+			StaleDays:           90,
+			MaxRuntimeTotalMs:   120000,
+		},
 	}
 }

@@ -302,6 +302,10 @@ type ReviewFinding struct {
 	WaiverReason       string              `json:"waiver_reason,omitempty"`
 	WaiverExpiresAt    time.Time           `json:"waiver_expires_at,omitempty"`
 	ResolutionEvidence *ResolutionEvidence `json:"resolution_evidence,omitempty"`
+	// Promotable controls whether this finding is eligible for constraint
+	// promotion. nil means default true (the finding may be promoted).
+	// Set to false to suppress promotion for this specific finding.
+	Promotable *bool `json:"promotable,omitempty"`
 }
 
 type ReviewFindingsArtifact struct {

@@ -14,6 +14,7 @@ import (
 	"verk/internal/adapters/repo/git"
 	"verk/internal/adapters/runtime"
 	"verk/internal/adapters/ticketstore/epos"
+	"verk/internal/engine/constraints"
 	"verk/internal/policy"
 	"verk/internal/state"
 
@@ -534,6 +535,10 @@ func RunTicket(ctx context.Context, req RunTicketRequest) (result RunTicketResul
 			if st.closeout.Closable {
 				st.progressDetail("all gates passed")
 				st.blockReason = ""
+				// Record constraint candidates from review findings on successful closeout.
+				if cfg.Constraints.Enabled && st.review != nil {
+					recordConstraintCandidates(absRepoRoot, req.RunID, req.Ticket.ID, st.review.Findings)
+				}
 				if err := st.transitionTo(state.TicketPhaseClosed); err != nil {
 					return RunTicketResult{}, err
 				}
@@ -808,6 +813,50 @@ func (st *ticketRunState) executeVerification(ctx context.Context) (bool, error)
 			return false, err
 		}
 		return false, nil
+	}
+
+	// Run compiled constraints when enabled. A failing constraint blocks the
+	// verify gate and causes the ticket to re-enter the implement → verify loop.
+	if st.cfg.Constraints.Enabled {
+		constraintStore := constraints.NewStore(st.repoRoot)
+		budgetMs := st.cfg.Constraints.MaxRuntimeTotalMs
+		if budgetMs <= 0 {
+			budgetMs = 120000
+		}
+		constraintResults, _, constraintErr := constraints.Execute(ctx, constraintStore, st.repoRoot, st.worktreePath, budgetMs)
+		if constraintErr != nil {
+			// Non-fatal: log and continue rather than hard-failing the ticket.
+			log.Printf("constraint execution error for ticket %s: %v", st.req.Ticket.ID, constraintErr)
+		} else {
+			failing := constraints.FailingConstraints(constraintResults)
+			if len(failing) > 0 {
+				// Inject a synthetic VerificationResult into the artifact so the
+				// constraint failure is visible in the verification output.
+				summary := constraints.ConstraintFailureSummary(failing)
+				syntheticResult := state.VerificationResult{
+					Command:    "verk-constraints",
+					ExitCode:   1,
+					Passed:     false,
+					DurationMS: 0,
+					StartedAt:  time.Now().UTC(),
+					FinishedAt: time.Now().UTC(),
+				}
+				verifyArtifact.Results = append(verifyArtifact.Results, syntheticResult)
+				verifyArtifact.Passed = false
+				st.verification = verifyArtifact
+				if err := st.persist(); err != nil {
+					return false, err
+				}
+				st.progressDetail(fmt.Sprintf("constraint check failed: %s", summary))
+				if err := handleVerificationFailure(st, *verifyArtifact); err != nil {
+					return false, err
+				}
+				if err := st.persist(); err != nil {
+					return false, err
+				}
+				return false, nil
+			}
+		}
 	}
 
 	if err := st.transitionTo(state.TicketPhaseReview); err != nil {
@@ -2326,4 +2375,21 @@ func derefReviewExpiry(value *time.Time) time.Time {
 		return time.Time{}
 	}
 	return *value
+}
+
+// recordConstraintCandidates appends promotable review findings to the
+// constraint candidate store after a successful ticket closeout.
+// Errors are logged but not propagated so they do not block ticket closure.
+func recordConstraintCandidates(repoRoot, runID, ticketID string, findings []state.ReviewFinding) {
+	store := constraints.NewStore(repoRoot)
+	for _, f := range findings {
+		// nil Promotable means default true.
+		if f.Promotable != nil && !*f.Promotable {
+			continue
+		}
+		sig := constraints.DeriveSignature(f.Title, f.File, string(f.Severity))
+		if _, err := store.AppendCandidate(sig, runID, ticketID, f.ID); err != nil {
+			log.Printf("constraint candidate record error ticket=%s finding=%s: %v", ticketID, f.ID, err)
+		}
+	}
 }
