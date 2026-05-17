@@ -12,7 +12,7 @@ func TestSuiteClaimLabel_AllModes(t *testing.T) {
 		{SamplingModeSmoke, "regression/sanity only — not an externally defensible ranking"},
 		{SamplingModeHoldout, "holdout — do not use for tuning"},
 		{SamplingModePublic, "public comparison — see sampling metadata"},
-		{SamplingModeRegression, "exploratory"},
+		{SamplingModeRegression, "regression — not an externally defensible ranking"},
 		{"unknown", "exploratory"},
 		{"", "exploratory"},
 	}

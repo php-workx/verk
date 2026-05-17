@@ -60,10 +60,11 @@ func runIntentGate(
 	}
 
 	// Build the set of criterion IDs required by the plan.
+	// Normalize to trimmed form so whitespace differences don't cause false mismatches.
 	requiredCriteria := make(map[string]struct{}, len(plan.Criteria))
 	for _, c := range plan.Criteria {
-		if strings.TrimSpace(c.ID) != "" {
-			requiredCriteria[c.ID] = struct{}{}
+		if id := strings.TrimSpace(c.ID); id != "" {
+			requiredCriteria[id] = struct{}{}
 		}
 	}
 
@@ -137,7 +138,9 @@ func validateIntentResult(
 	if len(requiredCriteria) > 0 {
 		coveredSet := make(map[string]struct{}, len(result.CoveredCriteria))
 		for _, id := range result.CoveredCriteria {
-			coveredSet[id] = struct{}{}
+			if norm := strings.TrimSpace(id); norm != "" {
+				coveredSet[norm] = struct{}{}
+			}
 		}
 		for id := range requiredCriteria {
 			if _, ok := coveredSet[id]; !ok {

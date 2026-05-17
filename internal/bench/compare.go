@@ -25,9 +25,10 @@ type Comparison struct {
 	Refusal   string                 `json:"refusal,omitempty"` // populated when comparison is rejected
 }
 
-// PairedTaskComparison pairs a baseline and candidate result for a single task.
+// PairedTaskComparison pairs a baseline and candidate result for a single task+profile cell.
 type PairedTaskComparison struct {
 	TaskID    string      `json:"task_id"`
+	ProfileID string      `json:"profile_id,omitempty"`
 	Baseline  *TaskResult `json:"baseline,omitempty"`  // nil if missing
 	Candidate *TaskResult `json:"candidate,omitempty"` // nil if missing
 	Outcome   string      `json:"outcome"`             // "regressed"|"improved"|"unchanged"|"missing"
@@ -126,39 +127,55 @@ func taskIDsEqual(a, b []string) bool {
 	return true
 }
 
+// pairKey returns the composite key for a TaskResult cell.
+// Including ProfileID prevents collisions when the same task is run
+// under multiple profiles within a single run.
+func pairKey(r TaskResult) string {
+	return r.TaskID + "/" + r.ProfileID
+}
+
 func pairResults(baseline, candidate []TaskResult) []PairedTaskComparison {
 	bMap := make(map[string]*TaskResult, len(baseline))
 	for i := range baseline {
-		bMap[baseline[i].TaskID] = &baseline[i]
+		bMap[pairKey(baseline[i])] = &baseline[i]
 	}
 	cMap := make(map[string]*TaskResult, len(candidate))
 	for i := range candidate {
-		cMap[candidate[i].TaskID] = &candidate[i]
+		cMap[pairKey(candidate[i])] = &candidate[i]
 	}
 
-	// Collect all task IDs from both sides.
+	// Collect all composite keys from both sides.
 	seen := make(map[string]struct{})
-	var taskIDs []string
+	var keys []string
 	for _, r := range baseline {
-		if _, ok := seen[r.TaskID]; !ok {
-			taskIDs = append(taskIDs, r.TaskID)
-			seen[r.TaskID] = struct{}{}
+		k := pairKey(r)
+		if _, ok := seen[k]; !ok {
+			keys = append(keys, k)
+			seen[k] = struct{}{}
 		}
 	}
 	for _, r := range candidate {
-		if _, ok := seen[r.TaskID]; !ok {
-			taskIDs = append(taskIDs, r.TaskID)
-			seen[r.TaskID] = struct{}{}
+		k := pairKey(r)
+		if _, ok := seen[k]; !ok {
+			keys = append(keys, k)
+			seen[k] = struct{}{}
 		}
 	}
 
-	pairs := make([]PairedTaskComparison, 0, len(taskIDs))
-	for _, id := range taskIDs {
-		b := bMap[id]
-		c := cMap[id]
+	pairs := make([]PairedTaskComparison, 0, len(keys))
+	for _, k := range keys {
+		b := bMap[k]
+		c := cMap[k]
+		taskID, profileID := k, ""
+		if b != nil {
+			taskID, profileID = b.TaskID, b.ProfileID
+		} else if c != nil {
+			taskID, profileID = c.TaskID, c.ProfileID
+		}
 		outcome := classifyOutcome(b, c)
 		pairs = append(pairs, PairedTaskComparison{
-			TaskID:    id,
+			TaskID:    taskID,
+			ProfileID: profileID,
 			Baseline:  b,
 			Candidate: c,
 			Outcome:   outcome,

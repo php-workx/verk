@@ -68,9 +68,18 @@ func PromoteCandidate(store *Store, sig Signature, specYAML string) error {
 	if t, ok := rawSpec["timeout_ms"]; ok {
 		switch v := t.(type) {
 		case int:
+			if v <= 0 {
+				return fmt.Errorf("timeout_ms must be positive, got %d", v)
+			}
 			timeoutMs = v
 		case float64:
-			timeoutMs = int(v)
+			iv := int(v)
+			if iv <= 0 {
+				return fmt.Errorf("timeout_ms must be positive, got %d", iv)
+			}
+			timeoutMs = iv
+		default:
+			return fmt.Errorf("timeout_ms must be a number, got %T", t)
 		}
 	}
 

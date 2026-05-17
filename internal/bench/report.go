@@ -272,6 +272,9 @@ func RenderMarkdown(w io.Writer, r Report) error {
 		for _, u := range tr.Usage {
 			ps.costUSD += u.CostUSD
 		}
+		if len(tr.Usage) == 0 && tr.Score.CostUSD > 0 {
+			ps.costUSD += tr.Score.CostUSD
+		}
 	}
 	if len(profileMap) > 0 {
 		fmt.Fprintf(bw, "## Per-Profile Breakdown\n\n")
@@ -347,6 +350,9 @@ func RenderCSV(w io.Writer, r Report) error {
 			if confidence == "" {
 				confidence = u.Confidence
 			}
+		}
+		if len(tr.Usage) == 0 && tr.Score.CostUSD > 0 {
+			totalCost = tr.Score.CostUSD
 		}
 		confidence = defaultUsageConfidence(UsageRecord{CostUSD: totalCost, Confidence: confidence})
 		if err := cw.Write([]string{

@@ -19,6 +19,8 @@ func SuiteClaimLabel(mode string) string {
 	switch mode {
 	case SamplingModeSmoke:
 		return "regression/sanity only — not an externally defensible ranking"
+	case SamplingModeRegression:
+		return "regression — not an externally defensible ranking"
 	case SamplingModeHoldout:
 		return "holdout — do not use for tuning"
 	case SamplingModePublic:
