@@ -26,7 +26,7 @@ func SuiteClaimLabel(mode string) string {
 	case SamplingModePublic:
 		return "public comparison — see sampling metadata"
 	default:
-		return "exploratory"
+		return designExploratory
 	}
 }
 

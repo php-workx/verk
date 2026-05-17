@@ -104,7 +104,7 @@ func aggregateTotals(results []TaskResult) ReportTotals {
 		// Accumulate cost by confidence level.
 		for _, u := range r.Usage {
 			switch u.Confidence {
-			case "exact":
+			case confidenceExact:
 				t.ExactCostUSD += u.CostUSD
 			default:
 				t.EstimatedCostUSD += u.CostUSD
@@ -125,17 +125,23 @@ func aggregateTotals(results []TaskResult) ReportTotals {
 	return t
 }
 
+const (
+	claimSystemResult = "system result"
+	confidenceExact   = "exact"
+	confidenceEstim   = "estimated"
+)
+
 // modeClaimLabel returns the report-safe claim label for a benchmark mode.
 func modeClaimLabel(mode BenchmarkMode) string {
 	switch mode {
 	case ModeFullVerk:
-		return "system result"
+		return claimSystemResult
 	case ModeWorkerOnly:
 		return "capability result"
 	case ModeRuntimeProbe:
 		return "runtime result"
 	default:
-		return "exploratory"
+		return designExploratory
 	}
 }
 
@@ -344,17 +350,32 @@ func RenderCSV(w io.Writer, r Report) error {
 	}
 	for _, tr := range r.PerTask {
 		var totalCost float64
-		var confidence string
+		var hasExact, hasEstimated bool
 		for _, u := range tr.Usage {
 			totalCost += u.CostUSD
-			if confidence == "" {
-				confidence = u.Confidence
+			switch defaultUsageConfidence(u) {
+			case confidenceExact:
+				hasExact = true
+			default:
+				if u.CostUSD > 0 {
+					hasEstimated = true
+				}
 			}
 		}
 		if len(tr.Usage) == 0 && tr.Score.CostUSD > 0 {
 			totalCost = tr.Score.CostUSD
+			hasEstimated = true
 		}
-		confidence = defaultUsageConfidence(UsageRecord{CostUSD: totalCost, Confidence: confidence})
+		// Mixed exact+estimated degrades to estimated.
+		var confidence string
+		switch {
+		case hasExact && !hasEstimated:
+			confidence = confidenceExact
+		case totalCost > 0:
+			confidence = confidenceEstim
+		default:
+			confidence = "unavailable"
+		}
 		if err := cw.Write([]string{
 			tr.TaskID,
 			tr.ProfileID,
@@ -374,14 +395,14 @@ func RenderCSV(w io.Writer, r Report) error {
 }
 
 // defaultUsageConfidence returns a confidence label for a UsageRecord.
-// "exact" when already set, "estimated" when cost is non-zero but confidence unset,
-// "unavailable" when no cost data.
+// Returns the existing confidence if set, "estimated" when cost is non-zero,
+// or "unavailable" when there is no cost data.
 func defaultUsageConfidence(u UsageRecord) string {
 	if u.Confidence != "" {
 		return u.Confidence
 	}
 	if u.CostUSD > 0 {
-		return "estimated"
+		return confidenceEstim
 	}
 	return "unavailable"
 }

@@ -152,6 +152,10 @@ func validateIntentResult(
 	// Rule 2: TargetFiles must be a subset of OwnedPaths using prefix matching
 	// (consistent with fileInOwned in wave_scheduler.go).
 	for _, f := range result.TargetFiles {
+		f = strings.TrimSpace(f)
+		if f == "" {
+			continue
+		}
 		if !fileInOwned(f, ownedPaths) {
 			return "superset_paths"
 		}
