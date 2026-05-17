@@ -113,7 +113,8 @@ type ticketRunState struct {
 	currentPhase           state.TicketPhase
 	currentOutcome         state.TicketOutcome
 	blockReason            string
-	createdAt              time.Time // set once; zero means lazy-init on first snapshot()
+	createdAt              time.Time             // set once; zero means lazy-init on first snapshot()
+	intent                 *state.IntentArtifact // last intent artifact when gate ran; nil otherwise
 	implementation         *state.ImplementationArtifact
 	verification           *state.VerificationArtifact
 	review                 *state.ReviewFindingsArtifact
@@ -289,6 +290,50 @@ func RunTicket(ctx context.Context, req RunTicketRequest) (result RunTicketResul
 			}
 			return RunTicketResult{Snapshot: st.snapshot(), Path: st.paths.snapshotPath}, nil
 		}
+	}
+
+	// Intent echo gate: runs once at Intake before the first worker dispatch.
+	// Skipped when cfg.Intent.Enabled is false (default). Resumed runs that
+	// are already past Intake do not re-run the gate.
+	if cfg.Intent.Enabled && st.currentPhase == state.TicketPhaseIntake {
+		workerProfile := workerProfileForPlan(req.Plan, cfg)
+		intentReq := runtime.IntentRequest{
+			RunID:        req.RunID,
+			TicketID:     req.Ticket.ID,
+			LeaseID:      req.Claim.LeaseID,
+			Runtime:      workerProfile.Runtime,
+			Model:        workerProfile.Model,
+			Reasoning:    workerProfile.Reasoning,
+			WorktreePath: st.worktreePath,
+			Instructions: runtime.BuildIntentPrompt(runtime.IntentRequest{
+				TicketID:     req.Ticket.ID,
+				LeaseID:      req.Claim.LeaseID,
+				WorktreePath: st.worktreePath,
+				Instructions: buildImplementPhaseInstructions(st, 1),
+				OwnedPaths:   req.Plan.OwnedPaths,
+			}),
+			OwnedPaths: req.Plan.OwnedPaths,
+		}
+		gateResult, gErr := runIntentGate(
+			ctx, absRepoRoot, req.RunID, req.Ticket.ID,
+			req.Adapter, intentReq, req.Plan, cfg.Intent,
+		)
+		if gErr != nil {
+			return RunTicketResult{}, fmt.Errorf("intent gate: %w", gErr)
+		}
+		if !gateResult.Passed {
+			st.currentPhase = state.TicketPhaseBlocked
+			st.currentOutcome = state.TicketOutcomeBlocked
+			st.blockReason = fmt.Sprintf("intent gate blocked: %s", gateResult.BlockReason)
+			if err := st.persist(); err != nil {
+				return RunTicketResult{}, err
+			}
+			if err := st.releaseClaim(); err != nil {
+				return RunTicketResult{}, err
+			}
+			return RunTicketResult{Snapshot: st.snapshot(), Path: st.paths.snapshotPath}, nil
+		}
+		st.intent = gateResult.Artifact
 	}
 
 	// Write freeze.json at run start so artifacts can audit the owned_paths
@@ -666,6 +711,29 @@ func handleImplementResult(st *ticketRunState, result runtime.WorkerResult, req 
 		st.implementation.RawChangedFiles = rawChangedFiles
 		st.implementation.EffectiveChangedFiles = effectiveChangedFiles
 		st.implementation.ChangedFiles = effectiveChangedFiles
+
+		// SR-1 post-implementation alignment: when the intent gate ran,
+		// compare changed files against the intent's planned TargetFiles.
+		// Files changed outside the planned set are surfaced as an advisory
+		// warning (out_of_scope_files) and logged; they do not block the
+		// ticket.
+		if st.intent != nil && len(st.intent.TargetFiles) > 0 {
+			plannedSet := make(map[string]struct{}, len(st.intent.TargetFiles))
+			for _, f := range st.intent.TargetFiles {
+				plannedSet[f] = struct{}{}
+			}
+			var outOfScope []string
+			for _, f := range effectiveChangedFiles {
+				if _, ok := plannedSet[f]; !ok {
+					outOfScope = append(outOfScope, f)
+				}
+			}
+			if len(outOfScope) > 0 {
+				st.implementation.OutOfScopeFiles = outOfScope
+				log.Printf("[INFO] ticket %s: %d file(s) changed outside intent-planned scope: %s",
+					st.req.Ticket.ID, len(outOfScope), strings.Join(outOfScope, ", "))
+			}
+		}
 	case runtime.WorkerStatusNeedsContext, runtime.WorkerStatusBlocked:
 		reason := workerBlockReason(result)
 		st.blockReason = reason

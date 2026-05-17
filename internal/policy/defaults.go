@@ -43,5 +43,9 @@ func DefaultConfig() Config {
 			RequirePublicContractScenarios: true,
 			RequireEpicIntegrationTicket:   true,
 		},
+		Intent: IntentConfig{
+			Enabled:     false,
+			MaxAttempts: 2,
+		},
 	}
 }

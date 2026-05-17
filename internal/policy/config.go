@@ -124,6 +124,19 @@ type LoggingConfig struct {
 	ArtifactRetention int    `yaml:"artifact_retention" json:"artifact_retention"`
 }
 
+// IntentConfig controls the pre-implementation intent echo gate.
+// When Enabled is true, the engine calls RunIntent on the adapter up to
+// MaxAttempts times before dispatching the implementation worker. A failing
+// gate (after all retries) blocks the ticket with reason "intent_non_convergent".
+// Enabled defaults to false so existing runs are unaffected until opted in.
+type IntentConfig struct {
+	// Enabled turns the intent gate on or off. Defaults to false.
+	Enabled bool `yaml:"enabled" json:"enabled"`
+	// MaxAttempts is the maximum number of RunIntent calls per ticket attempt.
+	// Defaults to 2.
+	MaxAttempts int `yaml:"max_attempts" json:"max_attempts"`
+}
+
 // TicketQualityConfig controls the deterministic ticket quality gate that runs
 // before a worker is dispatched. All fields have safe defaults via DefaultConfig.
 type TicketQualityConfig struct {
@@ -153,6 +166,7 @@ type Config struct {
 	Verification  VerificationConfig  `yaml:"verification" json:"verification"`
 	Logging       LoggingConfig       `yaml:"logging" json:"logging"`
 	TicketQuality TicketQualityConfig `yaml:"ticket_quality" json:"ticket_quality"`
+	Intent        IntentConfig        `yaml:"intent" json:"intent"`
 }
 
 func LoadConfig(repoRoot string) (Config, error) {
