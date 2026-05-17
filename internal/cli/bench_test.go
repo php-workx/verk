@@ -61,13 +61,6 @@ func TestBenchList_PrintsRegisteredProviders(t *testing.T) {
 	}
 }
 
-func TestBenchRun_NotYetImplemented(t *testing.T) {
-	_, _, code := runBenchCmd(t, "run", "smoke")
-	if code == 0 {
-		t.Fatal("bench run: expected non-zero exit code, got 0")
-	}
-}
-
 func TestBenchReport_NotYetImplemented(t *testing.T) {
 	_, _, code := runBenchCmd(t, "report", "run-abc-123")
 	if code == 0 {
