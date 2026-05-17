@@ -493,3 +493,43 @@ type IntentArtifact struct {
 	TestPlan        string   `json:"test_plan"`        // prose summary of test approach
 	RawResponse     string   `json:"raw_response,omitempty"`
 }
+
+// WaveTicketSummary holds compact per-ticket context for wave and epic-plan
+// review artifacts.
+type WaveTicketSummary struct {
+	TicketID     string   `json:"ticket_id"`
+	CriterionIDs []string `json:"criterion_ids"`
+	OwnedPaths   []string `json:"owned_paths"`
+	ReviewPassed bool     `json:"review_passed"`
+}
+
+// WaveReviewArtifact is persisted at
+// .verk/runs/<run-id>/waves/wave-<n>/wave-review.json
+//
+// It records the outcome of a single fresh-context reviewer call over the
+// union diff produced by all tickets in the wave. The reviewer checks for
+// cross-ticket contradictions, integration drift, incomplete fanout, and
+// orphaned references that per-ticket reviewers may not catch.
+//
+// TargetTicketIDs per-finding assignment (mapping a finding's file to a
+// specific ticket's owned_paths) is a planned enhancement; for v1 the
+// wave-level artifact records the finding without per-ticket routing.
+type WaveReviewArtifact struct {
+	ArtifactMeta
+	WaveID            string              `json:"wave_id"`
+	Ordinal           int                 `json:"ordinal"`
+	ReviewerRuntime   string              `json:"reviewer_runtime,omitempty"`
+	Model             string              `json:"model,omitempty"`
+	ReviewScope       string              `json:"review_scope"` // always "wave"
+	BaseCommit        string              `json:"base_commit"`
+	ScopeUnion        []string            `json:"scope_union"` // union of owned_paths across tickets
+	TicketSummaries   []WaveTicketSummary `json:"ticket_summaries"`
+	Findings          []ReviewFinding     `json:"findings"`
+	BlockingFindings  []string            `json:"blocking_findings"`
+	Passed            bool                `json:"passed"`
+	Mode              string              `json:"mode"` // "shadow" | "enforce"
+	FullDiffBytes     int                 `json:"full_diff_bytes"`
+	IncludedDiffBytes int                 `json:"included_diff_bytes"`
+	TokensIn          int                 `json:"tokens_in,omitempty"`
+	TokensOut         int                 `json:"tokens_out,omitempty"`
+}

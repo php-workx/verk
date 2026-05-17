@@ -137,6 +137,31 @@ type IntentConfig struct {
 	MaxAttempts int `yaml:"max_attempts" json:"max_attempts"`
 }
 
+// WaveReviewConfig controls the wave-level cross-ticket reviewer that runs
+// after all tickets in a wave complete but before the wave is accepted.
+//
+// The reviewer looks at the union diff across all wave tickets to catch
+// cross-ticket contradictions, integration drift, incomplete fanout, and
+// orphaned references that per-ticket reviewers may not catch.
+type WaveReviewConfig struct {
+	// Mode controls when the wave reviewer is active.
+	//   "disabled" — no wave review is run.
+	//   "shadow"   — the review runs and is persisted, but findings do not
+	//                block the wave. Operators can inspect the artifact at
+	//                .verk/runs/<run-id>/waves/wave-<n>/wave-review.json.
+	//   "enforce"  — any open finding at or above Threshold blocks the wave.
+	// Default: "shadow"
+	Mode string `yaml:"mode" json:"mode"`
+	// Threshold is the minimum severity level that constitutes a blocking
+	// finding in enforce mode. Accepted values: P0, P1, P2, P3, P4.
+	// Default: "P2"
+	Threshold string `yaml:"threshold" json:"threshold"`
+	// SkipSingleTicket, when true, skips the wave review when the wave
+	// contains only one ticket (a per-ticket reviewer already ran for it).
+	// Default: true
+	SkipSingleTicket bool `yaml:"skip_single_ticket" json:"skip_single_ticket"`
+}
+
 // TicketQualityConfig controls the deterministic ticket quality gate that runs
 // before a worker is dispatched. All fields have safe defaults via DefaultConfig.
 type TicketQualityConfig struct {
@@ -167,6 +192,7 @@ type Config struct {
 	Logging       LoggingConfig       `yaml:"logging" json:"logging"`
 	TicketQuality TicketQualityConfig `yaml:"ticket_quality" json:"ticket_quality"`
 	Intent        IntentConfig        `yaml:"intent" json:"intent"`
+	WaveReview    WaveReviewConfig    `yaml:"wave_review" json:"wave_review"`
 }
 
 func LoadConfig(repoRoot string) (Config, error) {

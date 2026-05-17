@@ -120,10 +120,27 @@ func (a *reflectingAdapter) ReviewRequests() []runtime.ReviewRequest {
 func newReflectingAdapter(numTickets int) *reflectingAdapter {
 	start := epicTestStart()
 	workerResults := make([]runtime.WorkerResult, numTickets)
-	// +1 review result: the extra slot is reserved for the epic closure gate
-	// reviewer that runs after all child tickets close. Without it the gate
-	// tries to invoke the reviewer but runs out of scripted results.
-	reviewResults := make([]runtime.ReviewResult, numTickets+1)
+	// +2 review result slots are reserved after per-ticket reviews:
+	//   +1 for the wave-level cross-ticket reviewer (P5) that runs when the
+	//      wave has ≥ 2 tickets (SkipSingleTicket=true in DefaultConfig).
+	//   +1 for the epic closure gate reviewer that runs after all tickets close.
+	// When numTickets == 1 the wave review is skipped by SkipSingleTicket, so
+	// both slots are available but only the epic gate uses the second one.
+
+	passedReview := func(i int, suffix string) runtime.ReviewResult {
+		return runtime.ReviewResult{
+			Status:             runtime.WorkerStatusDone,
+			RetryClass:         runtime.RetryClassTerminal,
+			LeaseID:            "placeholder", // will be overwritten by reflectingAdapter
+			StartedAt:          start.Add(time.Duration(i) * time.Second).Add(2 * time.Second),
+			FinishedAt:         start.Add(time.Duration(i) * time.Second).Add(3 * time.Second),
+			ReviewStatus:       runtime.ReviewStatusPassed,
+			Summary:            "clean",
+			ResultArtifactPath: suffix + ".json",
+		}
+	}
+
+	allReviewResults := make([]runtime.ReviewResult, 0, numTickets+2)
 	for i := 0; i < numTickets; i++ {
 		workerResults[i] = runtime.WorkerResult{
 			Status:             runtime.WorkerStatusDone,
@@ -133,20 +150,15 @@ func newReflectingAdapter(numTickets int) *reflectingAdapter {
 			FinishedAt:         start.Add(time.Duration(i) * time.Second).Add(time.Second),
 			ResultArtifactPath: "artifact.json",
 		}
-		reviewResults[i] = runtime.ReviewResult{
-			Status:             runtime.WorkerStatusDone,
-			RetryClass:         runtime.RetryClassTerminal,
-			LeaseID:            "placeholder", // will be overwritten by reflectingAdapter
-			StartedAt:          start.Add(time.Duration(i) * time.Second).Add(2 * time.Second),
-			FinishedAt:         start.Add(time.Duration(i) * time.Second).Add(3 * time.Second),
-			ReviewStatus:       runtime.ReviewStatusPassed,
-			Summary:            "clean",
-			ResultArtifactPath: "review.json",
-		}
+		allReviewResults = append(allReviewResults, passedReview(i, "review"))
 	}
-	// Epic closure gate reviewer result (index numTickets).
-	epicIdx := numTickets
-	reviewResults[epicIdx] = runtime.ReviewResult{
+	// Wave-level reviewer (P5): runs when numTickets >= 2 (SkipSingleTicket=true).
+	// When numTickets == 1 this slot is a no-op (the wave review is skipped), but
+	// having it present keeps the adaptor pool large enough for any code path.
+	allReviewResults = append(allReviewResults, passedReview(numTickets, "wave-review"))
+	// Epic closure gate reviewer result.
+	epicIdx := numTickets + 1
+	allReviewResults = append(allReviewResults, runtime.ReviewResult{
 		Status:             runtime.WorkerStatusDone,
 		RetryClass:         runtime.RetryClassTerminal,
 		LeaseID:            "placeholder", // will be overwritten by reflectingAdapter
@@ -155,11 +167,11 @@ func newReflectingAdapter(numTickets int) *reflectingAdapter {
 		ReviewStatus:       runtime.ReviewStatusPassed,
 		Summary:            "epic gate: no blocking findings",
 		ResultArtifactPath: "epic-review.json",
-	}
+	})
 	return &reflectingAdapter{
-		inner:         runtimefake.New(workerResults, reviewResults),
+		inner:         runtimefake.New(workerResults, allReviewResults),
 		workerResults: workerResults,
-		reviewResults: reviewResults,
+		reviewResults: allReviewResults,
 	}
 }
 
@@ -868,6 +880,7 @@ func TestRunEpicSelectsRuntimePerTicket(t *testing.T) {
 				},
 			},
 			[]runtime.ReviewResult{
+				// Per-ticket review for ticket-claude (index 0).
 				{
 					Status:             runtime.WorkerStatusDone,
 					RetryClass:         runtime.RetryClassTerminal,
@@ -878,12 +891,25 @@ func TestRunEpicSelectsRuntimePerTicket(t *testing.T) {
 					Summary:            "clean",
 					ResultArtifactPath: filepath.Join(repoRoot, "claude-review.json"),
 				},
+				// Wave-level cross-ticket review (P5): runs via the DefaultRuntime
+				// ("claude") adapter after all wave tickets complete (index 1).
 				{
 					Status:             runtime.WorkerStatusDone,
 					RetryClass:         runtime.RetryClassTerminal,
 					LeaseID:            "lease-run-runtime-ticket-claude-wave-1",
 					StartedAt:          epicTestStart().Add(14 * time.Second),
 					FinishedAt:         epicTestStart().Add(15 * time.Second),
+					ReviewStatus:       runtime.ReviewStatusPassed,
+					Summary:            "no cross-ticket issues",
+					ResultArtifactPath: filepath.Join(repoRoot, "claude-wave-review.json"),
+				},
+				// Epic closure gate review (index 2).
+				{
+					Status:             runtime.WorkerStatusDone,
+					RetryClass:         runtime.RetryClassTerminal,
+					LeaseID:            "lease-run-runtime-ticket-claude-wave-1",
+					StartedAt:          epicTestStart().Add(16 * time.Second),
+					FinishedAt:         epicTestStart().Add(17 * time.Second),
 					ReviewStatus:       runtime.ReviewStatusPassed,
 					Summary:            "clean",
 					ResultArtifactPath: filepath.Join(repoRoot, "claude-review-2.json"),
@@ -920,7 +946,12 @@ func TestRunEpicSelectsRuntimePerTicket(t *testing.T) {
 	got := append([]string(nil), requestedRuntimes...)
 	mu.Unlock()
 	sort.Strings(got)
-	if !reflect.DeepEqual(got, []string{"claude", "claude", "codex"}) {
+	// Expected adapter factory calls (sorted):
+	//   "codex"  — per-ticket worker for ticket-codex
+	//   "claude" — per-ticket worker for ticket-claude
+	//   "claude" — wave-level cross-ticket reviewer (P5), runs via DefaultRuntime
+	//   "claude" — epic closure gate reviewer
+	if !reflect.DeepEqual(got, []string{"claude", "claude", "claude", "codex"}) {
 		t.Fatalf("unexpected requested runtimes: %#v", requestedRuntimes)
 	}
 }

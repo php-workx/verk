@@ -664,6 +664,73 @@ func RunEpic(ctx context.Context, req RunEpicRequest) (RunEpicResult, error) { /
 			acceptedWave.Acceptance["diff_persist_error"] = diffArtifactErr.Error()
 		}
 
+		// --- Wave-level cross-ticket reviewer (P5) --------------------------------
+		// Run after all tickets reach closeout/blocked and diff artifacts are
+		// persisted, but before the wave status is finalized. Only runs when the
+		// wave was not already failed by a hard error so the reviewer sees a
+		// consistent state.
+		// Pre-check skip conditions before resolving the adapter to avoid consuming
+		// adapter resources (e.g. scripted reviewer slots in tests) unnecessarily.
+		waveReviewMode := strings.TrimSpace(cfg.WaveReview.Mode)
+		if waveReviewMode == "" {
+			waveReviewMode = "shadow"
+		}
+		waveReviewEligible := !waveFailed && acceptErr == nil &&
+			waveReviewMode != "disabled" &&
+			len(wave.TicketIDs) > 0 &&
+			(!cfg.WaveReview.SkipSingleTicket || len(wave.TicketIDs) != 1) &&
+			!waveReviewArtifactExists(req.RepoRoot, req.RunID, waveID)
+		if waveReviewEligible {
+			waveTickets := make([]epos.Ticket, 0, len(wave.TicketIDs))
+			for _, tid := range wave.TicketIDs {
+				if t, loadErr := loadEpicTicket(req.RepoRoot, tid); loadErr == nil {
+					waveTickets = append(waveTickets, t)
+				}
+			}
+			waveReviewAdapter, adapterErr := resolveWaveAdapter(req)
+			if adapterErr != nil {
+				log.Printf("[WARN] wave review %s: resolve adapter: %v", waveID, adapterErr)
+			} else {
+				waveReviewArtifact, waveReviewErr := RunWaveReview(
+					ctx,
+					waveReviewAdapter,
+					req.RepoRoot,
+					waveID,
+					waveOrdinal,
+					waveTickets,
+					wave.WaveBaseCommit,
+					cfg.WaveReview,
+					req.RunID,
+				)
+				if waveReviewErr != nil {
+					// Enforce mode: wave fails due to blocking review findings.
+					waveFailed = true
+					if waveErr == nil {
+						waveErr = waveReviewErr
+					} else {
+						waveErr = errors.Join(waveErr, waveReviewErr)
+					}
+					if acceptedWave.Status == state.WaveStatusAccepted {
+						acceptedWave.Status = state.WaveStatusFailed
+					}
+					if acceptedWave.Acceptance == nil {
+						acceptedWave.Acceptance = map[string]any{}
+					}
+					acceptedWave.Acceptance["wave_review_failed"] = waveReviewErr.Error()
+				}
+				if waveReviewArtifact != nil && acceptedWave.Acceptance != nil {
+					acceptedWave.Acceptance["wave_review_mode"] = waveReviewArtifact.Mode
+					acceptedWave.Acceptance["wave_review_passed"] = waveReviewArtifact.Passed
+				} else if waveReviewArtifact != nil {
+					acceptedWave.Acceptance = map[string]any{
+						"wave_review_mode":   waveReviewArtifact.Mode,
+						"wave_review_passed": waveReviewArtifact.Passed,
+					}
+				}
+			}
+		}
+		// -------------------------------------------------------------------------
+
 		acceptedWave.UpdatedAt = time.Now().UTC()
 		if acceptedWave.FinishedAt.IsZero() {
 			acceptedWave.FinishedAt = acceptedWave.UpdatedAt

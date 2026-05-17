@@ -47,5 +47,10 @@ func DefaultConfig() Config {
 			Enabled:     false,
 			MaxAttempts: 2,
 		},
+		WaveReview: WaveReviewConfig{
+			Mode:             "shadow",
+			Threshold:        "P2",
+			SkipSingleTicket: true,
+		},
 	}
 }
